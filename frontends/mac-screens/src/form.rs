@@ -11,7 +11,7 @@ use std::rc::{Rc, Weak};
 
 use rusty_backup::controller::commander::Tone;
 
-use super::host::{Column, Ctl, Ev, Host, PullItem, Surface};
+use super::host::{Column, Ctl, Ev, Host, Painter, PullItem, Surface};
 use super::layout::{self, Node};
 
 /// What a control is, as far as reporting its changes goes.
@@ -26,6 +26,8 @@ pub enum Kind {
     Pulldown,
     Progress,
     Table,
+    Canvas,
+    TextView,
     /// A view the shell builds itself (a list, a bar) and hands the host.
     Custom,
 }
@@ -341,6 +343,37 @@ impl<K: Copy + PartialEq + 'static> Form<K> {
     /// The row and state of the last tick box the user changed on list `k`.
     pub fn toggled(&self, k: K) -> Option<(usize, bool)> {
         self.host.toggled(self.surface, self.st.ctl(k))
+    }
+
+    /// A view drawn by `painter`; a click reports `k`, and `clicked` says where.
+    pub fn canvas(&self, k: K, id: &str, painter: Painter) {
+        let c = self.built(k, Kind::Canvas);
+        self.host.canvas(self.surface, c, id, painter);
+    }
+
+    pub fn redraw(&self, k: K) {
+        self.host.redraw(self.surface, self.st.ctl(k));
+    }
+
+    /// The last click on canvas `k` and its size then: `(x, y, w, h)`.
+    pub fn clicked(&self, k: K) -> Option<(f64, f64, f64, f64)> {
+        self.host.clicked(self.surface, self.st.ctl(k))
+    }
+
+    /// A read-only text view in the fixed-width log font.
+    pub fn text_view(&self, k: K, id: &str) {
+        let c = self.built(k, Kind::TextView);
+        self.host.text_view(self.surface, c, id);
+    }
+
+    pub fn set_text_view(&self, k: K, text: &str) {
+        self.host
+            .set_text_view(self.surface, self.st.ctl(k), &plain(text));
+    }
+
+    pub fn append_text_view(&self, k: K, text: &str, follow: bool) {
+        self.host
+            .append_text_view(self.surface, self.st.ctl(k), &plain(text), follow);
     }
 
     /// Drop every view whose key `gone` names (rows built again for a new source).

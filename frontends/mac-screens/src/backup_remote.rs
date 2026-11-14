@@ -5,17 +5,13 @@
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::NSWindow;
 use rusty_backup::controller::backup::{hints, ids, BackupAction, RemoteDrive};
 use rusty_backup::controller::commander::Tone;
 
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::sync::SyncGuard;
-use crate::table::Table;
-use crate::ui::{self, CloseDelegate};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::sync::SyncGuard;
 
 /// What the window shows, read while the controller is borrowed.
 pub struct RemoteShown {
@@ -36,44 +32,46 @@ enum K {
     Error,
     Note,
     List,
+    /// Return or a double-click on a drive.
+    Pick,
     Close,
 }
 
 pub struct RemoteWindow {
-    window: Retained<NSWindow>,
-    _delegate: Retained<CloseDelegate>,
+    ui: Rc<dyn Host>,
+    window: Surface,
     form: Form<K>,
-    list: Table,
     send: Rc<dyn Fn(BackupAction)>,
     sync: SyncGuard,
     drives: RefCell<Vec<RemoteDrive>>,
 }
 
 impl RemoteWindow {
-    pub fn open(mtm: MainThreadMarker, send: Rc<dyn Fn(BackupAction)>) -> Rc<RemoteWindow> {
+    pub fn open(ui: Rc<dyn Host>, send: Rc<dyn Fn(BackupAction)>) -> Rc<RemoteWindow> {
         Rc::new_cyclic(|me: &Weak<RemoteWindow>| {
-            let close = send.clone();
-            let (window, delegate) = ui::window(
-                mtm,
+            let (close, later) = (send.clone(), ui.clone());
+            let window = ui.window(
                 "Remote Drive",
-                520.0,
-                380.0,
+                520,
+                380,
                 Box::new(move || {
                     let close = close.clone();
-                    crate::app::later(Box::new(move || close(BackupAction::RemoteClose)));
+                    later.later(Box::new(move || close(BackupAction::RemoteClose)));
                 }),
             );
             let resize = me.clone();
-            delegate.on_resize(Box::new(move || {
-                if let Some(w) = resize.upgrade() {
-                    w.layout();
-                }
-            }));
-            let body = window.contentView().expect("the window's content view");
+            ui.on_resize(
+                window,
+                Box::new(move || {
+                    if let Some(w) = resize.upgrade() {
+                        w.layout();
+                    }
+                }),
+            );
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body,
+            let form = Form::with_host(
+                ui.clone(),
+                window,
                 Rc::new(move |k| {
                     if let Some(w) = fire.upgrade() {
                         w.fired(k);
@@ -87,25 +85,20 @@ impl RemoteWindow {
             form.label(K::Busy, "Connecting...");
             form.wrap(K::Error, "");
             form.wrap(K::Note, "");
-            let list = Table::new(mtm, ids::REMOTE_DRIVE, &[("Drive", 460.0, false)]);
-            list.view.setHeaderView(None);
-            let activate = me.clone();
-            list.on_activate(
-                mtm,
-                Rc::new(move || {
-                    if let Some(w) = activate.upgrade() {
-                        w.picked();
-                    }
-                }),
+            // No column title: the list shows no header.
+            form.table(
+                K::List,
+                ids::REMOTE_DRIVE,
+                &[("", 460.0, false)],
+                Some(K::Pick),
+                None,
             );
-            form.add(K::List, &list.scroll);
             form.button(K::Close, "Close", ids::REMOTE_CLOSE);
-            ui::present(&window);
+            ui.present(window);
             RemoteWindow {
+                ui: ui.clone(),
                 window,
-                _delegate: delegate,
                 form,
-                list,
                 send,
                 sync: SyncGuard::default(),
                 drives: RefCell::default(),
@@ -128,8 +121,8 @@ impl RemoteWindow {
             let drives = s.drives.unwrap_or_default();
             f.show(K::List, !drives.is_empty());
             if *self.drives.borrow() != drives {
-                self.list
-                    .set_rows(drives.iter().map(|d| vec![d.label.clone()]).collect());
+                let rows: Vec<Vec<String>> = drives.iter().map(|d| vec![d.label.clone()]).collect();
+                f.set_rows(K::List, &rows);
                 *self.drives.borrow_mut() = drives;
             }
         });
@@ -138,8 +131,8 @@ impl RemoteWindow {
 
     fn picked(&self) {
         let Some(d) = self
-            .list
-            .selected()
+            .form
+            .selected_row(K::List)
             .and_then(|i| self.drives.borrow().get(i).cloned())
         else {
             return;
@@ -151,9 +144,6 @@ impl RemoteWindow {
     }
 
     fn layout(&self) {
-        let Some(body) = self.window.contentView() else {
-            return;
-        };
         let row_h = Size::Fixed(layout::ROW);
         let line = |k: K| Node::leaf(k, Size::Stretch(1), Size::Fixed((layout::ROW - 6) * 2 + 4));
         let tree = Node::inset(
@@ -175,13 +165,13 @@ impl RemoteWindow {
             ]),
             layout::MARGIN,
         );
-        self.form.place_shown(tree, ui::area(&body));
+        self.form.place_shown(tree, self.ui.area(self.window));
     }
 
     /// Send once the current handler returns: the window may close with it.
     fn send_later(&self, action: BackupAction) {
         let send = self.send.clone();
-        crate::app::later(Box::new(move || send(action)));
+        self.ui.later(Box::new(move || send(action)));
     }
 
     fn fired(&self, k: K) {
@@ -192,6 +182,10 @@ impl RemoteWindow {
             K::Address => BackupAction::RemoteSetAddress(self.form.text(k)),
             K::Connect => BackupAction::RemoteConnect,
             K::Close => BackupAction::RemoteClose,
+            K::Pick => {
+                self.picked();
+                return;
+            }
             _ => return,
         };
         self.send_later(action);
@@ -200,7 +194,6 @@ impl RemoteWindow {
 
 impl Drop for RemoteWindow {
     fn drop(&mut self) {
-        self.window.setDelegate(None);
-        self.window.orderOut(None);
+        self.ui.release(self.window);
     }
 }

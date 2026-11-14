@@ -16,7 +16,7 @@ use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, PasswordSpec, PickSpec, TextSpec};
 
-use crate::screens::host::{Column, Ctl, Ev, Host, PullItem, Surface};
+use crate::screens::host::{Align, Column, Ctl, Ev, Host, Ink, Painter, Pen, PullItem, Surface};
 use crate::screens::layout::Rect;
 use crate::screens::prompt;
 
@@ -49,6 +49,27 @@ extern "C" {
     fn rb_host_select_row(s: u32, c: u32, i: u32);
     fn rb_host_toggled(s: u32, c: u32, row: *mut i32, on: *mut c_int) -> c_int;
     fn rb_host_key_equivalent(s: u32, c: u32, key: *const c_char);
+    fn rb_host_canvas(s: u32, c: u32, id: *const c_char);
+    fn rb_host_redraw(s: u32, c: u32);
+    fn rb_host_clicked(s: u32, c: u32, out: *mut f64) -> c_int;
+    fn rb_host_text_view(s: u32, c: u32, id: *const c_char);
+    fn rb_host_set_text_view(s: u32, c: u32, text: *const c_char);
+    fn rb_host_append_text_view(s: u32, c: u32, text: *const c_char, follow: c_int);
+
+    fn rb_pen_fill(x: f64, y: f64, w: f64, h: f64, ink: c_int, rgb: u32);
+    fn rb_pen_line(x0: f64, y0: f64, x1: f64, y1: f64, ink: c_int, rgb: u32);
+    fn rb_pen_frame(x: f64, y: f64, w: f64, h: f64, width: f64, ink: c_int, rgb: u32);
+    fn rb_pen_text(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        text: *const c_char,
+        ink: c_int,
+        rgb: u32,
+        center: c_int,
+    );
+    fn rb_pen_text_width(text: *const c_char) -> f64;
 
     fn rb_host_open_url(url: *const c_char);
     fn rb_host_copy_text(text: *const c_char);
@@ -152,6 +173,7 @@ thread_local! {
     static HANDLERS: RefCell<Vec<(Surface, Rc<dyn Fn(Ctl, Ev)>)>> = RefCell::new(Vec::new());
     static WINDOWS: RefCell<Vec<WindowHooks>> = RefCell::new(Vec::new());
     static LATER: RefCell<VecDeque<Box<dyn FnOnce()>>> = RefCell::new(VecDeque::new());
+    static PAINTERS: RefCell<Vec<((Surface, Ctl), Painter)>> = RefCell::new(Vec::new());
     static HOST: Rc<VintageHost> = Rc::new(VintageHost {
         status: RefCell::new(String::new()),
         log: RefCell::new(Vec::new()),
@@ -172,6 +194,66 @@ pub extern "C" fn rb_window_event(s: u32, kind: u32) {
     });
     if let Some(f) = hook {
         f();
+    }
+}
+
+/// A canvas's `drawRect:`: run its painter with a pen over the current graphics context.
+#[no_mangle]
+pub extern "C" fn rb_canvas_draw(s: u32, c: u32, w: f64, h: f64, dark: c_int) {
+    let painter = PAINTERS.with(|p| {
+        p.borrow()
+            .iter()
+            .find(|x| x.0 == (s, c))
+            .map(|x| x.1.clone())
+    });
+    if let Some(p) = painter {
+        p(&VintagePen, w, h, dark != 0);
+    }
+}
+
+/// Draws through `rb_pen_*`, which work only inside a canvas's `drawRect:`.
+struct VintagePen;
+
+/// An ink as the host takes it: a kind (0 a colour, 1 label, 2 separator, 3 on a fill) and 0xRRGGBB.
+fn ink(i: Ink) -> (c_int, u32) {
+    match i {
+        Ink::Rgb(r, g, b) => (0, (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)),
+        Ink::Label => (1, 0),
+        Ink::Separator => (2, 0),
+        Ink::OnFill => (3, 0),
+    }
+}
+
+impl Pen for VintagePen {
+    fn fill(&self, x: f64, y: f64, w: f64, h: f64, i: Ink) {
+        let (k, rgb) = ink(i);
+        // SAFETY: called from a painter, inside the canvas's drawRect:.
+        unsafe { rb_pen_fill(x, y, w, h, k, rgb) }
+    }
+
+    fn line(&self, x0: f64, y0: f64, x1: f64, y1: f64, i: Ink) {
+        let (k, rgb) = ink(i);
+        // SAFETY: as for `fill`.
+        unsafe { rb_pen_line(x0, y0, x1, y1, k, rgb) }
+    }
+
+    fn frame(&self, x: f64, y: f64, w: f64, h: f64, width: f64, i: Ink) {
+        let (k, rgb) = ink(i);
+        // SAFETY: as for `fill`.
+        unsafe { rb_pen_frame(x, y, w, h, width, k, rgb) }
+    }
+
+    fn text(&self, (x, y, w, h): (f64, f64, f64, f64), text: &str, i: Ink, align: Align) {
+        let (k, rgb) = ink(i);
+        let t = cs(text);
+        // SAFETY: as for `fill`; the host copies the text.
+        unsafe { rb_pen_text(x, y, w, h, t.as_ptr(), k, rgb, flag(align == Align::Center)) }
+    }
+
+    fn text_width(&self, text: &str) -> f64 {
+        let t = cs(text);
+        // SAFETY: measuring only; the host copies the text.
+        unsafe { rb_pen_text_width(t.as_ptr()) }
     }
 }
 
@@ -266,6 +348,17 @@ impl Host for VintageHost {
             at.map(|i| w.remove(i))
         });
         drop(hooks);
+        let painters = PAINTERS.with(|p| {
+            let mut p = p.borrow_mut();
+            let gone: Vec<Painter> = p
+                .iter()
+                .filter(|x| x.0 .0 == s)
+                .map(|x| x.1.clone())
+                .collect();
+            p.retain(|x| x.0 .0 != s);
+            gone
+        });
+        drop(painters);
         // SAFETY: a plain call on the main thread.
         unsafe { rb_host_release(s) }
     }
@@ -460,6 +553,51 @@ impl Host for VintageHost {
             return None;
         }
         usize::try_from(row).ok().map(|r| (r, on != 0))
+    }
+
+    fn canvas(&self, s: Surface, c: Ctl, id: &str, painter: Painter) {
+        PAINTERS.with(|p| {
+            let mut p = p.borrow_mut();
+            p.retain(|x| x.0 != (s, c));
+            p.push(((s, c), painter));
+        });
+        let i = cs(id);
+        // SAFETY: the host copies the id.
+        unsafe { rb_host_canvas(s, c, i.as_ptr()) }
+    }
+
+    fn redraw(&self, s: Surface, c: Ctl) {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_redraw(s, c) }
+    }
+
+    fn clicked(&self, s: Surface, c: Ctl) -> Option<(f64, f64, f64, f64)> {
+        let mut out = [0f64; 4];
+        // SAFETY: the host writes four numbers when the canvas has been clicked.
+        let any = unsafe { rb_host_clicked(s, c, out.as_mut_ptr()) };
+        if any == 0 {
+            None
+        } else {
+            Some((out[0], out[1], out[2], out[3]))
+        }
+    }
+
+    fn text_view(&self, s: Surface, c: Ctl, id: &str) {
+        let i = cs(id);
+        // SAFETY: the host copies the id.
+        unsafe { rb_host_text_view(s, c, i.as_ptr()) }
+    }
+
+    fn set_text_view(&self, s: Surface, c: Ctl, text: &str) {
+        let t = cs(text);
+        // SAFETY: the host copies the text.
+        unsafe { rb_host_set_text_view(s, c, t.as_ptr()) }
+    }
+
+    fn append_text_view(&self, s: Surface, c: Ctl, text: &str, follow: bool) {
+        let t = cs(text);
+        // SAFETY: the host copies the text.
+        unsafe { rb_host_append_text_view(s, c, t.as_ptr(), flag(follow)) }
     }
 
     fn key_equivalent(&self, s: Surface, c: Ctl, key: &str) {

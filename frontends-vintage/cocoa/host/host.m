@@ -12,6 +12,7 @@ extern void rb_event(uint32_t s, uint32_t c, uint32_t kind);
 extern void rb_window_event(uint32_t s, uint32_t kind);
 extern void rb_later(void);
 extern void rb_tick(void);
+extern void rb_canvas_draw(uint32_t s, uint32_t c, double w, double h, int dark);
 
 enum { RB_ACT = 0, RB_EDITED = 1, RB_VALUE_SET = 2, RB_SELECTED = 3, RB_ACTIVATED = 4, RB_TOGGLED = 5 };
 
@@ -209,6 +210,55 @@ static BOOL rb_reading = NO;
 }
 @end
 
+// A view Rust paints: drawRect: runs the surface's painter, a click is remembered and reported.
+@interface RBCanvas : NSView
+{
+@public
+    uint32_t sid;
+    uint32_t ctl;
+    BOOL has_click;
+    double click[4];
+}
+@end
+
+// Whether `v` draws in a dark appearance; only 10.14 and later have one.
+static BOOL rb_dark(NSView *v)
+{
+    if (![v respondsToSelector:@selector(effectiveAppearance)])
+        return NO;
+    id look = [v performSelector:@selector(effectiveAppearance)];
+    NSString *name = [look respondsToSelector:@selector(name)] ? [look performSelector:@selector(name)] : nil;
+    return name != nil && [name rangeOfString:@"Dark"].location != NSNotFound;
+}
+
+static BOOL rb_painting_dark = NO;
+
+@implementation RBCanvas
+- (BOOL)isFlipped
+{
+    return YES;
+}
+
+- (void)drawRect:(NSRect)dirty
+{
+    NSRect b = [self bounds];
+    rb_painting_dark = rb_dark(self);
+    rb_canvas_draw(sid, ctl, b.size.width, b.size.height, rb_painting_dark ? 1 : 0);
+}
+
+- (void)mouseDown:(NSEvent *)event
+{
+    NSPoint at = [self convertPoint:[event locationInWindow] fromView:nil];
+    NSRect b = [self bounds];
+    click[0] = at.x;
+    click[1] = at.y;
+    click[2] = b.size.width;
+    click[3] = b.size.height;
+    has_click = YES;
+    rb_event(sid, ctl, RB_ACT);
+}
+@end
+
 @interface RBSurface : NSObject
 {
 @public
@@ -217,6 +267,7 @@ static BOOL rb_reading = NO;
     NSView *body;
     NSMutableDictionary *views;
     NSMutableDictionary *lists;
+    NSMutableDictionary *texts;
     RBTarget *target;
 }
 @end
@@ -230,6 +281,7 @@ static BOOL rb_reading = NO;
     [body release];
     [views release];
     [lists release];
+    [texts release];
     [target release];
     [super dealloc];
 }
@@ -328,6 +380,7 @@ uint32_t rb_host_window(const char *title, int32_t w, int32_t h)
     [x->window setContentView:x->body];
     x->views = [[NSMutableDictionary alloc] init];
     x->lists = [[NSMutableDictionary alloc] init];
+    x->texts = [[NSMutableDictionary alloc] init];
     x->target = [[RBTarget alloc] initWithSurface:s];
     x->delegate = [[RBWindowDelegate alloc] initWithSurface:s];
     [x->window setDelegate:(id)x->delegate];
@@ -675,6 +728,11 @@ void rb_host_table(uint32_t s, uint32_t c, const char *ax_id, const char *const 
         [r addObject:[NSNumber numberWithBool:(right[i] ? YES : NO)]];
     }
     l->right = [r retain];
+    BOOL titled = NO;
+    for (i = 0; i < n; i++)
+        titled = titled || (titles[i] && *titles[i]);
+    if (!titled)
+        [l->table setHeaderView:nil];
     [l->table setUsesAlternatingRowBackgroundColors:YES];
     [l->table setAllowsMultipleSelection:NO];
     [l->table setAllowsEmptySelection:YES];
@@ -833,4 +891,133 @@ int32_t rb_host_alert(const char *title, const char *message, const char *const 
         [[[a buttons] objectAtIndex:escape] setKeyEquivalent:@"\033"];
     NSInteger r = [a runModal] - NSAlertFirstButtonReturn;
     return (r >= 0 && r < (NSInteger)n) ? (int32_t)r : -1;
+}
+
+void rb_host_canvas(uint32_t s, uint32_t c, const char *ax_id)
+{
+    RBCanvas *v = [[[RBCanvas alloc] initWithFrame:NSZeroRect] autorelease];
+    v->sid = s;
+    v->ctl = c;
+    set_id(v, ax_id);
+    adopt(s, c, v, NO);
+}
+
+void rb_host_redraw(uint32_t s, uint32_t c)
+{
+    [view(s, c) setNeedsDisplay:YES];
+}
+
+int rb_host_clicked(uint32_t s, uint32_t c, double *out)
+{
+    RBCanvas *v = view(s, c);
+    if (![v isKindOfClass:[RBCanvas class]] || !v->has_click)
+        return 0;
+    int i;
+    for (i = 0; i < 4; i++)
+        out[i] = v->click[i];
+    return 1;
+}
+
+static NSColor *rb_ink(int ink, uint32_t rgb)
+{
+    switch (ink) {
+    case 1: return [NSColor controlTextColor];
+    case 2: return [NSColor colorWithCalibratedWhite:0.5 alpha:0.6];
+    case 3: return rb_painting_dark ? [NSColor whiteColor] : [NSColor blackColor];
+    default:
+        return [NSColor colorWithCalibratedRed:((rgb >> 16) & 0xff) / 255.0
+                                         green:((rgb >> 8) & 0xff) / 255.0
+                                          blue:(rgb & 0xff) / 255.0
+                                         alpha:1.0];
+    }
+}
+
+void rb_pen_fill(double x, double y, double w, double h, int ink, uint32_t rgb)
+{
+    [rb_ink(ink, rgb) set];
+    [NSBezierPath fillRect:NSMakeRect(x, y, w, h)];
+}
+
+void rb_pen_line(double x0, double y0, double x1, double y1, int ink, uint32_t rgb)
+{
+    [rb_ink(ink, rgb) set];
+    [NSBezierPath strokeLineFromPoint:NSMakePoint(x0, y0) toPoint:NSMakePoint(x1, y1)];
+}
+
+void rb_pen_frame(double x, double y, double w, double h, double width, int ink, uint32_t rgb)
+{
+    [rb_ink(ink, rgb) set];
+    NSBezierPath *p = [NSBezierPath bezierPathWithRect:NSMakeRect(x, y, w, h)];
+    [p setLineWidth:width];
+    [p stroke];
+}
+
+// The small system font in `color`, aligned, cut with an ellipsis where it does not fit.
+static NSDictionary *rb_text_attrs(NSColor *color, int center)
+{
+    NSMutableParagraphStyle *style = [[[NSMutableParagraphStyle alloc] init] autorelease];
+    [style setAlignment:(center ? NSCenterTextAlignment : NSLeftTextAlignment)];
+    [style setLineBreakMode:NSLineBreakByTruncatingTail];
+    return [NSDictionary dictionaryWithObjectsAndKeys:
+        [NSFont systemFontOfSize:11.0], NSFontAttributeName,
+        color, NSForegroundColorAttributeName,
+        style, NSParagraphStyleAttributeName, nil];
+}
+
+void rb_pen_text(double x, double y, double w, double h, const char *text, int ink, uint32_t rgb, int center)
+{
+    [str(text) drawInRect:NSMakeRect(x, y, w, h) withAttributes:rb_text_attrs(rb_ink(ink, rgb), center)];
+}
+
+double rb_pen_text_width(const char *text)
+{
+    return [str(text) sizeWithAttributes:rb_text_attrs([NSColor blackColor], 0)].width;
+}
+
+static NSFont *rb_log_font(void)
+{
+    NSFont *f = [NSFont userFixedPitchFontOfSize:11.0];
+    return f != nil ? f : [NSFont systemFontOfSize:11.0];
+}
+
+void rb_host_text_view(uint32_t s, uint32_t c, const char *ax_id)
+{
+    NSRect frame = NSMakeRect(0, 0, 400, 120);
+    NSScrollView *scroll = [[[NSScrollView alloc] initWithFrame:frame] autorelease];
+    [scroll setHasVerticalScroller:YES];
+    [scroll setBorderType:NSBezelBorder];
+    NSTextView *t = [[[NSTextView alloc] initWithFrame:frame] autorelease];
+    [t setEditable:NO];
+    [t setSelectable:YES];
+    [t setVerticallyResizable:YES];
+    [t setHorizontallyResizable:NO];
+    [t setAutoresizingMask:NSViewWidthSizable];
+    [[t textContainer] setWidthTracksTextView:YES];
+    [t setFont:rb_log_font()];
+    set_id(t, ax_id);
+    [scroll setDocumentView:t];
+    [surf(s)->texts setObject:t forKey:key(c)];
+    adopt(s, c, scroll, NO);
+}
+
+void rb_host_set_text_view(uint32_t s, uint32_t c, const char *text)
+{
+    NSTextView *t = [surf(s)->texts objectForKey:key(c)];
+    NSString *v = str(text);
+    if (![[t string] isEqualToString:v]) {
+        [t setString:v];
+        [t setFont:rb_log_font()];
+    }
+}
+
+void rb_host_append_text_view(uint32_t s, uint32_t c, const char *text, int follow)
+{
+    NSTextView *t = [surf(s)->texts objectForKey:key(c)];
+    NSDictionary *attrs = [NSDictionary dictionaryWithObjectsAndKeys:
+        rb_log_font(), NSFontAttributeName,
+        [NSColor textColor], NSForegroundColorAttributeName, nil];
+    NSAttributedString *a = [[[NSAttributedString alloc] initWithString:str(text) attributes:attrs] autorelease];
+    [[t textStorage] appendAttributedString:a];
+    if (follow)
+        [t scrollRangeToVisible:NSMakeRange([[t string] length], 0)];
 }

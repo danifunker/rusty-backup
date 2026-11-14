@@ -8,9 +8,6 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::NSWindow;
 use rusty_backup::controller::app::{DiskDevice, Notify};
 use rusty_backup::controller::inspect::{format_size, ResizePlan};
 use rusty_backup::controller::resize::{
@@ -18,13 +15,12 @@ use rusty_backup::controller::resize::{
 };
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::partition_bar::{self, Bar};
-use crate::sync::SyncGuard;
-use crate::table::Table;
-use crate::ui::{self, CloseDelegate};
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::partition_bar::{self, Bar};
+use super::sync::SyncGuard;
 
 const HEADS: [&str; 6] = [
     "#",
@@ -66,12 +62,11 @@ pub struct ResizeWindow {
     host: EffectHost,
     sync: SyncGuard,
     me: Weak<ResizeWindow>,
-    window: Retained<NSWindow>,
-    _delegate: Retained<CloseDelegate>,
+    ui: Rc<dyn Host>,
+    window: Surface,
     form: Form<K>,
-    current: Retained<Bar>,
-    after: Retained<Bar>,
-    preview: Table,
+    current: Bar,
+    after: Bar,
     /// Each row's partition and its size-mode choices, as built.
     shape: RefCell<Vec<(usize, bool, Vec<SizeMode>)>>,
     shown_preview: RefCell<Option<Vec<PreviewRow>>>,
@@ -80,18 +75,17 @@ pub struct ResizeWindow {
 
 impl ResizeWindow {
     pub fn open(
-        mtm: MainThreadMarker,
+        ui: Rc<dyn Host>,
         notify: Arc<dyn Notify>,
         host: EffectHost,
         plan: ResizePlan,
     ) -> Rc<ResizeWindow> {
         let me = Rc::new_cyclic(|me: &Weak<ResizeWindow>| {
             let close = me.clone();
-            let (window, delegate) = ui::window(
-                mtm,
+            let window = ui.window(
                 "Resize Partitions",
-                720.0,
-                600.0,
+                720,
+                600,
                 Box::new(move || {
                     if let Some(d) = close.upgrade() {
                         if !d.ctrl.borrow().is_running() {
@@ -101,16 +95,18 @@ impl ResizeWindow {
                 }),
             );
             let resize = me.clone();
-            delegate.on_resize(Box::new(move || {
-                if let Some(d) = resize.upgrade() {
-                    d.layout();
-                }
-            }));
-            let body = window.contentView().expect("the window's content view");
+            ui.on_resize(
+                window,
+                Box::new(move || {
+                    if let Some(d) = resize.upgrade() {
+                        d.layout();
+                    }
+                }),
+            );
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body,
+            let form = Form::with_host(
+                ui.clone(),
+                window,
                 Rc::new(move |k| {
                     if let Some(d) = fire.upgrade() {
                         d.fired(k);
@@ -133,21 +129,19 @@ impl ResizeWindow {
             );
             f.label(K::DiskLine, "");
             f.label(K::CurrentCaption, "");
-            let current = Bar::new(mtm, "resize.current_bar");
+            let current = Bar::add(f, K::Current, "resize.current_bar");
             current.set_options(1.0, false);
-            f.add(K::Current, &current);
             f.label(K::AfterCaption, "");
-            let after = Bar::new(mtm, "resize.after_bar");
+            let after = Bar::add(f, K::After, "resize.after_bar");
             after.set_options(1.0, true);
-            f.add(K::After, &after);
             f.label(K::SizesHead, "Partition Sizes:");
             for (i, t) in HEADS.iter().enumerate() {
                 f.label(K::Head(i), t);
             }
             f.label(K::Error, "");
             f.label(K::PreviewHead, "Preview:");
-            let preview = Table::new(
-                mtm,
+            f.table(
+                K::Preview,
                 "resize.preview_list",
                 &[
                     ("#", 40.0, true),
@@ -157,26 +151,26 @@ impl ResizeWindow {
                     ("New Size", 110.0, true),
                     ("Action", 180.0, false),
                 ],
+                None,
+                None,
             );
-            f.add(K::Preview, &preview.scroll);
             f.label(K::Job, "");
             f.label(K::Target, "");
             f.button(K::PreviewButton, "Preview", ids::PREVIEW);
             f.button(K::Apply, "Apply", ids::APPLY);
             f.button(K::Cancel, "Cancel", ids::CANCEL);
             f.button(K::Close, "Close", ids::CLOSE);
-            ui::present(&window);
+            ui.present(window);
             ResizeWindow {
                 ctrl: RefCell::new(ResizeController::new(notify)),
                 host,
                 sync: SyncGuard::default(),
                 me: me.clone(),
+                ui: ui.clone(),
                 window,
-                _delegate: delegate,
                 form,
                 current,
                 after,
-                preview,
                 shape: RefCell::default(),
                 shown_preview: RefCell::default(),
                 changed: Cell::new(false),
@@ -217,7 +211,7 @@ impl ResizeWindow {
     /// Send `action` once the current handler returns: the window may close with it.
     fn send(&self, action: ResizeAction) {
         let me = self.me.clone();
-        crate::app::later(Box::new(move || {
+        self.ui.later(Box::new(move || {
             if let Some(d) = me.upgrade() {
                 d.apply(action);
             }
@@ -246,12 +240,12 @@ impl ResizeWindow {
             let mut c = self.ctrl.borrow_mut();
             (c.take_log(), c.take_disk_changed())
         };
-        crate::app::append_log(log);
+        self.ui.log(log);
         if changed {
             self.changed.set(true);
         }
         if !self.ctrl.borrow().is_open() {
-            self.window.orderOut(None);
+            self.ui.hide(self.window);
             return;
         }
         self.sync.run(|| self.refresh());
@@ -299,7 +293,7 @@ impl ResizeWindow {
         f.show(K::PreviewHead, preview.is_some());
         f.show(K::Preview, preview.is_some());
         if *self.shown_preview.borrow() != preview {
-            let cells = preview
+            let cells: Vec<Vec<String>> = preview
                 .iter()
                 .flatten()
                 .map(|r| {
@@ -313,7 +307,7 @@ impl ResizeWindow {
                     ]
                 })
                 .collect();
-            self.preview.set_rows(cells);
+            f.set_rows(K::Preview, &cells);
             *self.shown_preview.borrow_mut() = preview;
         }
         let job = job.map(|j| {
@@ -380,9 +374,6 @@ impl ResizeWindow {
     }
 
     fn layout(&self) {
-        let Some(body) = self.window.contentView() else {
-            return;
-        };
         let f = &self.form;
         let line =
             |k: K, n: i32| Node::leaf(k, Size::Stretch(1), Size::Fixed((layout::ROW - 6) * n + 4));
@@ -467,7 +458,7 @@ impl ResizeWindow {
             Node::button(K::Close, 90),
         ]));
         let tree = Node::inset(Node::column(rows), layout::MARGIN);
-        f.place_shown(tree, ui::area(&body));
+        f.place_shown(tree, self.ui.area(self.window));
     }
 
     fn fired(&self, k: K) {
@@ -505,7 +496,6 @@ impl ResizeWindow {
 
 impl Drop for ResizeWindow {
     fn drop(&mut self) {
-        self.window.setDelegate(None);
-        self.window.orderOut(None);
+        self.ui.release(self.window);
     }
 }

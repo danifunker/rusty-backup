@@ -4,16 +4,13 @@
 
 use std::rc::{Rc, Weak};
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::NSWindow;
 use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::optical::{ids, OpticalAction};
 
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::sync::SyncGuard;
-use crate::ui::{self, CloseDelegate};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::sync::SyncGuard;
 
 /// What the window shows.
 pub struct AddRemoteShown {
@@ -34,8 +31,8 @@ enum K {
 }
 
 pub struct AddRemoteWindow {
-    window: Retained<NSWindow>,
-    _delegate: Retained<CloseDelegate>,
+    ui: Rc<dyn Host>,
+    window: Surface,
     form: Form<K>,
     send: Rc<dyn Fn(OpticalAction)>,
     sync: SyncGuard,
@@ -45,27 +42,25 @@ pub struct AddRemoteWindow {
 
 impl AddRemoteWindow {
     pub fn open(
-        mtm: MainThreadMarker,
+        ui: Rc<dyn Host>,
         recent: &[String],
         send: Rc<dyn Fn(OpticalAction)>,
     ) -> Rc<AddRemoteWindow> {
         Rc::new_cyclic(|me: &Weak<AddRemoteWindow>| {
-            let close = send.clone();
-            let (window, delegate) = ui::window(
-                mtm,
+            let (close, later) = (send.clone(), ui.clone());
+            let window = ui.window(
                 "Add remote daemon",
-                420.0,
-                320.0,
+                420,
+                320,
                 Box::new(move || {
                     let close = close.clone();
-                    crate::app::later(Box::new(move || close(OpticalAction::CloseAddRemote)));
+                    later.later(Box::new(move || close(OpticalAction::CloseAddRemote)));
                 }),
             );
-            let body = window.contentView().expect("the window's content view");
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body,
+            let form = Form::with_host(
+                ui.clone(),
+                window,
                 Rc::new(move |k| {
                     if let Some(w) = fire.upgrade() {
                         w.fired(k);
@@ -83,10 +78,10 @@ impl AddRemoteWindow {
             for (i, a) in recent.iter().enumerate() {
                 form.button(K::Recent(i), a, "");
             }
-            ui::present(&window);
+            ui.present(window);
             AddRemoteWindow {
+                ui: ui.clone(),
                 window,
-                _delegate: delegate,
                 form,
                 send,
                 sync: SyncGuard::default(),
@@ -106,9 +101,6 @@ impl AddRemoteWindow {
     }
 
     fn layout(&self) {
-        let Some(body) = self.window.contentView() else {
-            return;
-        };
         let row_h = Size::Fixed(layout::ROW);
         let line = |k: K| Node::leaf(k, Size::Stretch(1), Size::Fixed(layout::ROW - 4));
         let mut col = vec![
@@ -130,7 +122,7 @@ impl AddRemoteWindow {
             ]));
         }
         let tree = Node::inset(Node::column(col), layout::MARGIN);
-        self.form.place_shown(tree, ui::area(&body));
+        self.form.place_shown(tree, self.ui.area(self.window));
     }
 
     fn fired(&self, k: K) {
@@ -151,13 +143,12 @@ impl AddRemoteWindow {
             _ => return,
         };
         let send = self.send.clone();
-        crate::app::later(Box::new(move || send(action)));
+        self.ui.later(Box::new(move || send(action)));
     }
 }
 
 impl Drop for AddRemoteWindow {
     fn drop(&mut self) {
-        self.window.setDelegate(None);
-        self.window.orderOut(None);
+        self.ui.release(self.window);
     }
 }

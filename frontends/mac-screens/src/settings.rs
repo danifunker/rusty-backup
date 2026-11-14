@@ -37,7 +37,7 @@ enum K {
 pub struct SettingsWindow {
     ctrl: RefCell<SettingsController>,
     sync: SyncGuard,
-    host: Rc<dyn Host>,
+    ui: Rc<dyn Host>,
     window: Surface,
     form: Form<K>,
     /// Called once after Clear Recent Files, so the screens drop their in-memory lists.
@@ -47,15 +47,15 @@ pub struct SettingsWindow {
 impl SettingsWindow {
     /// The window over the app's config store, loaded and shown.
     pub fn open(
-        host: Rc<dyn Host>,
+        ui: Rc<dyn Host>,
         recent: RecentHandle,
         on_cleared: Box<dyn Fn()>,
     ) -> Rc<SettingsWindow> {
         let mut ctrl = SettingsController::with_store(Box::new(recent));
         ctrl.apply(SettingsAction::Open);
         let me = Rc::new_cyclic(|me: &Weak<SettingsWindow>| {
-            let (close, later) = (me.clone(), host.clone());
-            let window = host.window(
+            let (close, later) = (me.clone(), ui.clone());
+            let window = ui.window(
                 "Settings",
                 560,
                 360,
@@ -70,7 +70,7 @@ impl SettingsWindow {
             );
             let fire = me.clone();
             let form = Form::with_host(
-                host.clone(),
+                ui.clone(),
                 window,
                 Rc::new(move |k| {
                     if let Some(w) = fire.upgrade() {
@@ -97,11 +97,11 @@ impl SettingsWindow {
             f.label(K::File, &file);
             f.button(K::Save, "Save", ids::SAVE);
             f.button(K::Cancel, "Cancel", ids::CANCEL);
-            host.present(window);
+            ui.present(window);
             SettingsWindow {
                 ctrl: RefCell::new(ctrl),
                 sync: SyncGuard::default(),
-                host,
+                ui,
                 window,
                 form,
                 on_cleared,
@@ -121,7 +121,7 @@ impl SettingsWindow {
             (self.on_cleared)();
         }
         if !self.ctrl.borrow().is_open() {
-            self.host.hide(self.window);
+            self.ui.hide(self.window);
             return;
         }
         self.refresh();
@@ -174,7 +174,7 @@ impl SettingsWindow {
             ]),
             layout::MARGIN,
         );
-        self.form.place_shown(tree, self.host.area(self.window));
+        self.form.place_shown(tree, self.ui.area(self.window));
     }
 
     fn fired(&self, k: K) {
@@ -196,6 +196,6 @@ impl SettingsWindow {
 
 impl Drop for SettingsWindow {
     fn drop(&mut self) {
-        self.host.release(self.window);
+        self.ui.release(self.window);
     }
 }

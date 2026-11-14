@@ -9,9 +9,6 @@ use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSProgressIndicator, NSWindow};
 use rusty_backup::controller::app::{DiskDevice, Notify, Snapshot};
 use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::disk_write::{
@@ -21,11 +18,11 @@ use rusty_backup::controller::disk_write::{
 };
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::sync::SyncGuard;
-use crate::ui::{self, CloseDelegate};
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::sync::SyncGuard;
 
 const ALIGNS: [(WrapAlign, &str); 3] = [
     (WrapAlign::DosTraditional, "DOS legacy (LBA 63)"),
@@ -100,8 +97,8 @@ pub struct DiskWriteWindow {
     sync: SyncGuard,
     me: Weak<DiskWriteWindow>,
     devices: RefCell<Vec<DiskDevice>>,
-    window: Retained<NSWindow>,
-    _delegate: Retained<CloseDelegate>,
+    ui: Rc<dyn Host>,
+    window: Surface,
     form: Form<K>,
     region_keys: RefCell<Vec<Option<usize>>>,
 }
@@ -109,7 +106,7 @@ pub struct DiskWriteWindow {
 impl DiskWriteWindow {
     /// Open the window on an image another screen hands over.
     pub fn open(
-        mtm: MainThreadMarker,
+        ui: Rc<dyn Host>,
         notify: Arc<dyn Notify>,
         host: EffectHost,
         devices: &[DiskDevice],
@@ -117,11 +114,10 @@ impl DiskWriteWindow {
     ) -> Rc<DiskWriteWindow> {
         let me = Rc::new_cyclic(|me: &Weak<DiskWriteWindow>| {
             let close = me.clone();
-            let (window, delegate) = ui::window(
-                mtm,
+            let window = ui.window(
                 "Physical Disk Export",
-                640.0,
-                600.0,
+                640,
+                600,
                 Box::new(move || {
                     if let Some(d) = close.upgrade() {
                         d.send(DiskWriteAction::Close);
@@ -129,16 +125,18 @@ impl DiskWriteWindow {
                 }),
             );
             let resize = me.clone();
-            delegate.on_resize(Box::new(move || {
-                if let Some(d) = resize.upgrade() {
-                    d.layout();
-                }
-            }));
-            let body = window.contentView().expect("the window's content view");
+            ui.on_resize(
+                window,
+                Box::new(move || {
+                    if let Some(d) = resize.upgrade() {
+                        d.layout();
+                    }
+                }),
+            );
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body,
+            let form = Form::with_host(
+                ui.clone(),
+                window,
                 Rc::new(move |k| {
                     if let Some(d) = fire.upgrade() {
                         d.fired(k);
@@ -203,7 +201,7 @@ impl DiskWriteWindow {
             f.button(K::Write, "Write to disk...", ids::WRITE);
             f.button(K::CancelWrite, "Cancel write", ids::CANCEL_WRITE);
             f.button(K::Close, "Cancel", ids::CLOSE);
-            ui::present(&window);
+            ui.present(window);
             DiskWriteWindow {
                 ctrl: RefCell::new(DiskWriteController::new(DiskWriteServices {
                     jobs: JobRegistry::new(),
@@ -213,8 +211,8 @@ impl DiskWriteWindow {
                 sync: SyncGuard::default(),
                 me: me.clone(),
                 devices: RefCell::new(devices.to_vec()),
+                ui: ui.clone(),
                 window,
-                _delegate: delegate,
                 form,
                 region_keys: RefCell::default(),
             }
@@ -250,7 +248,7 @@ impl DiskWriteWindow {
     /// Send `action` once the current handler returns: the window may close with it.
     fn send(&self, action: DiskWriteAction) {
         let me = self.me.clone();
-        crate::app::later(Box::new(move || {
+        self.ui.later(Box::new(move || {
             if let Some(d) = me.upgrade() {
                 d.apply(action);
             }
@@ -277,9 +275,9 @@ impl DiskWriteWindow {
     fn after(&self, effects: Vec<Effect>) {
         self.host.run(effects, &self.reply());
         let log = self.ctrl.borrow_mut().take_log();
-        crate::app::append_log(log);
+        self.ui.log(log);
         if !self.ctrl.borrow().is_open() {
-            self.window.orderOut(None);
+            self.ui.hide(self.window);
             return;
         }
         let shown = self.read();
@@ -320,14 +318,10 @@ impl DiskWriteWindow {
             .as_ref()
             .or(s.scan.as_ref())
             .or(s.progress.as_ref());
-        let (line, pct) = job.map(crate::inspect::job_line).unwrap_or_default();
+        let (line, pct) = job.map(super::jobs::job_line).unwrap_or_default();
         f.set_text(K::Job, &line);
         f.show(K::Job, job.is_some());
-        let bar = f
-            .v(K::JobProgress)
-            .downcast::<NSProgressIndicator>()
-            .expect("a progress bar");
-        ui::set_progress(&bar, job.is_some(), pct);
+        f.set_progress(K::JobProgress, job.is_some(), pct);
         f.show(K::CancelWrite, s.writing);
         let source = s.source.as_ref().map(|src| {
             let table = if src.has_partition_table {
@@ -454,9 +448,6 @@ impl DiskWriteWindow {
     }
 
     fn layout(&self) {
-        let Some(body) = self.window.contentView() else {
-            return;
-        };
         let f = &self.form;
         let row_h = Size::Fixed(layout::ROW);
         let line =
@@ -527,7 +518,7 @@ impl DiskWriteWindow {
             Node::button(K::Close, 90),
         ]));
         let tree = Node::inset(Node::column(col), layout::MARGIN);
-        f.place_shown(tree, ui::area(&body));
+        f.place_shown(tree, self.ui.area(self.window));
     }
 
     fn action(&self, k: K) -> Option<DiskWriteAction> {
@@ -588,7 +579,6 @@ impl DiskWriteWindow {
 
 impl Drop for DiskWriteWindow {
     fn drop(&mut self) {
-        self.window.setDelegate(None);
-        self.window.orderOut(None);
+        self.ui.release(self.window);
     }
 }

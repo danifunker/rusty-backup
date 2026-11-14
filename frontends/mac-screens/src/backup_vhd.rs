@@ -6,15 +6,12 @@
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::NSWindow;
 use rusty_backup::controller::backup::{format_size, ids, BackupAction, SizeMode, VhdRow};
 
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::sync::SyncGuard;
-use crate::ui::{self, CloseDelegate};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::sync::SyncGuard;
 
 const LAYOUTS: [&str; 2] = [
     "Whole Disk (single .vhd file)",
@@ -47,8 +44,8 @@ enum K {
 }
 
 pub struct VhdWindow {
-    window: Retained<NSWindow>,
-    _delegate: Retained<CloseDelegate>,
+    ui: Rc<dyn Host>,
+    window: Surface,
     form: Form<K>,
     send: Rc<dyn Fn(BackupAction)>,
     sync: SyncGuard,
@@ -58,31 +55,28 @@ pub struct VhdWindow {
 
 impl VhdWindow {
     /// The window, with a row per partition the controller offered; `send` delivers its edits.
-    pub fn open(
-        mtm: MainThreadMarker,
-        send: Rc<dyn Fn(BackupAction)>,
-        rows: &[VhdRow],
-    ) -> Rc<Self> {
+    pub fn open(ui: Rc<dyn Host>, send: Rc<dyn Fn(BackupAction)>, rows: &[VhdRow]) -> Rc<Self> {
         Rc::new_cyclic(|me: &Weak<VhdWindow>| {
             let close = send.clone();
-            let (window, delegate) = ui::window(
-                mtm,
+            let window = ui.window(
                 "VHD Backup Options",
-                640.0,
-                420.0,
+                640,
+                420,
                 Box::new(move || close(BackupAction::VhdClose)),
             );
             let resize = me.clone();
-            delegate.on_resize(Box::new(move || {
-                if let Some(w) = resize.upgrade() {
-                    w.layout();
-                }
-            }));
-            let body = window.contentView().expect("the window's content view");
+            ui.on_resize(
+                window,
+                Box::new(move || {
+                    if let Some(w) = resize.upgrade() {
+                        w.layout();
+                    }
+                }),
+            );
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body,
+            let form = Form::with_host(
+                ui.clone(),
+                window,
                 Rc::new(move |k| {
                     if let Some(w) = fire.upgrade() {
                         w.fired(k);
@@ -108,10 +102,10 @@ impl VhdWindow {
             }
             form.button(K::Start, "Start VHD Backup", ids::VHD_START);
             form.button(K::Cancel, "Cancel", ids::VHD_CANCEL);
-            ui::present(&window);
+            ui.present(window);
             VhdWindow {
+                ui: ui.clone(),
                 window,
-                _delegate: delegate,
                 form,
                 send,
                 sync: SyncGuard::default(),
@@ -166,9 +160,6 @@ impl VhdWindow {
     }
 
     fn layout(&self) {
-        let Some(body) = self.window.contentView() else {
-            return;
-        };
         let row_h = Size::Fixed(layout::ROW);
         let fixed = |k: K, w: i32| Node::leaf(k, Size::Fixed(w), row_h);
         let widths = [30, 200, 160, 90];
@@ -206,7 +197,7 @@ impl VhdWindow {
             Node::button(K::Start, 150),
         ]));
         let tree = Node::inset(Node::column(col), layout::MARGIN);
-        self.form.place_shown(tree, ui::area(&body));
+        self.form.place_shown(tree, self.ui.area(self.window));
     }
 
     fn size_action(&self, i: usize, mode: Option<SizeMode>) -> Option<BackupAction> {
@@ -246,14 +237,13 @@ impl VhdWindow {
         if let Some(a) = action {
             // The window may be rebuilt by what this sends: act once the handler returns.
             let send = self.send.clone();
-            crate::app::later(Box::new(move || send(a)));
+            self.ui.later(Box::new(move || send(a)));
         }
     }
 }
 
 impl Drop for VhdWindow {
     fn drop(&mut self) {
-        self.window.setDelegate(None);
-        self.window.orderOut(None);
+        self.ui.release(self.window);
     }
 }

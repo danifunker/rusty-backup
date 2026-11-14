@@ -16,15 +16,17 @@ use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOn
 use objc2_app_kit::{
     NSAccessibility, NSApplication, NSButton, NSColor, NSControl, NSControlStateValueOff,
     NSControlStateValueOn, NSLineBreakMode, NSMenuItem, NSPopUpButton, NSProgressIndicator,
-    NSSecureTextField, NSTextField, NSTextFieldCell, NSView, NSWindow, NSWorkspace,
+    NSScrollView, NSSecureTextField, NSTextField, NSTextFieldCell, NSTextView, NSView, NSWindow,
+    NSWorkspace,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSURL};
+use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize, NSURL};
 use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, PasswordSpec, PickSpec, TextSpec};
 
+use crate::canvas::Canvas;
 use crate::layout::{self, Node};
-use crate::screens::host::{Column, Ctl, Ev, Host, PullItem, Surface};
+use crate::screens::host::{Column, Ctl, Ev, Host, Painter, PullItem, Surface};
 use crate::table::Table;
 use crate::ui::{self, ns, Callback, CloseDelegate, TextChange};
 
@@ -97,6 +99,9 @@ struct Rec {
     /// The window whose content this surface is, when it is one.
     window: Option<(Retained<NSWindow>, Retained<CloseDelegate>)>,
     tables: Vec<(Ctl, Table, LastTick)>,
+    canvases: Vec<(Ctl, Retained<Canvas>)>,
+    /// Each text view and the text it shows.
+    texts: Vec<(Ctl, Retained<NSTextView>, String)>,
 }
 
 pub struct AppKitHost {
@@ -165,6 +170,8 @@ impl AppKitHost {
             slot,
             window: None,
             tables: Vec::new(),
+            canvases: Vec::new(),
+            texts: Vec::new(),
         }));
         (all.len() - 1) as Surface
     }
@@ -455,6 +462,9 @@ impl Host for AppKitHost {
             .map(|(t, w, r)| (t.as_str(), *w, *r))
             .collect();
         let t = Table::new(self.mtm, id, &cols);
+        if columns.iter().all(|c| c.0.is_empty()) {
+            t.view.setHeaderView(None);
+        }
         let slot = self.with(s, |r| r.slot.clone());
         let picked = slot.clone();
         t.on_select(Rc::new(move |_| fire(&picked, c, Ev::Selected)));
@@ -507,6 +517,97 @@ impl Host for AppKitHost {
         })
     }
 
+    fn canvas(&self, s: Surface, c: Ctl, id: &str, painter: Painter) {
+        let slot = self.with(s, |r| r.slot.clone());
+        let v = Canvas::new(
+            self.mtm,
+            id,
+            painter,
+            Box::new(move || fire(&slot, c, Ev::Act)),
+        );
+        self.adopt_view(s, c, &v);
+        self.with(s, |r| {
+            r.canvases.retain(|x| x.0 != c);
+            r.canvases.push((c, v));
+        });
+    }
+
+    fn redraw(&self, s: Surface, c: Ctl) {
+        self.view(s, c).setNeedsDisplay(true);
+    }
+
+    fn clicked(&self, s: Surface, c: Ctl) -> Option<(f64, f64, f64, f64)> {
+        let v = self.with(s, |r| {
+            r.canvases.iter().find(|x| x.0 == c).map(|x| x.1.clone())
+        });
+        v.and_then(|v| v.clicked())
+    }
+
+    fn text_view(&self, s: Surface, c: Ctl, id: &str) {
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 120.0));
+        let scroll = NSScrollView::initWithFrame(self.mtm.alloc(), frame);
+        scroll.setHasVerticalScroller(true);
+        scroll.setBorderType(objc2_app_kit::NSBorderType::BezelBorder);
+        let text = NSTextView::initWithFrame(self.mtm.alloc(), frame);
+        text.setEditable(false);
+        text.setSelectable(true);
+        text.setVerticallyResizable(true);
+        text.setHorizontallyResizable(false);
+        text.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable);
+        text.setMaxSize(NSSize::new(f64::MAX, f64::MAX));
+        // SAFETY: the text view's own container, read on the main thread.
+        if let Some(container) = unsafe { text.textContainer() } {
+            container.setWidthTracksTextView(true);
+        }
+        text.setFont(Some(&crate::app::log_font()));
+        if !id.is_empty() {
+            ui::set_id(&text, id);
+        }
+        scroll.setDocumentView(Some(&text));
+        self.adopt_view(s, c, &scroll);
+        self.with(s, |r| {
+            r.texts.retain(|x| x.0 != c);
+            r.texts.push((c, text, String::new()));
+        });
+    }
+
+    fn set_text_view(&self, s: Surface, c: Ctl, text: &str) {
+        let view = self.with(s, |r| {
+            let entry = r.texts.iter_mut().find(|x| x.0 == c)?;
+            if entry.2 == text {
+                return None;
+            }
+            entry.2 = text.to_string();
+            Some(entry.1.clone())
+        });
+        if let Some(v) = view {
+            v.setString(&ns(text));
+            v.setTextColor(Some(&NSColor::textColor()));
+        }
+    }
+
+    fn append_text_view(&self, s: Surface, c: Ctl, text: &str, follow: bool) {
+        let view = self.with(s, |r| {
+            let entry = r.texts.iter_mut().find(|x| x.0 == c)?;
+            entry.2.push_str(text);
+            Some(entry.1.clone())
+        });
+        if let Some(v) = view {
+            // SAFETY: inserting at the end of the view's own text storage.
+            unsafe {
+                if let Some(store) = v.textStorage() {
+                    let attributed = objc2_foundation::NSAttributedString::from_nsstring(&ns(text));
+                    store.appendAttributedString(&attributed);
+                }
+            }
+            v.setFont(Some(&crate::app::log_font()));
+            v.setTextColor(Some(&NSColor::textColor()));
+            if follow {
+                v.scrollRangeToVisible(NSRange::new(v.string().length(), 0));
+            }
+        }
+    }
+
     fn key_equivalent(&self, s: Surface, c: Ctl, key: &str) {
         self.button_of(s, c).setKeyEquivalent(&ns(key));
     }
@@ -515,6 +616,8 @@ impl Host for AppKitHost {
         let gone = self.with(s, |r| {
             r.delegates.retain(|(x, _)| *x != c);
             r.tables.retain(|t| t.0 != c);
+            r.canvases.retain(|t| t.0 != c);
+            r.texts.retain(|t| t.0 != c);
             let at = r.views.iter().position(|(x, _)| *x == c);
             at.map(|i| r.views.remove(i).1)
         });

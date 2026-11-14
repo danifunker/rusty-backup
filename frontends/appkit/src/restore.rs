@@ -180,7 +180,6 @@ enum K {
 
 pub struct RestoreScreen {
     ctrl: RefCell<RestoreController>,
-    mtm: MainThreadMarker,
     notify: Arc<dyn Notify>,
     /// The daemon's drives, as listed in the remote target's table.
     remote_list: Table,
@@ -368,7 +367,6 @@ impl RestoreScreen {
                     jobs: JobRegistry::new(),
                     notify: notify.clone(),
                 })),
-                mtm,
                 notify,
                 remote_list,
                 remote_drives: RefCell::default(),
@@ -510,7 +508,7 @@ impl RestoreScreen {
             return;
         }
         let d = DiskWriteWindow::open(
-            self.mtm,
+            crate::form::AppKitHost::current(),
             self.notify.clone(),
             self.host.clone(),
             &self.devices.borrow(),

@@ -8,20 +8,17 @@
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::NSWindow;
 use rusty_backup::controller::inspect::InspectAction;
 use rusty_backup::controller::partition_edit::{
     ids, type_choices, type_note, BootStyle, LayoutBar, SizeMode, TableEditAction, TableEditView,
     TableKind,
 };
 
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::partition_bar::{self, Bar};
-use crate::sync::SyncGuard;
-use crate::ui::{self, CloseDelegate};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::partition_bar::{self, Bar};
+use super::sync::SyncGuard;
 
 const HEADS: [&str; 7] = [
     "#",
@@ -123,11 +120,11 @@ impl Shape {
 }
 
 pub struct EditorWindow {
-    window: Retained<NSWindow>,
-    _delegate: Retained<CloseDelegate>,
+    ui: Rc<dyn Host>,
+    window: Surface,
     form: Form<K>,
-    current: Retained<Bar>,
-    after: Retained<Bar>,
+    current: Bar,
+    after: Bar,
     send: Rc<dyn Fn(InspectAction)>,
     sync: SyncGuard,
     shape: RefCell<Option<Shape>>,
@@ -139,30 +136,31 @@ fn table(edit: TableEditAction) -> InspectAction {
 
 impl EditorWindow {
     /// The window; `send` delivers its edits to the Inspect controller.
-    pub fn open(mtm: MainThreadMarker, send: Rc<dyn Fn(InspectAction)>) -> Rc<EditorWindow> {
+    pub fn open(ui: Rc<dyn Host>, send: Rc<dyn Fn(InspectAction)>) -> Rc<EditorWindow> {
         Rc::new_cyclic(|me: &Weak<EditorWindow>| {
-            let close = send.clone();
-            let (window, delegate) = ui::window(
-                mtm,
+            let (close, later) = (send.clone(), ui.clone());
+            let window = ui.window(
                 "Edit Partition Table",
-                820.0,
-                640.0,
+                820,
+                640,
                 Box::new(move || {
                     let close = close.clone();
-                    crate::app::later(Box::new(move || close(InspectAction::CloseEditor)));
+                    later.later(Box::new(move || close(InspectAction::CloseEditor)));
                 }),
             );
             let resize = me.clone();
-            delegate.on_resize(Box::new(move || {
-                if let Some(w) = resize.upgrade() {
-                    w.layout();
-                }
-            }));
-            let body = window.contentView().expect("the window's content view");
+            ui.on_resize(
+                window,
+                Box::new(move || {
+                    if let Some(w) = resize.upgrade() {
+                        w.layout();
+                    }
+                }),
+            );
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body,
+            let form = Form::with_host(
+                ui.clone(),
+                window,
                 Rc::new(move |k| {
                     if let Some(w) = fire.upgrade() {
                         w.fired(k);
@@ -172,12 +170,10 @@ impl EditorWindow {
             let f = &form;
             f.label(K::KindLine, "");
             f.label(K::CurrentCaption, "");
-            let current = Bar::new(mtm, "table.current_bar");
+            let current = Bar::add(f, K::Current, "table.current_bar");
             current.set_options(1.0, false);
-            f.add(K::Current, &current);
             f.label(K::AfterCaption, "");
-            let after = Bar::new(mtm, "table.after_bar");
-            f.add(K::After, &after);
+            let after = Bar::add(f, K::After, "table.after_bar");
             for (i, t) in HEADS.iter().enumerate() {
                 f.label(K::Head(i), t);
             }
@@ -200,10 +196,10 @@ impl EditorWindow {
             f.button(K::Validate, "Validate", ids::TABLE_VALIDATE);
             f.button(K::Apply, "Apply Changes", ids::TABLE_APPLY);
             f.button(K::Cancel, "Cancel", ids::CANCEL);
-            ui::present(&window);
+            ui.present(window);
             EditorWindow {
+                ui: ui.clone(),
                 window,
-                _delegate: delegate,
                 form,
                 current,
                 after,
@@ -373,9 +369,6 @@ impl EditorWindow {
     }
 
     fn layout(&self) {
-        let Some(body) = self.window.contentView() else {
-            return;
-        };
         let f = &self.form;
         let shape = self.shape.borrow();
         let Some(shape) = shape.as_ref() else {
@@ -494,7 +487,7 @@ impl EditorWindow {
             Node::button(K::Cancel, 90),
         ]));
         let tree = Node::inset(Node::column(col), layout::MARGIN);
-        f.place_shown(tree, ui::area(&body));
+        f.place_shown(tree, self.ui.area(self.window));
     }
 
     fn fired(&self, k: K) {
@@ -560,13 +553,12 @@ impl EditorWindow {
         };
         // The grid may be built again by what this sends: act once the handler returns.
         let send = self.send.clone();
-        crate::app::later(Box::new(move || send(action)));
+        self.ui.later(Box::new(move || send(action)));
     }
 }
 
 impl Drop for EditorWindow {
     fn drop(&mut self) {
-        self.window.setDelegate(None);
-        self.window.orderOut(None);
+        self.ui.release(self.window);
     }
 }

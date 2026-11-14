@@ -45,6 +45,39 @@ pub type PullItem = (String, Option<Ctl>, bool);
 /// One list column: its title, its width in points, and whether it is right-aligned.
 pub type Column = (String, f64, bool);
 
+/// A colour a painter draws in: a fixed one, or the theme's for its role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ink {
+    Rgb(u8, u8, u8),
+    /// Body text.
+    Label,
+    /// A hairline between parts.
+    Separator,
+    /// Text on a coloured fill: white in dark mode, black in light.
+    OnFill,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Center,
+}
+
+/// A canvas's drawing calls, valid only while its painter runs. Coordinates are flipped points.
+pub trait Pen {
+    fn fill(&self, x: f64, y: f64, w: f64, h: f64, ink: Ink);
+    fn line(&self, x0: f64, y0: f64, x1: f64, y1: f64, ink: Ink);
+    /// A rectangle's outline `width` points wide.
+    fn frame(&self, x: f64, y: f64, w: f64, h: f64, width: f64, ink: Ink);
+    /// Text in the small system font, cut with an ellipsis where it does not fit.
+    /// `r` is `(x, y, w, h)`.
+    fn text(&self, r: (f64, f64, f64, f64), text: &str, ink: Ink, align: Align);
+    fn text_width(&self, text: &str) -> f64;
+}
+
+/// Draws a canvas `w` by `h` points; `dark` is the view's appearance.
+pub type Painter = Rc<dyn Fn(&dyn Pen, f64, f64, bool)>;
+
 pub trait Host {
     /// Send every report from surface `s` to `on`, replacing any handler before.
     fn bind(&self, s: Surface, on: Rc<dyn Fn(Ctl, Ev)>);
@@ -91,6 +124,18 @@ pub trait Host {
     fn select_row(&self, s: Surface, c: Ctl, i: usize);
     /// The row and state of the last tick box the user changed.
     fn toggled(&self, s: Surface, c: Ctl) -> Option<(usize, bool)>;
+
+    /// A view drawn by `painter`; a click reports `Act`, and `clicked` says where.
+    fn canvas(&self, s: Surface, c: Ctl, id: &str, painter: Painter);
+    fn redraw(&self, s: Surface, c: Ctl);
+    /// The last click on a canvas and the canvas's size then: `(x, y, w, h)`.
+    fn clicked(&self, s: Surface, c: Ctl) -> Option<(f64, f64, f64, f64)>;
+    /// A read-only text view in a scroll view, in the fixed-width log font.
+    fn text_view(&self, s: Surface, c: Ctl, id: &str);
+    /// Replace its text; only a change redraws.
+    fn set_text_view(&self, s: Surface, c: Ctl, text: &str);
+    /// Add to its text, scrolling to the end when `follow`.
+    fn append_text_view(&self, s: Surface, c: Ctl, text: &str, follow: bool);
 
     fn remove(&self, s: Surface, c: Ctl);
     fn shown(&self, s: Surface, c: Ctl) -> bool;

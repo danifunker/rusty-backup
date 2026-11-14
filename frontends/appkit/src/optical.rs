@@ -494,7 +494,11 @@ impl OpticalScreen {
             Some((shown, recent)) => {
                 let held = self.add_remote_window.borrow().clone();
                 let w = held.unwrap_or_else(|| {
-                    let w = AddRemoteWindow::open(self.mtm, &recent, self.send());
+                    let w = AddRemoteWindow::open(
+                        crate::form::AppKitHost::current(),
+                        &recent,
+                        self.send(),
+                    );
                     *self.add_remote_window.borrow_mut() = Some(w.clone());
                     w
                 });

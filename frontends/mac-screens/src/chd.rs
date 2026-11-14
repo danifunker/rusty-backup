@@ -11,8 +11,8 @@ use rusty_backup::controller::app::chd::{
     ChdOptionsControl, ChdOptionsMode, ChdProfile,
 };
 
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
+use super::form::Form;
+use super::layout::{self, Node, Size};
 
 /// The control's own parts, which the parent's key wraps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

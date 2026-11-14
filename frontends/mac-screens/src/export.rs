@@ -5,22 +5,23 @@
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::NSWindow;
+#[cfg(feature = "chd")]
 use rusty_backup::controller::app::chd::{ChdOptionsControl, ChdProfile};
+#[cfg(not(feature = "chd"))]
+use rusty_backup::controller::backup::{ChdOptions, ChdProfile};
 use rusty_backup::controller::inspect::{
     after_caption, ids, per_partition_refusal, ExportFormat, InspectAction, InspectController,
     LayoutSegment, PartitionExportConfig, EXPORT_FORMATS, EXPORT_INTRO, HFV_WHOLE_REFUSAL,
 };
 use rusty_backup::controller::restore::SizeMode;
 
-use crate::chd::{ChdControl, ChdIds, ChdKey};
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::partition_bar::{self, Bar};
-use crate::sync::SyncGuard;
-use crate::ui::{self, CloseDelegate};
+#[cfg(feature = "chd")]
+use super::chd::{ChdControl, ChdIds, ChdKey};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::partition_bar::{self, Bar};
+use super::sync::SyncGuard;
 
 /// What the window shows, read while the controller is borrowed.
 pub struct Shown {
@@ -80,6 +81,7 @@ enum K {
     Per,
     FormatCaption,
     Format(usize),
+    #[cfg(feature = "chd")]
     Chd(ChdKey),
     SizesTitle,
     Number(usize),
@@ -93,11 +95,12 @@ enum K {
 }
 
 pub struct ExportWindow {
-    window: Retained<NSWindow>,
-    _delegate: Retained<CloseDelegate>,
+    ui: Rc<dyn Host>,
+    window: Surface,
     form: Form<K>,
-    current: Retained<Bar>,
-    after: Retained<Bar>,
+    current: Bar,
+    after: Bar,
+    #[cfg(feature = "chd")]
     chd: ChdControl<K>,
     send: Rc<dyn Fn(InspectAction)>,
     /// Physical Disk Export: the screen hands the image to the disk writer.
@@ -110,33 +113,34 @@ pub struct ExportWindow {
 impl ExportWindow {
     /// The window; `send` delivers its edits to the Inspect controller.
     pub fn open(
-        mtm: MainThreadMarker,
+        ui: Rc<dyn Host>,
         send: Rc<dyn Fn(InspectAction)>,
         physical: Rc<dyn Fn()>,
     ) -> Rc<ExportWindow> {
         Rc::new_cyclic(|me: &Weak<ExportWindow>| {
-            let close = send.clone();
-            let (window, delegate) = ui::window(
-                mtm,
+            let (close, later) = (send.clone(), ui.clone());
+            let window = ui.window(
                 "Export Disk Image",
-                640.0,
-                700.0,
+                640,
+                700,
                 Box::new(move || {
                     let close = close.clone();
-                    crate::app::later(Box::new(move || close(InspectAction::CloseExport)));
+                    later.later(Box::new(move || close(InspectAction::CloseExport)));
                 }),
             );
             let resize = me.clone();
-            delegate.on_resize(Box::new(move || {
-                if let Some(w) = resize.upgrade() {
-                    w.layout();
-                }
-            }));
-            let body = window.contentView().expect("the window's content view");
+            ui.on_resize(
+                window,
+                Box::new(move || {
+                    if let Some(w) = resize.upgrade() {
+                        w.layout();
+                    }
+                }),
+            );
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body,
+            let form = Form::with_host(
+                ui.clone(),
+                window,
                 Rc::new(move |k| {
                     if let Some(w) = fire.upgrade() {
                         w.fired(k);
@@ -146,12 +150,10 @@ impl ExportWindow {
             let f = &form;
             f.wrap(K::Intro, EXPORT_INTRO);
             f.label(K::CurrentCaption, "Current:");
-            let current = Bar::new(mtm, "export.current_bar");
+            let current = Bar::add(f, K::Current, "export.current_bar");
             current.set_options(1.0, false);
-            f.add(K::Current, &current);
             f.label(K::AfterCaption, "");
-            let after = Bar::new(mtm, "export.after_bar");
-            f.add(K::After, &after);
+            let after = Bar::add(f, K::After, "export.after_bar");
             f.radio(K::Whole, 0, "Whole Disk (single file)", ids::EXPORT_WHOLE);
             f.radio(
                 K::Per,
@@ -164,6 +166,8 @@ impl ExportWindow {
                 let id = if i == 0 { ids::EXPORT_FORMAT } else { "" };
                 f.radio(K::Format(i), 1, c.label, id);
             }
+            // Without CHD support the format stays off and Export starts with the default options.
+            #[cfg(feature = "chd")]
             let chd = ChdControl::build(
                 f,
                 K::Chd,
@@ -180,13 +184,14 @@ impl ExportWindow {
             f.button(K::Start, "Export...", ids::EXPORT_START);
             f.button(K::Physical, "Physical Disk Export...", ids::EXPORT_PHYSICAL);
             f.button(K::Cancel, "Cancel", ids::EXPORT_CLOSE);
-            ui::present(&window);
+            ui.present(window);
             ExportWindow {
+                ui: ui.clone(),
                 window,
-                _delegate: delegate,
                 form,
                 current,
                 after,
+                #[cfg(feature = "chd")]
                 chd,
                 send,
                 physical,
@@ -215,6 +220,7 @@ impl ExportWindow {
                 f.enable(K::Format(i), allowed);
                 f.set_check(K::Format(i), c.format == s.format);
             }
+            #[cfg(feature = "chd")]
             self.chd.set_visible(f, s.format == ExportFormat::Chd);
             let total = |l: &[LayoutSegment]| l.iter().map(|x| x.size_bytes).sum::<u64>();
             let (now, then) = (total(&s.current), total(&s.after));
@@ -281,9 +287,6 @@ impl ExportWindow {
     }
 
     fn layout(&self) {
-        let Some(body) = self.window.contentView() else {
-            return;
-        };
         let line =
             |k: K, n: i32| Node::leaf(k, Size::Stretch(1), Size::Fixed((layout::ROW - 6) * n + 4));
         let row_h = Size::Fixed(layout::ROW);
@@ -314,6 +317,7 @@ impl ExportWindow {
                     .collect(),
             ));
         }
+        #[cfg(feature = "chd")]
         rows.extend(self.chd.rows());
         rows.push(line(K::SizesTitle, 1));
         for (i, _) in self.rows.borrow().iter() {
@@ -333,7 +337,7 @@ impl ExportWindow {
             Node::button(K::Start, 95),
         ]));
         let tree = Node::inset(Node::column(rows), layout::MARGIN);
-        self.form.place_shown(tree, ui::area(&body));
+        self.form.place_shown(tree, self.ui.area(self.window));
     }
 
     fn fired(&self, k: K) {
@@ -342,6 +346,7 @@ impl ExportWindow {
         }
         let f = &self.form;
         let action = match k {
+            #[cfg(feature = "chd")]
             K::Chd(c) => {
                 if self.chd.handle(f, c) {
                     f.enable(K::Start, self.chd.is_valid());
@@ -356,10 +361,13 @@ impl ExportWindow {
                 Some(c) => InspectAction::SetExportFormat(c.format),
                 None => return,
             },
+            #[cfg(feature = "chd")]
             K::Start if self.chd.is_valid() => InspectAction::StartExport(self.chd.choice().0),
+            #[cfg(not(feature = "chd"))]
+            K::Start => InspectAction::StartExport(ChdOptions::defaults_for(ChdProfile::Hd)),
             K::Physical => {
                 let physical = self.physical.clone();
-                crate::app::later(Box::new(move || physical()));
+                self.ui.later(Box::new(move || physical()));
                 return;
             }
             K::Cancel => InspectAction::CloseExport,
@@ -388,13 +396,12 @@ impl ExportWindow {
         };
         // The window may close or rebuild with what this sends: act once the handler returns.
         let send = self.send.clone();
-        crate::app::later(Box::new(move || send(action)));
+        self.ui.later(Box::new(move || send(action)));
     }
 }
 
 impl Drop for ExportWindow {
     fn drop(&mut self) {
-        self.window.setDelegate(None);
-        self.window.orderOut(None);
+        self.ui.release(self.window);
     }
 }

@@ -6,9 +6,6 @@ use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSProgressIndicator, NSView};
 use rusty_backup::controller::app::Notify;
 use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::remote_pick::{
@@ -16,12 +13,11 @@ use rusty_backup::controller::remote_pick::{
 };
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::sync::SyncGuard;
-use crate::table::Table;
-use crate::ui;
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::sync::SyncGuard;
 
 const COLUMNS: [(&str, f64, bool); 3] = [
     ("Name", 420.0, false),
@@ -44,6 +40,8 @@ enum K {
     Error,
     Hint,
     List,
+    /// Return or a double-click on a row.
+    Open,
     Disconnect,
 }
 
@@ -54,25 +52,26 @@ pub struct RemotePage {
     me: Weak<RemotePage>,
     /// Runs after every change, so Inspect drains the log and opens a picked image.
     on_change: RefCell<Option<Rc<dyn Fn()>>>,
+    ui: Rc<dyn Host>,
     /// The page, which Inspect's page gives way to while the picker is active.
-    pub page: Retained<NSView>,
+    page: Surface,
     form: Form<K>,
-    list: Table,
     rows: RefCell<Vec<PickRow>>,
 }
 
 impl RemotePage {
+    /// The picker on `page`, a surface its parent places.
     pub fn build(
-        mtm: MainThreadMarker,
+        ui: Rc<dyn Host>,
+        page: Surface,
         notify: Arc<dyn Notify>,
         host: EffectHost,
     ) -> Rc<RemotePage> {
-        let page = ui::flipped(mtm);
         Rc::new_cyclic(|me: &Weak<RemotePage>| {
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                page.clone(),
+            let form = Form::with_host(
+                ui.clone(),
+                page,
                 Rc::new(move |k| {
                     if let Some(p) = fire.upgrade() {
                         p.fired(k);
@@ -84,17 +83,7 @@ impl RemotePage {
             form.progress(K::JobProgress);
             form.label(K::Error, "");
             form.label(K::Hint, "");
-            let list = Table::new(mtm, ids::LIST, &COLUMNS);
-            let activate = me.clone();
-            list.on_activate(
-                mtm,
-                Rc::new(move || {
-                    if let Some(p) = activate.upgrade() {
-                        crate::app::later(Box::new(move || p.activated()));
-                    }
-                }),
-            );
-            form.add(K::List, &list.scroll);
+            form.table(K::List, ids::LIST, &COLUMNS, Some(K::Open), None);
             form.button(K::Disconnect, "", ids::DISCONNECT);
             RemotePage {
                 ctrl: RefCell::new(RemotePickController::new(notify)),
@@ -102,9 +91,9 @@ impl RemotePage {
                 sync: SyncGuard::default(),
                 me: me.clone(),
                 on_change: RefCell::default(),
+                ui: ui.clone(),
                 page,
                 form,
-                list,
                 rows: RefCell::default(),
             }
         })
@@ -171,17 +160,10 @@ impl RemotePage {
             let rows = if loaded { ctrl.rows() } else { Vec::new() };
             let hint = loaded.then(|| ctrl.hint());
             self.sync.run(|| {
-                let (line, pct) = job
-                    .as_ref()
-                    .map(crate::inspect::job_line)
-                    .unwrap_or_default();
+                let (line, pct) = job.as_ref().map(super::jobs::job_line).unwrap_or_default();
                 f.set_text(K::Job, &line);
                 f.show(K::Job, job.is_some());
-                let bar = f
-                    .v(K::JobProgress)
-                    .downcast::<NSProgressIndicator>()
-                    .expect("a progress bar");
-                ui::set_progress(&bar, job.is_some(), pct);
+                f.set_progress(K::JobProgress, job.is_some(), pct);
                 f.line(K::Error, ctrl.error(), Some(Tone::Error));
                 f.line(K::Hint, hint, None);
                 f.show(K::List, loaded);
@@ -189,7 +171,8 @@ impl RemotePage {
                 f.enable(K::Disconnect, !ctrl.transition_running());
                 f.set_title(K::Disconnect, &ctrl.disconnect_label());
                 if *self.rows.borrow() != rows {
-                    self.list.set_rows(rows.iter().map(cells).collect());
+                    let cells: Vec<Vec<String>> = rows.iter().map(cells).collect();
+                    f.set_rows(K::List, &cells);
                     *self.rows.borrow_mut() = rows;
                 }
             });
@@ -200,8 +183,8 @@ impl RemotePage {
     /// Return or a double-click on a row: up, into a folder, or open the image.
     fn activated(&self) {
         let row = self
-            .list
-            .selected()
+            .form
+            .selected_row(K::List)
             .and_then(|i| self.rows.borrow().get(i).cloned());
         let action = match row {
             Some(r) if r.parent => RemotePickAction::Up,
@@ -235,15 +218,27 @@ impl RemotePage {
             ]),
             layout::MARGIN,
         );
-        self.form.place_shown(tree, ui::area(&self.page));
+        self.form.place_shown(tree, self.ui.area(self.page));
     }
 
     fn fired(&self, k: K) {
-        if self.sync.active() || k != K::Disconnect {
+        if self.sync.active() {
             return;
         }
         let me = self.me.clone();
-        crate::app::later(Box::new(move || {
+        if k == K::Open {
+            // Act once the list's own handler returns: the page may give way to Inspect.
+            self.ui.later(Box::new(move || {
+                if let Some(p) = me.upgrade() {
+                    p.activated();
+                }
+            }));
+            return;
+        }
+        if k != K::Disconnect {
+            return;
+        }
+        self.ui.later(Box::new(move || {
             if let Some(p) = me.upgrade() {
                 p.apply(RemotePickAction::Disconnect);
             }

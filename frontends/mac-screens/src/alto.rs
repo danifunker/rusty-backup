@@ -5,20 +5,17 @@ use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::NSWindow;
 use rusty_backup::controller::alto_resize::{
     ids, AltoResizeAction, AltoResizeController, AltoTarget,
 };
 use rusty_backup::controller::app::Notify;
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::sync::SyncGuard;
-use crate::ui::{self, CloseDelegate};
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::sync::SyncGuard;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum K {
@@ -37,25 +34,24 @@ pub struct AltoWindow {
     host: EffectHost,
     sync: SyncGuard,
     me: Weak<AltoWindow>,
-    window: Retained<NSWindow>,
-    _delegate: Retained<CloseDelegate>,
+    ui: Rc<dyn Host>,
+    window: Surface,
     form: Form<K>,
 }
 
 impl AltoWindow {
     pub fn open(
-        mtm: MainThreadMarker,
+        ui: Rc<dyn Host>,
         notify: Arc<dyn Notify>,
         host: EffectHost,
         path: PathBuf,
     ) -> Rc<AltoWindow> {
         let me = Rc::new_cyclic(|me: &Weak<AltoWindow>| {
             let close = me.clone();
-            let (window, delegate) = ui::window(
-                mtm,
+            let window = ui.window(
                 "Resize Alto Disk",
-                520.0,
-                340.0,
+                520,
+                340,
                 Box::new(move || {
                     if let Some(d) = close.upgrade() {
                         d.send(AltoResizeAction::Close);
@@ -63,16 +59,18 @@ impl AltoWindow {
                 }),
             );
             let resize = me.clone();
-            delegate.on_resize(Box::new(move || {
-                if let Some(d) = resize.upgrade() {
-                    d.layout();
-                }
-            }));
-            let body = window.contentView().expect("the window's content view");
+            ui.on_resize(
+                window,
+                Box::new(move || {
+                    if let Some(d) = resize.upgrade() {
+                        d.layout();
+                    }
+                }),
+            );
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body,
+            let form = Form::with_host(
+                ui.clone(),
+                window,
                 Rc::new(move |k| {
                     if let Some(d) = fire.upgrade() {
                         d.fired(k);
@@ -90,14 +88,14 @@ impl AltoWindow {
             form.wrap(K::Result, "");
             form.button(K::Save, "Resize and Save As...", ids::SAVE_AS);
             form.button(K::Close, "Close", ids::CLOSE);
-            ui::present(&window);
+            ui.present(window);
             AltoWindow {
                 ctrl: RefCell::new(AltoResizeController::new(notify)),
                 host,
                 sync: SyncGuard::default(),
                 me: me.clone(),
+                ui: ui.clone(),
                 window,
-                _delegate: delegate,
                 form,
             }
         });
@@ -123,7 +121,7 @@ impl AltoWindow {
     /// Send `action` once the current handler returns: the window may close with it.
     fn send(&self, action: AltoResizeAction) {
         let me = self.me.clone();
-        crate::app::later(Box::new(move || {
+        self.ui.later(Box::new(move || {
             if let Some(d) = me.upgrade() {
                 d.apply(action);
             }
@@ -149,9 +147,9 @@ impl AltoWindow {
     fn after(&self, effects: Vec<Effect>) {
         self.host.run(effects, &self.reply());
         let log = self.ctrl.borrow_mut().take_log();
-        crate::app::append_log(log);
+        self.ui.log(log);
         if !self.ctrl.borrow().is_open() {
-            self.window.orderOut(None);
+            self.ui.hide(self.window);
             return;
         }
         self.sync.run(|| self.refresh());
@@ -188,9 +186,6 @@ impl AltoWindow {
     }
 
     fn layout(&self) {
-        let Some(body) = self.window.contentView() else {
-            return;
-        };
         let line =
             |k: K, n: i32| Node::leaf(k, Size::Stretch(1), Size::Fixed((layout::ROW - 6) * n + 4));
         let mut rows = vec![line(K::Source, 1), line(K::Summary, 2), line(K::Caption, 1)];
@@ -206,7 +201,7 @@ impl AltoWindow {
             Node::button(K::Close, 90),
         ]));
         let tree = Node::inset(Node::column(rows), layout::MARGIN);
-        self.form.place(&tree, ui::area(&body));
+        self.form.place(&tree, self.ui.area(self.window));
     }
 
     fn fired(&self, k: K) {
@@ -225,7 +220,6 @@ impl AltoWindow {
 
 impl Drop for AltoWindow {
     fn drop(&mut self) {
-        self.window.setDelegate(None);
-        self.window.orderOut(None);
+        self.ui.release(self.window);
     }
 }

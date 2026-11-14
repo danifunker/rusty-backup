@@ -552,8 +552,8 @@ impl App {
         inspect.browse.page.setHidden(true);
         content.addSubview(&optical.browse.page);
         optical.browse.page.setHidden(true);
-        content.addSubview(&inspect.remote.page);
-        inspect.remote.page.setHidden(true);
+        content.addSubview(&inspect.remote_view);
+        inspect.remote_view.setHidden(true);
         inspect.on_page(Rc::new(|| {
             if let Some(app) = app() {
                 app.refresh();
@@ -1008,7 +1008,7 @@ impl App {
             let browse = browsing && tab == AppTab::Inspect && !covered;
             ui::set_visible(&self.inspect.browse.page, browse);
             let pick = picking && tab == AppTab::Inspect && !covered;
-            ui::set_visible(&self.inspect.remote.page, pick);
+            ui::set_visible(&self.inspect.remote_view, pick);
             let disc = disc && tab == AppTab::Optical && !covered;
             ui::set_visible(&self.optical.browse.page, disc);
         });
@@ -1104,7 +1104,7 @@ impl App {
             }
             self.inspect.browse.page.setHidden(true);
             self.optical.browse.page.setHidden(true);
-            self.inspect.remote.page.setHidden(true);
+            self.inspect.remote_view.setHidden(true);
             ui::move_to(&c.page, ui::area(&self.content));
             c.layout();
             return;
@@ -1172,7 +1172,7 @@ impl App {
                 self.inspect.browse.layout();
                 ui::move_to(&self.optical.browse.page, *r);
                 self.optical.browse.layout();
-                ui::move_to(&self.inspect.remote.page, *r);
+                ui::move_to(&self.inspect.remote_view, *r);
                 self.inspect.remote.layout();
             }
             ui::move_to(self.part(*part), *r);

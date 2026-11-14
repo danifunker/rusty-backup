@@ -7,9 +7,6 @@ use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::NSWindow;
 use rusty_backup::controller::app::Notify;
 use rusty_backup::controller::resize_image::{
     format_size, ids, labels, Page, PartMode, ResizeImageAction as A, ResizeImageController,
@@ -17,12 +14,12 @@ use rusty_backup::controller::resize_image::{
 };
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::partition_bar::{self, Bar};
-use crate::sync::SyncGuard;
-use crate::ui::{self, CloseDelegate};
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::partition_bar::{self, Bar};
+use super::sync::SyncGuard;
 use rusty_backup::controller::commander::Tone;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -73,17 +70,17 @@ pub struct ResizeImageWindow {
     host: EffectHost,
     sync: SyncGuard,
     me: Weak<ResizeImageWindow>,
-    window: Retained<NSWindow>,
-    _delegate: Retained<CloseDelegate>,
+    ui: Rc<dyn Host>,
+    window: Surface,
     form: Form<K>,
-    before: Retained<Bar>,
-    after: Retained<Bar>,
+    before: Bar,
+    after: Bar,
     rows: usize,
 }
 
 impl ResizeImageWindow {
     pub fn open(
-        mtm: MainThreadMarker,
+        ui: Rc<dyn Host>,
         notify: Arc<dyn Notify>,
         host: EffectHost,
         source: ResizeImageSource,
@@ -93,22 +90,20 @@ impl ResizeImageWindow {
         let rows = ctrl.rows().len();
         let me = Rc::new_cyclic(|me: &Weak<ResizeImageWindow>| {
             let close = me.clone();
-            let (window, delegate) = ui::window(
-                mtm,
+            let window = ui.window(
                 labels::TITLE,
-                680.0,
-                420.0 + 30.0 * rows as f64,
+                680,
+                420 + 30 * rows as i32,
                 Box::new(move || {
                     if let Some(d) = close.upgrade() {
                         d.send(A::Close);
                     }
                 }),
             );
-            let body = window.contentView().expect("the window's content view");
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body,
+            let form = Form::with_host(
+                ui.clone(),
+                window,
                 Rc::new(move |k| {
                     if let Some(d) = fire.upgrade() {
                         d.fired(k);
@@ -127,13 +122,11 @@ impl ResizeImageWindow {
             f.button(K::Repair, "Repair...", ids::REPAIR);
             f.check(K::Anyway, labels::CONTINUE_ANYWAY, ids::CONTINUE_ANYWAY);
             f.label(K::BeforeCaption, "Now:");
-            let before = Bar::new(mtm, ids::BAR);
+            let before = Bar::add(f, K::Before, ids::BAR);
             before.set_options(1.0, false);
-            f.add(K::Before, &before);
             f.label(K::AfterCaption, "After:");
-            let after = Bar::new(mtm, "resize_image.bar_after");
+            let after = Bar::add(f, K::After, "resize_image.bar_after");
             after.set_options(1.0, true);
-            f.add(K::After, &after);
             for i in 0..rows {
                 f.label(K::RowTitle(i), "");
                 f.popup(K::RowMode(i), &[], &format!("{}.{i}", ids::ROW_MODE));
@@ -160,14 +153,14 @@ impl ResizeImageWindow {
             f.button(K::Next, "Next", ids::NEXT);
             f.button(K::Cancel, "Cancel", ids::CANCEL);
             f.button(K::OpenResult, labels::OPEN_RESULT, ids::OPEN_RESULT);
-            ui::present(&window);
+            ui.present(window);
             ResizeImageWindow {
                 ctrl: RefCell::new(ctrl),
                 host,
                 sync: SyncGuard::default(),
                 me: me.clone(),
+                ui: ui.clone(),
                 window,
-                _delegate: delegate,
                 form,
                 before,
                 after,
@@ -203,7 +196,7 @@ impl ResizeImageWindow {
     /// Send `action` once the current handler returns: the window may close with it.
     fn send(&self, action: A) {
         let me = self.me.clone();
-        crate::app::later(Box::new(move || {
+        self.ui.later(Box::new(move || {
             if let Some(d) = me.upgrade() {
                 d.apply(action);
             }
@@ -226,9 +219,9 @@ impl ResizeImageWindow {
     fn after(&self, effects: Vec<Effect>) {
         self.host.run(effects, &self.reply());
         let log = self.ctrl.borrow_mut().take_log();
-        crate::app::append_log(log);
+        self.ui.log(log);
         if !self.ctrl.borrow().is_open() {
-            self.window.orderOut(None);
+            self.ui.hide(self.window);
             return;
         }
         self.sync.run(|| self.refresh());
@@ -455,9 +448,6 @@ impl ResizeImageWindow {
     }
 
     fn layout(&self) {
-        let Some(body) = self.window.contentView() else {
-            return;
-        };
         let row_h = Size::Fixed(layout::ROW);
         let text = |k: K, lines: i32| {
             Node::leaf(
@@ -547,7 +537,7 @@ impl ResizeImageWindow {
             ]),
         ]);
         let tree = Node::inset(Node::column(col), layout::MARGIN);
-        self.form.place_shown(tree, ui::area(&body));
+        self.form.place_shown(tree, self.ui.area(self.window));
     }
 
     fn fired(&self, k: K) {
@@ -620,7 +610,6 @@ fn short(title: &str) -> &str {
 
 impl Drop for ResizeImageWindow {
     fn drop(&mut self) {
-        self.window.setDelegate(None);
-        self.window.orderOut(None);
+        self.ui.release(self.window);
     }
 }

@@ -191,6 +191,8 @@ pub struct InspectScreen {
     editor_window: RefCell<Option<Rc<EditorWindow>>>,
     /// The daemon's listing, standing in Inspect's place while it is active.
     pub remote: Rc<RemotePage>,
+    /// The remote picker's page, which the app places in Inspect's while it is active.
+    pub remote_view: Retained<NSView>,
     page_changed: RefCell<Option<Rc<dyn Fn()>>>,
     /// Export, open while the controller says so, and its Physical Disk Export's writer.
     export_window: RefCell<Option<Rc<ExportWindow>>>,
@@ -344,7 +346,14 @@ impl InspectScreen {
             body.addSubview(v);
         }
         let browse = BrowseView::build(mtm, notify.clone(), host.clone(), false);
-        let remote = RemotePage::build(mtm, notify.clone(), host.clone());
+        let remote_view = ui::flipped(mtm);
+        let remote_surface = crate::form::AppKitHost::get(mtm).adopt(remote_view.clone());
+        let remote = RemotePage::build(
+            crate::form::AppKitHost::get(mtm),
+            remote_surface,
+            notify.clone(),
+            host.clone(),
+        );
         let screen = Rc::new_cyclic(|me: &Weak<InspectScreen>| InspectScreen {
             mtm,
             ctrl: RefCell::new(InspectController::new(InspectServices {
@@ -387,6 +396,7 @@ impl InspectScreen {
             chd_window: RefCell::default(),
             browse,
             remote,
+            remote_view,
         });
         let me = screen.me.clone();
         screen.remote.on_change(Rc::new(move || {
@@ -553,7 +563,12 @@ impl InspectScreen {
         let busy = self.resize.borrow().as_ref().is_some_and(|d| d.is_open());
         let plan = self.ctrl.borrow().resize_plan();
         if let (false, Some(plan)) = (busy, plan) {
-            let d = ResizeWindow::open(self.mtm, self.notify.clone(), self.host.clone(), plan);
+            let d = ResizeWindow::open(
+                crate::form::AppKitHost::current(),
+                self.notify.clone(),
+                self.host.clone(),
+                plan,
+            );
             d.set_devices(&self.devices.borrow());
             *self.resize.borrow_mut() = Some(d);
         }
@@ -573,7 +588,7 @@ impl InspectScreen {
         match source {
             Ok(source) => {
                 let d = ResizeImageWindow::open(
-                    self.mtm,
+                    crate::form::AppKitHost::current(),
                     self.notify.clone(),
                     self.host.clone(),
                     source,
@@ -592,7 +607,12 @@ impl InspectScreen {
         let source = self.ctrl.borrow().alto_resize_source();
         match source {
             Ok(path) => {
-                let d = AltoWindow::open(self.mtm, self.notify.clone(), self.host.clone(), path);
+                let d = AltoWindow::open(
+                    crate::form::AppKitHost::current(),
+                    self.notify.clone(),
+                    self.host.clone(),
+                    path,
+                );
                 *self.alto.borrow_mut() = Some(d);
             }
             Err(e) => crate::app::append_log(vec![(LogLevel::Error, e)]),
@@ -850,7 +870,7 @@ impl InspectScreen {
             }
             HostRequest::ExpandHfs(source) => {
                 let d = ExpandHfsWindow::open(
-                    self.mtm,
+                    crate::form::AppKitHost::current(),
                     self.notify.clone(),
                     self.host.clone(),
                     *source,
@@ -944,7 +964,7 @@ impl InspectScreen {
                     s.open_physical();
                 }
             });
-            let w = ExportWindow::open(self.mtm, send, physical);
+            let w = ExportWindow::open(crate::form::AppKitHost::current(), send, physical);
             *self.export_window.borrow_mut() = Some(w.clone());
             w
         });
@@ -962,7 +982,7 @@ impl InspectScreen {
         }
         self.apply(InspectAction::CloseExport);
         let d = DiskWriteWindow::open(
-            self.mtm,
+            crate::form::AppKitHost::current(),
             self.notify.clone(),
             self.host.clone(),
             &self.devices.borrow(),
@@ -991,7 +1011,7 @@ impl InspectScreen {
                     s.apply(a);
                 }
             });
-            let w = EditorWindow::open(self.mtm, send);
+            let w = EditorWindow::open(crate::form::AppKitHost::current(), send);
             *self.editor_window.borrow_mut() = Some(w.clone());
             w
         });

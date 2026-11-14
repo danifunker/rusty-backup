@@ -102,7 +102,6 @@ fn chd_key(k: ChdKey) -> K {
 pub struct BackupScreen {
     ctrl: RefCell<BackupController>,
     host: EffectHost,
-    mtm: MainThreadMarker,
     recent: RecentHandle,
     recent_files: RefCell<Vec<String>>,
     devices: RefCell<Vec<DiskDevice>>,
@@ -202,7 +201,6 @@ impl BackupScreen {
                     notify,
                 })),
                 host,
-                mtm,
                 recent_files: RefCell::new(recent.list(RecentMode::Backup)),
                 recent,
                 devices: RefCell::default(),
@@ -324,7 +322,7 @@ impl BackupScreen {
                     s.apply(a);
                 }
             });
-            let w = RemoteWindow::open(self.mtm, send);
+            let w = RemoteWindow::open(crate::form::AppKitHost::current(), send);
             *self.remote.borrow_mut() = Some(w.clone());
             w
         });
@@ -360,7 +358,7 @@ impl BackupScreen {
                 }
             });
             let list: Vec<_> = shown.rows.iter().map(|(r, _)| r.clone()).collect();
-            let w = VhdWindow::open(self.mtm, send, &list);
+            let w = VhdWindow::open(crate::form::AppKitHost::current(), send, &list);
             *self.vhd.borrow_mut() = Some(w.clone());
             w
         });
