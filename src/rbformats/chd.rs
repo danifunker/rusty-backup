@@ -52,6 +52,36 @@ impl ChdReader {
     }
 }
 
+/// What a resize keeps from a CHD it re-encodes, and what makes one unfit to resize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChdShape {
+    pub hunk_bytes: u32,
+    pub codecs: [u32; 4],
+    /// A child (diff) CHD: its bytes depend on a parent file.
+    pub has_parent: bool,
+    pub is_hd: bool,
+    pub logical_bytes: u64,
+}
+
+/// Read `path`'s [`ChdShape`].
+pub fn chd_shape(path: &Path) -> Result<ChdShape> {
+    let path_str = path
+        .to_str()
+        .with_context(|| format!("CHD path is not valid UTF-8: {}", path.display()))?;
+    let chd = libchdman_rs::Chd::open(path_str, false, None)
+        .map_err(|e| anyhow::anyhow!("failed to open CHD {}: {:?}", path.display(), e))?;
+    let info = chd
+        .info()
+        .map_err(|e| anyhow::anyhow!("failed to read CHD info: {:?}", e))?;
+    Ok(ChdShape {
+        hunk_bytes: info.hunk_bytes,
+        codecs: info.codecs,
+        has_parent: info.has_parent,
+        is_hd: info.is_hd,
+        logical_bytes: info.logical_bytes,
+    })
+}
+
 /// Render a human-readable summary of a CHD file, mimicking the layout of
 /// `chdman info`. Used by the GUI's "CHD Info" button so users can inspect
 /// version, codecs, hunk/unit size, SHA1s, and metadata tags without leaving

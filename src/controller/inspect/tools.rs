@@ -210,7 +210,7 @@ impl InspectController {
     /// Resize Image applies: a plain image file with a partition table, read as it is on disk.
     pub fn can_resize_image(&self) -> bool {
         self.can_expand_image()
-            && self.found.chd_path.is_none()
+            && (self.found.chd_path.is_none() || cfg!(feature = "chd"))
             && !matches!(&self.source, Some(Source::Image { _temp: Some(_), .. }))
             && !matches!(self.found.table, None | Some(PartitionTable::None { .. }))
     }
@@ -803,8 +803,11 @@ impl InspectController {
     pub fn resize_image_source(
         &mut self,
     ) -> Result<crate::controller::resize_image::ResizeImageSource, String> {
-        if !self.is_image_file() || self.found.chd_path.is_some() {
+        if !self.is_image_file() {
             return Err("Resize Image works on a disk image file.".to_string());
+        }
+        if self.found.chd_path.is_some() && !cfg!(feature = "chd") {
+            return Err("This build has no CHD support.".to_string());
         }
         if matches!(&self.source, Some(Source::Image { _temp: Some(_), .. })) {
             return Err(

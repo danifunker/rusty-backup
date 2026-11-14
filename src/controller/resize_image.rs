@@ -703,6 +703,24 @@ impl ResizeImageController {
         if self.check {
             lines.push("Then check every resized or moved volume again".to_string());
         }
+        if let Some(layout) = &self.layout {
+            if layout.chd.is_some() {
+                lines.push(
+                    "The CHD is unpacked to a raw file, resized, then packed again with its \
+                     codecs and hunk size"
+                        .to_string(),
+                );
+            }
+            let free = match layout.space.free {
+                Some(f) => format!(" ({} free)", format_size(f)),
+                None => String::new(),
+            };
+            lines.push(format!(
+                "Needs about {} free in {}{free}",
+                format_size(layout.space.needed),
+                layout.space.dir.display()
+            ));
+        }
         lines
     }
 

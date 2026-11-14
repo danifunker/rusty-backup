@@ -102,8 +102,27 @@ pub fn repair_partition(path: &Path, offset: u64, part: &PartitionInfo) -> Verdi
     check_partition(path, offset, part)
 }
 
+/// The image is a CHD: every step works on an unpacked raw copy, packed again at the end.
+pub fn is_chd(path: &Path) -> bool {
+    crate::model::source_reader::is_chd_path(path)
+}
+
+/// The image's bytes as a disk (a CHD decoded as it is read).
+fn open_source(path: &Path) -> Result<Box<dyn crate::rbformats::ReadSeek>> {
+    match is_chd(path) {
+        true => crate::model::source_reader::open_read(path),
+        false => Ok(Box::new(
+            std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?,
+        )),
+    }
+}
+
 /// The disk's size in bytes (a VHD's footer not counted), and whether it is a VHD.
 pub fn disk_size_of(path: &Path) -> Result<(u64, bool)> {
+    if is_chd(path) {
+        let mut r = open_source(path)?;
+        return Ok((r.seek(SeekFrom::End(0))?, false));
+    }
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let len = file.seek(SeekFrom::End(0))?;
     Ok(match detect_vhd(&mut file, len) {
@@ -149,7 +168,7 @@ pub fn probe(path: &Path, partitions: &[PartitionInfo], ctx: &JobCtx) -> Result<
         }
         ctx.set_phase(format!("Reading partition {}", p.index + 1));
         let ts = p.partition_type_string.as_deref();
-        let mut file = std::fs::File::open(path)?;
+        let mut file = open_source(path)?;
         let hfs_block = classic_hfs_block(&mut file, p.byte_offset());
         let fixed = match crate::fs::in_place_resize_support(&mut file, p.byte_offset(), ts) {
             InPlaceResize::Unsupported(name) => Some(name.to_string()),
@@ -158,7 +177,7 @@ pub fn probe(path: &Path, partitions: &[PartitionInfo], ctx: &JobCtx) -> Result<
         let minimum = match fixed {
             Some(_) => None,
             None => match crate::fs::partition_minimum_size(
-                std::fs::File::open(path)?,
+                open_source(path)?,
                 p.byte_offset(),
                 check_type(p),
                 ts,
@@ -210,6 +229,8 @@ impl ResizeImageRequest {
 /// The steps of one resize, in the order they run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
+    /// A CHD is decoded into a raw work file.
+    Unpack,
     Copy,
     Rebuild,
     Grow,
@@ -217,11 +238,14 @@ pub enum Step {
     Place,
     Finish,
     Check,
+    /// The work file is encoded into the resized CHD.
+    Pack,
 }
 
 impl Step {
     pub fn label(self) -> &'static str {
         match self {
+            Step::Unpack => "Unpack the CHD",
             Step::Copy => "Copy the image",
             Step::Rebuild => "Rebuild the HFS volume with larger blocks",
             Step::Grow => "Grow the file",
@@ -229,6 +253,7 @@ impl Step {
             Step::Place => "Write the rebuilt HFS volume",
             Step::Finish => "Set the disk size",
             Step::Check => "Check the volumes again",
+            Step::Pack => "Pack the CHD",
         }
     }
 }
@@ -257,17 +282,79 @@ pub type SharedProgress = Arc<Mutex<Progress>>;
 pub struct Layout {
     pub old_disk_size: u64,
     pub is_vhd: bool,
+    /// A CHD source: the codecs and hunk size its resized copy is packed with.
+    pub chd: Option<([u32; 4], u32)>,
+    pub space: Space,
     pub plans: Vec<crate::partition::resize::PartitionResizePlan>,
     /// Where the last partition ends once resized.
     pub data_end: u64,
 }
 
+/// The free space a resize needs where it writes, and how much there is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Space {
+    pub dir: PathBuf,
+    pub needed: u64,
+    /// `None` when the system does not say.
+    pub free: Option<u64>,
+}
+
+/// What `req` needs free beside its output: a copy, a growth, or a CHD's raw work file and repack.
+fn space_needed(req: &ResizeImageRequest, old: u64, chd: bool) -> Result<Space> {
+    let dir = req
+        .target()
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let needed = match (chd, req.copy_to.is_some()) {
+        (true, _) => {
+            // The raw work file at full size, then the new CHD (about the old one, scaled).
+            let packed = std::fs::metadata(&req.source)?.len();
+            let scaled = (packed as u128 * req.disk_size as u128 / old.max(1) as u128) as u64;
+            req.disk_size + scaled
+        }
+        (false, true) => req.disk_size + SECTOR,
+        (false, false) => req.disk_size.saturating_sub(old),
+    };
+    Ok(Space {
+        free: crate::os::available_space(&dir),
+        dir,
+        needed,
+    })
+}
+
+/// A CHD's packing settings (codecs, hunk size), or why it cannot be resized here.
+#[cfg(feature = "chd")]
+fn chd_settings(path: &Path) -> Result<([u32; 4], u32)> {
+    let shape = crate::rbformats::chd::chd_shape(path)?;
+    if shape.has_parent {
+        bail!(
+            "{} is a child CHD that depends on a parent file; merge it into a standalone CHD \
+             first (chdman copy)",
+            path.display()
+        );
+    }
+    if !shape.is_hd {
+        bail!("{} is not a hard-disk CHD", path.display());
+    }
+    Ok((shape.codecs, shape.hunk_bytes))
+}
+
+#[cfg(not(feature = "chd"))]
+fn chd_settings(_path: &Path) -> Result<([u32; 4], u32)> {
+    bail!("this build has no CHD support; resize a raw image or use the full build")
+}
+
 /// Plan `req` against the image as it is now; every refusal is found here, before a write.
 pub fn plan(req: &ResizeImageRequest) -> Result<Layout> {
-    let mut file = std::fs::File::open(&req.source)
-        .with_context(|| format!("open {}", req.source.display()))?;
+    let chd = match is_chd(&req.source) {
+        true => Some(chd_settings(&req.source)?),
+        false => None,
+    };
+    let mut file = open_source(&req.source)?;
     let len = file.seek(SeekFrom::End(0))?;
-    let is_vhd = detect_vhd(&mut file, len);
+    let is_vhd = chd.is_none() && detect_vhd(&mut file, len);
     let old_disk_size = match is_vhd {
         true => len - SECTOR,
         false => len,
@@ -327,9 +414,20 @@ pub fn plan(req: &ResizeImageRequest) -> Result<Layout> {
         .cloned()
         .collect();
     rehearse(&mut file, &patched)?;
+    let space = space_needed(req, old_disk_size, chd.is_some())?;
+    if let Some(free) = space.free.filter(|f| *f < space.needed) {
+        bail!(
+            "this needs about {} free in {}, and there is {}",
+            format_size(space.needed),
+            space.dir.display(),
+            format_size(free)
+        );
+    }
     Ok(Layout {
         old_disk_size,
         is_vhd,
+        chd,
+        space,
         plans,
         data_end,
     })
@@ -337,8 +435,8 @@ pub fn plan(req: &ResizeImageRequest) -> Result<Layout> {
 
 /// Resize each filesystem on an overlay first: the engine writes the table before it patches a
 /// filesystem, so a refusal found there would leave the disk half-written.
-fn rehearse(
-    file: &mut std::fs::File,
+fn rehearse<R: Read + Seek>(
+    file: &mut R,
     plans: &[crate::partition::resize::PartitionResizePlan],
 ) -> Result<()> {
     for p in plans
@@ -365,14 +463,14 @@ fn rehearse(
 }
 
 /// Reads fall through to the file; writes stay in memory, a sector at a time.
-struct Overlay<'a> {
-    file: &'a mut std::fs::File,
+struct Overlay<'a, R: Read + Seek> {
+    file: &'a mut R,
     pos: u64,
     sectors: std::collections::HashMap<u64, Vec<u8>>,
 }
 
-impl<'a> Overlay<'a> {
-    fn new(file: &'a mut std::fs::File) -> Self {
+impl<'a, R: Read + Seek> Overlay<'a, R> {
+    fn new(file: &'a mut R) -> Self {
         Overlay {
             file,
             pos: 0,
@@ -398,7 +496,7 @@ impl<'a> Overlay<'a> {
     }
 }
 
-impl Read for Overlay<'_> {
+impl<R: Read + Seek> Read for Overlay<'_, R> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         let (n, at) = (self.pos / SECTOR, (self.pos % SECTOR) as usize);
         let sector = self.sector(n)?;
@@ -409,7 +507,7 @@ impl Read for Overlay<'_> {
     }
 }
 
-impl Write for Overlay<'_> {
+impl<R: Read + Seek> Write for Overlay<'_, R> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         let (n, at) = (self.pos / SECTOR, (self.pos % SECTOR) as usize);
         let mut sector = self.sector(n)?;
@@ -425,9 +523,11 @@ impl Write for Overlay<'_> {
     }
 }
 
-impl Seek for Overlay<'_> {
+impl<R: Read + Seek> Seek for Overlay<'_, R> {
     fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
-        let end = self.file.metadata()?.len();
+        let here = self.file.stream_position()?;
+        let end = self.file.seek(SeekFrom::End(0))?;
+        self.file.seek(SeekFrom::Start(here))?;
         self.pos = match to {
             SeekFrom::Start(n) => n,
             SeekFrom::End(d) => (end as i64 + d).max(0) as u64,
@@ -440,7 +540,9 @@ impl Seek for Overlay<'_> {
 /// The steps `req` runs, in order.
 pub fn steps(req: &ResizeImageRequest, layout: &Layout) -> Vec<Step> {
     let mut steps = Vec::new();
-    if req.copy_to.is_some() {
+    if layout.chd.is_some() {
+        steps.push(Step::Unpack);
+    } else if req.copy_to.is_some() {
         steps.push(Step::Copy);
     }
     if !req.rebuild.is_empty() {
@@ -461,6 +563,9 @@ pub fn steps(req: &ResizeImageRequest, layout: &Layout) -> Vec<Step> {
     }
     if req.check_after {
         steps.push(Step::Check);
+    }
+    if layout.chd.is_some() {
+        steps.push(Step::Pack);
     }
     steps
 }
@@ -484,6 +589,12 @@ pub fn run(req: &ResizeImageRequest, ctx: &JobCtx, shared: &SharedProgress) -> R
     let steps = steps(req, &layout);
     crate::model::worker::lock_status(&**shared).steps =
         steps.iter().map(|s| (*s, StepState::Pending)).collect();
+    // A CHD is worked on as a raw file beside its output, removed however the run ends.
+    let work = match layout.chd {
+        Some(_) => Scratch(Some(scratch_path(req, &layout, "work.img"))),
+        None => Scratch(None),
+    };
+    let work_path = work.0.clone().unwrap_or_else(|| req.target().to_path_buf());
     let mut rebuilt = Vec::new();
     for step in steps {
         if ctx.is_cancelled() {
@@ -491,12 +602,12 @@ pub fn run(req: &ResizeImageRequest, ctx: &JobCtx, shared: &SharedProgress) -> R
         }
         set_state(shared, step, StepState::Running);
         ctx.set_phase(step.label());
-        match run_step(step, req, &layout, ctx, shared, &mut rebuilt) {
+        match run_step(step, req, &layout, &work_path, ctx, shared, &mut rebuilt) {
             Ok(note) => set_state(shared, step, StepState::Done(note)),
             Err(e) => {
                 let msg = format!("{e:#}");
                 set_state(shared, step, StepState::Failed(msg.clone()));
-                if req.copy_to.is_some() {
+                if req.copy_to.is_some() && (layout.chd.is_none() || step == Step::Pack) {
                     let _ = std::fs::remove_file(req.target());
                     line(
                         shared,
@@ -510,24 +621,55 @@ pub fn run(req: &ResizeImageRequest, ctx: &JobCtx, shared: &SharedProgress) -> R
     Ok(())
 }
 
+/// A file the run makes for itself, removed when the run ends.
+struct Scratch(Option<PathBuf>);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// `.NAME.resize-WHAT` beside the output, so a rename onto it stays on one filesystem.
+fn scratch_path(req: &ResizeImageRequest, layout: &Layout, what: &str) -> PathBuf {
+    let stem = req
+        .target()
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "image".to_string());
+    layout.space.dir.join(format!(".{stem}.resize-{what}"))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_step(
     step: Step,
     req: &ResizeImageRequest,
     layout: &Layout,
+    target: &Path,
     ctx: &JobCtx,
     shared: &SharedProgress,
     rebuilt: &mut Vec<(usize, std::fs::File)>,
 ) -> Result<String> {
-    let target = req.target();
     let mut log = |m: &str| line(shared, m);
     match step {
+        Step::Unpack => {
+            unpack(req.source.as_path(), target, ctx)?;
+            Ok(format!("{} raw", format_size(layout.old_disk_size)))
+        }
+        Step::Pack => {
+            pack(req, layout, target, ctx, &mut log)?;
+            Ok(format!("to {}", req.target().display()))
+        }
         Step::Copy => {
             copy_file(req.source.as_path(), target, ctx)?;
             Ok(format!("to {}", target.display()))
         }
         Step::Rebuild => {
             for &(index, block) in &req.rebuild {
-                rebuilt.push((index, rebuild_hfs(req, layout, index, block, &mut log)?));
+                let volume = rebuild_hfs(req, layout, target, index, block, &mut log)?;
+                rebuilt.push((index, volume));
             }
             Ok(format!("{} volume(s)", rebuilt.len()))
         }
@@ -619,11 +761,95 @@ fn copy_file(from: &Path, to: &Path, ctx: &JobCtx) -> Result<()> {
     Ok(())
 }
 
+/// Decode the CHD at `from` into a new raw file at `to`; zero runs are skipped, so it stays sparse.
+fn unpack(from: &Path, to: &Path, ctx: &JobCtx) -> Result<()> {
+    let mut src = open_source(from)?;
+    let total = src.seek(SeekFrom::End(0))?;
+    src.seek(SeekFrom::Start(0))?;
+    let mut dst = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)
+        .with_context(|| format!("create {}", to.display()))?;
+    let mut buf = vec![0u8; COPY_CHUNK];
+    let mut done = 0u64;
+    while done < total {
+        if ctx.is_cancelled() {
+            bail!("cancelled");
+        }
+        let want = (total - done).min(COPY_CHUNK as u64) as usize;
+        src.read_exact(&mut buf[..want])?;
+        match buf[..want].iter().all(|b| *b == 0) {
+            true => {
+                dst.seek(SeekFrom::Current(want as i64))?;
+            }
+            false => dst.write_all(&buf[..want])?,
+        }
+        done += want as u64;
+        ctx.set_bytes(done, total);
+    }
+    dst.set_len(total)?;
+    dst.flush()?;
+    Ok(())
+}
+
+/// Encode the work file into the resized CHD with the source's codecs and hunk size; in place,
+/// the new CHD replaces the source only once it is whole.
+#[cfg(feature = "chd")]
+fn pack(
+    req: &ResizeImageRequest,
+    layout: &Layout,
+    work: &Path,
+    ctx: &JobCtx,
+    log: &mut impl FnMut(&str),
+) -> Result<()> {
+    use crate::rbformats::chd_options::ChdOptions;
+    let (codecs, hunk_size) = layout.chd.unwrap_or_default();
+    let opts = ChdOptions { hunk_size, codecs };
+    let total = req.disk_size;
+    let in_place = req.copy_to.is_none();
+    let base = match in_place {
+        true => scratch_path(req, layout, "pack"),
+        false => req.target().with_extension(""),
+    };
+    let packed = base.with_extension("chd");
+    let _gone = Scratch(in_place.then(|| packed.clone()));
+    let mut reader = std::io::BufReader::new(std::fs::File::open(work)?);
+    crate::rbformats::chd::compress_chd_expand(
+        &mut reader,
+        &base,
+        total,
+        Some(opts),
+        &mut |done| ctx.set_bytes(done, total),
+        &|| ctx.is_cancelled(),
+        log,
+    )?;
+    match in_place {
+        true => crate::os::replace_file(&packed, &req.source)
+            .with_context(|| format!("replace {}", req.source.display()))?,
+        false if packed != req.target() => std::fs::rename(&packed, req.target())?,
+        false => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "chd"))]
+fn pack(
+    _req: &ResizeImageRequest,
+    _layout: &Layout,
+    _work: &Path,
+    _ctx: &JobCtx,
+    _log: &mut impl FnMut(&str),
+) -> Result<()> {
+    bail!("this build has no CHD support")
+}
+
 /// Clone partition `index`'s HFS volume, read from the untouched source, into a temp file at its
 /// new size and `block`; then clear the old volume's signature so the table resize leaves it be.
 fn rebuild_hfs(
     req: &ResizeImageRequest,
     layout: &Layout,
+    work: &Path,
     index: usize,
     block: u32,
     log: &mut impl FnMut(&str),
@@ -638,12 +864,11 @@ fn rebuild_hfs(
         .iter()
         .find(|r| r.index == index)
         .map_or(part.size_bytes, |r| r.new_size_bytes);
-    let source = std::fs::File::open(&req.source)?;
+    let source = open_source(&req.source)?;
     let mut fs = fs_mac::hfs::HfsFilesystem::open(source, part.byte_offset())
         .map_err(|e| anyhow::anyhow!("open the HFS volume: {e}"))?;
     let name = fs.volume_summary().volume_name;
-    let dir = req.target().parent().filter(|d| !d.as_os_str().is_empty());
-    let mut out = tempfile::tempfile_in(dir.unwrap_or(Path::new(".")))?;
+    let mut out = tempfile::tempfile_in(&layout.space.dir)?;
     log(&format!(
         "Partition {}: rebuilding \"{name}\" at {} with {} KiB blocks",
         index + 1,
@@ -661,7 +886,7 @@ fn rebuild_hfs(
         report.files_copied,
         report.dirs_copied
     ));
-    let mut target = open_rw(req.target())?;
+    let mut target = open_rw(work)?;
     target.seek(SeekFrom::Start(part.byte_offset()))?;
     target.write_all(&[0u8; 3 * SECTOR as usize])?;
     Ok(out)
