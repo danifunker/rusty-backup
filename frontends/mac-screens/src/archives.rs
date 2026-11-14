@@ -11,9 +11,6 @@ use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSProgressIndicator, NSView};
 use rusty_backup::controller::app::{busy_elsewhere_notice, Notify, RecentHandle, RecentMode};
 use rusty_backup::controller::archives::{
     hints, human_size, ids, mount_label, row_label, ArchiveEntryRow, ArchivesAction,
@@ -22,11 +19,11 @@ use rusty_backup::controller::archives::{
 use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::sync::SyncGuard;
-use crate::table::Table;
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::sync::SyncGuard;
 
 const COLUMNS: [(&str, f64, bool); 4] = [
     ("Name", 360.0, false),
@@ -79,6 +76,8 @@ enum K {
     Notes,
     Count,
     List,
+    /// A row's tick box, as `toggled` reports it.
+    Ticked,
     FormatCaption,
     Format,
     ExtractAll,
@@ -96,9 +95,9 @@ pub struct ArchivesScreen {
     busy: Cell<Option<&'static str>>,
     sync: SyncGuard,
     me: Weak<ArchivesScreen>,
-    body: Retained<NSView>,
+    ui: Rc<dyn Host>,
+    page: Surface,
     form: Form<K>,
-    list: Table,
     /// A mounted payload's temporary folder lives as long as the screen.
     guards: RefCell<Vec<Box<dyn std::any::Any>>>,
     mount_asked: RefCell<Option<PathBuf>>,
@@ -106,25 +105,19 @@ pub struct ArchivesScreen {
     listed: RefCell<Option<(PathBuf, usize)>>,
 }
 
-fn progress_of(form: &Form<K>, k: K) -> Retained<NSProgressIndicator> {
-    form.v(k)
-        .downcast::<NSProgressIndicator>()
-        .expect("a progress bar")
-}
-
 impl ArchivesScreen {
     pub fn build(
-        mtm: MainThreadMarker,
-        body: Retained<NSView>,
+        ui: Rc<dyn Host>,
+        page: Surface,
         notify: Arc<dyn Notify>,
         recent: RecentHandle,
         host: EffectHost,
     ) -> Rc<ArchivesScreen> {
         let screen = Rc::new_cyclic(|me: &Weak<ArchivesScreen>| {
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body.clone(),
+            let form = Form::with_host(
+                ui.clone(),
+                page,
                 Rc::new(move |k| {
                     if let Some(s) = fire.upgrade() {
                         s.fired(k);
@@ -142,17 +135,7 @@ impl ArchivesScreen {
             f.progress(K::JobProgress);
             f.wrap(K::Notes, "");
             f.label(K::Count, "");
-            let list = Table::new(mtm, ids::ENTRIES, &COLUMNS);
-            let tick = me.clone();
-            list.add_checks(
-                mtm,
-                Rc::new(move |i, on| {
-                    if let Some(s) = tick.upgrade() {
-                        s.ticked(i, on);
-                    }
-                }),
-            );
-            f.add(K::List, &list.scroll);
+            f.table(K::List, ids::ENTRIES, &COLUMNS, None, Some(K::Ticked));
             let formats: Vec<String> = ForkFormat::ALL
                 .iter()
                 .map(|x| x.label().to_string())
@@ -176,9 +159,9 @@ impl ArchivesScreen {
                 busy: Cell::new(None),
                 sync: SyncGuard::default(),
                 me: me.clone(),
-                body,
+                ui: ui.clone(),
+                page,
                 form,
-                list,
                 guards: RefCell::default(),
                 mount_asked: RefCell::default(),
                 listed: RefCell::default(),
@@ -255,9 +238,9 @@ impl ArchivesScreen {
                 }
             }
         }
-        crate::app::append_log(log);
+        self.ui.log(log);
         // Off screen nothing needs it, and a job wakes this many times a second.
-        if !self.body.isHiddenOrHasHiddenAncestor() {
+        if self.ui.on_screen(self.page) {
             self.refresh();
         }
     }
@@ -268,7 +251,7 @@ impl ArchivesScreen {
         }
         let me = self.me.clone();
         // The list reloads with the new ticks: act once its click handler returns.
-        crate::app::later(Box::new(move || {
+        self.ui.later(Box::new(move || {
             if let Some(s) = me.upgrade() {
                 s.apply(ArchivesAction::SetSelected(i, on));
             }
@@ -282,7 +265,8 @@ impl ArchivesScreen {
         if *self.listed.borrow() == key {
             return;
         }
-        self.list.set_rows(ctrl.rows().iter().map(cells).collect());
+        self.form
+            .set_rows(K::List, &ctrl.rows().iter().map(cells).collect::<Vec<_>>());
         *self.listed.borrow_mut() = key;
     }
 
@@ -320,13 +304,10 @@ impl ArchivesScreen {
         f.show(K::Close, path.is_some());
         f.enable(K::Close, !extracting);
         let job = ctrl.load_snapshot();
-        let (text, pct) = job
-            .as_ref()
-            .map(crate::inspect::job_line)
-            .unwrap_or_default();
+        let (text, pct) = job.as_ref().map(super::jobs::job_line).unwrap_or_default();
         f.set_text(K::Job, &text);
         f.show(K::Job, job.is_some());
-        crate::ui::set_progress(&progress_of(f, K::JobProgress), job.is_some(), pct);
+        f.set_progress(K::JobProgress, job.is_some(), pct);
 
         let mut notes = Vec::new();
         let mut tone = None;
@@ -360,10 +341,10 @@ impl ArchivesScreen {
         ] {
             f.show(k, loaded);
         }
-        let ticks = (0..ctrl.rows().len())
+        let ticks: Vec<bool> = (0..ctrl.rows().len())
             .map(|i| ctrl.is_selected(i))
             .collect();
-        self.list.set_checks(ticks);
+        self.form.set_checks(K::List, &ticks);
         let at = ForkFormat::ALL.iter().position(|x| *x == ctrl.format());
         f.select(K::Format, at.unwrap_or(0));
         f.enable(K::ExtractAll, !extracting);
@@ -388,7 +369,7 @@ impl ArchivesScreen {
         let pct = run
             .as_ref()
             .and_then(|(d, t, _)| (*t > 0).then(|| (d * 100 / t).min(100) as u32));
-        crate::ui::set_progress(&progress_of(f, K::RunProgress), run.is_some(), pct);
+        f.set_progress(K::RunProgress, run.is_some(), pct);
     }
 
     pub fn relayout(&self) {
@@ -467,6 +448,12 @@ impl ArchivesScreen {
         if self.sync.active() {
             return;
         }
+        if k == K::Ticked {
+            if let Some((i, on)) = self.form.toggled(K::List) {
+                self.ticked(i, on);
+            }
+            return;
+        }
         let action = match k {
             K::Format => self
                 .form
@@ -487,7 +474,7 @@ impl ArchivesScreen {
         };
         if let Some(a) = action {
             let me = self.me.clone();
-            crate::app::later(Box::new(move || {
+            self.ui.later(Box::new(move || {
                 if let Some(s) = me.upgrade() {
                     s.apply(a);
                 }

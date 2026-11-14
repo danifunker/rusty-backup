@@ -10,10 +10,6 @@ use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSProgressIndicator, NSView};
-use rusty_backup::controller::app::chd::ChdOptionsControl;
 use rusty_backup::controller::app::{busy_elsewhere_notice, Notify};
 use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::convert::{
@@ -22,12 +18,12 @@ use rusty_backup::controller::convert::{
 };
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::chd::{ChdControl, ChdIds, ChdKey};
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::sync::SyncGuard;
-use crate::table::Table;
+use super::chd::{ChdControl, ChdIds, ChdKey, ChdOptionsControl};
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::sync::SyncGuard;
 
 const PROFILES: [ChdProfile; 3] = [ChdProfile::Hd, ChdProfile::Cd, ChdProfile::Dvd];
 const COLUMNS: [(&str, f64, bool); 4] = [
@@ -102,6 +98,8 @@ enum K {
     All,
     None,
     List,
+    /// A row's tick box, as `toggled` reports it.
+    Ticked,
     Problem,
     Run,
     RunProgress,
@@ -116,31 +114,25 @@ pub struct ConvertScreen {
     busy: Cell<Option<&'static str>>,
     sync: SyncGuard,
     me: Weak<ConvertScreen>,
-    body: Retained<NSView>,
+    ui: Rc<dyn Host>,
+    page: Surface,
     form: Form<K>,
     chd: Vec<(ChdProfile, ChdControl<K>)>,
-    list: Table,
     listed: RefCell<Vec<Row>>,
-}
-
-fn progress_of(form: &Form<K>, k: K) -> Retained<NSProgressIndicator> {
-    form.v(k)
-        .downcast::<NSProgressIndicator>()
-        .expect("a progress bar")
 }
 
 impl ConvertScreen {
     pub fn build(
-        mtm: MainThreadMarker,
-        body: Retained<NSView>,
+        ui: Rc<dyn Host>,
+        page: Surface,
         notify: Arc<dyn Notify>,
         host: EffectHost,
     ) -> Rc<ConvertScreen> {
         let screen = Rc::new_cyclic(|me: &Weak<ConvertScreen>| {
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body.clone(),
+            let form = Form::with_host(
+                ui.clone(),
+                page,
                 Rc::new(move |k| {
                     if let Some(s) = fire.upgrade() {
                         s.fired(k);
@@ -224,17 +216,7 @@ impl ConvertScreen {
             f.label(K::Summary, "");
             f.button(K::All, "Select All", ids::SELECT_ALL);
             f.button(K::None, "Select None", ids::SELECT_NONE);
-            let list = Table::new(mtm, ids::FILES, &COLUMNS);
-            let tick = me.clone();
-            list.add_checks(
-                mtm,
-                Rc::new(move |i, on| {
-                    if let Some(s) = tick.upgrade() {
-                        s.later(ConvertAction::SetSelected(i, on));
-                    }
-                }),
-            );
-            f.add(K::List, &list.scroll);
+            f.table(K::List, ids::FILES, &COLUMNS, None, Some(K::Ticked));
             f.label(K::Problem, "");
             f.label(K::Run, "");
             f.progress(K::RunProgress);
@@ -247,10 +229,10 @@ impl ConvertScreen {
                 busy: Cell::new(None),
                 sync: SyncGuard::default(),
                 me: me.clone(),
-                body,
+                ui: ui.clone(),
+                page,
                 form,
                 chd,
-                list,
                 listed: RefCell::default(),
             }
         });
@@ -284,7 +266,7 @@ impl ConvertScreen {
     /// Apply `action` once the current handler returns: the controls may be rebuilt by it.
     fn later(&self, action: ConvertAction) {
         let me = self.me.clone();
-        crate::app::later(Box::new(move || {
+        self.ui.later(Box::new(move || {
             if let Some(s) = me.upgrade() {
                 s.apply(action);
             }
@@ -313,9 +295,9 @@ impl ConvertScreen {
     fn after(&self, effects: Vec<Effect>) {
         self.host.run(effects, &self.reply());
         let log = self.ctrl.borrow_mut().take_log();
-        crate::app::append_log(log);
+        self.ui.log(log);
         // Off screen nothing needs it, and a job wakes this many times a second.
-        if !self.body.isHiddenOrHasHiddenAncestor() {
+        if self.ui.on_screen(self.page) {
             self.refresh();
         }
     }
@@ -381,13 +363,10 @@ impl ConvertScreen {
         f.set_text(K::Output, &ConvertController::path_text(c.output()));
         f.set_text(K::OutputHint, c.output_hint());
         let scan = c.scan_snapshot();
-        let (line, pct) = scan
-            .as_ref()
-            .map(crate::inspect::job_line)
-            .unwrap_or_default();
+        let (line, pct) = scan.as_ref().map(super::jobs::job_line).unwrap_or_default();
         f.set_text(K::Scan, &line);
         f.show(K::Scan, scan.is_some());
-        crate::ui::set_progress(&progress_of(f, K::ScanProgress), scan.is_some(), pct);
+        f.set_progress(K::ScanProgress, scan.is_some(), pct);
         f.line(K::ScanError, c.scan_error(), Some(Tone::Error));
 
         let shown = c.shown_kinds();
@@ -458,9 +437,15 @@ impl ConvertScreen {
         }
         f.set_text(K::Summary, &c.summary());
         if *self.listed.borrow() != rows {
-            self.list.set_rows(rows.iter().map(cells).collect());
-            self.list
-                .set_checks(rows.iter().map(|r| r.selected && !r.skipped).collect());
+            self.form
+                .set_rows(K::List, &rows.iter().map(cells).collect::<Vec<_>>());
+            self.form.set_checks(
+                K::List,
+                &rows
+                    .iter()
+                    .map(|r| r.selected && !r.skipped)
+                    .collect::<Vec<_>>(),
+            );
             *self.listed.borrow_mut() = rows;
         }
 
@@ -477,7 +462,7 @@ impl ConvertScreen {
         let pct = run
             .as_ref()
             .map(|(x, _)| (x.clamp(0.0, 1.0) * 100.0) as u32);
-        crate::ui::set_progress(&progress_of(f, K::RunProgress), run.is_some(), pct);
+        f.set_progress(K::RunProgress, run.is_some(), pct);
         let (text, error) = c.outcome().unzip();
         f.line(
             K::Outcome,
@@ -599,6 +584,12 @@ impl ConvertScreen {
 
     fn fired(&self, k: K) {
         if self.sync.active() {
+            return;
+        }
+        if k == K::Ticked {
+            if let Some((i, on)) = self.form.toggled(K::List) {
+                self.later(ConvertAction::SetSelected(i, on));
+            }
             return;
         }
         let f = &self.form;

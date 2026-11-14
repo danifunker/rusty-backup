@@ -5,18 +5,14 @@
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
-#[cfg(feature = "chd")]
-use rusty_backup::controller::app::chd::{ChdOptionsControl, ChdProfile};
-#[cfg(not(feature = "chd"))]
-use rusty_backup::controller::backup::{ChdOptions, ChdProfile};
+use rusty_backup::controller::backup::ChdProfile;
 use rusty_backup::controller::inspect::{
     after_caption, ids, per_partition_refusal, ExportFormat, InspectAction, InspectController,
     LayoutSegment, PartitionExportConfig, EXPORT_FORMATS, EXPORT_INTRO, HFV_WHOLE_REFUSAL,
 };
 use rusty_backup::controller::restore::SizeMode;
 
-#[cfg(feature = "chd")]
-use super::chd::{ChdControl, ChdIds, ChdKey};
+use super::chd::{ChdControl, ChdIds, ChdKey, ChdOptionsControl};
 use super::form::Form;
 use super::host::{Host, Surface};
 use super::layout::{self, Node, Size};
@@ -81,7 +77,6 @@ enum K {
     Per,
     FormatCaption,
     Format(usize),
-    #[cfg(feature = "chd")]
     Chd(ChdKey),
     SizesTitle,
     Number(usize),
@@ -100,7 +95,6 @@ pub struct ExportWindow {
     form: Form<K>,
     current: Bar,
     after: Bar,
-    #[cfg(feature = "chd")]
     chd: ChdControl<K>,
     send: Rc<dyn Fn(InspectAction)>,
     /// Physical Disk Export: the screen hands the image to the disk writer.
@@ -166,8 +160,6 @@ impl ExportWindow {
                 let id = if i == 0 { ids::EXPORT_FORMAT } else { "" };
                 f.radio(K::Format(i), 1, c.label, id);
             }
-            // Without CHD support the format stays off and Export starts with the default options.
-            #[cfg(feature = "chd")]
             let chd = ChdControl::build(
                 f,
                 K::Chd,
@@ -191,7 +183,6 @@ impl ExportWindow {
                 form,
                 current,
                 after,
-                #[cfg(feature = "chd")]
                 chd,
                 send,
                 physical,
@@ -220,7 +211,6 @@ impl ExportWindow {
                 f.enable(K::Format(i), allowed);
                 f.set_check(K::Format(i), c.format == s.format);
             }
-            #[cfg(feature = "chd")]
             self.chd.set_visible(f, s.format == ExportFormat::Chd);
             let total = |l: &[LayoutSegment]| l.iter().map(|x| x.size_bytes).sum::<u64>();
             let (now, then) = (total(&s.current), total(&s.after));
@@ -317,7 +307,6 @@ impl ExportWindow {
                     .collect(),
             ));
         }
-        #[cfg(feature = "chd")]
         rows.extend(self.chd.rows());
         rows.push(line(K::SizesTitle, 1));
         for (i, _) in self.rows.borrow().iter() {
@@ -346,7 +335,6 @@ impl ExportWindow {
         }
         let f = &self.form;
         let action = match k {
-            #[cfg(feature = "chd")]
             K::Chd(c) => {
                 if self.chd.handle(f, c) {
                     f.enable(K::Start, self.chd.is_valid());
@@ -361,10 +349,7 @@ impl ExportWindow {
                 Some(c) => InspectAction::SetExportFormat(c.format),
                 None => return,
             },
-            #[cfg(feature = "chd")]
             K::Start if self.chd.is_valid() => InspectAction::StartExport(self.chd.choice().0),
-            #[cfg(not(feature = "chd"))]
-            K::Start => InspectAction::StartExport(ChdOptions::defaults_for(ChdProfile::Hd)),
             K::Physical => {
                 let physical = self.physical.clone();
                 self.ui.later(Box::new(move || physical()));

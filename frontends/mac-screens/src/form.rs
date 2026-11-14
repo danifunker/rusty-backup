@@ -518,6 +518,27 @@ impl<K: Copy + PartialEq + 'static> Form<K> {
         }
     }
 
+    /// Prune `tree` of hidden views and lay it out at its page's width: taller than the view, the
+    /// page scrolls.
+    pub fn place_page(&self, tree: Node<K>) {
+        let keep = |k: &K| self.shown(*k);
+        let tree = match tree.prune(&keep) {
+            Some(t) => t,
+            None => return,
+        };
+        let (w, visible) = match self.host.page_viewport(self.surface) {
+            Some(v) => v,
+            None => return,
+        };
+        let h = visible.max(tree.min_height());
+        self.host.set_surface_size(self.surface, w, h);
+        self.place(&tree, layout::Rect { x: 0, y: 0, w, h });
+    }
+
+    pub fn tooltip(&self, k: K, text: &str) {
+        self.host.tooltip(self.surface, self.st.ctl(k), text);
+    }
+
     /// Prune `tree` of hidden views, then place it in `area`.
     pub fn place_shown(&self, tree: Node<K>, area: layout::Rect) {
         let keep = |k: &K| self.shown(*k);

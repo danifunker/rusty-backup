@@ -17,10 +17,10 @@ use rusty_backup::controller::build_disk::{
 use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::partition_edit::{type_choices, type_note, BuildAction};
 
-use crate::build_disk::K;
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::partition_bar::{self, Bar};
+use super::build_disk::K;
+use super::form::Form;
+use super::layout::{self, Node, Size};
+use super::partition_bar::{self, Bar};
 
 /// The handlers embedded, each a DosType and its load file, and the DosTypes without one.
 type HandlerList = (Vec<(String, PathBuf)>, Vec<String>);
@@ -97,10 +97,9 @@ pub struct Rows {
 }
 
 impl Rows {
-    /// The step's fixed controls; the rows come with the plan.
-    pub fn build(f: &Form<K>, bar: &Bar) -> Rows {
+    /// The step's fixed controls (the bar is the screen's, already on `f`); the rows come with the plan.
+    pub fn build(f: &Form<K>) -> Rows {
         f.label(K::RowsCaption, "");
-        f.add(K::Bar, bar);
         f.wrap(K::RowsError, "");
         for (i, t) in HEADS.iter().enumerate() {
             f.label(K::RowHead(i), t);

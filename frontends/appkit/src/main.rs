@@ -5,17 +5,11 @@
 
 #[cfg(target_os = "macos")]
 mod app;
-mod archives;
-#[cfg(target_os = "macos")]
-mod backup;
 #[cfg(target_os = "macos")]
 mod browse;
-mod build_disk;
-mod build_rows;
 mod canvas;
 #[cfg(target_os = "macos")]
 mod commander;
-mod convert;
 #[cfg(target_os = "macos")]
 mod effects;
 #[cfg(target_os = "macos")]
@@ -26,8 +20,8 @@ mod inspect;
 #[path = "../../mac-screens/src/mod.rs"]
 mod screens;
 use screens::{
-    alto, backup_remote, backup_vhd, chd, disk_write, editor, expand_hfs, export, layout,
-    optical_remote, remote_pick, resize, resize_image, sync,
+    alto, chd, disk_write, editor, expand_hfs, export, layout, optical_remote, remote_pick, resize,
+    resize_image, sync,
 };
 #[cfg(target_os = "macos")]
 mod menu;
@@ -42,7 +36,6 @@ mod partition_bar;
 mod popup;
 #[cfg(target_os = "macos")]
 mod report;
-mod restore;
 #[cfg(target_os = "macos")]
 mod row_icons;
 #[cfg(target_os = "macos")]

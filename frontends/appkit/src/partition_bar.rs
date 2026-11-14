@@ -26,9 +26,6 @@ const LEGEND: f64 = 20.0;
 /// The bar and its legend's height in points.
 pub const HEIGHT: i32 = BAR_HEIGHT as i32 + 6 + LEGEND as i32;
 
-/// The bar alone, without its legend.
-pub const BAR_ONLY: i32 = BAR_HEIGHT as i32;
-
 const DARK_FILLS: [(u8, u8, u8); 8] = [
     (62, 118, 166),
     (74, 129, 52),
@@ -140,19 +137,6 @@ impl Bar {
         let bar: Retained<Bar> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
         ui::set_id(&bar, id);
         bar
-    }
-
-    /// Draw across `scale` of the width (a smaller disk beside a larger one), with or without a legend.
-    pub fn set_options(&self, scale: f32, legend: bool) {
-        {
-            let mut s = self.ivars().borrow_mut();
-            if (s.scale - scale).abs() < f32::EPSILON && s.legend == legend {
-                return;
-            }
-            s.scale = scale;
-            s.legend = legend;
-        }
-        self.setNeedsDisplay(true);
     }
 
     pub fn on_select(&self, f: Rc<dyn Fn(Option<usize>)>) {

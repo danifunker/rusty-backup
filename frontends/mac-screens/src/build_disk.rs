@@ -10,9 +10,6 @@ use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSProgressIndicator, NSView};
 use rusty_backup::controller::app::{busy_elsewhere_notice, no_devices_hint, DiskDevice, Notify};
 use rusty_backup::controller::build_disk::{
     containers, hints, ids, labels, BuildDiskAction, BuildDiskController, CdLayout, CdOption,
@@ -24,12 +21,13 @@ use rusty_backup::controller::partition_edit::BuildAction;
 use rusty_backup::controller::restore::device_label;
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::build_rows::{line, Options, Rows};
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::partition_bar::Bar;
-use crate::sync::SyncGuard;
+use super::build_rows::{line, Options, Rows};
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::partition_bar::Bar;
+use super::sync::SyncGuard;
 
 const OUTPUTS: [&str; 2] = ["Image file", "Physical disk"];
 const CONTROLLERS: [&str; 2] = ["SASI (256-byte sectors)", "SCSI (1024-byte sectors)"];
@@ -149,9 +147,10 @@ pub struct BuildScreen {
     busy: Cell<Option<&'static str>>,
     sync: SyncGuard,
     me: Weak<BuildScreen>,
-    body: Retained<NSView>,
+    ui: Rc<dyn Host>,
+    page: Surface,
     form: Form<K>,
-    bar: Retained<Bar>,
+    bar: Bar,
     rows: Rows,
     options: Options,
     formats: Vec<ExportFormat>,
@@ -167,16 +166,16 @@ fn strings(v: &[&str]) -> Vec<String> {
 
 impl BuildScreen {
     pub fn build(
-        mtm: MainThreadMarker,
-        body: Retained<NSView>,
+        ui: Rc<dyn Host>,
+        page: Surface,
         notify: Arc<dyn Notify>,
         host: EffectHost,
     ) -> Rc<BuildScreen> {
         let screen = Rc::new_cyclic(|me: &Weak<BuildScreen>| {
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body.clone(),
+            let form = Form::with_host(
+                ui.clone(),
+                page,
                 Rc::new(move |k| {
                     if let Some(s) = fire.upgrade() {
                         s.fired(k);
@@ -216,10 +215,8 @@ impl BuildScreen {
             f.label(K::AlignCaption, "Alignment:");
             f.popup(K::AlignPick, &[], ids::ALIGN_PICK);
             f.field(K::Align, ids::ALIGN, "Alignment", false);
-            f.v(K::AlignPick)
-                .setToolTip(Some(&crate::ui::ns(hints::ALIGN)));
-            f.v(K::Align)
-                .setToolTip(Some(&crate::ui::ns(hints::ALIGN_CUSTOM)));
+            f.tooltip(K::AlignPick, hints::ALIGN);
+            f.tooltip(K::Align, hints::ALIGN_CUSTOM);
             f.label(K::HeadsCaption, "Heads:");
             f.field(K::Heads, ids::HEADS, "Heads", false);
             f.label(K::SectorsCaption, "Sectors/track:");
@@ -249,9 +246,9 @@ impl BuildScreen {
             }
             f.label(K::CdSidecarsCaption, "macOS ._ files:");
             f.popup(K::CdSidecars, &[], ids::CD_SIDECARS);
-            let bar = Bar::new(mtm, "build_disk.bar");
+            let bar = Bar::add(f, K::Bar, "build_disk.bar");
             bar.set_options(1.0, true);
-            let rows = Rows::build(f, &bar);
+            let rows = Rows::build(f);
             f.wrap(K::Review, "");
             f.wrap(K::Warnings, "");
             f.wrap(K::Danger, "");
@@ -274,7 +271,8 @@ impl BuildScreen {
                 busy: Cell::new(None),
                 sync: SyncGuard::default(),
                 me: me.clone(),
-                body,
+                ui: ui.clone(),
+                page,
                 form,
                 bar,
                 rows,
@@ -337,9 +335,9 @@ impl BuildScreen {
     fn after(&self, effects: Vec<Effect>) {
         self.host.run(effects, &self.reply());
         let log = self.ctrl.borrow_mut().take_log();
-        crate::app::append_log(log);
+        self.ui.log(log);
         // Off screen nothing needs it, and a job wakes this many times a second.
-        if !self.body.isHiddenOrHasHiddenAncestor() {
+        if self.ui.on_screen(self.page) {
             self.refresh();
         }
     }
@@ -600,17 +598,10 @@ impl BuildScreen {
     fn show_build(&self, ctrl: &BuildDiskController, on: bool) {
         let f = &self.form;
         let job = ctrl.progress().filter(|p| p.is_running());
-        let (text, pct) = job
-            .as_ref()
-            .map(crate::inspect::job_line)
-            .unwrap_or_default();
+        let (text, pct) = job.as_ref().map(super::jobs::job_line).unwrap_or_default();
         f.set_text(K::Job, &text);
         f.show(K::Job, on && job.is_some());
-        let bar = f
-            .v(K::JobProgress)
-            .downcast::<NSProgressIndicator>()
-            .expect("a progress bar");
-        crate::ui::set_progress(&bar, on && job.is_some(), pct);
+        f.set_progress(K::JobProgress, on && job.is_some(), pct);
         f.show(K::Cancel, on && job.is_some());
         let outcome = match ctrl.outcome() {
             Some(Ok(())) => Some((labels::DONE.to_string(), None)),
@@ -925,7 +916,7 @@ impl BuildScreen {
         if let Some(a) = self.action(k) {
             // Rows may be built again by what this sends: act once the handler returns.
             let me = self.me.clone();
-            crate::app::later(Box::new(move || {
+            self.ui.later(Box::new(move || {
                 if let Some(s) = me.upgrade() {
                     s.apply(a);
                 }

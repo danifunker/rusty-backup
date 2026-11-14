@@ -23,16 +23,16 @@ use rusty_backup::controller::app::{
 use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::archives::ArchivesScreen;
-use crate::backup::BackupScreen;
-use crate::build_disk::BuildScreen;
 use crate::commander::CommanderScreen;
-use crate::convert::ConvertScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Size};
 use crate::optical::OpticalScreen;
-use crate::restore::RestoreScreen;
+use crate::screens::archives::ArchivesScreen;
+use crate::screens::backup::BackupScreen;
+use crate::screens::build_disk::BuildScreen;
+use crate::screens::convert::ConvertScreen;
+use crate::screens::restore::RestoreScreen;
 use crate::screens::settings::SettingsWindow;
 use crate::sync::SyncGuard;
 use crate::ui::{self, ns};
@@ -517,24 +517,31 @@ impl App {
                 .map(|(_, p)| p.body.clone())
                 .expect("a page per screen")
         };
+        let ak = crate::form::AppKitHost::get(mtm);
+        let page_of = |tab: AppTab| ak.adopt(body_of(tab));
         let backup = BackupScreen::build(
-            mtm,
-            body_of(AppTab::Backup),
+            ak.clone(),
+            page_of(AppTab::Backup),
             ctrl.notify(),
             ctrl.recent_handle(),
             host.clone(),
         );
         let restore = RestoreScreen::build(
-            mtm,
-            body_of(AppTab::Restore),
+            ak.clone(),
+            page_of(AppTab::Restore),
             ctrl.notify(),
             ctrl.recent_handle(),
             host.clone(),
         );
-        let build = BuildScreen::build(mtm, body_of(AppTab::Build), ctrl.notify(), host.clone());
+        let build = BuildScreen::build(
+            ak.clone(),
+            page_of(AppTab::Build),
+            ctrl.notify(),
+            host.clone(),
+        );
         let archives = ArchivesScreen::build(
-            mtm,
-            body_of(AppTab::Archives),
+            ak.clone(),
+            page_of(AppTab::Archives),
             ctrl.notify(),
             ctrl.recent_handle(),
             host.clone(),
@@ -546,8 +553,12 @@ impl App {
             ctrl.recent_handle(),
             host.clone(),
         );
-        let convert =
-            ConvertScreen::build(mtm, body_of(AppTab::Convert), ctrl.notify(), host.clone());
+        let convert = ConvertScreen::build(
+            ak.clone(),
+            page_of(AppTab::Convert),
+            ctrl.notify(),
+            host.clone(),
+        );
         content.addSubview(&inspect.browse.page);
         inspect.browse.page.setHidden(true);
         content.addSubview(&optical.browse.page);

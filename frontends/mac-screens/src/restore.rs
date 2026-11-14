@@ -13,9 +13,6 @@ use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSProgressIndicator, NSView};
 use rusty_backup::controller::app::{
     busy_elsewhere_notice, no_devices_hint, DiskDevice, Notify, RecentHandle, RecentMode,
 };
@@ -30,13 +27,13 @@ use rusty_backup::controller::restore::{
 };
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::disk_write::DiskWriteWindow;
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::partition_bar::{self, Bar};
-use crate::sync::SyncGuard;
-use crate::table::Table;
+use super::disk_write::DiskWriteWindow;
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::partition_bar::{self, Bar};
+use super::sync::SyncGuard;
 
 const KINDS: [&str; 2] = ["Write to device", "Save as image file"];
 const TABLES: [(NewTableType, &str); 3] = [
@@ -124,6 +121,8 @@ enum K {
     RemoteError,
     RemoteNote,
     RemoteList,
+    /// Return or a double-click on a remote drive.
+    RemotePick,
     RemoteImageCaption,
     RemoteImage,
     RemoteUseImage,
@@ -180,9 +179,9 @@ enum K {
 
 pub struct RestoreScreen {
     ctrl: RefCell<RestoreController>,
+    ui: Rc<dyn Host>,
     notify: Arc<dyn Notify>,
     /// The daemon's drives, as listed in the remote target's table.
-    remote_list: Table,
     remote_drives: RefCell<Vec<RemoteDrive>>,
     /// Write Image File's disk writer, while its controller is open.
     writer: RefCell<Option<Rc<DiskWriteWindow>>>,
@@ -195,31 +194,25 @@ pub struct RestoreScreen {
     sync: SyncGuard,
     me: Weak<RestoreScreen>,
     form: Form<K>,
-    current: Retained<Bar>,
-    after: Retained<Bar>,
+    current: Bar,
+    after: Bar,
     /// The size rows' partitions and their mode choices, as built.
     rows: RefCell<Vec<(usize, Vec<SizeMode>)>>,
 }
 
-fn progress_of(form: &Form<K>, k: K) -> Retained<NSProgressIndicator> {
-    form.v(k)
-        .downcast::<NSProgressIndicator>()
-        .expect("a progress bar")
-}
-
 impl RestoreScreen {
     pub fn build(
-        mtm: MainThreadMarker,
-        body: Retained<NSView>,
+        ui: Rc<dyn Host>,
+        page: Surface,
         notify: Arc<dyn Notify>,
         recent: RecentHandle,
         host: EffectHost,
     ) -> Rc<RestoreScreen> {
         let screen = Rc::new_cyclic(|me: &Weak<RestoreScreen>| {
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body,
+            let form = Form::with_host(
+                ui.clone(),
+                page,
                 Rc::new(move |k| {
                     if let Some(s) = fire.upgrade() {
                         s.fired(k);
@@ -259,18 +252,14 @@ impl RestoreScreen {
             form.label(K::RemoteBusy, "Connecting...");
             form.wrap(K::RemoteError, "");
             form.wrap(K::RemoteNote, "");
-            let remote_list = Table::new(mtm, ids::REMOTE_DRIVE, &[("Drive", 460.0, false)]);
-            remote_list.view.setHeaderView(None);
-            let activate = me.clone();
-            remote_list.on_activate(
-                mtm,
-                Rc::new(move || {
-                    if let Some(s) = activate.upgrade() {
-                        s.remote_picked();
-                    }
-                }),
+            // No column title: the list shows no header.
+            form.table(
+                K::RemoteList,
+                ids::REMOTE_DRIVE,
+                &[("", 460.0, false)],
+                Some(K::RemotePick),
+                None,
             );
-            form.add(K::RemoteList, &remote_list.scroll);
             form.label(K::RemoteImageCaption, "or image file:");
             form.field(
                 K::RemoteImage,
@@ -325,12 +314,10 @@ impl RestoreScreen {
             );
             form.label(K::ExpandLine, "");
             form.label(K::CurrentCaption, "Current:");
-            let current = Bar::new(mtm, "restore.current_bar");
+            let current = Bar::add(&form, K::Current, "restore.current_bar");
             current.set_options(1.0, false);
-            form.add(K::Current, &current);
             form.label(K::AfterCaption, "");
-            let after = Bar::new(mtm, "restore.after_bar");
-            form.add(K::After, &after);
+            let after = Bar::add(&form, K::After, "restore.after_bar");
             form.label(K::AlignCaption, "Partition starts:");
             form.popup(K::Align, &[], ids::ALIGNMENT);
             form.field(
@@ -367,8 +354,8 @@ impl RestoreScreen {
                     jobs: JobRegistry::new(),
                     notify: notify.clone(),
                 })),
+                ui: ui.clone(),
                 notify,
-                remote_list,
                 remote_drives: RefCell::default(),
                 writer: RefCell::default(),
                 host,
@@ -469,7 +456,7 @@ impl RestoreScreen {
                 // A job another screen started behind the question keeps this one from starting.
                 let locked = self.busy.get().map(busy_elsewhere_notice);
                 if let Some(why) = locked.as_ref().filter(|_| yes) {
-                    crate::app::append_log(vec![(
+                    self.ui.log(vec![(
                         LogLevel::Warning,
                         format!("Restore not started. {why}"),
                     )]);
@@ -498,7 +485,7 @@ impl RestoreScreen {
                 HostRequest::WriteImage(open) => self.open_writer(open),
             }
         }
-        crate::app::append_log(log);
+        self.ui.log(log);
         self.refresh();
     }
 
@@ -508,7 +495,7 @@ impl RestoreScreen {
             return;
         }
         let d = DiskWriteWindow::open(
-            crate::form::AppKitHost::current(),
+            self.ui.clone(),
             self.notify.clone(),
             self.host.clone(),
             &self.devices.borrow(),
@@ -558,13 +545,10 @@ impl RestoreScreen {
         .into_iter()
         .flatten()
         .next();
-        let (line, pct) = job
-            .as_ref()
-            .map(crate::inspect::job_line)
-            .unwrap_or_default();
+        let (line, pct) = job.as_ref().map(super::jobs::job_line).unwrap_or_default();
         f.set_text(K::Job, &line);
         f.show(K::Job, job.is_some());
-        crate::ui::set_progress(&progress_of(f, K::JobProgress), job.is_some(), pct);
+        f.set_progress(K::JobProgress, job.is_some(), pct);
 
         // The source: a backup folder, a partition image, or Write Image File's image.
         let writing = mode == RestoreMode::WriteImage;
@@ -858,8 +842,8 @@ impl RestoreScreen {
         });
         f.set_text(K::Run, run.as_ref().map_or("", |r| r.0.as_str()));
         f.show(K::Run, run.is_some());
-        crate::ui::set_progress(
-            &progress_of(f, K::Progress),
+        f.set_progress(
+            K::Progress,
             run.is_some(),
             run.as_ref().map(|r| r.1.unwrap_or(0)),
         );
@@ -979,8 +963,8 @@ impl RestoreScreen {
         f.line(K::RemoteNote, note, None);
         f.show(K::RemoteList, linked && !drives.is_empty());
         if *self.remote_drives.borrow() != drives {
-            self.remote_list
-                .set_rows(drives.iter().map(|d| vec![d.label.clone()]).collect());
+            let rows: Vec<Vec<String>> = drives.iter().map(|d| vec![d.label.clone()]).collect();
+            f.set_rows(K::RemoteList, &rows);
             *self.remote_drives.borrow_mut() = drives;
         }
         for k in [K::RemoteImageCaption, K::RemoteImage, K::RemoteUseImage] {
@@ -999,14 +983,14 @@ impl RestoreScreen {
     /// Return or a double-click on a daemon's drive makes it the target.
     fn remote_picked(&self) {
         let Some(d) = self
-            .remote_list
-            .selected()
+            .form
+            .selected_row(K::RemoteList)
             .and_then(|i| self.remote_drives.borrow().get(i).cloned())
         else {
             return;
         };
         let me = self.me.clone();
-        crate::app::later(Box::new(move || {
+        self.ui.later(Box::new(move || {
             if let Some(s) = me.upgrade() {
                 s.apply(RestoreAction::RemotePickDevice {
                     path: d.path,
@@ -1230,6 +1214,10 @@ impl RestoreScreen {
     /// A control's action or a field's change.
     fn fired(&self, k: K) {
         if self.sync.active() {
+            return;
+        }
+        if k == K::RemotePick {
+            self.remote_picked();
             return;
         }
         let f = &self.form;

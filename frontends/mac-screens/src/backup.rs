@@ -12,10 +12,6 @@ use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::NSView;
-use rusty_backup::controller::app::chd::ChdOptionsControl;
 use rusty_backup::controller::app::{
     busy_elsewhere_notice, no_devices_hint, DiskDevice, Notify, RecentHandle, RecentMode,
 };
@@ -27,13 +23,14 @@ use rusty_backup::controller::backup::{
 use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::backup_remote::{RemoteShown, RemoteWindow};
-use crate::backup_vhd::{VhdShown, VhdWindow};
-use crate::chd::{ChdControl, ChdIds, ChdKey};
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::sync::SyncGuard;
+use super::backup_remote::{RemoteShown, RemoteWindow};
+use super::backup_vhd::{VhdShown, VhdWindow};
+use super::chd::{ChdControl, ChdIds, ChdKey, ChdOptionsControl};
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::sync::SyncGuard;
 
 /// The source menu's picks: a recent image, a device, or one of the ways to open one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -102,6 +99,7 @@ fn chd_key(k: ChdKey) -> K {
 pub struct BackupScreen {
     ctrl: RefCell<BackupController>,
     host: EffectHost,
+    ui: Rc<dyn Host>,
     recent: RecentHandle,
     recent_files: RefCell<Vec<String>>,
     devices: RefCell<Vec<DiskDevice>>,
@@ -120,17 +118,17 @@ pub struct BackupScreen {
 
 impl BackupScreen {
     pub fn build(
-        mtm: MainThreadMarker,
-        body: Retained<NSView>,
+        ui: Rc<dyn Host>,
+        page: Surface,
         notify: Arc<dyn Notify>,
         recent: RecentHandle,
         host: EffectHost,
     ) -> Rc<BackupScreen> {
         let screen = Rc::new_cyclic(|me: &Weak<BackupScreen>| {
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body,
+            let form = Form::with_host(
+                ui.clone(),
+                page,
                 Rc::new(move |k| {
                     if let Some(s) = fire.upgrade() {
                         s.fired(k);
@@ -201,6 +199,7 @@ impl BackupScreen {
                     notify,
                 })),
                 host,
+                ui: ui.clone(),
                 recent_files: RefCell::new(recent.list(RecentMode::Backup)),
                 recent,
                 devices: RefCell::default(),
@@ -277,7 +276,7 @@ impl BackupScreen {
                 HostRequest::RememberRecent(path) => self.remember(path),
             }
         }
-        crate::app::append_log(log);
+        self.ui.log(log);
         self.show_vhd();
         self.show_remote();
         self.refresh();
@@ -322,7 +321,7 @@ impl BackupScreen {
                     s.apply(a);
                 }
             });
-            let w = RemoteWindow::open(crate::form::AppKitHost::current(), send);
+            let w = RemoteWindow::open(self.ui.clone(), send);
             *self.remote.borrow_mut() = Some(w.clone());
             w
         });
@@ -358,7 +357,7 @@ impl BackupScreen {
                 }
             });
             let list: Vec<_> = shown.rows.iter().map(|(r, _)| r.clone()).collect();
-            let w = VhdWindow::open(crate::form::AppKitHost::current(), send, &list);
+            let w = VhdWindow::open(self.ui.clone(), send, &list);
             *self.vhd.borrow_mut() = Some(w.clone());
             w
         });
@@ -457,16 +456,11 @@ impl BackupScreen {
             }
             let (line, jpct) = job
                 .as_ref()
-                .map(|(j, _)| crate::inspect::job_line(j))
+                .map(|(j, _)| super::jobs::job_line(j))
                 .unwrap_or_default();
             f.set_text(K::Job, &line);
             f.show(K::Job, job.is_some());
-            if let Some(p) = f
-                .v(K::JobProgress)
-                .downcast_ref::<objc2_app_kit::NSProgressIndicator>()
-            {
-                crate::ui::set_progress(p, job.is_some(), jpct);
-            }
+            f.set_progress(K::JobProgress, job.is_some(), jpct);
             f.show(K::CancelScan, job.as_ref().is_some_and(|(_, c)| *c));
             f.set_text(K::Table, table.as_deref().unwrap_or(""));
             self.show_rows(&rows);
@@ -522,16 +516,11 @@ impl BackupScreen {
             );
             f.set_text(K::Run, run.as_deref().unwrap_or(""));
             f.show(K::Run, run.is_some());
-            if let Some(p) = f
-                .v(K::Progress)
-                .downcast_ref::<objc2_app_kit::NSProgressIndicator>()
-            {
-                crate::ui::set_progress(
-                    p,
-                    run.is_some(),
-                    pct.or(Some(0)).filter(|_| run.is_some()),
-                );
-            }
+            f.set_progress(
+                K::Progress,
+                run.is_some(),
+                pct.or(Some(0)).filter(|_| run.is_some()),
+            );
             f.set_text(K::Why, why.as_deref().unwrap_or(""));
             f.show(K::Why, !running && !can_start);
             // The footer shows one line: progress, else why Start is off, else the outcome.

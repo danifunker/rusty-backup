@@ -137,6 +137,14 @@ pub trait Host {
     /// Add to its text, scrolling to the end when `follow`.
     fn append_text_view(&self, s: Surface, c: Ctl, text: &str, follow: bool);
 
+    fn tooltip(&self, s: Surface, c: Ctl, text: &str);
+    /// The visible size of the scroll view a page's surface sits in, if it is in one.
+    fn page_viewport(&self, s: Surface) -> Option<(i32, i32)>;
+    /// Size a page's surface; taller than its viewport, it scrolls.
+    fn set_surface_size(&self, s: Surface, w: i32, h: i32);
+    /// The surface is on screen: neither it nor any view holding it is hidden.
+    fn on_screen(&self, s: Surface) -> bool;
+
     fn remove(&self, s: Surface, c: Ctl);
     fn shown(&self, s: Surface, c: Ctl) -> bool;
     fn show(&self, s: Surface, c: Ctl, on: bool);

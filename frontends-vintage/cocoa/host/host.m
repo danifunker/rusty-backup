@@ -1021,3 +1021,37 @@ void rb_host_append_text_view(uint32_t s, uint32_t c, const char *text, int foll
     if (follow)
         [t scrollRangeToVisible:NSMakeRange([[t string] length], 0)];
 }
+
+void rb_host_tooltip(uint32_t s, uint32_t c, const char *text)
+{
+    [(NSView *)view(s, c) setToolTip:str(text)];
+}
+
+int rb_host_page_viewport(uint32_t s, int32_t *out)
+{
+    NSScrollView *scroll = [surf(s)->body enclosingScrollView];
+    if (scroll == nil)
+        return 0;
+    NSSize v = [scroll contentSize];
+    out[0] = (int32_t)v.width;
+    out[1] = (int32_t)v.height;
+    return 1;
+}
+
+void rb_host_set_surface_size(uint32_t s, int32_t w, int32_t h)
+{
+    NSView *body = surf(s)->body;
+    NSSize size = NSMakeSize(w, h);
+    if (!NSEqualSizes([body frame].size, size))
+        [body setFrameSize:size];
+}
+
+// Hidden itself, or inside a hidden view (an off-screen tab's page).
+int rb_host_on_screen(uint32_t s)
+{
+    NSView *v = surf(s)->body;
+    for (; v != nil; v = [v superview])
+        if ([v isHidden])
+            return 0;
+    return 1;
+}

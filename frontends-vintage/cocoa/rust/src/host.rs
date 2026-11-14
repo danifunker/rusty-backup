@@ -49,6 +49,10 @@ extern "C" {
     fn rb_host_select_row(s: u32, c: u32, i: u32);
     fn rb_host_toggled(s: u32, c: u32, row: *mut i32, on: *mut c_int) -> c_int;
     fn rb_host_key_equivalent(s: u32, c: u32, key: *const c_char);
+    fn rb_host_tooltip(s: u32, c: u32, text: *const c_char);
+    fn rb_host_page_viewport(s: u32, out: *mut i32) -> c_int;
+    fn rb_host_set_surface_size(s: u32, w: i32, h: i32);
+    fn rb_host_on_screen(s: u32) -> c_int;
     fn rb_host_canvas(s: u32, c: u32, id: *const c_char);
     fn rb_host_redraw(s: u32, c: u32);
     fn rb_host_clicked(s: u32, c: u32, out: *mut f64) -> c_int;
@@ -553,6 +557,33 @@ impl Host for VintageHost {
             return None;
         }
         usize::try_from(row).ok().map(|r| (r, on != 0))
+    }
+
+    fn tooltip(&self, s: Surface, c: Ctl, text: &str) {
+        let t = cs(text);
+        // SAFETY: the host copies the text.
+        unsafe { rb_host_tooltip(s, c, t.as_ptr()) }
+    }
+
+    fn page_viewport(&self, s: Surface) -> Option<(i32, i32)> {
+        let mut out = [0i32; 2];
+        // SAFETY: the host writes two integers when the surface is in a scroll view.
+        let any = unsafe { rb_host_page_viewport(s, out.as_mut_ptr()) };
+        if any == 0 {
+            None
+        } else {
+            Some((out[0], out[1]))
+        }
+    }
+
+    fn set_surface_size(&self, s: Surface, w: i32, h: i32) {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_set_surface_size(s, w, h) }
+    }
+
+    fn on_screen(&self, s: Surface) -> bool {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_on_screen(s) != 0 }
     }
 
     fn canvas(&self, s: Surface, c: Ctl, id: &str, painter: Painter) {

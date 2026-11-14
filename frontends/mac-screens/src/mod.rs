@@ -11,11 +11,19 @@
 #![allow(dead_code)]
 
 pub mod alto;
+pub mod archives;
+pub mod backup;
 pub mod backup_remote;
 pub mod backup_vhd;
+pub mod build_disk;
+pub mod build_rows;
 // CHD and optical media need prebuilt libraries the vintage build cannot link; see the plan § 8.
 #[cfg(feature = "chd")]
 pub mod chd;
+#[cfg(not(feature = "chd"))]
+#[path = "chd_off.rs"]
+pub mod chd;
+pub mod convert;
 pub mod disk_write;
 pub mod editor;
 pub mod effects;
@@ -33,5 +41,6 @@ pub mod remote_pick;
 pub mod report;
 pub mod resize;
 pub mod resize_image;
+pub mod restore;
 pub mod settings;
 pub mod sync;

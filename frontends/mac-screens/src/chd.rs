@@ -6,9 +6,10 @@
 
 use std::cell::RefCell;
 
+pub use rusty_backup::controller::app::chd::ChdOptionsControl;
 use rusty_backup::controller::app::chd::{
     codec_choices, codec_long_name, hunk_presets, modes_for, unit_size_for, ChdOptions,
-    ChdOptionsControl, ChdOptionsMode, ChdProfile,
+    ChdOptionsMode, ChdProfile,
 };
 
 use super::form::Form;

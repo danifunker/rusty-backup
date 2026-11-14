@@ -3,7 +3,7 @@
 //!
 //! What stays here is AppKit's own: a field's cell that reports a value set through accessibility
 //! (typing reports through the delegate), and a guard so reading a field, which commits an edit in
-//! progress, reports nothing. `Form::new`, `add`, `v` and `place_page` are this shell's extras.
+//! progress, reports nothing. `Form::new` and `v` are this shell's extras.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -25,7 +25,7 @@ use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, PasswordSpec, PickSpec, TextSpec};
 
 use crate::canvas::Canvas;
-use crate::layout::{self, Node};
+use crate::layout;
 use crate::screens::host::{Column, Ctl, Ev, Host, Painter, PullItem, Surface};
 use crate::table::Table;
 use crate::ui::{self, ns, Callback, CloseDelegate, TextChange};
@@ -608,6 +608,28 @@ impl Host for AppKitHost {
         }
     }
 
+    fn tooltip(&self, s: Surface, c: Ctl, text: &str) {
+        self.view(s, c).setToolTip(Some(&ns(text)));
+    }
+
+    fn page_viewport(&self, s: Surface) -> Option<(i32, i32)> {
+        let scroll = self.body(s).enclosingScrollView()?;
+        let visible = scroll.contentSize();
+        Some((visible.width as i32, visible.height as i32))
+    }
+
+    fn set_surface_size(&self, s: Surface, w: i32, h: i32) {
+        let body = self.body(s);
+        let size = NSSize::new(f64::from(w), f64::from(h));
+        if body.frame().size != size {
+            body.setFrameSize(size);
+        }
+    }
+
+    fn on_screen(&self, s: Surface) -> bool {
+        !self.body(s).isHiddenOrHasHiddenAncestor()
+    }
+
     fn key_equivalent(&self, s: Surface, c: Ctl, key: &str) {
         self.button_of(s, c).setKeyEquivalent(&ns(key));
     }
@@ -774,22 +796,7 @@ impl<K: Copy + PartialEq + 'static> crate::screens::form::Form<K> {
         AppKitHost::current()
     }
 
-    /// Add a view the screen built (a list, a bar) as `k`.
-    pub fn add(&self, k: K, view: &NSView) {
-        let c = self.custom(k);
-        self.ak().adopt_view(self.surface(), c, view);
-    }
-
     pub fn v(&self, k: K) -> Retained<NSView> {
         self.ak().view(self.surface(), self.ctl(k))
-    }
-
-    /// Prune `tree` of hidden views and lay it out in the page the form is on, which scrolls.
-    pub fn place_page(&self, tree: Node<K>) {
-        let keep = |k: &K| self.shown(*k);
-        if let Some(tree) = tree.prune(&keep) {
-            let body = self.ak().body(self.surface());
-            crate::app::place_page(&body, &tree, &|k, r| ui::move_to(&self.v(k), r));
-        }
     }
 }
