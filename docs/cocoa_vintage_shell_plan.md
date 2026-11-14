@@ -196,5 +196,6 @@ Phases 1 to 3 are done for x86_64: every AppKit screen, dialog and the main wind
 - **CI.** `build-macos-vintage` builds the app with `build.sh`, checks its 10.7 floor and symbols,
   and ships `Rusty-Backup-Cocoa-macos-vintage-x64-<ver>.dmg` (HFS+, readable on 10.7).
 - **Flows.** All cocoa flows pass here under Rosetta, the floppy conversions on the Convert tab
-  included. The Lion Mac waits on its Accessibility setting.
+  included, and all 65 pass on a real 10.7.5 Mac through `regression-tests/drivers/remote_cocoa.py`
+  (FLOWS.md, "Cocoa flows on a real 10.7 Mac").
 - **PowerPC** (Phase 5): see § 3; the host compiles clean on the G5 against the 10.4u SDK.

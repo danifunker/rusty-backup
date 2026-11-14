@@ -127,7 +127,11 @@ pub fn start_cocoa(cocoa: &Path, work: &Path) -> Result<Driver, UiError> {
             "the Cocoa driver needs 'clang' (the Xcode command-line tools)".to_string(),
         ));
     }
-    let mut cmd = Command::new(objc_driver_binary()?);
+    // RB_COCOA_DRIVER swaps in a relay to another Mac (drivers/remote_cocoa.py) for a 10.7 run.
+    let mut cmd = match std::env::var_os("RB_COCOA_DRIVER") {
+        Some(relay) => Command::new(relay),
+        None => Command::new(objc_driver_binary()?),
+    };
     cmd.arg(cocoa).arg(work);
     Driver::launch(cmd, work, "Cocoa")
 }

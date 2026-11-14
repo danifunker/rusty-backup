@@ -192,6 +192,29 @@ repo inside WSL (building from `/mnt/c` is very slow), then:
 device, and ALSA's null sink does not keep time there, so `flow.audio.cdda-play` fails under
 WSL only: the track drains at once.
 
+### Cocoa flows on a real 10.7 Mac
+
+`drivers/remote_cocoa.py` stands in for the Cocoa driver (`RB_COCOA_DRIVER`) and runs it on
+another Mac over ssh, with Accessibility on there and someone logged in at its desktop. It
+mirrors each case's scratch folder to the same path on both Macs, so the runner's scratch and
+cases roots go under `/tmp`; it pushes what the runner writes before each op, pulls what the
+app writes (by checksum, compressed) after each answer and every 3 s, and forwards a port the
+runner's `rb-cli serve` listens on back over the ssh connection. Lion's Xcode 4.6 can't
+compile the driver (object literals), so build it here for x86_64 and copy it over:
+
+```bash
+clang -arch x86_64 -mmacosx-version-min=10.7 -fno-objc-arc -O2 drivers/ax_driver.m -framework Foundation -framework ApplicationServices -o /tmp/ax_driver_objc
+```
+
+Then, with an ssh alias `lion` that has `ControlMaster auto`, the app and driver copied to
+`/tmp/rbl/` on it, and `rsync -a cases/ /tmp/rbl/cases/` here:
+
+```bash
+RB_COCOA_DRIVER=$PWD/drivers/remote_cocoa.py RB_COCOA_REMOTE=lion RB_COCOA_REMOTE_APP="/tmp/rbl/app/Rusty Backup.app/Contents/MacOS/Rusty Backup" RB_COCOA_REMOTE_DRV=/tmp/rbl/drv/ax_driver_objc RB_COCOA_SYNC=/tmp/rbl/cases ./runner/target/release/rb-regress run --cases /tmp/rbl/cases --scratch-root /tmp/rbl/scratch --shell cocoa --tiers 8
+```
+
+All 65 cocoa flows pass this way on a 10.7.5 Mac mini (2026-11-14).
+
 ### What the GTK driver works around
 
 Each of these failed silently until it was handled; keep them in mind before
