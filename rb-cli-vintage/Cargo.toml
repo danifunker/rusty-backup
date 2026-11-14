@@ -20,7 +20,9 @@
 # The empty [workspace] table below makes this its own workspace root, so it
 # resolves independently (rb-cli-vintage/Cargo.lock) and does NOT get pulled
 # into the parent package's build.
+# The vintage Cocoa shell's Rust half shares this frozen lockfile (docs/cocoa_vintage_shell_plan.md).
 [workspace]
+members = ["../frontends-vintage/cocoa/rust"]
 
 [package]
 name = "rb-cli-vintage"

@@ -1,0 +1,27 @@
+# The vintage Cocoa shell's Rust half (docs/cocoa_vintage_shell_plan.md): a staticlib the
+# Objective-C host links. A member of rb-cli-vintage's workspace so it builds on Rust 1.73
+# against that frozen lockfile.
+[package]
+name = "rusty-backup-cocoa"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "AGPL-3.0"
+publish = false
+workspace = "../../../rb-cli-vintage"
+
+[lib]
+name = "rb_cocoa"
+path = "src/lib.rs"
+crate-type = ["staticlib"]
+
+[features]
+default = []
+rust173-polyfill = ["rb-cli-vintage/rust173-polyfill"]
+native-zstd = ["rb-cli-vintage/native-zstd"]
+remote = ["rb-cli-vintage/remote"]
+yaml = ["rb-cli-vintage/yaml"]
+os-stub = ["rb-cli-vintage/os-stub"]
+
+[dependencies]
+rb-cli-vintage = { path = "../../../rb-cli-vintage", default-features = false }
