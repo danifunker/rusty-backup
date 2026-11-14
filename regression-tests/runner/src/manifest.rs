@@ -440,7 +440,7 @@ impl Case {
 
     /// The case needs what the vintage Cocoa build leaves out: CHD, optical media, CD audio.
     fn cocoa_lacks(&self) -> bool {
-        const NEEDS: [&str; 4] = ["optical", "audio", "chd", "convert"];
+        const NEEDS: [&str; 3] = ["optical", "audio", "chd"];
         let id = self.id.to_ascii_lowercase();
         NEEDS
             .iter()

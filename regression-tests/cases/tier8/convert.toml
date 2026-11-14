@@ -3,7 +3,7 @@
 [meta]
 tier = 8
 group = "flow.convert"
-description = "Convert an image on the Convert tab, then prove the output with rb-cli."
+description = "Convert images on the Convert tab (a disc to CHD, floppies between containers), then prove the output with rb-cli."
 
 [[case]]
 id = "flow.convert.iso-to-chd"
@@ -38,3 +38,159 @@ expect_exit = 0
 args = ["optical", "extract", "{fixture}", "--to", "{scratch}/iso"]
 expect_exit = 0
 files_identical = [["{scratch}/iso/CIV_II_GOLD_111_UPDATE.SIT", "{scratch}/chd/CIV_II_GOLD_111_UPDATE.SIT"]]
+
+[[case]]
+id = "flow.convert.floppy-dc42"
+description = "Convert an 800 KB HFS floppy to DiskCopy 4.2 on the Convert tab, then read its file back out of the .dsk"
+level = "full"
+area = ["convert", "floppy"]
+shells = ["gtk", "win32", "appkit"]
+capabilities = ["convert.floppy"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "hfs", "--size", "800K", "{scratch}/f.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/f.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+# The Mac's own floppy image format, its tag bytes and checksum written by the converter.
+[[case.step]]
+ui = [
+  { tab = "Convert" },
+  { pick = "{scratch}/f.img" },
+  { activate = "convert.source_file" },
+  { wait = "will be converted", timeout_ms = 60000 },
+  { focus = "convert.floppy.format" },
+  { choose = "DiskCopy" },
+  { pick = "{scratch}/f.dsk" },
+  { activate = "convert.output" },
+  { wait = "f.dsk" },
+  { activate = "convert.start" },
+  { wait = "Converted 1 file", timeout_ms = 120000 },
+]
+
+# The file comes back out of the converted container byte for byte.
+[[case.step]]
+args = ["get", "{scratch}/f.dsk", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.convert.floppy-moof"
+description = "Convert an 800 KB HFS floppy to MOOF (Applesauce GCR) on the Convert tab, then read its file back out of the .moof"
+level = "full"
+area = ["convert", "floppy"]
+shells = ["gtk", "win32", "appkit"]
+capabilities = ["convert.floppy"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "hfs", "--size", "800K", "{scratch}/f.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/f.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+# Sector to GCR bitstream: the 800 KB Mac geometry the MOOF writer encodes.
+[[case.step]]
+ui = [
+  { tab = "Convert" },
+  { pick = "{scratch}/f.img" },
+  { activate = "convert.source_file" },
+  { wait = "will be converted", timeout_ms = 60000 },
+  { focus = "convert.floppy.format" },
+  { choose = "MOOF" },
+  { pick = "{scratch}/f.moof" },
+  { activate = "convert.output" },
+  { wait = "f.moof" },
+  { activate = "convert.start" },
+  { wait = "Converted 1 file", timeout_ms = 120000 },
+]
+
+# The file comes back out of the converted container byte for byte.
+[[case.step]]
+args = ["get", "{scratch}/f.moof", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.convert.floppy-2mg"
+description = "Convert an 800 KB HFS floppy to 2MG on the Convert tab, then read its file back out of the .2mg"
+level = "full"
+area = ["convert", "floppy"]
+shells = ["gtk", "win32", "appkit"]
+capabilities = ["convert.floppy"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "hfs", "--size", "800K", "{scratch}/f.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/f.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+# The Apple II universal container, a header over the same blocks.
+[[case.step]]
+ui = [
+  { tab = "Convert" },
+  { pick = "{scratch}/f.img" },
+  { activate = "convert.source_file" },
+  { wait = "will be converted", timeout_ms = 60000 },
+  { focus = "convert.floppy.format" },
+  { choose = "2MG" },
+  { pick = "{scratch}/f.2mg" },
+  { activate = "convert.output" },
+  { wait = "f.2mg" },
+  { activate = "convert.start" },
+  { wait = "Converted 1 file", timeout_ms = 120000 },
+]
+
+# The file comes back out of the converted container byte for byte.
+[[case.step]]
+args = ["get", "{scratch}/f.2mg", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.convert.floppy-d88"
+description = "Convert a 720 KB FAT floppy to D88 (PC-98 / FM Towns) on the Convert tab, then read its file back out of the .d88"
+level = "full"
+area = ["convert", "floppy"]
+shells = ["gtk", "win32", "appkit"]
+capabilities = ["convert.floppy"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "720K", "{scratch}/f.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/f.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+# A PC floppy into a per-sector track container.
+[[case.step]]
+ui = [
+  { tab = "Convert" },
+  { pick = "{scratch}/f.img" },
+  { activate = "convert.source_file" },
+  { wait = "will be converted", timeout_ms = 60000 },
+  { focus = "convert.floppy.format" },
+  { choose = "D88" },
+  { pick = "{scratch}/f.d88" },
+  { activate = "convert.output" },
+  { wait = "f.d88" },
+  { activate = "convert.start" },
+  { wait = "Converted 1 file", timeout_ms = 120000 },
+]
+
+# The file comes back out of the converted container byte for byte.
+[[case.step]]
+args = ["get", "{scratch}/f.d88", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
