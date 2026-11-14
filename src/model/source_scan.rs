@@ -81,9 +81,11 @@ pub fn scan_source(path: &Path, is_device: bool, ctx: &JobCtx) -> anyhow::Result
         }
     };
     let source_handle = file.try_clone().ok();
-    // A device cannot answer seek(End); carry the length the OS reports instead.
+    // A raw device takes only whole, aligned sectors and cannot answer seek(End).
     let mut reader: Box<dyn ReadSeek> = if is_device {
-        Box::new(crate::os::known_len_source(file, path))
+        Box::new(crate::os::SectorAlignedReader::new(
+            crate::os::known_len_source(file, path),
+        ))
     } else {
         Box::new(BufReader::new(file))
     };
@@ -109,7 +111,9 @@ pub fn scan_source(path: &Path, is_device: bool, ctx: &JobCtx) -> anyhow::Result
         let clone = handle?.try_clone().ok()?;
         // AFFS / Atari / DFS / CBM size themselves via seek(End), which a device refuses.
         Some(if is_device {
-            Box::new(crate::os::known_len_source(clone, &owned)) as Box<dyn ReadSeek>
+            Box::new(crate::os::SectorAlignedReader::new(
+                crate::os::known_len_source(clone, &owned),
+            )) as Box<dyn ReadSeek>
         } else {
             Box::new(BufReader::new(clone))
         })
@@ -140,8 +144,8 @@ pub fn read_device_table(
         .into_parts()
         .0;
     ctx.set_phase("Reading the partition table...");
-    // A device cannot answer seek(End); carry the length the OS reports instead.
-    let mut reader = crate::os::known_len_source(file, path);
+    // A raw device takes only whole, aligned sectors and cannot answer seek(End).
+    let mut reader = crate::os::SectorAlignedReader::new(crate::os::known_len_source(file, path));
     let table = PartitionTable::detect(&mut reader).map_err(|e| ScanFailure {
         load_error: format!("Could not read partition table: {e}"),
         log_error: Some(format!("Target scan failed: {e}")),

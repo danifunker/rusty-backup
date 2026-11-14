@@ -150,8 +150,10 @@ pub fn inspect_source(
             .try_clone()
             .map_err(|e| format!("Cannot clone file handle: {e}"))?;
         if is_device {
-            // A device cannot answer seek(End); carry the length the OS reports instead.
-            Box::new(crate::os::known_len_source(f, path))
+            // A raw device takes only whole, aligned sectors and cannot answer seek(End).
+            Box::new(crate::os::SectorAlignedReader::new(
+                crate::os::known_len_source(f, path),
+            ))
         } else {
             Box::new(BufReader::new(f))
         }

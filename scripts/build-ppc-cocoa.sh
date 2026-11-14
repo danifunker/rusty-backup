@@ -21,8 +21,9 @@ case "$PPC_CPU" in
   *) echo "unknown PPC_CPU $PPC_CPU" >&2; exit 2 ;;
 esac
 SDK="${PPC_SDK:-/Developer/SDKs/MacOSX10.4u.sdk}"
-REMOTE="rb-cocoa"
-HOSTLIB="$RB_DIR/rb-cli-ppc/cocoa-host"
+# Per CPU: an archive built for one family would set the whole link's cpusubtype.
+REMOTE="rb-cocoa-$LABEL"
+HOSTLIB="$RB_DIR/rb-cli-ppc/cocoa-host/$LABEL"
 PPC_OUT="$MRUSTC_DIR/output-rb-ppc-$LABEL"
 VERSION="${RELEASE_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$RB_DIR/rb-cli-ppc/Cargo.toml" | head -1)}"
 

@@ -116,10 +116,12 @@ def tunnel(line):
 
 def main():
     dirs = " ".join("'%s'" % d for d in [scratch] + EXTRA)
-    # A fresh mirror of the case's scratch, and no app left over from a case the runner
-    # killed before its relay could stop it.
-    subprocess.call(["ssh", HOST, "killall '%s' '%s' 2>/dev/null; rm -rf '%s' && mkdir -p %s"
-                     % (os.path.basename(DRV), os.path.basename(APP), scratch, dirs)])
+    # A fresh mirror of the case's scratch, and no driver (or the app it started) left over from
+    # a case the runner killed first. Only the driver's children: never an app the user opened.
+    reap = ("for d in $(ps axo pid=,comm= | awk '$2 ~ /%s$/ {print $1}'); do "
+            "ps axo pid=,ppid= | awk -v d=$d '$2==d {print $1}' | xargs kill 2>/dev/null; "
+            "kill $d; done" % os.path.basename(DRV))
+    subprocess.call(["ssh", HOST, "%s; rm -rf '%s' && mkdir -p %s" % (reap, scratch, dirs)])
     for d in EXTRA:
         rsync([d + "/", "%s:%s/" % (HOST, d)])
     with lock:
@@ -160,7 +162,7 @@ def main():
         time.sleep(0.2)
     if proc.poll() is None:
         proc.kill()
-        subprocess.call(["ssh", HOST, "killall '%s'" % os.path.basename(DRV)])
+        subprocess.call(["ssh", HOST, reap])
     pull()
     done.set()
 
