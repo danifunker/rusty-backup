@@ -13,6 +13,22 @@ extern "C" {
 }
 
 fn main() {
+    // mrustc keeps only what main reaches, and only the host calls these: take their addresses.
+    let entry = [
+        rb_version as usize,
+        rb_start as usize,
+        rb_tick as usize,
+        rb_command as usize,
+        rb_open_files as usize,
+        host::rb_event as usize,
+        host::rb_window_event as usize,
+        host::rb_later as usize,
+        host::rb_timed as usize,
+        host::rb_canvas_draw as usize,
+        host::rb_rows_event as usize,
+        host::rb_dropped as usize,
+    ];
+    std::hint::black_box(&entry);
     let args: Vec<std::ffi::CString> = std::env::args_os()
         .map(|a| std::ffi::CString::new(a.to_string_lossy().into_owned()).unwrap_or_default())
         .collect();

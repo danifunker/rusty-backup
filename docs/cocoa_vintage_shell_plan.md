@@ -91,11 +91,12 @@ Objective-C shell builds each screen itself). Less change to the AppKit shell, b
 `scripts/build-ppc-cocoa.sh` (with `PPC_HOST` set) builds it in three steps:
 
 - `host`: Apple gcc 4.0 on the G5 compiles `host.m` and `main.m` against the 10.4u SDK with
-  `-DRB_RUST_MAIN` into `librbcocoahost.a`, which comes back to `rb-cli-ppc/cocoa-host/`.
+  `-DRB_RUST_MAIN` into `librbcocoahost.a`, kept on the G5 (one per CPU family).
 - `app`: `scripts/build-ppc.sh ppc` builds rb-cli-ppc's second bin, `rusty-backup-cocoa`
   (`rust/src/ppc_main.rs`). mrustc links binaries, not staticlibs, so Rust owns `main` and calls
   the host's `rb_objc_main`; `#[link]` attributes name the archive, Cocoa and libobjc, and the
-  archive's directory is added to `PPC_LDFLAGS`. gcc 10's driver does the link.
+  archive's folder on the G5 is added to `PPC_LDFLAGS`, which reach its gcc unchanged. gcc 10's
+  driver does the link.
 - `bundle`: the .app (10.4 floor in Info.plist) and its HFS+ DMG are made on the G5, into
   `dist/Rusty-Backup-Cocoa-macos-ppc-<cpu>-<version>.dmg`.
 

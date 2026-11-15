@@ -23,14 +23,13 @@ esac
 SDK="${PPC_SDK:-/Developer/SDKs/MacOSX10.4u.sdk}"
 # Per CPU: an archive built for one family would set the whole link's cpusubtype.
 REMOTE="rb-cocoa-$LABEL"
-HOSTLIB="$RB_DIR/rb-cli-ppc/cocoa-host/$LABEL"
 PPC_OUT="$MRUSTC_DIR/output-rb-ppc-$LABEL"
 VERSION="${RELEASE_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$RB_DIR/rb-cli-ppc/Cargo.toml" | head -1)}"
 
 note() { printf '\033[33m%s\033[0m\n' "$*"; }
 
-# The host's two files, compiled against the 10.4 SDK and archived; the archive comes back here
-# so the link step (which mirrors local -L directories to the Mac) can find it.
+# The host's two files, compiled against the 10.4 SDK and archived on the Mac, where the link
+# runs: PPC_LDFLAGS reach the Mac's gcc as they are, so its -L names the Mac's folder.
 stage_host() {
   note "compiling the Objective-C host on $PPC_HOST"
   ssh "$PPC_HOST" "mkdir -p $REMOTE"
@@ -39,14 +38,13 @@ stage_host() {
       gcc-4.0 -arch ppc $CPU_FLAGS -mmacosx-version-min=10.4 -isysroot $SDK -DRB_RUST_MAIN \
         -Wall -Werror -Wno-deprecated-declarations -O2 -c \$m.m -o \$m.o || exit 1; done && \
       rm -f librbcocoahost.a && ar rcs librbcocoahost.a host.o main.o && ranlib librbcocoahost.a"
-  mkdir -p "$HOSTLIB"
-  ssh "$PPC_HOST" "cat $REMOTE/librbcocoahost.a" > "$HOSTLIB/librbcocoahost.a"
 }
 
 # The Rust half: rb-cli-ppc's bins, with the archive's directory on every link line.
 stage_app() {
-  [ -f "$HOSTLIB/librbcocoahost.a" ] || stage_host
-  PPC_LDFLAGS="${PPC_LDFLAGS:--L/opt/local/lib -latomic -lMacportsLegacySupport -lgcc_s.1} -L$HOSTLIB" \
+  ssh "$PPC_HOST" "test -f $REMOTE/librbcocoahost.a" || stage_host
+  local home; home=$(ssh "$PPC_HOST" 'echo $HOME')
+  PPC_LDFLAGS="${PPC_LDFLAGS:--L/opt/local/lib -latomic -lMacportsLegacySupport -lgcc_s.1} -L$home/$REMOTE" \
     PPC_HOST="$PPC_HOST" PPC_CPU="$PPC_CPU" "$RB_DIR/scripts/build-ppc.sh" ppc
   [ -e "$PPC_OUT/rusty-backup-cocoa" ] || { echo "no $PPC_OUT/rusty-backup-cocoa" >&2; exit 1; }
 }

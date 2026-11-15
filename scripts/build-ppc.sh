@@ -157,6 +157,8 @@ HOSTC_OUT="$MRUSTC_DIR/output-rb-hostc"
 PPC_OUT="$MRUSTC_DIR/output-rb-ppc-${PPC_CPU_LABEL}"
 JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
+# A file's mtime in seconds: GNU stat on Linux, BSD stat on a Mac.
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
 banner() { printf '\n\033[1;36m==== %s ====\033[0m\n' "$*"; }
 note()   { printf '\033[33m%s\033[0m\n' "$*"; }
 die()    { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -462,8 +464,8 @@ seed_retime_build_outputs() {
       # The engine glob only matters for the root package, whose lib name differs.
       case "$cand" in *librusty_backup*) case "$stem" in rb-cli-ppc-*) ;; *) continue ;; esac ;; esac
       [ -e "$cand" ] || continue
-      ts="$(stat -c %Y "$cand")"
-      [ -z "$best" ] || [ "$ts" -lt "$(stat -c %Y "$best")" ] && best="$cand"
+      ts="$(mtime "$cand")"
+      [ -z "$best" ] || [ "$ts" -lt "$(mtime "$best")" ] && best="$cand"
     done
     if [ -n "$best" ]; then
       touch -r "$best" "$txt"
