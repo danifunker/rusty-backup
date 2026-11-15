@@ -3377,7 +3377,9 @@ pub fn is_browsable_scheme_slice(type_name: &str) -> bool {
 /// call to decide whether to offer Browse (and, for Commander, whether to
 /// auto-open a partition at all).
 pub fn partition_is_browsable(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool {
-    is_browsable_type(ptype)
+    // An ICON / LEXICON disk types its QNX 2 partitions 07, 08 and 09; the table names them.
+    type_name == "QNX 2"
+        || is_browsable_type(ptype)
         || is_fat_name(type_name)
         || is_browsable_type_string(type_string)
         || is_browsable_superfloppy(ptype, type_name)
@@ -4055,6 +4057,11 @@ mod tests {
         assert!(partition_is_browsable(0x00, None, "FAT16 (no type byte)"));
         // A BSD disklabel's FFS partition opens; its swap does not (a NetBSD/alpha system disk).
         assert!(partition_is_browsable(0, None, "BSD a (4.2BSD)"));
+        // ICON / LEXICON QNX 2 partitions past the first are typed 08 and 09.
+        assert!(partition_is_browsable(0x08, None, "QNX 2"));
+        assert!(partition_is_browsable(0x09, None, "QNX 2"));
+        assert!(!partition_is_browsable(0x08, None, "QNX 2 (not formatted)"));
+        assert!(!partition_is_browsable(0x08, None, "AIX"));
         assert!(!partition_is_browsable(0, None, "BSD b (swap)"));
     }
 
