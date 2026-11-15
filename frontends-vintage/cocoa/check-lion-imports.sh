@@ -9,12 +9,14 @@
 #
 #   frontends-vintage/cocoa/check-lion-imports.sh "path/to/Rusty Backup.app/Contents/MacOS/Rusty Backup"
 set -eu
+# comm needs both lists in one collation; the runner's locale is not C.
+export LC_ALL=C
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN="$1"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 nm -m -u "$BIN" | grep -E '\(from (libSystem|libc\+\+|libc\+\+abi|libobjc|libiconv)\)' \
     | sed -E 's/^.*external //; s/ \(from .*$//' | sort -u > "$TMP/imports"
-gzip -dc "$HERE/lion/exports.txt.gz" > "$TMP/exports"
+gzip -dc "$HERE/lion/exports.txt.gz" | sort -u > "$TMP/exports"
 MISSING="$(comm -23 "$TMP/imports" "$TMP/exports")"
 if [ -n "$MISSING" ]; then
     echo "Symbols Mac OS X 10.7 does not export (the app would crash on Lion; see rb-cli-vintage/lion_compat.cpp):" >&2
