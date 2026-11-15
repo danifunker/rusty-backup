@@ -66,8 +66,9 @@ stage_bundle() {
   sed -e "s/@VERSION@/$VERSION/g" -e 's|<string>10.7</string>|<string>10.4</string>|' \
     "$HERE/host/Info.plist" | ssh "$PPC_HOST" "cat > '$app/Contents/Info.plist'"
   printf 'APPL????' | ssh "$PPC_HOST" "cat > '$app/Contents/PkgInfo'"
-  # The icons travel as one tar stream; the Mac's tar unpacks it into Resources.
-  ( cd "$RB_DIR/assets/icons" && tar cf - icon.icns toolbar/png/*-48.png \
+  # The icons travel as one tar stream; the Mac's tar unpacks it into Resources. The app icon
+  # is icon-vintage.icns (scripts/make-legacy-icns.py): 10.4 reads none of icon.icns' formats.
+  ( cd "$RB_DIR/assets/icons" && tar cf - -s '/^icon-vintage.icns$/icon.icns/' icon-vintage.icns toolbar/png/*-48.png \
       rows/png/{file,file-plus,file-minus,folder,folder-plus,folder-minus,folder-open}-32.png ) |
     ssh "$PPC_HOST" "cd '$app/Contents/Resources' && tar xf - && mv toolbar/png/* rows/png/* . && rm -rf toolbar rows"
   # MacPorts' gcc10 runtime and legacy-support ride in Contents/Frameworks, as rb-cli's lib/ does.

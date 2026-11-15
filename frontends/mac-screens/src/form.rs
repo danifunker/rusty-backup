@@ -554,6 +554,15 @@ impl<K: Copy + PartialEq + 'static> Form<K> {
         self.place(&tree, layout::Rect { x: 0, y: 0, w, h });
     }
 
+    /// Lines `k`'s text wraps to across the page, at about 7 pt a character.
+    pub fn wrapped_lines(&self, k: K) -> i32 {
+        let page = self.host.page_viewport(self.surface).map(|v| v.0).unwrap_or(1000);
+        let per = ((page - 2 * layout::MARGIN - 16) / 7).max(20) as usize;
+        let text = self.text(k);
+        let n: usize = text.lines().map(|l| l.chars().count().div_ceil(per).max(1)).sum();
+        n as i32
+    }
+
     pub fn tooltip(&self, k: K, text: &str) {
         self.host.tooltip(self.surface, self.st.ctl(k), text);
     }

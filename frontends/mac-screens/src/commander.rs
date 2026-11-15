@@ -341,10 +341,11 @@ impl SideView {
             Node::button(l(S::Close), 65),
         ];
         let opens = vec![
-            Node::button(l(S::OpenFile), 70),
-            Node::button(l(S::OpenFolder), 80),
-            Node::button(l(S::OpenBackup), 80),
-            Node::button(l(S::Connect), 80),
+            // Sized to their labels: at 800 px wide a pane is about 310 px.
+            Node::button(l(S::OpenFile), 60),
+            Node::button(l(S::OpenFolder), 72),
+            Node::button(l(S::OpenBackup), 76),
+            Node::button(l(S::Connect), 78),
             Node::button(l(S::CloseImage), 95),
             Node::Space(Size::Stretch(1)),
         ];

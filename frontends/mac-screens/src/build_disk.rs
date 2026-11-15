@@ -619,7 +619,7 @@ impl BuildScreen {
         let f = &self.form;
         let row_h = Size::Fixed(layout::ROW);
         let lines = |k: K| {
-            let n = f.text(k).lines().count().max(1) as i32;
+            let n = f.wrapped_lines(k).max(1);
             Node::leaf(k, Size::Stretch(1), Size::Fixed((layout::ROW - 6) * n + 4))
         };
         let fixed = |k: K, w: i32| Node::leaf(k, Size::Fixed(w), row_h);

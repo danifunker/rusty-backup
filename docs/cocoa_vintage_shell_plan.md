@@ -201,6 +201,11 @@ Phases 1 to 3 are done for x86_64: every AppKit screen, dialog and the main wind
 - **Flows.** All cocoa flows pass here under Rosetta, the floppy conversions on the Convert tab
   included, and all 65 pass on a real 10.7.5 Mac through `regression-tests/drivers/remote_cocoa.py`
   (FLOWS.md, "Cocoa flows on a real 10.7 Mac").
+- **Small screens.** Windows are kept inside the screen's usable area (`fit_on_screen` in
+  `host.m`), and wrapped text is sized by the lines it wraps to (`Form::wrapped_lines`), so every
+  tab fits an 800x600 display. `RUSTY_BACKUP_SCREEN=800x600` lays the app out as on that screen,
+  for a screenshot run; on PowerPC, the bundle's icon is `icon-vintage.icns`
+  (`scripts/make-legacy-icns.py`), since Tiger reads none of `icon.icns`' formats.
 - **PowerPC** (Phase 5): built per § 3 for G3 and G4 and run on a G5 under 10.5.8. Two fixes
   came out of it: mrustc wrote float constants in the host's byte order (every column width
   read as 0; fixed in the pinned fork, `docs/build-ppc-mrustc.md`), and push buttons now get
