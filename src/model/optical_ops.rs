@@ -343,7 +343,13 @@ pub fn chd_info(path: &Path) -> Result<String, String> {
 
 /// Eject the disc in a local drive.
 pub fn eject(device_path: &Path) -> Result<(), String> {
-    crate::optical::source::eject_disc(device_path).map_err(|e| format!("{e:#}"))
+    #[cfg(feature = "cd-audio")]
+    return crate::optical::source::eject_disc(device_path).map_err(|e| format!("{e:#}"));
+    #[cfg(not(feature = "cd-audio"))]
+    {
+        let _ = device_path;
+        Err("ejecting needs drive support, which is not in this build".to_string())
+    }
 }
 
 #[cfg(test)]

@@ -1630,6 +1630,7 @@ fn raw_device_path(device_path: &str) -> String {
 /// the volume) or will not claim still reads correctly, just with competition.
 /// The returned guard releases the claim on drop; `None` means we are proceeding
 /// without exclusivity.
+#[cfg(feature = "cd-audio")]
 pub(crate) fn claim_optical_disc(device_path: &str) -> Option<DiskClaim> {
     let bsd = bsd_name_from_path(Path::new(device_path));
 

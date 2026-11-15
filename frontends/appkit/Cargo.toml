@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 rusty-backup = { path = "../..", default-features = false, features = [
-    "chd", "optical", "native-zlib", "native-zstd", "seekable-zstd",
+    "chd", "optical", "cd-audio", "native-zlib", "native-zstd", "seekable-zstd",
     "remote", "tui-update", "crypto", "yaml", "audio",
 ] }
 
