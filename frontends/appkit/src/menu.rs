@@ -17,8 +17,7 @@ use rusty_backup::controller::keys::{Chord, Key};
 use crate::ui::{ns, target};
 
 /// The Help menu's items that open the project's pages.
-pub const WEBSITE: &str = "app.website";
-pub const ISSUES: &str = "app.issues";
+use crate::screens::main_window::{ISSUES, WEBSITE};
 
 /// Items that are always on: they switch to their screen first.
 const ALWAYS: [&str; 7] = [
@@ -199,7 +198,7 @@ pub fn build(mtm: MainThreadMarker) {
             ours_with(
                 mtm,
                 t.label(),
-                &crate::toolbar::screen_id(*t),
+                &crate::screens::main_window::screen_id(*t),
                 Some(t.shortcut()),
             )
         })
@@ -281,7 +280,7 @@ pub fn set_sources(recent: &[String], devices: &[String]) {
             r.addItem(&ours_with(
                 mtm,
                 path,
-                &format!("{}{i}", crate::inspect::RECENT_ITEM),
+                &format!("{}{i}", crate::screens::inspect::RECENT_ITEM),
                 None,
             ));
         }
@@ -290,7 +289,7 @@ pub fn set_sources(recent: &[String], devices: &[String]) {
             d.addItem(&ours_with(
                 mtm,
                 name,
-                &format!("{}{i}", crate::inspect::DEVICE_ITEM),
+                &format!("{}{i}", crate::screens::inspect::DEVICE_ITEM),
                 None,
             ));
         }
@@ -308,8 +307,8 @@ pub fn sync(on: &dyn Fn(&str) -> Option<bool>) {
     ITEMS.with(|items| {
         for (id, it) in items.borrow().iter() {
             let want = if ALWAYS.contains(&id.as_str())
-                || id.starts_with(crate::inspect::RECENT_ITEM)
-                || id.starts_with(crate::inspect::DEVICE_ITEM)
+                || id.starts_with(crate::screens::inspect::RECENT_ITEM)
+                || id.starts_with(crate::screens::inspect::DEVICE_ITEM)
             {
                 true
             } else {

@@ -47,8 +47,8 @@ ui = [
   { wait = "FAT" },
   { pick = "{scratch}" },
   { activate = "remote_pick.backup" },
-  # The checksum file is the last thing a backup writes.
-  { wait_file = "{scratch}/disk-backup/partition-0.zst.sha256", timeout_ms = 120000 },
+  # metadata.json is the last thing a backup writes, after the checksum files.
+  { wait_file = "{scratch}/disk-backup/metadata.json", timeout_ms = 120000 },
 ]
 
 [[case.step]]

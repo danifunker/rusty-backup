@@ -166,6 +166,7 @@ sign the two shells don't offer the same thing.
 | `tui` | `runner/src/tui.rs`: `rb-cli tui` in a pseudo-terminal at 120x40, `RB_TUI_ASCII=1`, a scratch `HOME` with the update check off; a small screen model reads what ratatui draws | nothing | Linux, macOS, and Windows 10 1809+ over ConPTY (`RUSTY_BACKUP_CONFIG_DIR` keeps its config in the scratch home there). About 4 s a flow on Linux, 5 s on Windows |
 | `gtk` | `drivers/gtk_driver.py` over AT-SPI, run by `runner/src/gtk.rs` under `dbus-run-session -- xvfb-run` (1600x2300, scratch `HOME`, `RUSTY_BACKUP_TEST_PICKS`, ALSA into a null sink so playback is silent) | `xvfb-run`, `dbus-run-session`, `xdotool`, python3 with the Atspi typelib, a built `frontends/gtk4` (`--gtk <path>`) | Linux. About 15 s a flow |
 | `appkit` | `drivers/ax_driver.swift`: Swift over AX, controls found by `AXIdentifier` (the controller id); its `labels.toml` section holds only Win32's behaviour drift and the Commander toolbar item, which has no AX identifier | `swiftc` and the AX (TCC) permission for the process running it | `runner/src/ax.rs` builds the driver into `runner/target/` and runs it (`--appkit <binary>`, default `frontends/appkit/target/release/rusty-backup-appkit`); macOS, CI target `appkit` where the runner grants AX ([docs/appkit_shell_plan.md](../docs/appkit_shell_plan.md)) |
+| `cocoa` | `drivers/ax_driver.m`: `ax_driver.swift` in Objective-C, so it runs from 10.7 up; it drives the vintage Cocoa shell (`frontends-vintage/cocoa/`) with the AppKit flows' ids, labels and steps | `clang` and the AX permission (10.7 to 10.8: Universal Access's "Enable access for assistive devices") | `runner/src/ax.rs` builds it into `runner/target/ax_driver_objc` (`--cocoa <binary>`, default `frontends-vintage/cocoa/build/x86_64/Rusty Backup.app/Contents/MacOS/Rusty Backup`); every case with an `appkit` shell gets a `cocoa` instance, save those whose id or area names optical, audio or chd (the vintage build has no CHD or optical media) |
 | `win32` | `drivers/uia_driver.py` over UI Automation, run by `runner/src/uia.rs` (`--win32 <exe>`, default `frontends/win32/target/release/rusty-backup-win32.exe`): controls found by `AutomationId`, the controller id, else by name; scratch config and picks file as for the other shells | Python with `comtypes` | Windows, CI target `win32`. The flows that list `win32` run on it as the screens land; its `labels.toml` section holds only behaviour drift (a copy into a host folder needs no Apply) ([docs/win32_shell_plan.md](../docs/win32_shell_plan.md)) |
 
 A case whose shell has no driver, or whose driver's tools are missing, resolves
@@ -190,6 +191,29 @@ repo inside WSL (building from `/mnt/c` is very slow), then:
 `~/gtkenv`'s tools on `/usr/bin` and mounts a private `/tmp/.X11-unix`. WSL has no sound
 device, and ALSA's null sink does not keep time there, so `flow.audio.cdda-play` fails under
 WSL only: the track drains at once.
+
+### Cocoa flows on a real 10.7 Mac
+
+`drivers/remote_cocoa.py` stands in for the Cocoa driver (`RB_COCOA_DRIVER`) and runs it on
+another Mac over ssh, with Accessibility on there and someone logged in at its desktop. It
+mirrors each case's scratch folder to the same path on both Macs, so the runner's scratch and
+cases roots go under `/tmp`; it pushes what the runner writes before each op, pulls what the
+app writes (by checksum, compressed) after each answer and every 3 s, and forwards a port the
+runner's `rb-cli serve` listens on back over the ssh connection. Lion's Xcode 4.6 can't
+compile the driver (object literals), so build it here for x86_64 and copy it over:
+
+```bash
+clang -arch x86_64 -mmacosx-version-min=10.7 -fno-objc-arc -O2 drivers/ax_driver.m -framework Foundation -framework ApplicationServices -o /tmp/ax_driver_objc
+```
+
+Then, with an ssh alias `lion` that has `ControlMaster auto`, the app and driver copied to
+`/tmp/rbl/` on it, and `rsync -a cases/ /tmp/rbl/cases/` here:
+
+```bash
+RB_COCOA_DRIVER=$PWD/drivers/remote_cocoa.py RB_COCOA_REMOTE=lion RB_COCOA_REMOTE_APP="/tmp/rbl/app/Rusty Backup.app/Contents/MacOS/Rusty Backup" RB_COCOA_REMOTE_DRV=/tmp/rbl/drv/ax_driver_objc RB_COCOA_SYNC=/tmp/rbl/cases ./runner/target/release/rb-regress run --cases /tmp/rbl/cases --scratch-root /tmp/rbl/scratch --shell cocoa --tiers 8
+```
+
+All 65 cocoa flows pass this way on a 10.7.5 Mac mini (2026-11-14).
 
 ### What the GTK driver works around
 
@@ -267,7 +291,7 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 | `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally; Backup's Remote Drive window connecting to a daemon, a restore into an image file on one, and Optical's Add remote daemon (gtk, win32, appkit) | tui, gtk, win32, appkit | restore + byte-compare |
 | `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk, win32, appkit | against `rb-cli optical extract` |
 | `settings.toml` | the update URL saved in Settings and found again in a fresh window (the association box is left alone: Save would touch the registry; AppKit has none) | gtk, win32, appkit | the reopened form |
-| `convert.toml` | the ISO fixture to a CD CHD on the Convert tab | gtk, win32, appkit | a file out of the CHD against the same file out of the ISO |
+| `convert.toml` | the ISO fixture to a CD CHD on the Convert tab; floppies made by rb-cli (HFS 800 KB, FAT 720 KB) to DiskCopy 4.2, MOOF, 2MG and D88 | gtk, win32, appkit; the floppies also cocoa | a file out of the CHD against the same file out of the ISO; the floppy's file read back out of each container |
 | `archives.toml` | open the StuffIt archive off the ISO fixture on Archives, extract all as raw forks | gtk, win32, appkit | against `rb-cli archive extract` |
 | `audio.toml` | play a CD-DA track | gtk, win32, appkit (no TUI player by design; under WSL the GTK run fails, see above) | the position advances |
 | `browse.toml` | Inspect's Browse opens the volume, Extract All writes it to a host folder, Close returns to Inspect; Edit Mode stages a new folder through the name prompt and Apply writes it; Edit as text replaces a file's text and Apply writes it; Export Volume writes a zip (appkit) | gtk, win32, appkit | the TUI can join once its extract-to-folder step is checked |

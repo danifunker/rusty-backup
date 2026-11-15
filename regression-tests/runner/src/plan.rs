@@ -23,7 +23,6 @@ use crate::registry::Registry;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-
 /// One unit of work on one machine.
 #[derive(Debug)]
 pub struct Job {

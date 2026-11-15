@@ -2623,7 +2623,7 @@ jobs:
   # feature. One artifact covers 10.7 / 10.8 / 10.9 / 10.10 / 10.11 (a 10.7-min
   # binary runs on any newer macOS). See docs/add_10_7_macos.md.
   build-macos-vintage:
-    name: Build rb-cli (macOS 10.7+ Intel, Rust 1.73)
+    name: Build rb-cli and the Cocoa app (macOS 10.7+ Intel, Rust 1.73)
     # Runs when the plan job selects its target.
     if: needs.plan.outputs.macos-vintage == 'true'
     needs: [generate-version, plan]
@@ -2712,6 +2712,36 @@ jobs:
         with:
           name: rb-cli-macos-vintage-x64-${{ needs.generate-version.outputs.version }}
           path: rb-cli-macos-vintage-x64-${{ needs.generate-version.outputs.version }}.zip
+
+      # The vintage Cocoa shell (docs/cocoa_vintage_shell_plan.md): the shared Mac screens on Rust
+      # 1.73 under an Objective-C 1.0 host, the same frozen lockfile, ad-hoc signed like rb-cli.
+      - name: Build the Cocoa app (10.7 floor)
+        run: frontends-vintage/cocoa/build.sh release x86_64
+
+      - name: Verify the app's 10.7 floor + no post-10.7 symbols
+        run: |
+          set -e
+          BIN="frontends-vintage/cocoa/build/x86_64/Rusty Backup.app/Contents/MacOS/Rusty Backup"
+          otool -l "$BIN" | grep -q "version 10.7" \
+            || { echo "::error::the Cocoa app's deployment target is not 10.7"; exit 1; }
+          if nm -u "$BIN" | grep -qE "clock_gettime|os_unfair_lock|__ulock|kIOMainPortDefault"; then
+            echo "::error::the Cocoa app imports a known post-10.7 symbol"
+            nm -u "$BIN" | grep -E "clock_gettime|os_unfair_lock|__ulock|kIOMainPortDefault"
+            exit 1
+          fi
+
+      - name: Package the Cocoa app (HFS+ DMG, readable on 10.7)
+        run: |
+          DMG="Rusty-Backup-Cocoa-macos-vintage-x64-${{ needs.generate-version.outputs.version }}.dmg"
+          hdiutil create -volname "Rusty Backup" -fs HFS+ -format UDZO -ov \
+            -srcfolder "frontends-vintage/cocoa/build/x86_64/Rusty Backup.app" "$DMG"
+          ls -lh "$DMG"
+
+      - name: Upload the Cocoa app
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Cocoa-macos-vintage-x64-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-Cocoa-macos-vintage-x64-${{ needs.generate-version.outputs.version }}.dmg
 
   # Vintage rb-cli (CLI + full TUI) for Windows 7 / 8 / 8.1. Built on a normal
   # windows-latest runner — again NO emulation: x86_64-pc-windows-msvc is native
@@ -3161,7 +3191,7 @@ jobs:
             "rb-cli-mini-armv7-linux-${VER}.tar.gz" \
             "rb-cli-linux-ppc64-${VER}.tar.gz" "rb-cli-linux-ppc32-${VER}.tar.gz" \
             "rb-cli-linux-riscv64-${VER}.tar.gz" "rb-cli-windows-arm64-${VER}.zip" \
-            "rb-cli-macos-vintage-x64-${VER}.zip" \
+            "rb-cli-macos-vintage-x64-${VER}.zip" "Rusty-Backup-Cocoa-macos-vintage-x64-${VER}.dmg" \
             "rb-cli-win7-x64-${VER}.zip" "rb-cli-win7-x86-${VER}.zip" \
             "rb-cli-linux-musl-x64-${VER}.tar.gz" "rb-cli-linux-musl-arm64-${VER}.tar.gz" \
             "rb-cli-linux-musl-i586-${VER}.tar.gz" "rb-cli-linux-musl-i686-${VER}.tar.gz" \
@@ -3231,7 +3261,7 @@ jobs:
 
           | Platform | Architecture | Command line (\`rb-cli\`) |
           |---|---|---|
-          | **macOS 10.7 – 10.11** (Lion → El Capitan) | Intel x64 | [rb-cli](${BASE}/rb-cli-macos-vintage-x64-${VER}.zip) |
+          | **macOS 10.7 – 10.11** (Lion → El Capitan) | Intel x64 | [rb-cli](${BASE}/rb-cli-macos-vintage-x64-${VER}.zip); the desktop app (preview): [Rusty Backup.app](${BASE}/Rusty-Backup-Cocoa-macos-vintage-x64-${VER}.dmg) |
           | **Windows 7 / 8 / 8.1** | x64 | [rb-cli](${BASE}/rb-cli-win7-x64-${VER}.zip) |
           | **Windows 7 / 8 / 8.1** | x86 (32-bit) | [rb-cli](${BASE}/rb-cli-win7-x86-${VER}.zip) |
           | **Any Linux** (static musl — *any* glibc / distro age, with CHD) | x64 | [rb-cli](${BASE}/rb-cli-linux-musl-x64-${VER}.tar.gz) |

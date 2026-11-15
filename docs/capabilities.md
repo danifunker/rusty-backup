@@ -39,6 +39,7 @@ reference the shells are measured against. Per-feature limits by build target li
 | `commander.copy` | yes | yes | yes | yes | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
 | `commander.host-folder` | yes | yes | yes | yes | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
 | `convert.disc` | - | yes | yes | yes | `flow.convert.iso-to-chd` |
+| `convert.floppy` | - | yes | yes | yes | `flow.convert.floppy-2mg`, `flow.convert.floppy-d88`, `flow.convert.floppy-dc42`, `flow.convert.floppy-moof` |
 | `inspect.browse` | - | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder` |
 | `inspect.edit-table` | - | - | - | yes | `flow.inspect.tools.expand-add` |
 | `inspect.expand-hfs` | yes | yes | yes | yes | `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |

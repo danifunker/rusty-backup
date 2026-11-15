@@ -91,6 +91,8 @@ PPC_CC_WRAPPER="$RB_DIR/scripts/ppc-cc-remote.py"
 PPC_AR_WRAPPER="$RB_DIR/scripts/ppc-ar-remote.py"
 # mrustc picks its C compiler from CC_<triple with - replaced by _>.
 export CC_powerpc_apple_darwin="$PPC_CC_WRAPPER"
+# Host build scripts and proc-macros on a Mac go through -O0 (see the script for why).
+[ "$(uname -s)" = Darwin ] && [ -z "${CC:-}" ] && export CC="$RB_DIR/scripts/host-cc-darwin.sh"
 # cc-rs uses the same convention, so the -sys crates pick the wrapper up free.
 # Archives must also be built on the Mac (Mach-O __.SYMDEF): see the doc's
 # "The remote archiver".
@@ -155,6 +157,8 @@ HOSTC_OUT="$MRUSTC_DIR/output-rb-hostc"
 PPC_OUT="$MRUSTC_DIR/output-rb-ppc-${PPC_CPU_LABEL}"
 JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
+# A file's mtime in seconds: GNU stat on Linux, BSD stat on a Mac.
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
 banner() { printf '\n\033[1;36m==== %s ====\033[0m\n' "$*"; }
 note()   { printf '\033[33m%s\033[0m\n' "$*"; }
 die()    { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -184,6 +188,9 @@ ppc_reap_orphans() {
   [ "$killed" = 0 ] && return 0
   note "reaped $killed orphaned remote compile(s) on $PPC_HOST ($remaining still up)"
 }
+
+# The mrustc this build uses is pinned (scripts/mrustc.pin); see scripts/mrustc-pin.sh.
+. "$RB_DIR/scripts/mrustc-pin.sh"
 
 # ---- rustc source patch marker ----------------------------------------------
 # A branch switch refreshes the patch's mtime without changing it; refresh dl-version so minicargo.mk won't re-apply it.
@@ -219,18 +226,15 @@ stage_mrustc() {
   [ -d "$MRUSTC_DIR" ] || die "mrustc not found at $MRUSTC_DIR (set MRUSTC_DIR)"
   cd "$MRUSTC_DIR"
 
-  # These two patches are REQUIRED to parse rusty-backup's manifest set. They
-  # live on branch 'rb-cli-vintage-build' in the fork. Fail loudly if missing.
-  grep -q "skip_composite_value" tools/common/toml.cpp \
-    || die "mrustc missing the TOML-parser patch (nested arrays / escapes). Check out the rb-cli-vintage-build branch."
-  grep -q 's == "rlib" || s == "lib"' tools/minicargo/manifest.cpp \
-    || die "mrustc missing the crate-type=\"lib\" patch. Check out the rb-cli-vintage-build branch."
+  [ "${MRUSTC_UNPINNED:-0}" = 1 ] || [ "$(mrustc_head)" = "$MRUSTC_COMMIT" ] \
+    || die "mrustc is not at the pinned commit; run 'scripts/build-ppc.sh mrustc-sync' first"
 
   make -C tools/common          # common_lib.a (shared TOML parser)
   make -C tools/minicargo/      # bin/minicargo
   make                          # bin/mrustc
   [ -x bin/mrustc ] && [ -x bin/minicargo ] || die "mrustc/minicargo did not build"
-  note "mrustc + minicargo built."
+  mrustc_head > "$MRUSTC_BUILT_STAMP"
+  note "mrustc + minicargo built from $(cut -c1-10 "$MRUSTC_BUILT_STAMP")."
 }
 
 # ---- stage 2: macOS build-script overrides for this rustc version -----------
@@ -460,8 +464,8 @@ seed_retime_build_outputs() {
       # The engine glob only matters for the root package, whose lib name differs.
       case "$cand" in *librusty_backup*) case "$stem" in rb-cli-ppc-*) ;; *) continue ;; esac ;; esac
       [ -e "$cand" ] || continue
-      ts="$(stat -c %Y "$cand")"
-      [ -z "$best" ] || [ "$ts" -lt "$(stat -c %Y "$best")" ] && best="$cand"
+      ts="$(mtime "$cand")"
+      [ -z "$best" ] || [ "$ts" -lt "$(mtime "$best")" ] && best="$cand"
     done
     if [ -n "$best" ]; then
       touch -r "$best" "$txt"
@@ -566,6 +570,11 @@ stage_probe() {
 main() {
   local stage="${1:-all}"
   case "$stage" in
+    mrustc-sync|mrustc|label|all) ;;
+    *) mrustc_pin_check ;;
+  esac
+  case "$stage" in
+    mrustc-sync) mrustc_pin_sync ;;
     mrustc)    stage_mrustc ;;
     overrides) stage_overrides ;;
     hostlibs)  stage_hostlibs ;;
@@ -587,7 +596,7 @@ main() {
       stage_host
       banner "HOST path complete. Run 'ppclibs', 'ppc' then 'dist' for PowerPC (needs PPC_HOST)."
       ;;
-    *) die "unknown stage '$stage' (mrustc|overrides|hostlibs|vendor|hostc|host|ppclibs|ppc|probe|dist|seed|retime|label|all)" ;;
+    *) die "unknown stage '$stage' (mrustc-sync|mrustc|overrides|hostlibs|vendor|hostc|host|ppclibs|ppc|probe|dist|seed|retime|label|all)" ;;
   esac
 }
 main "$@"

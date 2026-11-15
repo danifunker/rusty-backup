@@ -14,13 +14,13 @@ mod envelope;
 mod exec;
 mod fixtures;
 mod flow;
-mod gtk;
 mod gitinfo;
+mod gtk;
 mod inventory;
 mod known;
 mod local;
-mod oracles;
 mod manifest;
+mod oracles;
 mod parity;
 mod plan;
 mod produce;
@@ -45,6 +45,7 @@ struct Args {
     gtk: PathBuf,
     win32: PathBuf,
     appkit: PathBuf,
+    cocoa: PathBuf,
     identify: bool,
     detect: bool,
     set_oracle: Option<String>,
@@ -154,6 +155,9 @@ fn parse_args() -> Result<Args, String> {
         appkit: base
             .join("..")
             .join("frontends/appkit/target/release/rusty-backup-appkit"),
+        cocoa: base.join("..").join(
+            "frontends-vintage/cocoa/build/x86_64/Rusty Backup.app/Contents/MacOS/Rusty Backup",
+        ),
         identify: false,
         detect: false,
         set_oracle: None,
@@ -247,6 +251,10 @@ fn parse_args() -> Result<Args, String> {
                         args.win32 = PathBuf::from(value()?);
                         i += 1;
                     }
+                    "--cocoa" => {
+                        args.cocoa = PathBuf::from(value()?);
+                        i += 1;
+                    }
                     "--appkit" => {
                         args.appkit = PathBuf::from(value()?);
                         i += 1;
@@ -333,6 +341,7 @@ fn parse_args() -> Result<Args, String> {
     args.gtk = exec::absolutise(&args.gtk);
     args.win32 = exec::absolutise(&args.win32);
     args.appkit = exec::absolutise(&args.appkit);
+    args.cocoa = exec::absolutise(&args.cocoa);
     args.scratch_root = exec::absolutise(&args.scratch_root);
     args.artifacts_root = exec::absolutise(&args.artifacts_root);
     args.verifications_root = exec::absolutise(&args.verifications_root);
@@ -408,6 +417,9 @@ OPTIONS:
                            [default: <repo>/frontends/gtk4/target/release/rusty-backup-gtk]
     --appkit <PATH>        AppKit shell the appkit flows drive
                            [default: <repo>/frontends/appkit/target/release/rusty-backup-appkit]
+    --cocoa <PATH>         Vintage Cocoa shell the cocoa flows drive (the AppKit flows, save CHD
+                           and optical) [default: <repo>/frontends-vintage/cocoa/build/x86_64/
+                           Rusty Backup.app/Contents/MacOS/Rusty Backup]
     --fixture-root <DIR>   Fixture corpus root      [or RB_FIXTURE_ROOT, or local.toml]
     --sync                 (fixtures) copy the corpus from local.toml's
                            `corpus_source` into the fixture root first. Runs
@@ -543,8 +555,11 @@ fn cmd_fixtures(args: &Args) -> i32 {
     match serde_json::to_string_pretty(&inv) {
         Ok(j) => {
             if fs::write(&out, j).is_ok() {
-                println!("
-inventory: {}", out.display());
+                println!(
+                    "
+inventory: {}",
+                    out.display()
+                );
             }
         }
         Err(e) => eprintln!("warning: could not serialise inventory: {}", e),
@@ -686,9 +701,7 @@ fn cmd_verify(args: &Args) -> i32 {
             return 2;
         }
     };
-    let out_dir = args
-        .verifications_root
-        .join(exec::platform_token());
+    let out_dir = args.verifications_root.join(exec::platform_token());
     let report = match verify::verify(
         &reg,
         &args.artifacts_root,
@@ -1110,9 +1123,8 @@ fn cmd_validate(args: &Args) -> i32 {
             // an unimplemented feature is red for a reason, just not a bug.
             let docs = base.join("..").join("docs");
             let bugs = fs::read_to_string(docs.join("Regression_Bugs.md")).unwrap_or_default();
-            let features =
-                fs::read_to_string(docs.join("missing_features_from_regression.md"))
-                    .unwrap_or_default();
+            let features = fs::read_to_string(docs.join("missing_features_from_regression.md"))
+                .unwrap_or_default();
             if !bugs.is_empty() {
                 for (id, f) in k.all_entries() {
                     if !bugs.contains(f) && !features.contains(f) {
@@ -1268,7 +1280,9 @@ fn cmd_run(args: &Args) -> i32 {
         rb_version: build_label.clone(),
     };
 
-    let known = match known::KnownFailures::load(&regression_dir().join("data").join("known-failures.toml")) {
+    let known = match known::KnownFailures::load(
+        &regression_dir().join("data").join("known-failures.toml"),
+    ) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -1401,8 +1415,8 @@ fn cmd_run(args: &Args) -> i32 {
     // Known failures do not count - they are on the bug list and the run is
     // green with them. An XPASS does count, loudly: a fixed bug whose entry
     // stays behind will silently absorb the next real regression in that case.
-    let unexpected = counts.get("fail").copied().unwrap_or(0)
-        + counts.get("error").copied().unwrap_or(0);
+    let unexpected =
+        counts.get("fail").copied().unwrap_or(0) + counts.get("error").copied().unwrap_or(0);
     let xpass = counts.get("XPASS").copied().unwrap_or(0);
 
     if xpass > 0 {
@@ -1599,6 +1613,7 @@ fn run_case(
         &args.gtk,
         &args.win32,
         &args.appkit,
+        &args.cocoa,
         &scratch,
         controls,
     );
@@ -1650,16 +1665,17 @@ fn run_case(
             continue;
         }
 
-        let out = match exec::run_with_env(&args.rb_cli, &args_resolved, &scratch, timeout, &case.env) {
-            Ok(o) => o,
-            Err(e) => {
-                result.verdict = Verdict::Error;
-                result.failed_step = Some(idx);
-                result.skip_reason = Some(e.to_string());
-                result.duration_ms = started.elapsed().as_millis();
-                return result;
-            }
-        };
+        let out =
+            match exec::run_with_env(&args.rb_cli, &args_resolved, &scratch, timeout, &case.env) {
+                Ok(o) => o,
+                Err(e) => {
+                    result.verdict = Verdict::Error;
+                    result.failed_step = Some(idx);
+                    result.skip_reason = Some(e.to_string());
+                    result.duration_ms = started.elapsed().as_millis();
+                    return result;
+                }
+            };
 
         let failures = assertion::evaluate(step, &out, &resolve);
         if !failures.is_empty() {
@@ -1696,7 +1712,13 @@ fn run_case(
 struct Background(Vec<std::process::Child>);
 
 impl Background {
-    fn start(&mut self, rb_cli: &Path, args: &[String], cwd: &Path, idx: usize) -> Result<(), String> {
+    fn start(
+        &mut self,
+        rb_cli: &Path,
+        args: &[String],
+        cwd: &Path,
+        idx: usize,
+    ) -> Result<(), String> {
         let log = fs::File::create(cwd.join(format!("background-{}.log", idx)))
             .map_err(|e| format!("background log: {}", e))?;
         let err = log.try_clone().map_err(|e| e.to_string())?;
@@ -1707,7 +1729,13 @@ impl Background {
             .stdout(log)
             .stderr(err)
             .spawn()
-            .map_err(|e| format!("could not start {} in the background: {}", rb_cli.display(), e))?;
+            .map_err(|e| {
+                format!(
+                    "could not start {} in the background: {}",
+                    rb_cli.display(),
+                    e
+                )
+            })?;
         self.0.push(child);
         Ok(())
     }
@@ -1800,7 +1828,11 @@ fn preflight(rb_cli: &Path, repo: &Path) -> Result<String, String> {
     let mut notes = Vec::new();
     // A debug build is a different program: different assertions, different
     // timing, and every published number assumes release.
-    if !rb_cli.to_string_lossy().replace('\\', "/").contains("/release/") {
+    if !rb_cli
+        .to_string_lossy()
+        .replace('\\', "/")
+        .contains("/release/")
+    {
         notes.push("WARNING: not a /release/ build — results will not be comparable".to_string());
     }
     if let (Ok(bin), Some(src)) = (
@@ -1822,7 +1854,9 @@ fn preflight(rb_cli: &Path, repo: &Path) -> Result<String, String> {
     // rebuilt, and reported two false XPASS under the new sha while Linux,
     // rebuilt, reported the same two as plain passes.
     if let (Ok(self_bin), Some(runner_src)) = (
-        std::env::current_exe().and_then(|p| p.metadata()).and_then(|m| m.modified()),
+        std::env::current_exe()
+            .and_then(|p| p.metadata())
+            .and_then(|m| m.modified()),
         // newest_source_mtime appends "src" itself — hand it the crate root.
         newest_source_mtime(&regression_dir().join("runner")),
     ) {
@@ -1834,12 +1868,19 @@ fn preflight(rb_cli: &Path, repo: &Path) -> Result<String, String> {
         }
     }
 
-    let mut s = format!("rb-cli   : {}
+    let mut s = format!(
+        "rb-cli   : {}
 version  : {}
-", rb_cli.display(), version);
+",
+        rb_cli.display(),
+        version
+    );
     for n in notes {
-        s.push_str(&format!("{}
-", n));
+        s.push_str(&format!(
+            "{}
+",
+            n
+        ));
     }
     Ok(s)
 }
@@ -1979,7 +2020,11 @@ fn cmd_oracles(args: &Args) -> i32 {
         let existing = fs::read_to_string(oracles::overlay_path(&base)).unwrap_or_default();
         let mut merged = String::new();
         for block in existing.split("[[availability]]") {
-            if scan.matched.iter().any(|(o, _)| block.contains(&format!("oracle = {:?}", o))) {
+            if scan
+                .matched
+                .iter()
+                .any(|(o, _)| block.contains(&format!("oracle = {:?}", o)))
+            {
                 continue;
             }
             if merged.is_empty() {
@@ -1992,8 +2037,11 @@ fn cmd_oracles(args: &Args) -> i32 {
         merged.push_str(&body);
         match oracles::write(&base, &merged) {
             Ok(p) => {
-                println!("
-wrote {}", p.display());
+                println!(
+                    "
+wrote {}",
+                    p.display()
+                );
                 return 0;
             }
             Err(e) => {
@@ -2022,7 +2070,11 @@ wrote {}", p.display());
             .map(|o| o.kind.as_str())
             .unwrap_or("package");
         // An emulator with a binary still needs a guest; say `installed`.
-        let status = if kind == "emulator" { "installed" } else { "verified" };
+        let status = if kind == "emulator" {
+            "installed"
+        } else {
+            "verified"
+        };
         let existing = fs::read_to_string(oracles::overlay_path(&base)).unwrap_or_default();
         match oracles::set_hint(&existing, oracle, path, platform, &today_stamp(), status) {
             Ok(body) => match oracles::write(&base, &body) {
@@ -2060,7 +2112,10 @@ wrote {}", p.display());
     }
 
     if !args.detect {
-        println!("oracles: {} declared in data/oracles.toml", reg.oracles.len());
+        println!(
+            "oracles: {} declared in data/oracles.toml",
+            reg.oracles.len()
+        );
         println!("overlay: {}", path.display());
         println!("  --detect   probe this host and rewrite the overlay");
         println!("  --export   print it, to seed another machine");
@@ -2082,8 +2137,10 @@ wrote {}", p.display());
         let mut outv = std::io::stdout();
         let filled = oracles::prompt_for_missing(&mut found, &reg, &mut lock, &mut outv);
         if filled > 0 {
-            println!("
-recorded {filled} path(s) you provided");
+            println!(
+                "
+recorded {filled} path(s) you provided"
+            );
         }
     }
     let today = today_stamp();

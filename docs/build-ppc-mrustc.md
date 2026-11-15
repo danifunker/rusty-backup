@@ -114,9 +114,12 @@ Two things about `ppc-cc-remote.py` exist only because of these crates:
 ## Prerequisites
 
 ### This machine (the transpile host)
-- An mrustc clone from the fork `github.com/danifunker/mrustc`, with the
-  `ppc-minicargo-fixes` branch included. The branch layout is in
-  `docs/build-sol9-mrustc.md`, "mrustc: the fork's branches".
+- mrustc from the fork `github.com/danifunker/mrustc`, at the exact commit
+  `scripts/mrustc.pin` names (`scripts/build-ppc.sh mrustc-sync` clones or checks it out;
+  every other stage refuses a different commit, or a `bin/mrustc` not built from it, unless
+  `MRUSTC_UNPINNED=1`). The pin is on `ppc-build-2026-09`: upstream master plus the fork's
+  PowerPC, SPARC and minicargo commits. The branch layout is in `docs/build-sol9-mrustc.md`,
+  "mrustc: the fork's branches".
 - The rustc **1.74.0** source: `make RUSTCSRC RUSTC_VERSION=1.74.0` in the
   mrustc dir (downloads `rustc-1.74.0-src/` and applies
   `rustc-1.74.0-src.patch`, which carries the two stdlib fixes below).
@@ -137,7 +140,8 @@ a full stdlib build is minutes, not hours.
 
 ## mrustc fixes this needed
 
-All committed on `rb-cli-vintage-build`; each is a candidate upstream PR.
+First made on `rb-cli-vintage-build` (July 2026); most were merged upstream in reworked form,
+and the pinned `ppc-build-2026-09` carries the rest. Kept here as the record of why.
 
 **Manifest parsing** (pre-existing, needed to read rusty-backup's Cargo.toml set):
 
@@ -1331,7 +1335,7 @@ member's own alignment, and a packed member honestly reports 1 - so this looks
 like a case where C already agrees, and neither the pack pragma nor
 `has_manual_align` fires. See fix 24.
 
-Two mrustc bugs came out of this, both fixed on `rb-cli-vintage-build`:
+Two mrustc bugs came out of this, both fixed (first on `rb-cli-vintage-build`):
 
 1. **`make_type_repr_struct__inner` capped user-aligned members.** Now exempt, and
    `TypeRepr::user_align` propagates outward through struct, union, enum and array
@@ -1670,6 +1674,28 @@ SysV IPC structs. None are on the engine's file paths, and none are in the
 verified probe set - `ppc-libc-compare.py` already lists 17 structs it cannot
 resolve because of unions and function pointers, and these are among them.
 Worth revisiting if raw-socket or IPC code ever crosses.
+
+## Float constants were byte-swapped (fixed 2026-11-14)
+
+mrustc's constant evaluator stores integers in the target's byte order but copied floats in the
+host's: `write_float` / `read_float` (`src/hir_conv/constant_evaluation.cpp`) and
+`EncodedLiteralSlice::read_float` (`src/hir/hir_ops.cpp`) were plain `memcpy`s. Cross-compiling
+from a little-endian Mac or Linux box to big-endian PowerPC, every `f32` / `f64` in a `static`
+or `const` therefore came out byte-swapped. It showed in the Cocoa app as a table whose columns
+were all squeezed to their minimum: the widths, from a `const` table of `(&str, f64, bool)`,
+read back as `100.0` -> `0x0000000000005940`, a denormal that prints as 0. Floats computed at
+run time were never affected, which is why `rb-cli` looked healthy. Upstream master has the same
+bug (checked 2026-11-14). The fix (on the pinned `ppc-build-2026-09`; see `scripts/mrustc.pin`)
+swaps 32- and 64-bit floats with the target's endianness on the way in and out; every PowerPC
+tree has to be rebuilt with it, including libstd (`ppclibs`).
+
+## Host build scripts segfault on a Mac (Apple clang 21)
+
+Apple clang 21 at `-O1` miscompiles mrustc's C for std's `Once` (a null dereference in
+`WaiterQueue`'s drop), so every host build script and proc macro mrustc builds on a Mac crashes
+at its first `println!`. `scripts/host-cc-darwin.sh` is the host `CC` on a Mac (set by
+`build-ppc.sh`): it turns `-O1` into `-O0`, inside mrustc's `@response` file too. Host code is
+only build scripts and proc macros, so the speed doesn't matter.
 
 ## Where this stands
 

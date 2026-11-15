@@ -1,5 +1,5 @@
-//! A pop-up menu of controller actions (the browse view's View menu, a row's menu): shown at a
-//! point in a view, it answers the action picked, if any.
+//! The pop-up menu behind `Host::menu_at`: labels shown at a point in a view, answering the
+//! entry picked. Which action each entry stands for is the shared `popup`'s.
 
 use std::cell::Cell;
 
@@ -8,64 +8,21 @@ use objc2::runtime::AnyObject;
 use objc2::{sel, MainThreadMarker};
 use objc2_app_kit::{NSControlStateValueOn, NSMenu, NSMenuItem, NSView};
 use objc2_foundation::NSPoint;
-use rusty_backup::controller::commander::{
-    CommanderAction as A, RowMenuEntry, ViewItemKind, ViewMenuItem,
-};
 
 use crate::ui::{self, ns};
-
-/// One entry of a pop-up menu.
-pub enum MenuItem {
-    Item {
-        label: String,
-        enabled: bool,
-        checked: bool,
-        action: A,
-    },
-    Sub {
-        label: String,
-        items: Vec<(String, A)>,
-    },
-}
-
-impl MenuItem {
-    /// A View menu entry; its chord shows after the label.
-    pub fn view(v: ViewMenuItem) -> MenuItem {
-        MenuItem::Item {
-            label: match v.hint.is_empty() {
-                true => v.label,
-                false => format!("{}    {}", v.label, v.hint),
-            },
-            enabled: v.enabled,
-            checked: v.checked && v.kind != ViewItemKind::Command,
-            action: v.action,
-        }
-    }
-
-    pub fn row(e: RowMenuEntry) -> MenuItem {
-        match e {
-            RowMenuEntry::Item {
-                label,
-                action,
-                enabled,
-            } => MenuItem::Item {
-                label,
-                enabled,
-                checked: false,
-                action,
-            },
-            RowMenuEntry::Submenu { label, items } => MenuItem::Sub { label, items },
-        }
-    }
-}
 
 thread_local! {
     static PICKED: Cell<Option<isize>> = const { Cell::new(None) };
 }
 
-/// Show `items` at `at` in `view` and wait for the user; the action picked, if any.
-pub fn track(mtm: MainThreadMarker, view: &NSView, items: Vec<MenuItem>, at: NSPoint) -> Option<A> {
-    let mut actions: Vec<A> = Vec::new();
+/// Show host menu `entries` at `at` in `view` and wait; the pick, numbered as `MenuEntry` says.
+pub fn show(
+    mtm: MainThreadMarker,
+    view: &NSView,
+    entries: &[crate::screens::host::MenuEntry],
+    at: NSPoint,
+) -> Option<usize> {
+    use crate::screens::host::MenuEntry;
     let target = ui::callback(
         mtm,
         Box::new(|sender: &AnyObject| {
@@ -79,7 +36,7 @@ pub fn track(mtm: MainThreadMarker, view: &NSView, items: Vec<MenuItem>, at: NSP
         let it = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc(),
-                &ns(&ui::plain(label)),
+                &ns(label),
                 Some(sel!(fire:)),
                 &ns(""),
             )
@@ -92,30 +49,30 @@ pub fn track(mtm: MainThreadMarker, view: &NSView, items: Vec<MenuItem>, at: NSP
     };
     let menu = NSMenu::new(mtm);
     menu.setAutoenablesItems(false);
-    for item in items {
-        match item {
-            MenuItem::Item {
+    let mut n: isize = 0;
+    for e in entries {
+        match e {
+            MenuEntry::Item {
                 label,
                 enabled,
                 checked,
-                action,
             } => {
-                actions.push(action);
-                let it = entry(&label, enabled, actions.len() as isize - 1);
-                if checked {
+                let it = entry(label, *enabled, n);
+                n += 1;
+                if *checked {
                     it.setState(NSControlStateValueOn);
                 }
                 menu.addItem(&it);
             }
-            MenuItem::Sub { label, items } => {
+            MenuEntry::Sub { label, items } => {
                 let sub = NSMenu::new(mtm);
                 sub.setAutoenablesItems(false);
-                for (l, a) in items {
-                    actions.push(a);
-                    sub.addItem(&entry(&l, true, actions.len() as isize - 1));
+                for l in items {
+                    sub.addItem(&entry(l, true, n));
+                    n += 1;
                 }
                 let holder = NSMenuItem::new(mtm);
-                holder.setTitle(&ns(&ui::plain(&label)));
+                holder.setTitle(&ns(label));
                 holder.setSubmenu(Some(&sub));
                 menu.addItem(&holder);
             }
@@ -123,6 +80,5 @@ pub fn track(mtm: MainThreadMarker, view: &NSView, items: Vec<MenuItem>, at: NSP
     }
     PICKED.with(|p| p.set(None));
     menu.popUpMenuPositioningItem_atLocation_inView(None, at, Some(view));
-    let picked = PICKED.with(Cell::take)?;
-    actions.into_iter().nth(picked as usize)
+    PICKED.with(Cell::take).map(|p| p as usize)
 }

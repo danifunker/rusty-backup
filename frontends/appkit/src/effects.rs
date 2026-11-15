@@ -1,210 +1,26 @@
-//! Fulfils controller [`Effect`]s: pickers, questions, prompts, the clipboard, URLs.
-//!
-//! A question is a modal panel or alert, opened from a block of its own on the main queue: an AX
-//! press waits for the action it pressed, so a modal raised inside that action would hold the flow
-//! driver until the user answers. A modal runs its own loop, so the controllers are never borrowed
-//! while one is up, and a wake that arrives meanwhile ticks them as usual. A question asked while
-//! another is up waits its turn. The flow suite answers pickers through `controller::picks`.
+//! The AppKit panels behind the shared effect host (frontends/mac-screens/src/effects.rs):
+//! open and save panels, alerts, the one-line prompt, the pasteboard. The queue and the rule that
+//! a question opens on a turn of its own are the shared host's; these are its `Host` leaves.
 
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::cell::RefCell;
 use std::path::PathBuf;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAccessibility, NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSColor,
-    NSControl, NSControlTextEditingDelegate, NSModalResponseOK, NSOpenPanel, NSPasteboard,
+    NSAccessibility, NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSColor, NSControl,
+    NSControlTextEditingDelegate, NSModalResponseOK, NSOpenPanel, NSPasteboard,
     NSPasteboardTypeString, NSSavePanel, NSSecureTextField, NSTextField, NSTextFieldDelegate,
-    NSTextView, NSWorkspace,
+    NSTextView,
 };
 use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize, NSString, NSURL};
 use rusty_backup::controller::app::picker_start_folder;
 use rusty_backup::controller::remote_pick::asks_for_a_daemon;
-use rusty_backup::controller::{
-    picks, ChoiceSpec, ConfirmSpec, Effect, PasswordSpec, PickSpec, TextSpec,
-};
+use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, PasswordSpec, PickSpec, TextSpec};
 
 use crate::ui::{self, ns};
-
-/// An answer, routed by the screen that asked to its controller's matching `Action`.
-// The screens of slices 1 to 8 read every field; until then only the app's Confirm is routed.
-#[allow(dead_code)]
-pub enum Reply {
-    Picked {
-        purpose: &'static str,
-        path: Option<PathBuf>,
-    },
-    Confirmed {
-        purpose: &'static str,
-        yes: bool,
-    },
-    Answered {
-        purpose: &'static str,
-        text: Option<String>,
-    },
-    Chose {
-        purpose: &'static str,
-        choice: usize,
-    },
-    CloseScreen,
-}
-
-pub type ReplyFn = Rc<dyn Fn(Reply)>;
-
-#[derive(Clone)]
-pub struct EffectHost {
-    inner: Rc<Inner>,
-}
-
-struct Inner {
-    mtm: MainThreadMarker,
-    /// Where a transient message shows (the status line under the screens).
-    status: Retained<NSTextField>,
-    busy: Cell<bool>,
-    /// A question waits for a block of its own, not the action that raised it.
-    posted: Cell<bool>,
-    queue: RefCell<VecDeque<(Effect, ReplyFn)>>,
-}
-
-thread_local! {
-    static LATER: RefCell<Vec<Weak<Inner>>> = const { RefCell::new(Vec::new()) };
-}
-
-fn is_question(e: &Effect) -> bool {
-    matches!(
-        e,
-        Effect::PickFile(_)
-            | Effect::PickFolder(_)
-            | Effect::Confirm(_)
-            | Effect::Choose(_)
-            | Effect::AskText(_)
-            | Effect::AskPassword(_)
-    )
-}
-
-fn post_later(inner: &Rc<Inner>) {
-    LATER.with(|l| l.borrow_mut().push(Rc::downgrade(inner)));
-    dispatch2::DispatchQueue::main().exec_async(drain_later);
-}
-
-fn drain_later() {
-    let hosts = LATER.with(|l| std::mem::take(&mut *l.borrow_mut()));
-    for inner in hosts.iter().filter_map(Weak::upgrade) {
-        inner.posted.set(false);
-        EffectHost { inner }.drain(true);
-    }
-}
-
-impl EffectHost {
-    pub fn new(mtm: MainThreadMarker, status: Retained<NSTextField>) -> Self {
-        EffectHost {
-            inner: Rc::new(Inner {
-                mtm,
-                status,
-                busy: Cell::new(false),
-                posted: Cell::new(false),
-                queue: RefCell::default(),
-            }),
-        }
-    }
-
-    /// True while a dialog the host opened is up.
-    #[allow(dead_code)] // the screens' key handlers ask it from slice 1 on
-    pub fn dialog_open(&self) -> bool {
-        self.inner.busy.get()
-    }
-
-    /// Carry out `effects` in order; questions open on a block of their own.
-    pub fn run(&self, effects: Vec<Effect>, reply: &ReplyFn) {
-        for effect in effects {
-            self.inner
-                .queue
-                .borrow_mut()
-                .push_back((effect, reply.clone()));
-        }
-        if self.inner.busy.get() || self.inner.posted.get() {
-            return;
-        }
-        self.drain(false);
-    }
-
-    fn drain(&self, fresh: bool) {
-        loop {
-            let next = self.inner.queue.borrow_mut().pop_front();
-            let Some((effect, reply)) = next else { break };
-            if !fresh && is_question(&effect) {
-                self.inner.queue.borrow_mut().push_front((effect, reply));
-                self.inner.posted.set(true);
-                post_later(&self.inner);
-                break;
-            }
-            self.inner.busy.set(true);
-            self.one(effect, &reply);
-            self.inner.busy.set(false);
-        }
-    }
-
-    /// No `_` arm, so a new `Effect` fails to compile until handled here.
-    fn one(&self, effect: Effect, reply: &ReplyFn) {
-        let mtm = self.inner.mtm;
-        match effect {
-            Effect::PickFile(spec) => {
-                let path = pick(mtm, &spec, false);
-                reply(Reply::Picked {
-                    purpose: spec.purpose,
-                    path,
-                });
-            }
-            Effect::PickFolder(spec) => {
-                let path = pick(mtm, &spec, true);
-                reply(Reply::Picked {
-                    purpose: spec.purpose,
-                    path,
-                });
-            }
-            Effect::Confirm(spec) => {
-                let yes = confirm(mtm, &spec);
-                reply(Reply::Confirmed {
-                    purpose: spec.purpose,
-                    yes,
-                });
-            }
-            Effect::Choose(spec) => {
-                let choice = choose(mtm, &spec);
-                reply(Reply::Chose {
-                    purpose: spec.purpose,
-                    choice,
-                });
-            }
-            Effect::AskText(spec) => {
-                let text = ask_text(mtm, &spec);
-                reply(Reply::Answered {
-                    purpose: spec.purpose,
-                    text,
-                });
-            }
-            Effect::AskPassword(spec) => {
-                let text = ask_password(mtm, &spec);
-                reply(Reply::Answered {
-                    purpose: spec.purpose,
-                    text,
-                });
-            }
-            Effect::Message(text) => ui::set_text(&self.inner.status, &text),
-            Effect::OpenUrl(url) => {
-                if let Some(u) = NSURL::URLWithString(&ns(&url)) {
-                    NSWorkspace::sharedWorkspace().openURL(&u);
-                }
-            }
-            Effect::CopyToClipboard(text) => copy_text(&text),
-            Effect::CloseScreen => reply(Reply::CloseScreen),
-            Effect::Quit => NSApplication::sharedApplication(mtm).terminate(None),
-        }
-    }
-}
 
 /// Put `text` on the general pasteboard.
 pub fn copy_text(text: &str) {
@@ -223,12 +39,9 @@ fn path_of(url: Option<Retained<NSURL>>) -> Option<PathBuf> {
         .map(|p| PathBuf::from(p.to_string()))
 }
 
-/// The open or save panel, or the flow suite's scripted answer.
+/// The open or save panel; the flow suite's scripted answers are the shared effect host's.
 #[allow(deprecated)] // allowedFileTypes: its replacement needs macOS 11, the floor is 10.13
-fn pick(mtm: MainThreadMarker, spec: &PickSpec, folder: bool) -> Option<PathBuf> {
-    if let Some(answer) = picks::scripted(spec.purpose) {
-        return answer;
-    }
+pub(crate) fn pick(mtm: MainThreadMarker, spec: &PickSpec, folder: bool) -> Option<PathBuf> {
     let exts: Vec<Retained<NSString>> = spec
         .filters
         .iter()
@@ -269,6 +82,23 @@ fn pick(mtm: MainThreadMarker, spec: &PickSpec, folder: bool) -> Option<PathBuf>
     path_of(panel.URLs().firstObject())
 }
 
+/// An open panel for several files; none when cancelled.
+pub(crate) fn pick_files(mtm: MainThreadMarker, title: &str) -> Vec<PathBuf> {
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setMessage(Some(&ns(title)));
+    panel.setCanChooseFiles(true);
+    panel.setAllowsMultipleSelection(true);
+    if panel.runModal() != NSModalResponseOK {
+        return Vec::new();
+    }
+    panel
+        .URLs()
+        .iter()
+        .filter_map(|u| u.path())
+        .map(|p| PathBuf::from(p.to_string()))
+        .collect()
+}
+
 fn alert(mtm: MainThreadMarker, title: &str, message: &str) -> Retained<NSAlert> {
     let a = NSAlert::new(mtm);
     a.setMessageText(&ns(&ui::plain(title)));
@@ -299,7 +129,7 @@ pub fn ask(mtm: MainThreadMarker, title: &str, message: &str, buttons: &[String]
     (i < buttons.len()).then_some(i)
 }
 
-fn confirm(mtm: MainThreadMarker, spec: &ConfirmSpec) -> bool {
+pub(crate) fn confirm(mtm: MainThreadMarker, spec: &ConfirmSpec) -> bool {
     let a = alert(mtm, &spec.title, &spec.message);
     a.addButtonWithTitle(&ns(&spec.confirm_label));
     a.addButtonWithTitle(&ns("Cancel"));
@@ -309,7 +139,7 @@ fn confirm(mtm: MainThreadMarker, spec: &ConfirmSpec) -> bool {
     a.runModal() == NSAlertFirstButtonReturn
 }
 
-fn choose(mtm: MainThreadMarker, spec: &ChoiceSpec) -> usize {
+pub(crate) fn choose(mtm: MainThreadMarker, spec: &ChoiceSpec) -> usize {
     let a = alert(mtm, &spec.title, &spec.message);
     for c in &spec.choices {
         a.addButtonWithTitle(&ns(&c.label));
@@ -499,7 +329,7 @@ fn prompt(mtm: MainThreadMarker, ask: Ask) -> Option<String> {
     answer
 }
 
-fn ask_text(mtm: MainThreadMarker, spec: &TextSpec) -> Option<String> {
+pub(crate) fn ask_text(mtm: MainThreadMarker, spec: &TextSpec) -> Option<String> {
     let rule = spec.clone();
     let check: Check = Rc::new(move |t: &str| (rule.validator)(&rule, t));
     let ask = Ask {
@@ -515,7 +345,7 @@ fn ask_text(mtm: MainThreadMarker, spec: &TextSpec) -> Option<String> {
     prompt(mtm, ask)
 }
 
-fn ask_password(mtm: MainThreadMarker, spec: &PasswordSpec) -> Option<String> {
+pub(crate) fn ask_password(mtm: MainThreadMarker, spec: &PasswordSpec) -> Option<String> {
     let ask = Ask {
         title: "Password",
         message: &spec.prompt,

@@ -412,3 +412,49 @@ fn a_squashfs_image_browses_as_squashfs_not_hfs() {
         .collect();
     assert_eq!(names, ["a.txt"]);
 }
+
+#[test]
+fn every_qnx2_partition_of_an_icon_disk_offers_browse() {
+    // An ICON / LEXICON disk types its QNX 2 partitions 07, 08 and 09; all three browse.
+    let ctl = controller();
+    for (i, byte) in [0x07u8, 0x08, 0x09].into_iter().enumerate() {
+        let part = crate::partition::PartitionInfo {
+            index: i,
+            type_name: "QNX 2".to_string(),
+            partition_type_byte: byte,
+            start_lba: 29 + 1600 * i as u64,
+            start_byte: None,
+            size_bytes: 819_200,
+            bootable: i == 0,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: None,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        };
+        assert!(ctl.row_actions(&part).browse, "type {byte:#04x}");
+    }
+}
+
+#[test]
+fn a_gpt_basic_data_fat_partition_offers_browse() {
+    // hdiutil's GPTSPUD + MS-DOS layout: one FAT32 "Microsoft Basic Data" partition.
+    let ctl = controller();
+    let part = crate::partition::PartitionInfo {
+        index: 0,
+        type_name: "Microsoft Basic Data (disk image)".to_string(),
+        partition_type_byte: 0,
+        start_lba: 2048,
+        start_byte: None,
+        size_bytes: 38 << 20,
+        bootable: false,
+        is_logical: false,
+        is_extended_container: false,
+        partition_type_string: Some("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7".to_string()),
+        hfs_block_size: None,
+        rdb_part_block: None,
+        drv_name: None,
+    };
+    assert!(ctl.row_actions(&part).browse);
+}

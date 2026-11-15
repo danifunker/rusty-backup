@@ -254,9 +254,7 @@ pub fn verify(
         }
         let artifact_stale = *staleness.entry(meta.git_sha.clone()).or_insert_with(|| {
             crate::gitinfo::engine_changed_since(
-                regression_dir
-                    .parent()
-                    .unwrap_or(regression_dir),
+                regression_dir.parent().unwrap_or(regression_dir),
                 &meta.git_sha,
                 crate::gitinfo::ENGINE_PATHS,
             )
@@ -308,11 +306,7 @@ pub fn verify(
                         None,
                     ),
                     Some(exe) => {
-                        let argv = expand(
-                            check,
-                            image,
-                            &regression_dir.join("oracles"),
-                        );
+                        let argv = expand(check, image, &regression_dir.join("oracles"));
                         let cwd = image.parent().unwrap_or(artifacts_root);
                         match exec::run(&exe, &argv, cwd, VERIFY_TIMEOUT) {
                             Err(e) => (
@@ -568,7 +562,10 @@ mod tests {
 
     #[test]
     fn exit_zero_with_no_expectations_passes() {
-        assert_eq!(evaluate(&claim(None, None, None), &out(0, "", "")), Verdict::Pass);
+        assert_eq!(
+            evaluate(&claim(None, None, None), &out(0, "", "")),
+            Verdict::Pass
+        );
     }
 
     #[test]

@@ -299,6 +299,7 @@ pub struct UiSession {
     gtk: PathBuf,
     win32: PathBuf,
     appkit: PathBuf,
+    cocoa: PathBuf,
     scratch: PathBuf,
     controls: Controls,
     /// The control the last `focus` landed on, which `fill` and `choose` act on.
@@ -309,12 +310,14 @@ pub struct UiSession {
 }
 
 impl UiSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         shell: Option<String>,
         rb_cli: &Path,
         gtk: &Path,
         win32: &Path,
         appkit: &Path,
+        cocoa: &Path,
         scratch: &Path,
         controls: Controls,
     ) -> Self {
@@ -324,6 +327,7 @@ impl UiSession {
             gtk: gtk.to_path_buf(),
             win32: win32.to_path_buf(),
             appkit: appkit.to_path_buf(),
+            cocoa: cocoa.to_path_buf(),
             scratch: scratch.to_path_buf(),
             controls,
             focused: Control::default(),
@@ -351,7 +355,7 @@ impl UiSession {
         let shell = self.shell.clone().unwrap_or_default();
         match shell.as_str() {
             "tui" => self.run_tui(ops, resolve),
-            "gtk" | "win32" | "appkit" => self.run_driver(&shell, ops, resolve),
+            "gtk" | "win32" | "appkit" | "cocoa" => self.run_driver(&shell, ops, resolve),
             other => Err(UiError::Skip(
                 Verdict::SkipTool,
                 format!("no driver for the '{}' shell yet", other),
@@ -370,15 +374,18 @@ impl UiSession {
             let d = match shell {
                 "win32" => crate::uia::start(&self.win32, &self.scratch.join("win32"))?,
                 "appkit" => crate::ax::start(&self.appkit, &self.scratch.join("appkit"))?,
+                "cocoa" => crate::ax::start_cocoa(&self.cocoa, &self.scratch.join("cocoa"))?,
                 _ => crate::gtk::Driver::start(&self.gtk, &self.scratch.join("gtk"))?,
             };
             self.gtk_driver = Some(d);
         }
+        // The vintage Cocoa shell runs the AppKit flows as they are: same ids, labels and steps.
+        let shell = if shell == "cocoa" { "appkit" } else { shell };
         for op in ops {
             if op.only.as_deref().is_some_and(|o| o != shell) {
                 continue;
             }
-            // Only the AX driver can shoot its windows; elsewhere a tour's shot is no step.
+            // Only the AX drivers can shoot their windows; elsewhere a tour's shot is no step.
             if op.shot.is_some() && shell != "appkit" {
                 continue;
             }
@@ -408,9 +415,14 @@ impl UiSession {
             }
             let mut msg = self.driver_message(shell, op, resolve);
             // Win32 and AppKit find a control by its accessibility id, the controller id itself.
-            if (shell == "win32" || shell == "appkit") && (op.focus.is_some() || op.activate.is_some()) {
+            if (shell == "win32" || shell == "appkit")
+                && (op.focus.is_some() || op.activate.is_some())
+            {
                 if let Some(m) = msg.as_object_mut() {
-                    m.insert("id".to_string(), serde_json::Value::String(resolve(op_target(op))));
+                    m.insert(
+                        "id".to_string(),
+                        serde_json::Value::String(resolve(op_target(op))),
+                    );
                 }
             }
             let limit = Duration::from_millis(op.timeout_ms.unwrap_or(30_000));
