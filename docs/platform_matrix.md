@@ -40,7 +40,7 @@ of rb-cli pulls no GUI dependencies.
 | macOS 10.7+ x64 | macos-vintage | vintage | rb-cli + TUI; the Cocoa app (preview, `frontends-vintage/cocoa/`), an HFS+ DMG | Cocoa: the shared Mac screens (`frontends/mac-screens/`) over an Objective-C 1.0 host ([cocoa_vintage_shell_plan.md](cocoa_vintage_shell_plan.md)) | 1.73 | native-zstd, remote, tui, rust173-polyfill, yaml | no CHD, no optical, no crypto (edition-2024 deps); the app has no Optical screen, no CHD output or Convert to CHD, no update banner (no network stack), no Finder drag out |
 | Windows 7/8 x64, i686 | windows-vintage | vintage | rb-cli + TUI | Win32 on `windows` 0.58 (Phase 6) | 1.73 | native-zstd, remote, tui, rust173-polyfill, windows-legacy, yaml | no CHD, no optical, no crypto |
 | Solaris 9 SPARC | sol9 | vintage | rb-cli + TUI | Motif/CDE over a C ABI (deferred, §8) | mrustc (sparcv9-sun-solaris2.9) | native-zstd, remote, tui, rust173-polyfill | no GUI; mrustc gaps: no proc-macros, no inline asm |
-| Mac OS X 10.4/10.5 PowerPC | - | vintage | rb-cli + TUI (G3 build) | Carbon/Cocoa over a C ABI (deferred, §8) | mrustc, C compiled on a G5 (`scripts/build-ppc.sh`) | native-zstd, remote, tui, rust173-polyfill, os-stub | no physical devices (os-stub); not in CI |
+| Mac OS X 10.4/10.5 PowerPC | - | vintage | rb-cli + TUI; the Cocoa app as a G3 and a G4 (AltiVec) DMG | Cocoa: the shared Mac screens over the same Objective-C 1.0 host as 10.7 ([cocoa_vintage_shell_plan.md](cocoa_vintage_shell_plan.md) § 3) | mrustc pinned by `scripts/mrustc.pin`, C compiled on a G5 (`scripts/build-ppc.sh`, `scripts/build-ppc-cocoa.sh`) | native-zstd, remote, tui, rust173-polyfill, os-stub | no physical devices (os-stub); no CHD, optical or update banner (as 10.7); not in CI |
 | DOS (crusty-backup) | cbdos | n/a | separate C program, FreeDOS floppy + CD | conio (out of scope) | DJGPP | - | not the Rust engine |
 <!-- matrix:end -->
 
@@ -56,7 +56,7 @@ for wasm32) is a CI target too; the check script knows it.
 | GTK4 + libadwaita | `frontends/gtk4/` (shipped as a preview beside egui since 2026-11-08; CI target `gtk4`) | Linux modern, Phase 4 |
 | AppKit | `frontends/appkit/` (slices 0 to 9; CI target `appkit`; [appkit_shell_plan.md](appkit_shell_plan.md)) | macOS modern, Phase 3 |
 | Win32 | `frontends/win32/` (the skeleton, slice 0; CI target `win32`; [win32_shell_plan.md](win32_shell_plan.md)) | Windows modern, Phase 5 |
-| Vintage shells | `frontends-vintage/cocoa/` (macOS 10.7 to 10.12; PowerPC next) over the shared `frontends/mac-screens/` | Phase 6 |
+| Vintage shells | `frontends-vintage/cocoa/` (macOS 10.7 to 10.12, and 10.4/10.5 PowerPC) over the shared `frontends/mac-screens/` | Phase 6 |
 
 Every shell renders `src/controller` view-models only (`scripts/check-boundaries.sh`), and every
 shell with a flow driver runs the tier 8 front-end flows (`regression-tests/FLOWS.md`): today the

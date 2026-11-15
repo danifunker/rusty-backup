@@ -199,4 +199,7 @@ Phases 1 to 3 are done for x86_64: every AppKit screen, dialog and the main wind
 - **Flows.** All cocoa flows pass here under Rosetta, the floppy conversions on the Convert tab
   included, and all 65 pass on a real 10.7.5 Mac through `regression-tests/drivers/remote_cocoa.py`
   (FLOWS.md, "Cocoa flows on a real 10.7 Mac").
-- **PowerPC** (Phase 5): see § 3; the host compiles clean on the G5 against the 10.4u SDK.
+- **PowerPC** (Phase 5): built per § 3 for G3 and G4 and run on a G5 under 10.5.8. Two fixes
+  came out of it: mrustc wrote float constants in the host's byte order (every column width
+  read as 0; fixed in the pinned fork, `docs/build-ppc-mrustc.md`), and push buttons now get
+  their bezel's full height (Leopard's pill lost its top edge in a 23 pt row).
