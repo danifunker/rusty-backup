@@ -440,11 +440,9 @@ impl Case {
 
     /// The case needs what the vintage Cocoa build leaves out: CHD, optical media, CD audio.
     fn cocoa_lacks(&self) -> bool {
-        const NEEDS: [&str; 3] = ["optical", "audio", "chd"];
-        let id = self.id.to_ascii_lowercase();
-        NEEDS
-            .iter()
-            .any(|n| id.contains(n) || self.area.iter().any(|a| a.to_ascii_lowercase().contains(n)))
+        let n = "audio";
+        self.id.to_ascii_lowercase().contains(n)
+            || self.area.iter().any(|a| a.to_ascii_lowercase().contains(n))
     }
 
     /// The case as it runs: one instance per filesystem and shell, `{fs}` filled in.
@@ -455,8 +453,8 @@ impl Case {
             self.fs.iter().map(Some).collect()
         };
         let has_ui = self.steps.iter().any(|s| !s.ui.is_empty());
-        // The vintage Cocoa shell runs the AppKit flows, save those its build cannot (no CHD or
-        // optical media on Rust 1.73 for 10.7; see docs/cocoa_vintage_shell_plan.md).
+        // The vintage Cocoa shell runs the AppKit flows, save CD audio (cd-da-reader and rodio need
+        // newer Rust than its 1.73 build; see docs/cocoa_vintage_shell_plan.md).
         let cocoa = "cocoa".to_string();
         let mut shells_with: Vec<&String> = self.shells.iter().collect();
         if self.shells.iter().any(|s| s == "appkit") && !self.cocoa_lacks() {

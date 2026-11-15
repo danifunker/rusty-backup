@@ -272,7 +272,7 @@ impl InspectScreen {
             f.button(Part::BackupRemote, "Back Up Image...", remote_ids::BACKUP);
             f.label(Part::BackingUp, remote_hints::BACKING_UP);
             f.button(Part::CloseRemote, "Close Remote", remote_ids::CLOSE);
-            f.label(Part::Note, "");
+            f.wrap(Part::Note, "");
             f.label(Part::Flux, "");
             f.label(Part::Error, "");
             f.label(Part::Job, "");
@@ -1191,17 +1191,16 @@ impl InspectScreen {
             Node::Space(Size::Stretch(1)),
         ]));
         let lines = |p: Part| {
-            let text = self.form.text(p);
-            if text.is_empty() {
+            if self.form.text(p).is_empty() {
                 0
             } else {
-                text.lines().count() as i32
+                self.form.wrapped_lines(p)
             }
         };
         let line =
             |x: Part, n: i32| Node::leaf(x, Size::Stretch(1), Size::Fixed((layout::ROW - 6) * n));
         if lines(Part::Note) > 0 {
-            rows.push(line(Part::Note, 2));
+            rows.push(line(Part::Note, lines(Part::Note)));
         }
         if lines(Part::Flux) > 0 {
             rows.push(line(Part::Flux, 1));

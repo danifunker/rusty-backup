@@ -1,10 +1,12 @@
 pub mod boot_area;
 // CD-DA playback for the Optical tab's in-app audio player. `audio` implies
-// `chd` + `optical`, so the libchdman_rs / cd-da-reader imports always resolve.
+// `chd` + `cd-audio`, so the libchdman_rs / cd-da-reader imports always resolve.
 #[cfg(feature = "audio")]
 pub mod cd_audio;
 pub mod convert;
 pub mod rip;
+// Physical drives (CD via cd-da-reader, DVD/BD as flat sectors) and remote drives.
+#[cfg(feature = "cd-audio")]
 pub mod source;
 
 pub use convert::ConvertProgress;
@@ -63,8 +65,9 @@ fn chd_is_cd_safe(path: &std::path::Path) -> bool {
         false
     }
 }
-#[cfg(feature = "remote")]
+#[cfg(all(feature = "remote", feature = "cd-audio"))]
 pub use source::RemoteCdReader;
+#[cfg(feature = "cd-audio")]
 pub use source::{LocalCdReader, OpticalSource};
 
 /// Map opticaldiscs' raw per-file timestamps to the Mac-1904 creation /

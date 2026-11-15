@@ -4,6 +4,7 @@
 # repoints it at @executable_path, rebuilds legacy-support against the 10.4
 # SDK, enforces the CPU floor (AltiVec / cpusubtype) and checks Tiger-capability.
 #
+# With RB_APP set (scripts/build-ppc-cocoa.sh), it packages the Cocoa app in place instead.
 # Driven by build-ppc.sh's `dist` stage over `ssh bash -s`, but standalone on
 # purpose: scp it to the Mac and run it by hand when packaging rejects a build.
 #
@@ -11,13 +12,24 @@
 #   in:  ~/rb-cli-dist-src        the freshly linked rb-cli
 #   out: ~/rb-cli-ppc-$RB_CPU_LABEL.tar.gz
 set -e
-BIN=~/rb-cli-dist-src
-D=~/rb-cli-dist
-rm -rf "$D"; mkdir -p "$D/lib"
-cp "$BIN" "$D/rb-cli"; chmod u+w "$D/rb-cli"
+# RB_APP (an .app on this Mac) packages the Cocoa app in place: its dylibs go to Contents/Frameworks.
+if [ -n "${RB_APP:-}" ]; then
+  EXE="$RB_APP/Contents/MacOS/Rusty Backup"
+  LIBDIR="$RB_APP/Contents/Frameworks"
+  PREFIX="@executable_path/../Frameworks"
+  rm -rf "$LIBDIR"; mkdir -p "$LIBDIR"; chmod u+w "$EXE"
+else
+  BIN=~/rb-cli-dist-src
+  D=~/rb-cli-dist
+  EXE="$D/rb-cli"
+  LIBDIR="$D/lib"
+  PREFIX="@executable_path/lib"
+  rm -rf "$D"; mkdir -p "$LIBDIR"
+  cp "$BIN" "$EXE"; chmod u+w "$EXE"
+fi
 
 # Walk the closure, not just the direct deps: libgcc_s.1.dylib is a stub in front of two more.
-pending=$(otool -L "$D/rb-cli" | tail -n +2 | awk '{print $1}' | grep '^/opt/local/' || true)
+pending=$(otool -L "$EXE" | tail -n +2 | awk '{print $1}' | grep '^/opt/local/' || true)
 seen=""
 while [ -n "$pending" ]; do
   next=""
@@ -25,7 +37,7 @@ while [ -n "$pending" ]; do
     case " $seen " in *" $f "*) continue;; esac
     seen="$seen $f"
     [ -e "$f" ] || { echo "missing dependency $f" >&2; exit 1; }
-    cp "$f" "$D/lib/"; chmod u+w "$D/lib/$(basename "$f")"
+    cp "$f" "$LIBDIR/"; chmod u+w "$LIBDIR/$(basename "$f")"
     next="$next $(otool -L "$f" | tail -n +2 | awk '{print $1}' | grep '^/opt/local/' || true)"
   done
   pending="$next"
@@ -48,26 +60,26 @@ if [ ! -e "$CACHE" ] && [ -n "$LEG" ] && [ -d "$SDK104" ]; then
     && mkdir -p "$(dirname "$CACHE")" && cp lib/libMacportsLegacySupport.dylib "$CACHE"
   cd ~
 fi
-if [ -e "$CACHE" ] && [ -e "$D/lib/libMacportsLegacySupport.dylib" ]; then
-  cp "$CACHE" "$D/lib/libMacportsLegacySupport.dylib"
-  chmod u+w "$D/lib/libMacportsLegacySupport.dylib"
+if [ -e "$CACHE" ] && [ -e "$LIBDIR/libMacportsLegacySupport.dylib" ]; then
+  cp "$CACHE" "$LIBDIR/libMacportsLegacySupport.dylib"
+  chmod u+w "$LIBDIR/libMacportsLegacySupport.dylib"
   echo "legacy-support: using the 10.4-targeted rebuild (Tiger-capable)"
-elif [ -e "$D/lib/libMacportsLegacySupport.dylib" ]; then
+elif [ -e "$LIBDIR/libMacportsLegacySupport.dylib" ]; then
   echo "legacy-support: no 10.4 rebuild available - bundle is Leopard-only" >&2
 fi
 
-for f in "$D"/lib/*.dylib; do
-  install_name_tool -id "@executable_path/lib/$(basename "$f")" "$f"
+for f in "$LIBDIR"/*.dylib; do
+  install_name_tool -id "$PREFIX/$(basename "$f")" "$f"
 done
 for f in $seen; do
   b=$(basename "$f")
-  install_name_tool -change "$f" "@executable_path/lib/$b" "$D/rb-cli" 2>/dev/null || true
-  for g in "$D"/lib/*.dylib; do
-    install_name_tool -change "$f" "@executable_path/lib/$b" "$g" 2>/dev/null || true
+  install_name_tool -change "$f" "$PREFIX/$b" "$EXE" 2>/dev/null || true
+  for g in "$LIBDIR"/*.dylib; do
+    install_name_tool -change "$f" "$PREFIX/$b" "$g" 2>/dev/null || true
   done
 done
 
-left=$(otool -L "$D/rb-cli" "$D"/lib/*.dylib | grep -c '/opt/local' || true)
+left=$(otool -L "$EXE" "$LIBDIR"/*.dylib | grep -c '/opt/local' || true)
 [ "$left" -eq 0 ] || { echo "$left /opt/local reference(s) survived packaging" >&2; exit 1; }
 
 # ---- CPU floor: retag what is only mis-labelled, reject what is not ---------
@@ -91,7 +103,7 @@ retag_ppc_all() {
 case "$RB_CPU_FLAGS" in *-mno-altivec*) NOVEC=1 ;; *) NOVEC=0 ;; esac
 fail=0
 echo "CPU floor: PPC_CPU=${RB_CPU:-default} ($RB_CPU_FLAGS)"
-for f in "$D/rb-cli" "$D"/lib/*.dylib; do
+for f in "$EXE" "$LIBDIR"/*.dylib; do
   n=$(altivec_count "$f")
   gated=""
   if [ "$n" -gt 0 ] && cpu_gated "$f"; then gated=" (runtime-gated)"; fi
@@ -110,10 +122,10 @@ for f in "$D/rb-cli" "$D"/lib/*.dylib; do
 done
 [ "$fail" -eq 0 ] || { echo "bundle carries unguarded AltiVec for this CPU floor" >&2; exit 1; }
 
-(cd "$D" && ./rb-cli --version >/dev/null) || { echo "packaged rb-cli does not run" >&2; exit 1; }
+[ -n "${RB_APP:-}" ] || (cd "$D" && ./rb-cli --version >/dev/null) || { echo "packaged rb-cli does not run" >&2; exit 1; }
 # Tiger's libSystem has no $INODE64 symbols, so any left here means 10.4 refuses the bundle at load.
 i64=0
-for f in "$D/rb-cli" "$D"/lib/*.dylib; do
+for f in "$EXE" "$LIBDIR"/*.dylib; do
   i64=$((i64 + $(nm -mu "$f" 2>/dev/null | grep INODE64 | grep -c 'from libSystem' || true)))
 done
 [ "$i64" -eq 0 ] && echo "no \$INODE64 imports from libSystem: Tiger-capable" \
@@ -123,7 +135,7 @@ done
 # version requirement gets baked in silently and 10.4 refuses the binary at load.
 SDK104=/Developer/SDKs/MacOSX10.4u.sdk
 if [ -d "$SDK104" ]; then
-  otool -L "$D/rb-cli" | tail -n +2 | grep -E '^\	(/usr/lib|/System)' | while read -r path rest; do
+  otool -L "$EXE" | tail -n +2 | grep -E '^\	(/usr/lib|/System)' | while read -r path rest; do
     want=$(echo "$rest" | sed -n 's/.*compatibility version \([0-9.]*\).*/\1/p')
     sdklib="$SDK104$path"
     [ -e "$sdklib" ] || continue
@@ -134,7 +146,11 @@ if [ -d "$SDK104" ]; then
     fi
   done
 fi
+if [ -n "${RB_APP:-}" ]; then
+  echo "bundled $(ls "$LIBDIR" | wc -l | tr -d ' ') dylib(s) into $(basename "$RB_APP")/Contents/Frameworks"
+  exit 0
+fi
 TARBALL=~/rb-cli-ppc-${RB_CPU_LABEL:-unknown}.tar.gz
 rm -f "$TARBALL"
 (cd ~ && tar czf "$TARBALL" rb-cli-dist)
-echo "bundled $(ls "$D/lib" | wc -l | tr -d ' ') dylib(s); $(ls -l "$TARBALL" | awk '{print $5}') bytes -> $(basename "$TARBALL")"
+echo "bundled $(ls "$LIBDIR" | wc -l | tr -d ' ') dylib(s); $(ls -l "$TARBALL" | awk '{print $5}') bytes -> $(basename "$TARBALL")"

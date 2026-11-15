@@ -410,7 +410,7 @@ impl ArchivesScreen {
             ]));
         }
         if f.shown(K::Notes) {
-            let n = f.text(K::Notes).lines().count() as i32;
+            let n = f.wrapped_lines(K::Notes);
             col.push(lines(K::Notes, n));
         }
         if f.shown(K::List) {

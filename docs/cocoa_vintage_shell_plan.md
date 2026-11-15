@@ -76,8 +76,11 @@ Objective-C shell builds each screen itself). Less change to the AppKit shell, b
 ### x86_64, 10.7 to 10.12
 
 - Engine and `mac-screens`: a staticlib from the `rb-cli-vintage/` manifest (Rust 1.73,
-  `x86_64-apple-darwin`, deployment target 10.7, its frozen lockfile and features: no CHD, no
-  optical, no crypto).
+  `x86_64-apple-darwin`, deployment target 10.7, its frozen lockfile and features: CHD and
+  optical images, no CD-DA reading or player, no crypto). chdman builds from source with
+  `CXXFLAGS` pinning 10.7; `rb-cli-vintage/lion_compat.cpp` (linked by `build.rs`) supplies the
+  libc++ stream vtables and `getentropy` Lion lacks, and `check-lion-imports.sh` diffs every
+  libSystem / libc++ / libobjc import against `lion/exports.txt.gz`, taken from a 10.7.5 Mac.
 - Objective-C host: clang with `-mmacosx-version-min=10.7 -fno-objc-arc -Werror` and
   `-Werror=unguarded-availability`, so an API newer than 10.7 fails the build. Deprecation
   warnings are off (10.4 has only the old names) and `-fno-blocks` is out (the modern SDK's
@@ -98,7 +101,9 @@ Objective-C shell builds each screen itself). Less change to the AppKit shell, b
   archive's folder on the G5 is added to `PPC_LDFLAGS`, which reach its gcc unchanged. gcc 10's
   driver does the link.
 - `bundle`: the .app (10.4 floor in Info.plist) and its HFS+ DMG are made on the G5, into
-  `dist/Rusty-Backup-Cocoa-macos-ppc-<cpu>-<version>.dmg`.
+  `dist/Rusty-Backup-Cocoa-macos-ppc-<cpu>-<version>.dmg`. `scripts/ppc-package.sh` (`RB_APP`)
+  copies the MacPorts gcc10 runtime and the 10.4-built legacy-support into `Contents/Frameworks`,
+  so the app needs no MacPorts, and checks the CPU floor and the Tiger imports as for rb-cli.
 
 Tiger needs `panic=abort` (no `_Unwind_GetIPInfo` in `libgcc_s.10.4`). No CI: built and packaged
 on the G5 like `rb-cli-ppc`.
@@ -181,8 +186,8 @@ Phases 1 to 3 are done for x86_64: every AppKit screen, dialog and the main wind
   the panels and alerts the shared `EffectHost` asks for, and the main queue (`later`, `after`).
 - **Feature gates.** The mounting crate's features decide: `chd` (a stand-in `chd` module with
   the same calls and no controls keeps the screens free of cfg lines), `optical` (Optical, its
-  remote window, the disc browser) and `update` (the banner). AppKit turns all three on; the
-  vintage build has none of them (its engine has no CHD, optical or network stack).
+  remote window, the disc browser), `audio` (the CD player) and `update` (the banner). AppKit
+  turns all on; the 10.7 build has `chd` and `optical`, PowerPC none (no CHD fast enough there).
 - **AppKit** (`frontends/appkit/src/`) is now its host only: `form.rs` (the `Host`), `rows.rs`,
   `canvas.rs`, `table.rs`, `effects.rs` (panels), `popup.rs`, `toolbar.rs`, `menu.rs`, `ui.rs`,
   and `app.rs` (the application object and its delegate). All 68 tier 8 appkit flows pass.
@@ -193,12 +198,17 @@ Phases 1 to 3 are done for x86_64: every AppKit screen, dialog and the main wind
   a pre-10.6 fallback, `performSelectorOnMainThread:` for wakes and `later`.
 - **The flow driver** (`regression-tests/drivers/ax_driver.m`) is `ax_driver.swift` in
   Objective-C, built for 10.7. The runner's `cocoa` shell runs each AppKit flow on the vintage app
-  (`--cocoa`), save those that need CHD, optical media, CD audio or Convert.
+  (`--cocoa`), save those that need CD audio.
 - **CI.** `build-macos-vintage` builds the app with `build.sh`, checks its 10.7 floor and symbols,
   and ships `Rusty-Backup-Cocoa-macos-vintage-x64-<ver>.dmg` (HFS+, readable on 10.7).
 - **Flows.** All cocoa flows pass here under Rosetta, the floppy conversions on the Convert tab
   included, and all 65 pass on a real 10.7.5 Mac through `regression-tests/drivers/remote_cocoa.py`
   (FLOWS.md, "Cocoa flows on a real 10.7 Mac").
+- **Small screens.** Windows are kept inside the screen's usable area (`fit_on_screen` in
+  `host.m`), and wrapped text is sized by the lines it wraps to (`Form::wrapped_lines`), so every
+  tab fits an 800x600 display. `RUSTY_BACKUP_SCREEN=800x600` lays the app out as on that screen,
+  for a screenshot run; on PowerPC, the bundle's icon is `icon-vintage.icns`
+  (`scripts/make-legacy-icns.py`), since Tiger reads none of `icon.icns`' formats.
 - **PowerPC** (Phase 5): built per § 3 for G3 and G4 and run on a G5 under 10.5.8. Two fixes
   came out of it: mrustc wrote float constants in the host's byte order (every column width
   read as 0; fixed in the pinned fork, `docs/build-ppc-mrustc.md`), and push buttons now get

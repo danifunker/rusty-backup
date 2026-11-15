@@ -1,13 +1,23 @@
 use std::collections::VecDeque;
+#[cfg(feature = "cd-audio")]
 use std::fs::File;
+#[cfg(feature = "cd-audio")]
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Context, Result};
+#[cfg(any(feature = "cd-audio", not(feature = "remote")))]
+use anyhow::bail;
+#[cfg(any(feature = "cd-audio", feature = "remote"))]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(feature = "cd-audio")]
 use cd_da_reader::SectorReadFormat;
 
-use crate::backup::{LogLevel, LogMessage};
+#[cfg(feature = "cd-audio")]
+use crate::backup::LogLevel;
+use crate::backup::LogMessage;
+#[cfg(feature = "cd-audio")]
 use crate::optical::source::{LocalCdReader, OpticalSource};
 
 /// Output format for disc ripping.
@@ -127,6 +137,7 @@ impl RipProgress {
     }
 }
 
+#[cfg(feature = "cd-audio")]
 fn log(progress: &Arc<Mutex<RipProgress>>, level: LogLevel, message: impl Into<String>) {
     if let Ok(mut p) = progress.lock() {
         p.log_messages.push_back(LogMessage {
@@ -136,16 +147,19 @@ fn log(progress: &Arc<Mutex<RipProgress>>, level: LogLevel, message: impl Into<S
     }
 }
 
+#[cfg(feature = "cd-audio")]
 fn set_operation(progress: &Arc<Mutex<RipProgress>>, op: impl Into<String>) {
     if let Ok(mut p) = progress.lock() {
         p.operation = op.into();
     }
 }
 
+#[cfg(feature = "cd-audio")]
 fn is_cancelled(progress: &Arc<Mutex<RipProgress>>) -> bool {
     progress.lock().map(|p| p.cancel_requested).unwrap_or(false)
 }
 
+#[cfg(feature = "cd-audio")]
 fn set_progress(progress: &Arc<Mutex<RipProgress>>, current_bytes: u64, current_sector: u64) {
     if let Ok(mut p) = progress.lock() {
         p.current_bytes = current_bytes;
@@ -153,6 +167,7 @@ fn set_progress(progress: &Arc<Mutex<RipProgress>>, current_bytes: u64, current_
     }
 }
 
+#[cfg(feature = "cd-audio")]
 /// Main rip orchestrator. Runs on a background thread.
 pub fn run_rip(config: RipConfig, progress: Arc<Mutex<RipProgress>>) -> Result<()> {
     set_operation(&progress, "Opening drive...");
@@ -197,6 +212,7 @@ pub fn run_rip(config: RipConfig, progress: Arc<Mutex<RipProgress>>) -> Result<(
     Ok(())
 }
 
+#[cfg(feature = "cd-audio")]
 /// Open a locally-attached drive, picking the reader the medium actually needs.
 ///
 /// `cd-da-reader` speaks MMC/SCSI pass-through, which is the only way to read a
@@ -235,6 +251,7 @@ fn open_local_source(path: &str) -> Result<Box<dyn OpticalSource>> {
     Ok(Box::new(source))
 }
 
+#[cfg(feature = "cd-audio")]
 /// Build the [`OpticalSource`] for this rip — a local drive or a network proxy
 /// to a remote daemon's drive (see `docs/remote_ripping.md`).
 fn open_optical_source(config: &RipConfig) -> Result<Box<dyn OpticalSource>> {
@@ -251,9 +268,11 @@ fn open_optical_source(config: &RipConfig) -> Result<Box<dyn OpticalSource>> {
     }
 }
 
+#[cfg(feature = "cd-audio")]
 /// Sectors to read per chunk for READ CD commands.
 const SECTORS_PER_CHUNK: u32 = 128;
 
+#[cfg(feature = "cd-audio")]
 fn rip_iso(
     config: &RipConfig,
     source: &dyn OpticalSource,
@@ -345,6 +364,7 @@ fn rip_iso(
     Ok(())
 }
 
+#[cfg(feature = "cd-audio")]
 fn rip_bin_cue(
     config: &RipConfig,
     source: &dyn OpticalSource,
@@ -464,6 +484,7 @@ fn rip_bin_cue(
     Ok(())
 }
 
+#[cfg(feature = "cd-audio")]
 /// Generate a CUE sheet from the TOC.
 fn generate_cue_sheet(bin_filename: &str, toc: &cd_da_reader::Toc) -> String {
     let first_track_lba = toc.tracks.first().map(|t| t.start_lba).unwrap_or(0);
@@ -488,6 +509,7 @@ fn generate_cue_sheet(bin_filename: &str, toc: &cd_da_reader::Toc) -> String {
     lines.join("\n")
 }
 
+#[cfg(feature = "cd-audio")]
 /// Convert an LBA offset to MSF (minute:second:frame) for CUE sheets.
 /// Note: CUE MSF does NOT use the 150-frame pregap offset that Red Book uses.
 fn lba_to_msf(lba: u32) -> (u8, u8, u8) {
@@ -497,9 +519,20 @@ fn lba_to_msf(lba: u32) -> (u8, u8, u8) {
     (minutes, seconds, frames)
 }
 
+/// Without `cd-audio` this build reads no drives, so a rip fails at once with the reason.
+#[cfg(not(feature = "cd-audio"))]
+pub fn run_rip(_config: RipConfig, progress: Arc<Mutex<RipProgress>>) -> Result<()> {
+    let why = "reading CD/DVD drives is not available in this build";
+    if let Ok(mut p) = progress.lock() {
+        p.error = Some(why.to_string());
+        p.finished = true;
+    }
+    anyhow::bail!(why)
+}
+
 crate::model::worker::finished_with_error!(RipProgress);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cd-audio"))]
 mod tests {
     use super::*;
 

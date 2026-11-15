@@ -399,7 +399,10 @@ impl OpticalScreen {
 
     /// A track's position moves with no job to wake the shell, so a playing track keeps ticking.
     pub fn playing(&self) -> bool {
-        self.ctrl.borrow().audio().now_playing().is_some()
+        #[cfg(feature = "audio")]
+        return self.ctrl.borrow().audio().now_playing().is_some();
+        #[cfg(not(feature = "audio"))]
+        false
     }
 
     /// A control's action by its controller id: the menu bar's, and CHD Info's Close.
@@ -549,6 +552,12 @@ impl OpticalScreen {
         w.show(&shown);
     }
 
+    #[cfg(not(feature = "audio"))]
+    fn read_audio(&self) -> Option<AudioShown> {
+        None
+    }
+
+    #[cfg(feature = "audio")]
     fn read_audio(&self) -> Option<AudioShown> {
         let ctrl = self.ctrl.borrow();
         let player = ctrl.audio();
@@ -676,12 +685,21 @@ impl OpticalScreen {
         f.enable(K::BrowseContents, !ctrl.is_browsing());
         f.show(K::ChdInfo, has_disc && ctrl.is_chd_image());
         f.enable(K::ChdInfo, ctrl.can_chd_info() && !ctrl.chd_info_running());
-        let player = ctrl.audio();
-        let tracks = player.audio_tracks().count();
-        f.show(K::Audio, has_disc && player.has_audio());
-        f.set_title(K::Audio, &format!("Audio Tracks ({tracks})"));
-        let now = player.readout().map(|r| r.line);
-        f.line(K::NowPlaying, now.as_deref(), None);
+        #[cfg(feature = "audio")]
+        {
+            let player = ctrl.audio();
+            let tracks = player.audio_tracks().count();
+            f.show(K::Audio, has_disc && player.has_audio());
+            f.set_title(K::Audio, &format!("Audio Tracks ({tracks})"));
+            let now = player.readout().map(|r| r.line);
+            f.line(K::NowPlaying, now.as_deref(), None);
+        }
+        // No CD-audio player in this build (the 10.7 app): no Audio Tracks button.
+        #[cfg(not(feature = "audio"))]
+        {
+            f.show(K::Audio, false);
+            f.line(K::NowPlaying, None, None);
+        }
 
         let rip = ctrl.task() == Task::Rip;
         f.set_text(K::Task, ctrl.task_label());
@@ -768,7 +786,7 @@ impl OpticalScreen {
         let pop = |k: K, w: Size| Node::leaf(k, w, Size::Fixed(layout::ROW + 2));
         let stretch = |k: K| Node::leaf(k, Size::Stretch(1), row_h);
         let lines = |k: K| {
-            let n = f.text(k).lines().count().max(1) as i32;
+            let n = f.wrapped_lines(k).max(1);
             Node::leaf(k, Size::Stretch(1), Size::Fixed((layout::ROW - 6) * n + 4))
         };
         let shown = |k: K| f.shown(k);

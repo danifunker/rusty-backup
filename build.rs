@@ -70,6 +70,8 @@ fn main() {
         }
     }
 
+    lion_compat();
+
     // NOTE: The GUI no longer embeds a `requireAdministrator` manifest. It used
     // to (release-only, GUI binary only), which forced a UAC prompt at *launch*
     // for every run and — more importantly — made the per-user installer's
@@ -83,4 +85,42 @@ fn main() {
     // elevation()` (whole-process UAC relaunch) only when the user actually
     // wants raw physical-disk access. File-only flows never elevate. See
     // docs/windows_self_update.md (elevation phase).
+}
+
+// The vintage 10.7 build links rb-cli-vintage/lion_compat.cpp: what libc++ and libSystem on Lion lack.
+fn lion_compat() {
+    let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let src = std::path::Path::new(&dir).join("lion_compat.cpp");
+    println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    let min = std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_default();
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if !src.exists() || target != "x86_64-apple-darwin" || !min.starts_with("10.") {
+        return;
+    }
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let obj = out.join("lion_compat.o");
+    let run = |cmd: &mut std::process::Command| {
+        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+        assert!(ok, "lion_compat: {:?} failed", cmd);
+    };
+    run(std::process::Command::new("clang++")
+        .args([
+            "-arch",
+            "x86_64",
+            "-O2",
+            "-std=c++17",
+            "-D_LIBCPP_DISABLE_AVAILABILITY",
+            "-c",
+        ])
+        .arg(format!("-mmacosx-version-min={}", min))
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj));
+    run(std::process::Command::new("ar")
+        .arg("crs")
+        .arg(out.join("liblion_compat.a"))
+        .arg(&obj));
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=lion_compat");
 }

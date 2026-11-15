@@ -790,7 +790,7 @@ fn handle_conn(
     // Optical tier: at most one drive session per connection (and, via a
     // process-global guard inside `optical_server`, one per daemon — cd-da-reader
     // keeps a global drive handle).
-    #[cfg(feature = "optical")]
+    #[cfg(feature = "cd-audio")]
     let mut optical = optical_server::OpticalState::default();
 
     // The opening frame disambiguates a JSON-free Family-B client (cb-dos —
@@ -851,9 +851,9 @@ fn handle_conn(
                     )?;
                     return Ok(());
                 }
-                #[cfg(feature = "optical")]
+                #[cfg(feature = "cd-audio")]
                 let capabilities = CAP_FAMILY_F | crate::remote::protocol::CAP_FAMILY_O;
-                #[cfg(not(feature = "optical"))]
+                #[cfg(not(feature = "cd-audio"))]
                 let capabilities = CAP_FAMILY_F;
                 write_control(
                     &mut writer,
@@ -1345,18 +1345,18 @@ fn handle_conn(
 
             // --- optical tier (Family O): proxy a physical CD/DVD drive ---
             Request::ListOpticalDrives => {
-                #[cfg(feature = "optical")]
+                #[cfg(feature = "cd-audio")]
                 optical.list_drives(&mut writer)?;
-                #[cfg(not(feature = "optical"))]
+                #[cfg(not(feature = "cd-audio"))]
                 reply_err(
                     &mut writer,
                     "daemon built without the optical feature".to_string(),
                 )?;
             }
             Request::OpenOptical { path, retry } => {
-                #[cfg(feature = "optical")]
+                #[cfg(feature = "cd-audio")]
                 optical.open(&path, &retry, &mut next_handle, &mut writer)?;
-                #[cfg(not(feature = "optical"))]
+                #[cfg(not(feature = "cd-audio"))]
                 {
                     let _ = (&path, &retry);
                     reply_err(
@@ -1366,9 +1366,9 @@ fn handle_conn(
                 }
             }
             Request::ReadToc { handle } => {
-                #[cfg(feature = "optical")]
+                #[cfg(feature = "cd-audio")]
                 optical.read_toc(handle, &mut writer)?;
-                #[cfg(not(feature = "optical"))]
+                #[cfg(not(feature = "cd-audio"))]
                 {
                     let _ = handle;
                     reply_err(
@@ -1383,9 +1383,9 @@ fn handle_conn(
                 count,
                 mode,
             } => {
-                #[cfg(feature = "optical")]
+                #[cfg(feature = "cd-audio")]
                 optical.read_sectors(handle, lba, count, mode, &mut writer)?;
-                #[cfg(not(feature = "optical"))]
+                #[cfg(not(feature = "cd-audio"))]
                 {
                     let _ = (handle, lba, count, mode);
                     reply_err(
@@ -1395,9 +1395,9 @@ fn handle_conn(
                 }
             }
             Request::EjectOptical { handle } => {
-                #[cfg(feature = "optical")]
+                #[cfg(feature = "cd-audio")]
                 optical.eject(handle, &mut writer)?;
-                #[cfg(not(feature = "optical"))]
+                #[cfg(not(feature = "cd-audio"))]
                 {
                     let _ = handle;
                     reply_err(
@@ -1407,9 +1407,9 @@ fn handle_conn(
                 }
             }
             Request::CloseOptical { handle } => {
-                #[cfg(feature = "optical")]
+                #[cfg(feature = "cd-audio")]
                 optical.close(handle, &mut writer)?;
-                #[cfg(not(feature = "optical"))]
+                #[cfg(not(feature = "cd-audio"))]
                 {
                     let _ = handle;
                     reply_err(
@@ -1434,7 +1434,7 @@ fn reply_err<W: std::io::Write>(writer: &mut W, message: String) -> Result<()> {
 /// on the daemon so a desktop client rips a remote drive while the daemon only
 /// issues SCSI reads — all encoding stays on the desktop. See
 /// `docs/remote_ripping.md`.
-#[cfg(feature = "optical")]
+#[cfg(feature = "cd-audio")]
 mod optical_server {
     use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1887,6 +1887,7 @@ const MAX_RANGE_READ: u32 = 4 * 1024 * 1024;
 
 /// Most sectors one `ReadOpticalSectors` may ask for: the daemon reads them
 /// into memory before streaming, and a client batches far below this.
+#[cfg(feature = "cd-audio")]
 const MAX_OPTICAL_SECTORS: u32 = 16 * 1024;
 
 /// Largest single `WriteBlock` payload we honour. The block writer splits big

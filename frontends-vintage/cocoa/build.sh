@@ -12,13 +12,20 @@ ARCH="${2:-x86_64}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HERE="$ROOT/frontends-vintage/cocoa"
 OUT="$HERE/build/$ARCH"
-FEATURES="native-zstd,remote,rust173-polyfill,yaml,tui"
+FEATURES="native-zstd,remote,rust173-polyfill,yaml,tui,chd,optical"
+# MAME's chdman from source for this deployment target (no prebuilt targets 10.7), without the
+# AVX2 FLAC flags that crash pre-Haswell Macs such as a Core 2 Duo.
+export LIBCHDMAN_FORCE_SOURCE=1 LIBCHDMAN_CPU=portable
 case "$ARCH" in
     x86_64) TARGET=x86_64-apple-darwin; MIN=10.7 ;;
     arm64) TARGET=aarch64-apple-darwin; MIN=11.0 ;;
     *) echo "unknown arch $ARCH" >&2; exit 2 ;;
 esac
 export MACOSX_DEPLOYMENT_TARGET=$MIN
+# cc 1.3 gives C++ the SDK's version, not MACOSX_DEPLOYMENT_TARGET; CXXFLAGS come last, so pin it.
+# MAME's (unused) directory-entry deleter names a 10.13 operator; check-lion-imports.sh then
+# proves the linked app imports nothing from libc++ that the oldest supported macOS lacks.
+export CXXFLAGS="-mmacosx-version-min=$MIN -D_LIBCPP_DISABLE_AVAILABILITY -faligned-allocation"
 
 # A Homebrew rustc on PATH shadows rustup's; pin both halves of the 1.73 toolchain (CI has no shadow).
 TC="$HOME/.rustup/toolchains/1.73.0-$(uname -m | sed 's/arm64/aarch64/')-apple-darwin"
@@ -45,7 +52,7 @@ for m in main host; do clang $CFLAGS -c "$HERE/host/$m.m" -o "$OUT/obj/$m.o"; do
 clang -arch $ARCH -mmacosx-version-min=$MIN -o "$APP/Contents/MacOS/Rusty Backup" \
     "$OUT/obj/main.o" "$OUT/obj/host.o" "$LIB" \
     -framework Cocoa -framework IOKit -framework DiskArbitration -framework CoreFoundation \
-    -framework Security -liconv -Wl,-dead_strip
+    -framework Security -liconv -lc++ -Wl,-dead_strip
 
 # The version the engine bakes in (build.rs): RELEASE_VERSION in CI, else the vintage manifest's.
 VERSION="${RELEASE_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/rb-cli-vintage/Cargo.toml" | head -1)}"
@@ -60,4 +67,5 @@ done
 codesign -s - --force "$APP" 2>/dev/null || true
 
 otool -l "$APP/Contents/MacOS/Rusty Backup" | grep -A3 -E 'LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION' | grep -E 'version|minos' | head -2
+[ "$ARCH" = x86_64 ] && "$HERE/check-lion-imports.sh" "$APP/Contents/MacOS/Rusty Backup"
 echo "Built $APP ($VERSION)"

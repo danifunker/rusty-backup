@@ -515,7 +515,7 @@ pub struct WireOpticalDrive {
     pub has_audio_cd: bool,
 }
 
-#[cfg(feature = "optical")]
+#[cfg(feature = "cd-audio")]
 mod optical_conv {
     use super::{WireOpticalDrive, WireRetryConfig, WireSectorMode, WireToc, WireTrack};
 

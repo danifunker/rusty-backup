@@ -423,6 +423,37 @@ static void adopt(uint32_t s, uint32_t c, NSView *v, BOOL acts)
     [x->views setObject:v forKey:key(c)];
 }
 
+// Keep a window frame inside its screen's usable area: an iBook's 1024x768 is narrower than the main window.
+static NSRect fit_on_screen(NSWindow *w, NSRect f)
+{
+    NSScreen *scr = [w screen] != nil ? [w screen] : [NSScreen mainScreen];
+    NSRect v = [scr visibleFrame];
+    // RUSTY_BACKUP_SCREEN=800x600 lays the app out as on that screen (less the menu bar), for testing.
+    const char *as = getenv("RUSTY_BACKUP_SCREEN");
+    int sw = 0, sh = 0;
+    if (as != NULL && sscanf(as, "%dx%d", &sw, &sh) == 2 && sw > 0 && sh > 22) {
+        if (sw < v.size.width)
+            v.size.width = sw;
+        if (sh - 22 < v.size.height) {
+            v.origin.y += v.size.height - (sh - 22);
+            v.size.height = sh - 22;
+        }
+    }
+    if (f.size.width > v.size.width)
+        f.size.width = v.size.width;
+    if (f.size.height > v.size.height)
+        f.size.height = v.size.height;
+    if (NSMaxX(f) > NSMaxX(v))
+        f.origin.x = NSMaxX(v) - f.size.width;
+    if (f.origin.x < v.origin.x)
+        f.origin.x = v.origin.x;
+    if (NSMaxY(f) > NSMaxY(v))
+        f.origin.y = NSMaxY(v) - f.size.height;
+    if (f.origin.y < v.origin.y)
+        f.origin.y = v.origin.y;
+    return f;
+}
+
 uint32_t rb_host_window(const char *title, int32_t w, int32_t h)
 {
     poster();
@@ -449,6 +480,7 @@ uint32_t rb_host_window(const char *title, int32_t w, int32_t h)
     x->delegate = [[RBWindowDelegate alloc] initWithSurface:s];
     [x->window setDelegate:(id)x->delegate];
     [x->window center];
+    [x->window setFrame:fit_on_screen(x->window, [x->window frame]) display:NO];
     [rb_surfaces addObject:x];
     return s;
 }
@@ -456,6 +488,8 @@ uint32_t rb_host_window(const char *title, int32_t w, int32_t h)
 void rb_host_window_show(uint32_t s)
 {
     NSWindow *w = surf(s)->window;
+    // Adding a toolbar grows the window by its height, so fit it again now.
+    [w setFrame:fit_on_screen(w, [w frame]) display:NO];
     [w makeKeyAndOrderFront:nil];
     [w makeFirstResponder:nil];
     [NSApp activateIgnoringOtherApps:YES];
@@ -1620,7 +1654,8 @@ int rb_host_window_frame(uint32_t s, double *out)
 
 void rb_host_set_window_frame(uint32_t s, double x, double y, double w, double h)
 {
-    [surf(s)->window setFrame:NSMakeRect(x, y, w, h) display:YES];
+    NSWindow *win = surf(s)->window;
+    [win setFrame:fit_on_screen(win, NSMakeRect(x, y, w, h)) display:YES];
 }
 
 // Several files, joined by newlines; empty when cancelled.
@@ -1679,6 +1714,7 @@ void rb_host_resize_window(uint32_t s, int32_t w, int32_t h)
     NSWindow *win = surf(s)->window;
     [win setContentSize:NSMakeSize(w, h)];
     [win center];
+    [win setFrame:fit_on_screen(win, [win frame]) display:YES];
 }
 
 // A surface on `body`, with no window of its own: a page or a pane.
@@ -1698,7 +1734,9 @@ static uint32_t new_surface(NSView *body)
 
 void rb_host_set_min_size(uint32_t s, int32_t w, int32_t h)
 {
-    [surf(s)->window setContentMinSize:NSMakeSize(w, h)];
+    NSWindow *win = surf(s)->window;
+    NSRect most = [win contentRectForFrameRect:fit_on_screen(win, [win frameRectForContentRect:NSMakeRect(0, 0, w, h)])];
+    [win setContentMinSize:most.size];
 }
 
 uint32_t rb_host_page(uint32_t s, uint32_t c)

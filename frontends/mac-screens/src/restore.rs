@@ -1046,7 +1046,7 @@ impl RestoreScreen {
         let pop = |k: K, w: Size| Node::leaf(k, w, Size::Fixed(layout::ROW + 2));
         let stretch = |k: K| Node::leaf(k, Size::Stretch(1), row_h);
         let lines = |k: K| {
-            let n = self.form.text(k).lines().count().max(1) as i32;
+            let n = self.form.wrapped_lines(k).max(1);
             Node::leaf(k, Size::Stretch(1), Size::Fixed((layout::ROW - 6) * n + 4))
         };
         let mut col = vec![

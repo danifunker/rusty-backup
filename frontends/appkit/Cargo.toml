@@ -14,16 +14,18 @@ path = "src/main.rs"
 
 [dependencies]
 rusty-backup = { path = "../..", default-features = false, features = [
-    "chd", "optical", "native-zlib", "native-zstd", "seekable-zstd",
+    "chd", "optical", "cd-audio", "native-zlib", "native-zstd", "seekable-zstd",
     "remote", "tui-update", "crypto", "yaml", "audio",
 ] }
 
 # The shared Mac screens (frontends/mac-screens) gate on these, as mounted code sees this crate's
 # features; the engine features behind them are always on in this shell.
 [features]
-default = ["chd", "optical", "update"]
+default = ["chd", "optical", "audio", "update"]
 chd = []
 optical = []
+# The Optical screen's CD-audio player (the engine's `audio`); the 10.7 app has no player.
+audio = []
 update = []
 
 [target.'cfg(target_os = "macos")'.dependencies]

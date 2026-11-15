@@ -2655,12 +2655,18 @@ jobs:
           path: rb-cli-vintage/target
           key: ${{ runner.os }}-vintage173-macos-build-${{ hashFiles('rb-cli-vintage/Cargo.lock') }}
 
-      - name: Build rb-cli (10.7 floor, CLI + TUI, slim)
+      - name: Build rb-cli (10.7 floor, CLI + TUI, CHD + optical images)
         env:
           # Stamps the binary's minimum-OS load command to 10.7; without it the
           # linker uses the runner's modern SDK version and the binary won't load
           # on Lion. (1.73's x86_64 std is already compiled for the 10.7 floor.)
           MACOSX_DEPLOYMENT_TARGET: "10.7"
+          # chdman from source (no prebuilt targets 10.7) without the AVX2 FLAC
+          # flags that crash a Core 2; cc 1.3 hands C++ the SDK's version, so
+          # CXXFLAGS pins 10.7 (same as frontends-vintage/cocoa/build.sh).
+          LIBCHDMAN_FORCE_SOURCE: "1"
+          LIBCHDMAN_CPU: portable
+          CXXFLAGS: -mmacosx-version-min=10.7 -D_LIBCPP_DISABLE_AVAILABILITY -faligned-allocation
         run: |
           # `--locked` uses the committed rb-cli-vintage/Cargo.lock (a frozen,
           # 1.73-resolvable dep set). `--ignore-rust-version` lets conservatively-
@@ -2668,7 +2674,7 @@ jobs:
           cargo +1.73.0 build --release --bin rb-cli \
             --manifest-path rb-cli-vintage/Cargo.toml \
             --target x86_64-apple-darwin \
-            --no-default-features --features native-zstd,remote,tui,rust173-polyfill,yaml \
+            --no-default-features --features native-zstd,remote,tui,rust173-polyfill,yaml,chd,optical \
             --ignore-rust-version --locked
 
       - name: Verify 10.7 floor + no post-10.7 symbols
@@ -2692,6 +2698,8 @@ jobs:
             nm -u "$BIN" | grep -E "clock_gettime|os_unfair_lock|__ulock|kIOMainPortDefault"
             exit 1
           fi
+          # Every libSystem / libc++ / libobjc import against Lion's own export list.
+          frontends-vintage/cocoa/check-lion-imports.sh "$BIN"
 
       - name: Ad-hoc sign (no notarization — Gatekeeper doesn't exist pre-10.14)
         run: |
