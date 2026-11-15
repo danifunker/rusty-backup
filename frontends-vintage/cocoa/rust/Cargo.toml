@@ -24,6 +24,9 @@ yaml = ["rb-cli-vintage/yaml"]
 # The settings and recent-files controllers are gated on it (as for any shell); TUI code is stripped.
 tui = ["rb-cli-vintage/tui"]
 os-stub = ["rb-cli-vintage/os-stub"]
+# CHD and optical disc images; the shared screens' own `chd` / `optical` gates key off these.
+chd = ["rb-cli-vintage/chd"]
+optical = ["rb-cli-vintage/optical"]
 
 [dependencies]
 rb-cli-vintage = { path = "../../../rb-cli-vintage", default-features = false }
