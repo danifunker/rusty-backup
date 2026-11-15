@@ -79,6 +79,8 @@ BR2_PACKAGE_DOSFSTOOLS=y
 BR2_PACKAGE_E2FSPROGS=y
 BR2_PACKAGE_UTIL_LINUX=y
 BR2_PACKAGE_UTIL_LINUX_BINARIES=y
+# The defconfig's 60M ext2 rootfs no longer holds rb-cli (i686 overflowed); the ISO uses the cpio.
+BR2_TARGET_ROOTFS_EXT2_SIZE="128M"
 # Bootable image: a hybrid ISO9660 (isolinux) — one file boots from a CD-ROM
 # *and* from a USB stick / CF card (dd it to the device). Covers both the CD and
 # the .img deployables with a single artifact. Our isolinux.cfg adds a serial
