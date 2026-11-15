@@ -98,7 +98,9 @@ Objective-C shell builds each screen itself). Less change to the AppKit shell, b
   archive's folder on the G5 is added to `PPC_LDFLAGS`, which reach its gcc unchanged. gcc 10's
   driver does the link.
 - `bundle`: the .app (10.4 floor in Info.plist) and its HFS+ DMG are made on the G5, into
-  `dist/Rusty-Backup-Cocoa-macos-ppc-<cpu>-<version>.dmg`.
+  `dist/Rusty-Backup-Cocoa-macos-ppc-<cpu>-<version>.dmg`. `scripts/ppc-package.sh` (`RB_APP`)
+  copies the MacPorts gcc10 runtime and the 10.4-built legacy-support into `Contents/Frameworks`,
+  so the app needs no MacPorts, and checks the CPU floor and the Tiger imports as for rb-cli.
 
 Tiger needs `panic=abort` (no `_Unwind_GetIPInfo` in `libgcc_s.10.4`). No CI: built and packaged
 on the G5 like `rb-cli-ppc`.

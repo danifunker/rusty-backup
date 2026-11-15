@@ -15,9 +15,9 @@ MRUSTC_DIR="${MRUSTC_DIR:-$HOME/repos/mrustc}"
 PPC_HOST="${PPC_HOST:?set PPC_HOST, e.g. admin@g5.local}"
 PPC_CPU="${PPC_CPU:-750}"
 case "$PPC_CPU" in
-  g3|G3|750) CPU_FLAGS="-mcpu=750"; LABEL=g3 ;;
-  g4|G4|7400|7450) CPU_FLAGS="-mcpu=7400"; LABEL=g4 ;;
-  g5|G5|970) CPU_FLAGS="-mcpu=970"; LABEL=g5 ;;
+  g3|G3|750) CPU_FLAGS="-mcpu=750"; PKG_FLAGS="-mcpu=750 -mno-altivec"; LABEL=g3 ;;
+  g4|G4|7400|7450) CPU_FLAGS="-mcpu=7400"; PKG_FLAGS="-mcpu=7400 -maltivec"; LABEL=g4 ;;
+  g5|G5|970) CPU_FLAGS="-mcpu=970"; PKG_FLAGS="-mcpu=970 -maltivec"; LABEL=g5 ;;
   *) echo "unknown PPC_CPU $PPC_CPU" >&2; exit 2 ;;
 esac
 SDK="${PPC_SDK:-/Developer/SDKs/MacOSX10.4u.sdk}"
@@ -70,6 +70,10 @@ stage_bundle() {
   ( cd "$RB_DIR/assets/icons" && tar cf - icon.icns toolbar/png/*-48.png \
       rows/png/{file,file-plus,file-minus,folder,folder-plus,folder-minus,folder-open}-32.png ) |
     ssh "$PPC_HOST" "cd '$app/Contents/Resources' && tar xf - && mv toolbar/png/* rows/png/* . && rm -rf toolbar rows"
+  # MacPorts' gcc10 runtime and legacy-support ride in Contents/Frameworks, as rb-cli's lib/ does.
+  note "bundling the app's dylibs (scripts/ppc-package.sh)"
+  ssh "$PPC_HOST" "RB_APP=\$HOME/'$app' RB_CPU=$PPC_CPU RB_CPU_FLAGS='$PKG_FLAGS' RB_CPU_LABEL=$LABEL bash -s" \
+    < "$RB_DIR/scripts/ppc-package.sh" || { echo "packaging the app failed" >&2; exit 1; }
   ssh "$PPC_HOST" "cd $REMOTE && rm -rf dmgroot '$dmg' && mkdir dmgroot && cp -R 'Rusty Backup.app' dmgroot/ && \
       hdiutil create -quiet -fs HFS+ -volname 'Rusty Backup' -srcfolder dmgroot -format UDZO '$dmg' && rm -rf dmgroot"
   mkdir -p "$RB_DIR/dist"
