@@ -743,6 +743,15 @@ void rb_host_move(uint32_t s, uint32_t c, int32_t x, int32_t y, int32_t w, int32
 {
     NSView *v = view(s, c);
     NSRect r = NSMakeRect(x, y, w > 0 ? w : 0, h > 0 ? h : 0);
+    // A push button's bezel (and its shadow) is taller than a layout row: centre it there, unclipped.
+    if ([v isKindOfClass:[NSButton class]] && ![v isKindOfClass:[NSPopUpButton class]]
+        && [(NSButton *)v bezelStyle] == NSRoundedBezelStyle) {
+        double natural = [[(NSButton *)v cell] cellSize].height;
+        if (natural > r.size.height) {
+            r.origin.y -= floor((natural - r.size.height) / 2);
+            r.size.height = natural;
+        }
+    }
     if (!NSEqualRects([v frame], r))
         [v setFrame:r];
 }

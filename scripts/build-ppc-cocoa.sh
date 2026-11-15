@@ -5,7 +5,7 @@
 # (mrustc here, C on the Mac), which links that archive. The bundle is put together and
 # packed into a DMG on the Mac, since hdiutil there writes an image 10.4 can open.
 #
-#   PPC_HOST=admin@g5 scripts/build-ppc-cocoa.sh [host|app|bundle|all]
+#   PPC_HOST=admin@g5 scripts/build-ppc-cocoa.sh [host|app|relink|bundle|all]
 #       -> dist/Rusty-Backup-Cocoa-macos-ppc-<cpu>-<version>.dmg
 set -euo pipefail
 
@@ -49,6 +49,13 @@ stage_app() {
   [ -e "$PPC_OUT/rusty-backup-cocoa" ] || { echo "no $PPC_OUT/rusty-backup-cocoa" >&2; exit 1; }
 }
 
+# After a host-only change: rebuild the archive and re-link the app; the engine stays as built.
+stage_relink() {
+  stage_host
+  rm -f "$PPC_OUT/rusty-backup-cocoa"
+  stage_app
+}
+
 # The bundle and its DMG, made on the Mac.
 stage_bundle() {
   local app="$REMOTE/Rusty Backup.app" dmg="Rusty-Backup-Cocoa-macos-ppc-$LABEL-$VERSION.dmg"
@@ -73,7 +80,8 @@ stage_bundle() {
 case "${1:-all}" in
   host) stage_host ;;
   app) stage_app ;;
+  relink) stage_relink ;;
   bundle) stage_bundle ;;
   all) stage_host; stage_app; stage_bundle ;;
-  *) echo "usage: $0 [host|app|bundle|all]" >&2; exit 2 ;;
+  *) echo "usage: $0 [host|app|relink|bundle|all]" >&2; exit 2 ;;
 esac
