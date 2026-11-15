@@ -1,0 +1,7 @@
+# The mrustc the Mac OS X PowerPC build uses: the fork, one exact commit.
+# scripts/build-ppc.sh refuses to build from any other (MRUSTC_UNPINNED=1 to experiment), and
+# `scripts/build-ppc.sh mrustc-sync` checks this commit out. To move the pin, push the new
+# commit to the fork first, then change MRUSTC_COMMIT here in the same change that needs it.
+MRUSTC_REPO=https://github.com/danifunker/mrustc.git
+MRUSTC_BRANCH=ppc-build-2026-09
+MRUSTC_COMMIT=cb15d3fb870d89c41565dfca8244acca33a38a35

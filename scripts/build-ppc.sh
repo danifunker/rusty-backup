@@ -189,6 +189,9 @@ ppc_reap_orphans() {
   note "reaped $killed orphaned remote compile(s) on $PPC_HOST ($remaining still up)"
 }
 
+# The mrustc this build uses is pinned (scripts/mrustc.pin); see scripts/mrustc-pin.sh.
+. "$RB_DIR/scripts/mrustc-pin.sh"
+
 # ---- rustc source patch marker ----------------------------------------------
 # A branch switch refreshes the patch's mtime without changing it; refresh dl-version so minicargo.mk won't re-apply it.
 sync_rustc_src_patch() {
@@ -223,18 +226,15 @@ stage_mrustc() {
   [ -d "$MRUSTC_DIR" ] || die "mrustc not found at $MRUSTC_DIR (set MRUSTC_DIR)"
   cd "$MRUSTC_DIR"
 
-  # These two patches are REQUIRED to parse rusty-backup's manifest set. They
-  # live on branch 'rb-cli-vintage-build' in the fork. Fail loudly if missing.
-  grep -q "skip_composite_value" tools/common/toml.cpp \
-    || die "mrustc missing the TOML-parser patch (nested arrays / escapes). Check out the rb-cli-vintage-build branch."
-  grep -q 's == "rlib" || s == "lib"' tools/minicargo/manifest.cpp \
-    || die "mrustc missing the crate-type=\"lib\" patch. Check out the rb-cli-vintage-build branch."
+  [ "${MRUSTC_UNPINNED:-0}" = 1 ] || [ "$(mrustc_head)" = "$MRUSTC_COMMIT" ] \
+    || die "mrustc is not at the pinned commit; run 'scripts/build-ppc.sh mrustc-sync' first"
 
   make -C tools/common          # common_lib.a (shared TOML parser)
   make -C tools/minicargo/      # bin/minicargo
   make                          # bin/mrustc
   [ -x bin/mrustc ] && [ -x bin/minicargo ] || die "mrustc/minicargo did not build"
-  note "mrustc + minicargo built."
+  mrustc_head > "$MRUSTC_BUILT_STAMP"
+  note "mrustc + minicargo built from $(cut -c1-10 "$MRUSTC_BUILT_STAMP")."
 }
 
 # ---- stage 2: macOS build-script overrides for this rustc version -----------
@@ -570,6 +570,11 @@ stage_probe() {
 main() {
   local stage="${1:-all}"
   case "$stage" in
+    mrustc-sync|mrustc|label|all) ;;
+    *) mrustc_pin_check ;;
+  esac
+  case "$stage" in
+    mrustc-sync) mrustc_pin_sync ;;
     mrustc)    stage_mrustc ;;
     overrides) stage_overrides ;;
     hostlibs)  stage_hostlibs ;;
@@ -591,7 +596,7 @@ main() {
       stage_host
       banner "HOST path complete. Run 'ppclibs', 'ppc' then 'dist' for PowerPC (needs PPC_HOST)."
       ;;
-    *) die "unknown stage '$stage' (mrustc|overrides|hostlibs|vendor|hostc|host|ppclibs|ppc|probe|dist|seed|retime|label|all)" ;;
+    *) die "unknown stage '$stage' (mrustc-sync|mrustc|overrides|hostlibs|vendor|hostc|host|ppclibs|ppc|probe|dist|seed|retime|label|all)" ;;
   esac
 }
 main "$@"
