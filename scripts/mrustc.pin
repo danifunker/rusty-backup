@@ -4,4 +4,4 @@
 # commit to the fork first, then change MRUSTC_COMMIT here in the same change that needs it.
 MRUSTC_REPO=https://github.com/danifunker/mrustc.git
 MRUSTC_BRANCH=ppc-build-2026-09
-MRUSTC_COMMIT=cb15d3fb870d89c41565dfca8244acca33a38a35
+MRUSTC_COMMIT=52d41fe9c0a298d921676f8d7960ed9706d38aa2
