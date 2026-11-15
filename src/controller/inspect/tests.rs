@@ -436,3 +436,25 @@ fn every_qnx2_partition_of_an_icon_disk_offers_browse() {
         assert!(ctl.row_actions(&part).browse, "type {byte:#04x}");
     }
 }
+
+#[test]
+fn a_gpt_basic_data_fat_partition_offers_browse() {
+    // hdiutil's GPTSPUD + MS-DOS layout: one FAT32 "Microsoft Basic Data" partition.
+    let ctl = controller();
+    let part = crate::partition::PartitionInfo {
+        index: 0,
+        type_name: "Microsoft Basic Data (disk image)".to_string(),
+        partition_type_byte: 0,
+        start_lba: 2048,
+        start_byte: None,
+        size_bytes: 38 << 20,
+        bootable: false,
+        is_logical: false,
+        is_extended_container: false,
+        partition_type_string: Some("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7".to_string()),
+        hfs_block_size: None,
+        rdb_part_block: None,
+        drv_name: None,
+    };
+    assert!(ctl.row_actions(&part).browse);
+}

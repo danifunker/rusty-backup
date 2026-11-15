@@ -3175,6 +3175,12 @@ pub fn is_browsable_type(ptype: u8) -> bool {
             // Minix; `open_filesystem` has handled both bytes since the driver landed.
             | 0x80
             | 0x81
+            // Windows RE (NTFS) and an EFI System Partition (FAT) on an MBR disk.
+            | 0x27
+            | 0xEF
+            // QNX 4 and QNX 6 Power-Safe: `open_filesystem` finds them by superblock.
+            | 0x4D..=0x4F
+            | 0xB1..=0xB4
     )
 }
 
@@ -3203,6 +3209,20 @@ pub fn is_browsable_type_string(type_str: Option<&str>) -> bool {
             | "Apple_Rhapsody_UFS"
             | "Apple_PRODOS"
             | "Apple_ProDOS"
+            // Mac OS X boot helpers (HFS+), yaboot's bootstrap (HFS), and UFS / MFS volumes.
+            | "Apple_Boot"
+            | "Apple_Bootstrap"
+            | "Apple_UFS"
+            | "Apple_MFS"
+            // GPT Basic Data (FAT / exFAT / NTFS), EFI System (FAT) and Windows Recovery (NTFS).
+            | "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"
+            | "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
+            | "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC"
+            // GPT Linux Home, Apple UFS, FreeBSD Data (UFS) and Apple Boot ("Recovery HD", HFS+).
+            | "933AC7E1-2EB4-4F13-B844-0E14E2AEF915"
+            | "55465300-0000-11AA-AA11-00306543ECAC"
+            | "516E7CB4-6ECF-11D6-8FF8-00022D09712B"
+            | "426F6F74-0000-11AA-AA11-00306543ECAC"
             // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
             | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
             // GPT "Apple HFS/HFS+" GUID — HFS or HFS+ volume in a GPT-wrapped
@@ -4062,6 +4082,31 @@ mod tests {
         assert!(partition_is_browsable(0x09, None, "QNX 2"));
         assert!(!partition_is_browsable(0x08, None, "QNX 2 (not formatted)"));
         assert!(!partition_is_browsable(0x08, None, "AIX"));
+        // GPT and APM types that hold a filesystem; LDM Data (dynamic volumes may span) stays out.
+        for ts in [
+            "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+            "C12A7328-F81F-11D2-BA4B-00A0C93EC93B",
+            "426F6F74-0000-11AA-AA11-00306543ECAC",
+            "Apple_Boot",
+            "Apple_Bootstrap",
+        ] {
+            assert!(partition_is_browsable(0, Some(ts), ""), "{ts}");
+        }
+        assert!(!partition_is_browsable(
+            0,
+            Some("AF9B60A0-1431-4F62-BC68-3311714A69AD"),
+            ""
+        ));
+        assert!(!partition_is_browsable(0, Some("Apple_Free"), ""));
+        // Typed partitions whose filesystem `open_filesystem` finds by superblock.
+        for (byte, name) in [
+            (0x27, "Windows RE"),
+            (0xEF, "EFI System"),
+            (0x4D, "QNX 4"),
+            (0xB1, "QNX 6 Power-Safe"),
+        ] {
+            assert!(partition_is_browsable(byte, None, name), "{name}");
+        }
         assert!(!partition_is_browsable(0, None, "BSD b (swap)"));
     }
 
