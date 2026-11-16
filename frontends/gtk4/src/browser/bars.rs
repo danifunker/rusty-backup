@@ -15,6 +15,9 @@ use rusty_backup::controller::commander::{
 use super::SendFn;
 use crate::widgets::{flow, flow_show, plain, set_text};
 
+/// Who hears the partition switcher's pick.
+type PickFn = Rc<dyn Fn(usize)>;
+
 /// Opens the file picker and hands the chosen paths to the callback.
 pub type AddFiles = Rc<dyn Fn(Rc<dyn Fn(Vec<PathBuf>)>)>;
 
@@ -77,7 +80,7 @@ pub struct Header {
     partition: gtk::DropDown,
     partition_ids: Rc<RefCell<Vec<usize>>>,
     partition_sync: Rc<Cell<bool>>,
-    on_partition: Rc<RefCell<Option<Rc<dyn Fn(usize)>>>>,
+    on_partition: Rc<RefCell<Option<PickFn>>>,
 }
 
 impl Header {
@@ -149,7 +152,7 @@ impl Header {
         partition.set_visible(false);
         let partition_ids: Rc<RefCell<Vec<usize>>> = Rc::default();
         let partition_sync: Rc<Cell<bool>> = Rc::default();
-        let on_partition: Rc<RefCell<Option<Rc<dyn Fn(usize)>>>> = Rc::default();
+        let on_partition: Rc<RefCell<Option<PickFn>>> = Rc::default();
         let (held, picks, hears) = (
             partition_sync.clone(),
             partition_ids.clone(),

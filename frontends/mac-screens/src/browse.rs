@@ -41,6 +41,9 @@ use super::sync::SyncGuard;
 const DETAIL_W: i32 = 330;
 const TREE_W: i32 = 200;
 
+/// Who hears the partition switcher's pick.
+type PickFn = Rc<dyn Fn(usize)>;
+
 /// The Mac archive formats the side panel exports to, with their menu labels.
 const MAC_FORMATS: [(ExportFormat, &str); 4] = [
     (ExportFormat::BinHex, "BinHex (.hqx)"),
@@ -193,7 +196,7 @@ pub struct BrowseView {
     on_change: RefCell<Option<Rc<dyn Fn()>>>,
     /// The partition switcher's indices, in its order, and who hears a pick.
     partitions: RefCell<Vec<usize>>,
-    on_partition: RefCell<Option<Rc<dyn Fn(usize)>>>,
+    on_partition: RefCell<Option<PickFn>>,
 }
 
 impl BrowseView {

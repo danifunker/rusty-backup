@@ -51,6 +51,9 @@ use crate::sync::SyncGuard;
 use crate::ui;
 use crate::window::{Event, ModelWindow};
 
+/// Who hears the partition switcher's pick.
+type PickFn = Rc<dyn Fn(usize)>;
+
 /// The side panel's width and the folder tree's, in DIPs.
 const DETAIL_W: i32 = 330;
 const TREE_W: i32 = 200;
@@ -114,7 +117,7 @@ pub struct BrowseView {
     /// The owner's partition switcher: its indices in list order, and who hears a pick.
     partition: Combo,
     partition_ids: RefCell<Vec<usize>>,
-    on_partition: RefCell<Option<Rc<dyn Fn(usize)>>>,
+    on_partition: RefCell<Option<PickFn>>,
     close: HWND,
     job: HWND,
     progress: HWND,
