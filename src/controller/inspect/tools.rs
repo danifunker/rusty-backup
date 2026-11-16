@@ -207,12 +207,23 @@ impl InspectController {
         self.is_image_file() && !self.export_running() && self.tools.expand.is_none()
     }
 
-    /// Resize Image applies: a plain image file with a partition table, read as it is on disk.
+    /// Resize Image applies: a plain image file with a partition table, read as it is on disk,
+    /// or a remote image whose daemon offers to resize it.
     pub fn can_resize_image(&self) -> bool {
-        self.can_expand_image()
+        let local = self.can_expand_image()
             && (self.found.chd_path.is_none() || cfg!(feature = "chd"))
-            && !matches!(&self.source, Some(Source::Image { _temp: Some(_), .. }))
-            && self.found.table.is_some()
+            && !matches!(&self.source, Some(Source::Image { _temp: Some(_), .. }));
+        let remote = self.remote_resizable() && !self.export_running();
+        (local || remote) && self.found.table.is_some()
+    }
+
+    /// A remote image on a daemon that resizes images (writable, and new enough to offer it).
+    fn remote_resizable(&self) -> bool {
+        #[cfg(feature = "remote")]
+        if let Some(Source::Remote { conn }) = &self.source {
+            return conn.0.try_lock().is_ok_and(|c| c.can_resize());
+        }
+        false
     }
 
     pub fn expanding(&self) -> bool {
@@ -799,10 +810,65 @@ impl InspectController {
         })
     }
 
+    /// Resize Image for a remote image: Inspect's reading of it, run by its daemon.
+    #[cfg(feature = "remote")]
+    fn remote_resize_source(
+        &mut self,
+        conn: crate::model::inspect_runner::RemoteImage,
+    ) -> Result<crate::controller::resize_image::ResizeImageSource, String> {
+        if !crate::model::worker::lock_status(&*conn.0).can_resize() {
+            return Err(
+                "This daemon cannot resize images: it is read-only, or its rb-cli is \
+                        older than this one. Update rb-cli there and run serve without \
+                        --read-only."
+                    .to_string(),
+            );
+        }
+        let table = self
+            .found
+            .table
+            .clone()
+            .ok_or_else(|| "This image has no partition table to resize.".to_string())?;
+        let partition_end = self.found.partitions.iter();
+        let partition_end = partition_end
+            .map(|p| p.byte_offset() + p.size_bytes)
+            .max()
+            .unwrap_or(0);
+        let size = self.disk_size().unwrap_or(partition_end).max(partition_end);
+        let plan = ResizePlan {
+            table,
+            partitions: self.found.partitions.clone(),
+            min_sizes: self.found.min_sizes.clone(),
+            alignment_sectors: self
+                .found
+                .alignment
+                .as_ref()
+                .map_or(0, |a| a.alignment_sectors),
+            size_bytes: size,
+            is_device: false,
+            device: None,
+            can_grow: true,
+            path: PathBuf::from(conn.1.as_str()),
+        };
+        let places = plan.partitions.iter();
+        let places = places
+            .filter_map(|p| self.partition_place(p.index).map(|pl| (p.index, pl)))
+            .collect();
+        Ok(crate::controller::resize_image::ResizeImageSource {
+            plan,
+            places,
+            backend: crate::model::resize_image::Backend::Remote(conn),
+        })
+    }
+
     /// What Resize Image starts from, or why this source cannot be resized as an image file.
     pub fn resize_image_source(
         &mut self,
     ) -> Result<crate::controller::resize_image::ResizeImageSource, String> {
+        #[cfg(feature = "remote")]
+        if let Some(Source::Remote { conn }) = &self.source {
+            return self.remote_resize_source(conn.clone());
+        }
         if !self.is_image_file() {
             return Err("Resize Image works on a disk image file.".to_string());
         }
@@ -823,7 +889,11 @@ impl InspectController {
             .iter()
             .filter_map(|p| self.partition_place(p.index).map(|pl| (p.index, pl)))
             .collect();
-        Ok(crate::controller::resize_image::ResizeImageSource { plan, places })
+        Ok(crate::controller::resize_image::ResizeImageSource {
+            plan,
+            places,
+            backend: crate::model::resize_image::Backend::Local,
+        })
     }
 
     /// The device size the shell knows for the open device.

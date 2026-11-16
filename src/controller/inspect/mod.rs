@@ -18,6 +18,8 @@
 mod browse;
 mod export;
 mod layout;
+#[cfg(feature = "remote")]
+mod link;
 mod open;
 mod tools;
 
@@ -86,6 +88,8 @@ pub mod purpose {
     pub const REMOTE_BACKUP: &str = "inspect.remote_backup";
     pub const OPEN_IMAGE: &str = "inspect.open_image";
     pub const OPEN_BACKUP: &str = "inspect.open_backup";
+    /// The remote image's daemon stopped answering: reconnect, or close the image.
+    pub const REMOTE_LOST: &str = "inspect.remote_lost";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
@@ -440,6 +444,8 @@ pub struct InspectController {
     tools: tools::ToolState,
     export: export::ExportState,
     browse: browse::BrowseState,
+    #[cfg(feature = "remote")]
+    link: link::LinkState,
 }
 
 impl InspectController {
@@ -459,6 +465,8 @@ impl InspectController {
             tools: tools::ToolState::default(),
             export: export::ExportState::default(),
             browse: browse::BrowseState::default(),
+            #[cfg(feature = "remote")]
+            link: link::LinkState::default(),
         }
     }
 
@@ -1145,6 +1153,8 @@ impl InspectController {
         self.tools.reset();
         self.browse.reset();
         self.export.close();
+        #[cfg(feature = "remote")]
+        self.link.reset();
     }
 
     /// Give up the elevated descriptor this controller opened, so the device can eject.
@@ -1310,6 +1320,8 @@ impl Controller for InspectController {
         fx.extend(self.poll_tools());
         self.poll_export();
         self.poll_browse();
+        #[cfg(feature = "remote")]
+        fx.extend(self.poll_link());
         fx
     }
 }
@@ -1404,6 +1416,8 @@ impl InspectController {
             purpose::REPAIR if yes => self.repair(),
             purpose::DEFRAGMENT => self.defragment_answered(yes),
             purpose::APPLY_TABLE => self.apply_table_answered(yes),
+            #[cfg(feature = "remote")]
+            purpose::REMOTE_LOST => self.link_answered(yes),
             _ => {}
         }
         Vec::new()

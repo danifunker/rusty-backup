@@ -409,6 +409,8 @@ impl ResizeImageWindow {
         ui::set_text(self.review, &c.review().join("\r\n"));
         set_check(self.copy, !c.in_place());
         set_check(self.in_place, c.in_place());
+        // A remote image is resized by its daemon, in place.
+        ui::set_enabled(self.copy, c.copy_allowed());
         let out = match c.in_place() {
             true => String::new(),
             false => c

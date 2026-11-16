@@ -72,6 +72,10 @@ pub const CAP_FAMILY_B: u16 = 1 << 1;
 /// `optical` feature.
 pub const CAP_FAMILY_O: u16 = 1 << 2;
 
+/// Resize Image on the daemon: it resizes an image under its root with its own engine.
+/// A writable daemon advertises it; a client hides remote resize when it is missing.
+pub const CAP_RESIZE: u16 = 1 << 3;
+
 /// Largest control-frame body we'll accept — guards against a hostile or
 /// corrupt length prefix. Control frames are small JSON; 8 MiB is generous.
 const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
@@ -79,6 +83,28 @@ const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 /// Largest single chunk on the bulk path (the fs layer already streams in
 /// 64 KiB–1 MiB blocks, so this only bounds a pathological single `write`).
 const MAX_CHUNK: usize = 4 * 1024 * 1024;
+
+/// One Resize Image step the daemon runs on its copy of the image.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WireResizeOp {
+    DiskSize,
+    Probe { indices: Vec<usize> },
+    Check { index: usize },
+    Repair { index: usize },
+    Plan(WireResizeJob),
+    Run(WireResizeJob),
+}
+
+/// What the wizard chose. The daemon reads the table itself; `expect` is the client's view of
+/// it, `(index, start LBA, size)`, so a changed image is refused rather than resized wrongly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireResizeJob {
+    pub disk_size: u64,
+    pub sizes: Vec<(usize, u64)>,
+    pub check_after: bool,
+    pub rebuild: Vec<(usize, u32)>,
+    pub expect: Vec<(usize, u64, u64)>,
+}
 
 /// Client → server control messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +302,10 @@ pub enum Request {
     /// Close an open optical handle, freeing the drive for the next session.
     CloseOptical { handle: u64 },
 
+    /// Resize Image, run by the daemon on an image under its root (needs [`CAP_RESIZE`]).
+    /// `Run` streams `ResizeProgress` frames, then `ResizeDone` or `Error`.
+    ResizeImage { path: String, op: WireResizeOp },
+
     /// Polite disconnect.
     Bye,
 }
@@ -300,29 +330,71 @@ pub enum Response {
         used_size: u64,
     },
     /// Directory listing.
-    Dir { entries: Vec<WireEntry> },
+    Dir {
+        entries: Vec<WireEntry>,
+    },
     /// A file is about to stream as a chunk sequence (see [`read_chunks`]).
-    FileBegin { size: u64 },
+    FileBegin {
+        size: u64,
+    },
     /// A write session was opened.
-    SessionOpened { session: u64 },
+    SessionOpened {
+        session: u64,
+    },
     /// `Apply` finished; `count` staged edits were replayed.
-    Applied { count: u64 },
+    Applied {
+        count: u64,
+    },
     /// `HostStat` result: whether the path exists and is a directory.
-    HostKind { exists: bool, is_dir: bool },
+    HostKind {
+        exists: bool,
+        is_dir: bool,
+    },
     /// `OpenBlock` result: the block handle + the image's length in bytes.
-    BlockOpened { handle: u64, size: u64 },
+    BlockOpened {
+        handle: u64,
+        size: u64,
+    },
     /// `ListDevices` result: the daemon machine's physical disks.
-    Devices { devices: Vec<WireDevice> },
+    Devices {
+        devices: Vec<WireDevice>,
+    },
     /// `OpenOptical` result: the optical session handle.
-    OpticalOpened { handle: u64 },
+    OpticalOpened {
+        handle: u64,
+    },
     /// `ReadToc` result: the disc's table of contents.
-    Toc { toc: WireToc },
+    Toc {
+        toc: WireToc,
+    },
     /// `ListOpticalDrives` result: the daemon machine's optical drives.
-    OpticalDrives { drives: Vec<WireOpticalDrive> },
+    OpticalDrives {
+        drives: Vec<WireOpticalDrive>,
+    },
     /// Generic success (e.g. `Close`).
     Ok,
+    /// Resize Image replies, one per [`WireResizeOp`].
+    ResizeDiskSize {
+        size: u64,
+        vhd: bool,
+    },
+    ResizeProbes {
+        probes: Vec<crate::model::resize_image::PartProbe>,
+    },
+    ResizeVerdict {
+        verdict: crate::model::resize_image::Verdict,
+    },
+    ResizeLayout {
+        layout: crate::model::resize_image::Layout,
+    },
+    ResizeProgress {
+        progress: crate::model::resize_image::Progress,
+    },
+    ResizeDone,
     /// Operation failed with a human-readable message.
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Serde-friendly mirror of [`disk_core::entry::FileEntry`] carrying only what
