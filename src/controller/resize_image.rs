@@ -129,6 +129,8 @@ impl PartMode {
 pub struct ResizeImageSource {
     pub plan: ResizePlan,
     pub places: HashMap<usize, PartitionPlace>,
+    /// Who runs the steps: this machine, or the daemon serving a remote image (in place only).
+    pub backend: engine::Backend,
 }
 
 /// One partition as the wizard shows it.
@@ -389,6 +391,17 @@ impl ResizeImageController {
 
     pub fn in_place(&self) -> bool {
         self.in_place
+    }
+
+    /// A resized copy may be written; not for a remote image, which the daemon resizes in place.
+    pub fn copy_allowed(&self) -> bool {
+        !self.backend().is_remote()
+    }
+
+    /// Who runs the steps for the open source.
+    fn backend(&self) -> engine::Backend {
+        let source = self.source.as_ref();
+        source.map_or(engine::Backend::Local, |s| s.backend.clone())
     }
 
     /// Where the resized image goes: the copy's path, or the original when in place.
@@ -769,7 +782,8 @@ impl ResizeImageController {
             return;
         }
         let path = source.plan.path.clone();
-        let (old, _) = match engine::disk_size_of(path.as_path()) {
+        let backend = source.backend.clone();
+        let (old, _) = match backend.disk_size(path.as_path()) {
             Ok(s) => s,
             Err(e) => {
                 self.log
@@ -782,6 +796,8 @@ impl ResizeImageController {
         fresh.old_disk = old;
         fresh.disk_text = stamp_size(old);
         fresh.output = Some(default_copy(path.as_path()));
+        // A copy would be a path on the daemon: a remote image is resized where it is.
+        fresh.in_place = backend.is_remote();
         let parts: Vec<PartitionInfo> = source
             .plan
             .partitions
@@ -815,7 +831,7 @@ impl ResizeImageController {
         fresh.probe_job = Some(Job::spawn(
             "Reading the partitions",
             Arc::clone(&fresh.notify),
-            move |ctx| engine::probe(path.as_path(), all.as_slice(), ctx),
+            move |ctx| backend.probe(path.as_path(), all.as_slice(), ctx),
         ));
         *self = fresh;
     }
@@ -839,6 +855,7 @@ impl ResizeImageController {
             })
             .collect();
         self.continue_anyway = false;
+        let backend = self.backend();
         self.check_job = Some(Job::spawn(
             "Checking the volumes",
             Arc::clone(&self.notify),
@@ -846,10 +863,7 @@ impl ResizeImageController {
                 let mut out = Vec::new();
                 for p in &parts {
                     ctx.set_phase(format!("Checking partition {}", p.index + 1));
-                    out.push((
-                        p.index,
-                        engine::check_partition(path.as_path(), p.byte_offset(), p),
-                    ));
+                    out.push((p.index, backend.check(path.as_path(), p, false)));
                 }
                 Ok(out)
             },
@@ -872,15 +886,13 @@ impl ResizeImageController {
             .filter(|r| r.index != index)
             .filter_map(|r| r.verdict.clone().map(|v| (r.index, v)))
             .collect::<Vec<_>>();
+        let backend = self.backend();
         self.check_job = Some(Job::spawn(
             "Repairing the volume",
             Arc::clone(&self.notify),
             move |_| {
                 let mut out = checked;
-                out.push((
-                    index,
-                    engine::repair_partition(path.as_path(), part.byte_offset(), &part),
-                ));
+                out.push((index, backend.check(path.as_path(), &part, true)));
                 Ok(out)
             },
         ));
@@ -956,10 +968,11 @@ impl ResizeImageController {
             return;
         };
         self.plan_error = None;
+        let backend = self.backend();
         self.plan_job = Some(Job::spawn(
             "Checking the plan",
             Arc::clone(&self.notify),
-            move |_| Ok(engine::plan(&req).map_err(|e| format!("{e:#}"))),
+            move |_| Ok(backend.plan(&req).map_err(|e| format!("{e:#}"))),
         ));
     }
 
@@ -1071,12 +1084,15 @@ impl ResizeImageController {
             format!("Resize Image: {}", req.target().display()),
         ));
         self.page = Page::Work;
+        let backend = self.backend();
         self.work = Some(Job::spawn(
             "Resizing the image",
             Arc::clone(&self.notify),
             move |ctx| {
                 let _wake = crate::os::wakelock::acquire("Rusty Backup: resize image");
-                Ok(engine::run(&req, ctx, &shared).map_err(|e| format!("{e:#}")))
+                Ok(backend
+                    .run(&req, ctx, &shared)
+                    .map_err(|e| format!("{e:#}")))
             },
         ));
     }
@@ -1203,7 +1219,8 @@ impl Controller for ResizeImageController {
             A::Repair(index) => return self.ask_repair(index),
             A::SetMode { index, mode } => self.set_mode(index, mode),
             A::SetSizeText { index, text } => self.set_text(index, text),
-            A::SetInPlace(on) => self.in_place = on,
+            A::SetInPlace(on) => self.in_place = on || !self.copy_allowed(),
+            A::PickOutput if !self.copy_allowed() => {}
             A::PickOutput => return self.pick_output(),
             A::Picked { purpose, path } => {
                 if let (purpose::OUTPUT, Some(path)) = (purpose, path) {

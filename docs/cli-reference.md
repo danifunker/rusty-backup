@@ -2021,7 +2021,7 @@ Usage: resize-image [OPTIONS] --size <SIZE> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — The disk image to resize (raw `.img` / `.hda` / `.vhd`)
+- `<IMAGE>` — The disk image to resize (raw `.img` / `.hda` / `.vhd`), or `rb://host[:port]/path` for one an `rb-cli serve` daemon resizes in place (needs `--in-place`)
 
 **Options**
 

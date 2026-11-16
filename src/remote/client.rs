@@ -11,8 +11,8 @@ use std::path::Path;
 
 use crate::remote::protocol::{
     read_chunks, read_control, write_control, ChunkWriter, Request, Response, WireEntry,
-    WireOpticalDrive, WireRetryConfig, WireSectorMode, WireToc, CAP_FAMILY_F, PROTOCOL_VERSION,
-    RB_HELLO_MAGIC,
+    WireOpticalDrive, WireResizeJob, WireResizeOp, WireRetryConfig, WireSectorMode, WireToc,
+    CAP_FAMILY_F, PROTOCOL_VERSION, RB_HELLO_MAGIC,
 };
 
 /// Result of opening a remote image: a handle + the filesystem's display
@@ -33,6 +33,8 @@ pub struct RemoteSession {
     writer: BufWriter<TcpStream>,
     /// Why the socket stopped answering, once a read from it failed.
     lost: Option<String>,
+    /// The capability bits the daemon offered in its `Hello`.
+    capabilities: u16,
 }
 
 impl RemoteSession {
@@ -49,6 +51,7 @@ impl RemoteSession {
             reader,
             writer,
             lost: None,
+            capabilities: 0,
         };
         session.handshake()?;
         session.reader.get_ref().set_read_timeout(None).ok();
@@ -58,6 +61,50 @@ impl RemoteSession {
     /// Why the connection died, once a read from the daemon failed (not a refusal it sent).
     pub fn lost(&self) -> Option<&str> {
         self.lost.as_deref()
+    }
+
+    /// The daemon offers `cap` (a `CAP_*` bit).
+    pub fn offers(&self, cap: u16) -> bool {
+        self.capabilities & cap != 0
+    }
+
+    /// One Resize Image step on the daemon's image at `path`; `Run` goes through [`Self::resize_run`].
+    pub fn resize_step(&mut self, path: &str, op: WireResizeOp) -> Result<Response> {
+        write_control(
+            &mut self.writer,
+            &Request::ResizeImage {
+                path: path.to_string(),
+                op,
+            },
+        )?;
+        match self.read_response()? {
+            Response::Error { message } => bail!("{message}"),
+            reply => Ok(reply),
+        }
+    }
+
+    /// Resize the daemon's image at `path`, handing each progress frame to `on_progress`.
+    pub fn resize_run(
+        &mut self,
+        path: &str,
+        job: WireResizeJob,
+        on_progress: &mut dyn FnMut(crate::model::resize_image::Progress),
+    ) -> Result<()> {
+        write_control(
+            &mut self.writer,
+            &Request::ResizeImage {
+                path: path.to_string(),
+                op: WireResizeOp::Run(job),
+            },
+        )?;
+        loop {
+            match self.read_response()? {
+                Response::ResizeProgress { progress } => on_progress(progress),
+                Response::ResizeDone => return Ok(()),
+                Response::Error { message } => bail!("{message}"),
+                other => bail!("unexpected reply to a resize: {other:?}"),
+            }
+        }
     }
 
     fn handshake(&mut self) -> Result<()> {
@@ -74,6 +121,7 @@ impl RemoteSession {
                 capabilities,
                 ..
             } => {
+                self.capabilities = capabilities;
                 if version != PROTOCOL_VERSION {
                     bail!(
                         "the daemon speaks protocol v{version} but this client needs \

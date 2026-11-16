@@ -12,7 +12,7 @@ use super::{PartitionInfo, PartitionTable};
 const CHUNK_SIZE: usize = 256 * 1024;
 
 /// Describes one partition's resize/move plan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PartitionResizePlan {
     pub index: usize,
     pub old_start_lba: u64,

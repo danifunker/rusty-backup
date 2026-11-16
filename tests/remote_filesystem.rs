@@ -3345,3 +3345,82 @@ fn a_connection_reports_the_daemon_dropping() {
     assert!(!conn.heartbeat(), "the heartbeat sees the cut");
     assert!(conn.lost().is_some());
 }
+
+/// A 16 MiB MBR disk with two 6 MiB FAT16 partitions, ONE and TWO.
+fn two_fat_mbr(path: &std::path::Path) {
+    let mut bytes = vec![0u8; 16 << 20];
+    for (i, label) in ["ONE", "TWO"].into_iter().enumerate() {
+        let vol = fat::create_blank_fat(6 << 20, Some(label)).unwrap();
+        let lba = 2048 + i * (6 << 20) / 512;
+        bytes[lba * 512..lba * 512 + vol.len()].copy_from_slice(&vol);
+        let e = 0x1BE + i * 16;
+        bytes[e + 4] = 0x06;
+        bytes[e + 8..e + 12].copy_from_slice(&(lba as u32).to_le_bytes());
+        bytes[e + 12..e + 16].copy_from_slice(&((vol.len() / 512) as u32).to_le_bytes());
+    }
+    bytes[510] = 0x55;
+    bytes[511] = 0xAA;
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn serve_dir(root: std::path::PathBuf, writable: bool) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, root, None, writable);
+    });
+    addr
+}
+
+/// `rb-cli resize-image rb://...`: the daemon grows its own image and partition 2 fills it.
+#[test]
+fn a_daemon_resizes_its_image_for_a_remote_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let img = root.join("disk.img");
+    two_fat_mbr(&img);
+    let addr = serve_dir(root, true);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rb-cli"))
+        .args(["resize-image", &format!("rb://{addr}/disk.img")])
+        .args(["--size", "32M", "--part", "2=fill", "--in-place"])
+        .output()
+        .unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{said}");
+    assert_eq!(std::fs::metadata(&img).unwrap().len(), 32 << 20, "{said}");
+    let mut f = std::fs::File::open(&img).unwrap();
+    let table = rusty_backup::partition::PartitionTable::detect(&mut f).unwrap();
+    let parts = table.partitions();
+    assert_eq!(parts[0].size_bytes, 6 << 20, "partition 1 keeps its size");
+    assert!(
+        parts[1].size_bytes > 20 << 20,
+        "partition 2 fills: {:?}",
+        parts[1]
+    );
+    assert!(said.contains("after"), "the check after ran: {said}");
+}
+
+/// A read-only daemon does not offer resize, and the CLI says why.
+#[test]
+fn a_read_only_daemon_refuses_remote_resize() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    two_fat_mbr(&root.join("disk.img"));
+    let addr = serve_dir(root.clone(), false);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rb-cli"))
+        .args(["resize-image", &format!("rb://{addr}/disk.img")])
+        .args(["--size", "32M", "--in-place"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(err.contains("read-only"), "{err}");
+    assert_eq!(
+        std::fs::metadata(root.join("disk.img")).unwrap().len(),
+        16 << 20
+    );
+}

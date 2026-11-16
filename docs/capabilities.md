@@ -48,7 +48,8 @@ reference the shells are measured against. Per-feature limits by build target li
 | `inspect.open-backup` | - | yes | yes | yes | `flow.restore.share-with-inspect` |
 | `inspect.open-image` | yes | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder`, `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |
 | `inspect.remote-backup` | yes | yes | yes | yes | `flow.network.remote-inspect-backup` |
-| `inspect.remote-open` | yes | yes | yes | yes | `flow.network.remote-inspect-backup` |
+| `inspect.remote-open` | yes | yes | yes | yes | `flow.network.remote-expand-image`, `flow.network.remote-inspect-backup` |
+| `inspect.remote-resize` | - | - | - | yes | `flow.network.remote-expand-image` |
 | `inspect.resize` | - | - | - | yes | `flow.inspect.tools.expand-add` |
 | `inspect.resize-image` | - | yes | yes | yes | `flow.inspect.resize-image.chd`, `flow.inspect.resize-image.grow-copy` |
 | `optical.browse_contents` | yes | yes | yes | yes | `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |

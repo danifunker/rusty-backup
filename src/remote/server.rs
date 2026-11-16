@@ -855,6 +855,10 @@ fn handle_conn(
                 let capabilities = CAP_FAMILY_F | crate::remote::protocol::CAP_FAMILY_O;
                 #[cfg(not(feature = "cd-audio"))]
                 let capabilities = CAP_FAMILY_F;
+                let capabilities = match writable {
+                    true => capabilities | crate::remote::protocol::CAP_RESIZE,
+                    false => capabilities,
+                };
                 write_control(
                     &mut writer,
                     &Response::Hello {
@@ -950,6 +954,7 @@ fn handle_conn(
             | Request::OpenBlockRw { .. }
             | Request::OpenWriteTarget { .. }
             | Request::MkdirHost { .. }
+            | Request::ResizeImage { .. }
                 if !writable =>
             {
                 reply_err(&mut writer, READ_ONLY_MSG.to_string())?;
@@ -1156,6 +1161,12 @@ fn handle_conn(
                     write_control(&mut writer, &Response::BlockOpened { handle, size })?;
                 }
             },
+
+            Request::ResizeImage { path, op } => {
+                if let Err(e) = resize_image(root, &path, op, &mut writer) {
+                    reply_err(&mut writer, format!("{e:#}"))?;
+                }
+            }
 
             Request::OpenBlockRw { path } => match open_block_rw(root, &path) {
                 Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
@@ -1425,6 +1436,91 @@ fn handle_conn(
 }
 
 /// Send an `Error` control frame.
+/// Run `f` as a job on this thread's behalf and wait for it (the engine wants a `JobCtx`).
+fn in_job<R: Send + 'static>(
+    what: &str,
+    f: impl FnOnce(&crate::model::job::JobCtx) -> Result<R> + Send + 'static,
+) -> Result<R> {
+    use crate::model::job::{Job, NoNotify, Status};
+    let job = Job::spawn(what.to_string(), std::sync::Arc::new(NoNotify), f);
+    match job.wait().status {
+        Status::Done => job
+            .take_result()
+            .ok_or_else(|| anyhow!("{what}: no result")),
+        Status::Failed(e) => bail!("{e}"),
+        _ => bail!("{what} was cancelled"),
+    }
+}
+
+/// One Resize Image step on an image under the root; errors go back as `Error`.
+fn resize_image<W: std::io::Write>(
+    root: &Path,
+    rel: &str,
+    op: crate::remote::protocol::WireResizeOp,
+    writer: &mut W,
+) -> Result<()> {
+    use crate::model::resize_image::{self as engine, daemon};
+    use crate::remote::protocol::WireResizeOp as Op;
+    let full = sandbox_join(root, rel)?;
+    if !full.is_file() {
+        bail!("{rel} is not an image file");
+    }
+    let reply = match op {
+        Op::DiskSize => {
+            let (size, vhd) = engine::disk_size_of(&full)?;
+            Response::ResizeDiskSize { size, vhd }
+        }
+        Op::Probe { indices } => {
+            let parts = daemon::partitions(&full, &indices)?;
+            let probes = in_job("Probing the partitions", move |ctx| {
+                engine::probe(&full, &parts, ctx)
+            })?;
+            Response::ResizeProbes { probes }
+        }
+        Op::Check { index } | Op::Repair { index } => {
+            let repair = matches!(op, Op::Repair { .. });
+            let part = daemon::partitions(&full, &[index])?.remove(0);
+            let verdict = match repair {
+                true => engine::repair_partition(&full, part.byte_offset(), &part),
+                false => engine::check_partition(&full, part.byte_offset(), &part),
+            };
+            Response::ResizeVerdict { verdict }
+        }
+        Op::Plan(job) => Response::ResizeLayout {
+            layout: engine::plan(&daemon::request(&full, &job)?)?,
+        },
+        Op::Run(job) => {
+            let req = daemon::request(&full, &job)?;
+            let shared: engine::SharedProgress = Default::default();
+            let progress = std::sync::Arc::clone(&shared);
+            let work = crate::model::job::Job::spawn(
+                "Resizing the image".to_string(),
+                std::sync::Arc::new(crate::model::job::NoNotify),
+                move |ctx| engine::run(&req, ctx, &progress),
+            );
+            // Progress frames until the engine ends, then its outcome.
+            loop {
+                let running = work.is_running();
+                let now = crate::model::worker::lock_status(&*shared).clone();
+                write_control(writer, &Response::ResizeProgress { progress: now })?;
+                if !running {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            match work.snapshot().status {
+                crate::model::job::Status::Done => Response::ResizeDone,
+                crate::model::job::Status::Failed(e) => Response::Error { message: e },
+                _ => Response::Error {
+                    message: "the resize was cancelled".to_string(),
+                },
+            }
+        }
+    };
+    write_control(writer, &reply)?;
+    Ok(())
+}
+
 fn reply_err<W: std::io::Write>(writer: &mut W, message: String) -> Result<()> {
     write_control(writer, &Response::Error { message })?;
     Ok(())

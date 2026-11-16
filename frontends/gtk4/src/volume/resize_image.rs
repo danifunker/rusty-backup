@@ -498,6 +498,8 @@ impl ResizeImageDialog {
 
         set_text(&self.review, &c.review().join("\n"));
         set_radio(&self.output_choice, usize::from(c.in_place()));
+        // A remote image is resized by its daemon, in place.
+        self.output_choice[0].set_sensitive(c.copy_allowed());
         let out = match c.in_place() {
             true => String::new(),
             false => c
