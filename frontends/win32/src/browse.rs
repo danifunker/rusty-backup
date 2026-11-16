@@ -14,7 +14,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use rusty_backup::controller::app::{CommanderRecent, Notify, Snapshot, UserConfig};
-use rusty_backup::controller::browser::{ids, TextDoc};
+use rusty_backup::controller::browser::{ids, TextDoc, CLOSE_LABEL};
 use rusty_backup::controller::commander::{
     editor_window, extract_fork_modes, journal_window, tree_window, BrowserPaneAction as P,
     CommanderAction as A, CommanderController, DisplayRow, EditBar, ExportBar, ExtractOptions,
@@ -22,7 +22,9 @@ use rusty_backup::controller::commander::{
     PanelActions, ResourceForkMode, Side, SidePanel, TreeText, VolumeLine, WindowKind,
     FOLLOW_DELAY,
 };
-use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen, InspectAction, InspectSource};
+use rusty_backup::controller::inspect::{
+    ids as inspect_ids, BrowseEdit, BrowseOpen, InspectAction, InspectSource,
+};
 use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller, Effect};
@@ -48,6 +50,9 @@ use crate::panel::{self, Handler};
 use crate::sync::SyncGuard;
 use crate::ui;
 use crate::window::{Event, ModelWindow};
+
+/// Who hears the partition switcher's pick.
+type PickFn = Rc<dyn Fn(usize)>;
 
 /// The side panel's width and the folder tree's, in DIPs.
 const DETAIL_W: i32 = 330;
@@ -109,6 +114,10 @@ pub struct BrowseView {
     extract_all: HWND,
     export_volume: HWND,
     volume_format: Combo,
+    /// The owner's partition switcher: its indices in list order, and who hears a pick.
+    partition: Combo,
+    partition_ids: RefCell<Vec<usize>>,
+    on_partition: RefCell<Option<PickFn>>,
     close: HWND,
     job: HWND,
     progress: HWND,
@@ -201,7 +210,9 @@ impl BrowseView {
         let extract_all = ui::button(page, "Extract All...", ids::EXTRACT_ALL);
         let export_volume = ui::button(page, "Export Volume...", ids::EXPORT_VOLUME);
         let volume_format = Combo::build(page, ids::EXPORT_VOLUME_FORMAT, &[]);
-        let close = ui::button(page, "Close", ids::CLOSE);
+        let close = ui::button(page, CLOSE_LABEL, ids::CLOSE);
+        let partition = Combo::build(page, inspect_ids::BROWSE_PARTITION, &[]);
+        ui::set_visible(partition.h, false);
         let job = ui::label(page, "");
         let progress = ui::child(
             page,
@@ -266,6 +277,9 @@ impl BrowseView {
             extract_all,
             export_volume,
             volume_format,
+            partition,
+            partition_ids: RefCell::default(),
+            on_partition: RefCell::default(),
             close,
             job,
             progress,
@@ -391,6 +405,29 @@ impl BrowseView {
         if self.active.get() {
             self.apply(A::Mode(ModeAction::UpgradeSeekable(path)));
         }
+    }
+
+    /// The owner's partitions for the header's switcher (hidden with fewer than two).
+    pub fn set_partitions(&self, choices: &[(usize, String)], current: Option<usize>) {
+        let show = choices.len() > 1;
+        if show {
+            let labels: Vec<String> = choices.iter().map(|(_, l)| l.clone()).collect();
+            self.partition.set_items(&labels);
+            let ids: Vec<usize> = choices.iter().map(|(i, _)| *i).collect();
+            if let Some(at) = ids.iter().position(|i| Some(*i) == current) {
+                self.partition.select(at);
+            }
+            self.partition_ids.replace(ids);
+        }
+        if ui::shown(self.partition.h) != show {
+            ui::set_visible(self.partition.h, show);
+            self.layout();
+        }
+    }
+
+    /// Who hears the switcher's pick (the owner switches, asking first about staged edits).
+    pub fn on_partition(&self, f: Rc<dyn Fn(usize)>) {
+        self.on_partition.replace(Some(f));
     }
 
     pub fn close(&self) {
@@ -961,10 +998,19 @@ impl BrowseView {
         let (area, dpi) = panel::client(self.page);
         let line = |h: HWND| Node::leaf(h, Size::Stretch(1), Size::Fixed(layout::ROW - 8));
         let fixed = |h: HWND, n: i32| Node::leaf(h, Size::Fixed(DETAIL_W), Size::Fixed(n));
-        let mut head = vec![
-            Node::leaf(self.title, Size::Fixed(130), Size::Fixed(layout::ROW - 8)),
-            line(self.volume),
-        ];
+        let mut head = vec![Node::leaf(
+            self.title,
+            Size::Fixed(130),
+            Size::Fixed(layout::ROW - 8),
+        )];
+        if ui::shown(self.partition.h) {
+            head.push(Node::leaf(
+                self.partition.h,
+                Size::Fixed(260),
+                Size::Fixed(layout::ROW),
+            ));
+        }
+        head.push(line(self.volume));
         if ui::shown(self.tools.boot) {
             head.push(Node::leaf(
                 self.tools.boot,
@@ -990,7 +1036,7 @@ impl BrowseView {
         tools.extend(before);
         tools.push(Node::Space(Size::Stretch(1)));
         tools.extend(after);
-        tools.push(Node::button(self.close, 70));
+        tools.push(Node::button(self.close, 110));
         col.push(Node::row(tools));
         col.extend(self.edit_row.nodes());
         if ui::shown(self.job) {
@@ -1156,6 +1202,17 @@ impl Handler for BrowseView {
                     let mode = self.extract_options().fork_mode;
                     self.apply(A::SetForkMode(mode));
                     self.apply(export);
+                }
+            }
+            return;
+        }
+        if from == self.partition.h {
+            if code == CBN_SELCHANGE {
+                let pick = self.partition.picked();
+                let index = pick.and_then(|p| self.partition_ids.borrow().get(p).copied());
+                let f = self.on_partition.borrow().clone();
+                if let (Some(index), Some(f)) = (index, f) {
+                    f(index);
                 }
             }
             return;

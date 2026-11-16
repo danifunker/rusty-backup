@@ -310,6 +310,12 @@ impl InspectScreen {
                 .hscrollbar_policy(gtk::PolicyType::Never)
                 .build();
             let browse = BrowseView::build(notify.clone(), host.clone());
+            let picker = me.clone();
+            browse.on_partition(Rc::new(move |index| {
+                if let Some(screen) = picker.upgrade() {
+                    screen.apply(InspectAction::SwitchBrowse(index));
+                }
+            }));
             let target = me.clone();
             browse.on_change(Rc::new(move || {
                 if let Some(screen) = target.upgrade() {
@@ -775,6 +781,11 @@ impl InspectScreen {
     fn refresh(&self) {
         let shown = self.read();
         self.sync.run(|| self.show(shown));
+        let (choices, current) = {
+            let c = self.ctrl.borrow();
+            (c.browse_choices(), c.browsing())
+        };
+        self.browse.set_partitions(&choices, current);
     }
 
     fn show(&self, s: Shown) {

@@ -7,6 +7,9 @@
 //! the profile turns off refuses its action with a message instead of acting. See
 //! docs/phase2_commander_plan.md § "Slice 10: one browser pane".
 
+/// The browse view's Close: it closes the browser, not the image or disc it came from.
+pub const CLOSE_LABEL: &str = "Close Browser";
+
 pub mod ids;
 pub mod metadata;
 pub mod pane;

@@ -96,7 +96,9 @@
 "backup.vhd_start" = "Start VHD Backup"
 "inspect.row.browse" = "Browse"
 "browse.extract_all" = "Extract All..."
-"browse.close" = "Close"
+"browse.close" = "Close Browser"
+# Named by its value: partition 1 of browse.toml's two-partition image.
+"inspect.browse_partition" = "1: FAT16 (<32MB) (16.0 MiB)"
 "browse.edit_mode" = "Edit Mode"
 "browse.new_folder" = "New Folder..."
 "browse.edit_text" = "Edit as text..."

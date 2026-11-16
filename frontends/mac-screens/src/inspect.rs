@@ -334,6 +334,12 @@ impl InspectScreen {
                 remote,
             }
         });
+        let picker = screen.me.clone();
+        screen.browse.on_partition(Rc::new(move |index| {
+            if let Some(s) = picker.upgrade() {
+                s.apply(InspectAction::SwitchBrowse(index));
+            }
+        }));
         let me = screen.me.clone();
         screen.remote.on_change(Rc::new(move || {
             if let Some(s) = me.upgrade() {
@@ -867,6 +873,11 @@ impl InspectScreen {
     fn refresh(&self) {
         let shown = self.read();
         self.sync.run(|| self.show(shown));
+        let (choices, current) = {
+            let c = self.ctrl.borrow();
+            (c.browse_choices(), c.browsing())
+        };
+        self.browse.set_partitions(&choices, current);
         let editor = {
             let c = self.ctrl.borrow();
             c.table_editor().map(|v| (v, c.table_write_target()))

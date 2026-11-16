@@ -22,6 +22,8 @@ pub(super) struct BrowseState {
     seekable: HashMap<usize, PathBuf>,
     /// A seekable-cache build: (partition index, cache path) and the job.
     build: Option<(usize, PathBuf, Job<()>)>,
+    /// The partition last handed to the browse view, for its partition switcher.
+    browsing: Option<usize>,
 }
 
 impl BrowseState {
@@ -46,6 +48,34 @@ fn finished(job: &Job<()>) -> Option<Result<(), String>> {
 }
 
 impl InspectController {
+    /// The partitions the browse view's switcher offers: (index, label), in table order.
+    pub fn browse_choices(&self) -> Vec<(usize, String)> {
+        if self.rows_locked() {
+            return Vec::new();
+        }
+        let parts = self.found.partitions.iter();
+        parts
+            .filter(|p| self.row_actions(p).browse)
+            .map(|p| {
+                (
+                    p.index,
+                    crate::controller::browser::rows::partition_label(p.index, p),
+                )
+            })
+            .collect()
+    }
+
+    /// The partition the browse view was last opened on.
+    pub fn browsing(&self) -> Option<usize> {
+        self.browse.browsing
+    }
+
+    /// The switcher picked `index`: close the open volume and browse that one instead.
+    pub(super) fn switch_browse(&mut self, index: usize) {
+        self.requests.push(HostRequest::CloseBrowse);
+        self.browse_partition(index);
+    }
+
     /// The partclone scan and seekable-cache build, for their progress bars.
     pub fn browse_jobs(&self) -> Vec<Snapshot> {
         let scan = self.browse.scan.as_ref().map(|s| s.3.snapshot());
@@ -73,6 +103,7 @@ impl InspectController {
         let Some(part) = self.found.partitions.iter().find(|p| p.index == index) else {
             return;
         };
+        self.browse.browsing = Some(index);
         let offset = part.byte_offset();
         let ptype = Self::effective_type(part);
         let type_string = part.partition_type_string.clone();
