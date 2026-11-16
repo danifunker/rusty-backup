@@ -59,6 +59,17 @@ impl RemoteConnection {
         &self.addr
     }
 
+    /// Why the daemon stopped answering, once a read from it failed.
+    pub fn lost(&self) -> Option<&str> {
+        self.session.lost()
+    }
+
+    /// A cheap round trip that proves the daemon still answers; a refusal counts as alive.
+    pub fn heartbeat(&mut self) -> bool {
+        let _ = self.session.host_stat("/");
+        self.session.lost().is_none()
+    }
+
     // --- image handles (browse inside an opened image) ---------------------
 
     /// Open a disk image on the daemon and remember its handle. Many images can

@@ -31,19 +31,33 @@ pub struct OpenedImage {
 pub struct RemoteSession {
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
+    /// Why the socket stopped answering, once a read from it failed.
+    lost: Option<String>,
 }
 
 impl RemoteSession {
     /// Connect to `addr` (`host:port`) and complete the handshake, verifying
     /// the daemon offers Family F.
     pub fn connect(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr).with_context(|| format!("connecting to {addr}"))?;
+        let stream = connect_stream(addr).with_context(|| format!("connecting to {addr}"))?;
         stream.set_nodelay(true).ok();
+        // A host that takes the connection but never answers must not hang the handshake.
+        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).ok();
         let reader = BufReader::new(stream.try_clone().context("cloning socket")?);
         let writer = BufWriter::new(stream);
-        let mut session = Self { reader, writer };
+        let mut session = Self {
+            reader,
+            writer,
+            lost: None,
+        };
         session.handshake()?;
+        session.reader.get_ref().set_read_timeout(None).ok();
         Ok(session)
+    }
+
+    /// Why the connection died, once a read from the daemon failed (not a refusal it sent).
+    pub fn lost(&self) -> Option<&str> {
+        self.lost.as_deref()
     }
 
     fn handshake(&mut self) -> Result<()> {
@@ -721,8 +735,29 @@ impl RemoteSession {
     }
 
     fn read_response(&mut self) -> Result<Response> {
-        read_control(&mut self.reader).context("reading daemon response")
+        let read = read_control(&mut self.reader);
+        if let Err(e) = &read {
+            self.lost.get_or_insert_with(|| format!("{e:#}"));
+        }
+        read.context("reading daemon response")
     }
+}
+
+/// How long one address may take to accept, so an unreachable host fails fast.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Connect to the first of `addr`'s resolved addresses that accepts within the timeout.
+fn connect_stream(addr: &str) -> std::io::Result<TcpStream> {
+    use std::net::ToSocketAddrs;
+    let mut last = None;
+    for a in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&a, CONNECT_TIMEOUT) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| crate::compat::io_other("the address resolved to nothing")))
 }
 
 impl Drop for RemoteSession {

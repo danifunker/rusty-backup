@@ -3178,4 +3178,170 @@ mod inspect_remote_pick {
             .iter()
             .any(|l| l.starts_with("disconnected from")));
     }
+
+    #[test]
+    fn a_failed_connect_asks_again_with_the_reason_and_leaves_the_page() {
+        // A port nothing listens on: bind, note it, drop the listener.
+        let addr = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let mut ctl =
+            RemotePickController::new(std::sync::Arc::new(rusty_backup::model::job::NoNotify));
+        ctl.apply(A::Connect);
+        ctl.apply(A::Answered {
+            purpose: purpose::CONNECT,
+            text: Some(addr.clone()),
+        });
+        ctl.wait_idle();
+        assert!(!ctl.is_active(), "a failed connect gives the page back");
+        let fx = ctl.tick();
+        let [Effect::AskText(spec)] = fx.as_slice() else {
+            panic!("expected the connect prompt again, got {fx:?}");
+        };
+        assert_eq!(spec.initial, addr);
+        let why = spec.error.as_deref().unwrap_or("");
+        assert!(
+            why.starts_with(&format!("Could not connect to {addr}:")),
+            "{why}"
+        );
+        assert!(
+            why.contains("rb-cli serve") && !why.contains("os error"),
+            "{why}"
+        );
+        assert!(ctl.tick().is_empty(), "asked once");
+        // Cancel leaves nothing behind.
+        ctl.apply(A::Answered {
+            purpose: purpose::CONNECT,
+            text: None,
+        });
+        assert!(!ctl.is_active());
+    }
+}
+
+/// A daemon behind a relay the test can cut: (relay address, the streams to shut down).
+fn daemon_behind_a_relay(
+    root: std::path::PathBuf,
+) -> (String, std::sync::mpsc::Receiver<Vec<std::net::TcpStream>>) {
+    use std::net::{Shutdown, TcpStream};
+    let daemon = TcpListener::bind("127.0.0.1:0").unwrap();
+    let daemon_addr = daemon.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let _ = serve_on(daemon, root, None, true);
+    });
+    let front = TcpListener::bind("127.0.0.1:0").unwrap();
+    let front_addr = front.local_addr().unwrap().to_string();
+    let (cut_tx, cut_rx) = std::sync::mpsc::channel::<Vec<TcpStream>>();
+    // Every connection through the relay; each one's streams go to the test, in order.
+    std::thread::spawn(move || {
+        for client in front.incoming() {
+            let Ok(client) = client else { return };
+            let server = TcpStream::connect(daemon_addr).unwrap();
+            let pipe = |mut a: TcpStream, mut b: TcpStream| {
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut a, &mut b);
+                    let _ = b.shutdown(Shutdown::Both);
+                });
+            };
+            let _ = cut_tx.send(vec![
+                client.try_clone().unwrap(),
+                server.try_clone().unwrap(),
+            ]);
+            pipe(client.try_clone().unwrap(), server.try_clone().unwrap());
+            pipe(server, client);
+        }
+    });
+    (front_addr, cut_rx)
+}
+
+fn cut(rx: &std::sync::mpsc::Receiver<Vec<std::net::TcpStream>>) {
+    for s in rx.recv().unwrap() {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// Inspect asks once when an open remote image's daemon drops; Reconnect reopens, No closes.
+#[test]
+fn inspect_asks_when_the_remote_daemon_drops() {
+    use rusty_backup::controller::inspect::{
+        purpose, InspectAction, InspectController, InspectServices, InspectSource, JobRegistry,
+    };
+    use rusty_backup::controller::{Controller, Effect};
+    use rusty_backup::remote::RemoteConnection;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    make_fat_image(&root.join("disk.img"), "LINKVOL", "A.BIN", 0x01, 512);
+    let (addr, cuts) = daemon_behind_a_relay(root);
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+    let mut ctl = InspectController::new(InspectServices {
+        jobs: JobRegistry::new(),
+        notify: std::sync::Arc::new(rusty_backup::model::job::NoNotify),
+    });
+    ctl.apply(InspectAction::Load(InspectSource::Remote {
+        conn: (std::sync::Arc::clone(&conn), "/disk.img".to_string()),
+    }));
+    ctl.wait_opened();
+    let mut asked = Vec::new();
+    for _ in 0..50 {
+        asked.extend(ctl.tick());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ctl.partitions().len() == 1, "the image opened");
+    assert!(
+        asked.iter().all(|e| !matches!(e, Effect::Confirm(_))),
+        "{asked:?}"
+    );
+    ctl.take_requests();
+
+    cut(&cuts);
+    // Any read through the session (here a heartbeat) marks it; the next tick asks.
+    assert!(!conn.lock().unwrap().heartbeat());
+    let fx = ctl.tick();
+    let [Effect::Confirm(c)] = fx.as_slice() else {
+        panic!("expected the lost-connection question, got {fx:?}");
+    };
+    assert_eq!(c.purpose, purpose::REMOTE_LOST);
+    assert!(c.title.contains(&addr) && c.confirm_label == "Reconnect");
+    assert!(ctl.remote_lost());
+    assert!(ctl.tick().is_empty(), "asked once");
+
+    // The daemon is still up behind the relay, so Reconnect opens the same image again.
+    ctl.apply(InspectAction::Confirmed {
+        purpose: purpose::REMOTE_LOST,
+        yes: true,
+    });
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while (ctl.remote_lost() || ctl.partitions().is_empty()) && std::time::Instant::now() < end {
+        ctl.tick();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        !ctl.remote_lost() && ctl.partitions().len() == 1,
+        "reopened"
+    );
+    assert_eq!(ctl.remote_path(), Some("/disk.img"));
+
+    // Cut the new line too; this time Cancel closes the image.
+    let reconnected = ctl.remote().expect("a remote source").0.clone();
+    cut(&cuts);
+    assert!(!reconnected.lock().unwrap().heartbeat());
+    assert!(matches!(&ctl.tick()[..], [Effect::Confirm(_)]));
+    ctl.apply(InspectAction::Confirmed {
+        purpose: purpose::REMOTE_LOST,
+        yes: false,
+    });
+    assert!(!ctl.has_source() && !ctl.remote_lost());
+}
+
+/// A daemon that goes away mid-session: the connection notices and says so.
+#[test]
+fn a_connection_reports_the_daemon_dropping() {
+    use rusty_backup::remote::RemoteConnection;
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, cuts) = daemon_behind_a_relay(dir.path().canonicalize().unwrap());
+    let mut conn = RemoteConnection::connect(&addr).expect("connects through the relay");
+    assert!(conn.heartbeat() && conn.lost().is_none());
+    cut(&cuts);
+    assert!(!conn.heartbeat(), "the heartbeat sees the cut");
+    assert!(conn.lost().is_some());
 }

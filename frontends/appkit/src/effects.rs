@@ -268,18 +268,22 @@ fn prompt(mtm: MainThreadMarker, ask: Ask) -> Option<String> {
     };
     field.setStringValue(&ns(&ui::plain(initial)));
     ui::set_id(&field, "prompt.text");
-    let error = ui::label(mtm, "");
+    let error = NSTextField::wrappingLabelWithString(&ns(""), mtm);
     error.setTextColor(Some(&NSColor::systemRedColor()));
+    // A first error (a failed connect) can run to a few lines: room for them, wrapped.
+    let lines = first_error
+        .as_deref()
+        .map_or(1, |e| (e.chars().count() / 44 + 1).min(4)) as f64;
     let body = ui::flipped(mtm);
     body.setFrame(NSRect::new(
         NSPoint::new(0.0, 0.0),
-        NSSize::new(320.0, 46.0),
+        NSSize::new(320.0, 28.0 + 17.0 * lines),
     ));
     body.addSubview(&field);
     body.addSubview(&error);
     error.setFrame(NSRect::new(
         NSPoint::new(0.0, 26.0),
-        NSSize::new(320.0, 18.0),
+        NSSize::new(320.0, 17.0 * lines + 1.0),
     ));
     // The alert's text is the field's caption, so a screen reader names the field by it.
     field.setAccessibilityLabel(Some(&ns(&ui::plain(message))));
