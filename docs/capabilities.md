@@ -29,6 +29,7 @@ reference the shells are measured against. Per-feature limits by build target li
 | `browse.export-volume` | - | - | - | yes | `flow.browse.export-selected-zip`, `flow.browse.export-volume-zip` |
 | `browse.extract` | yes | yes | yes | yes | `flow.browse.inspect-extract-all`, `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |
 | `browse.new-folder` | - | yes | yes | yes | `flow.browse.inspect-new-folder` |
+| `browse.switch-partition` | - | yes | yes | yes | `flow.browse.inspect-switch-partition` |
 | `build.cd-efs` | yes | yes | yes | yes | `flow.build.efs-cd` |
 | `build.cd-from-folder` | yes | yes | yes | yes | `flow.build.efs-cd` |
 | `build.format` | - | yes | yes | yes | `flow.build.mbr-fat`, `flow.build.mbr-ntfs12` |
@@ -40,15 +41,16 @@ reference the shells are measured against. Per-feature limits by build target li
 | `commander.host-folder` | yes | yes | yes | yes | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
 | `convert.disc` | - | yes | yes | yes | `flow.convert.iso-to-chd` |
 | `convert.floppy` | - | yes | yes | yes | `flow.convert.floppy-2mg`, `flow.convert.floppy-d88`, `flow.convert.floppy-dc42`, `flow.convert.floppy-moof` |
-| `inspect.browse` | - | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder` |
+| `inspect.browse` | - | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder`, `flow.browse.inspect-switch-partition` |
 | `inspect.edit-table` | - | - | - | yes | `flow.inspect.tools.expand-add` |
 | `inspect.expand-hfs` | yes | yes | yes | yes | `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |
 | `inspect.expand-image` | - | - | - | yes | `flow.inspect.tools.expand-add` |
 | `inspect.export` | - | - | - | yes | `flow.inspect.tools.export-vhd` |
 | `inspect.open-backup` | - | yes | yes | yes | `flow.restore.share-with-inspect` |
-| `inspect.open-image` | yes | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder`, `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |
+| `inspect.open-image` | yes | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder`, `flow.browse.inspect-switch-partition`, `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |
 | `inspect.remote-backup` | yes | yes | yes | yes | `flow.network.remote-inspect-backup` |
-| `inspect.remote-open` | yes | yes | yes | yes | `flow.network.remote-inspect-backup` |
+| `inspect.remote-open` | yes | yes | yes | yes | `flow.network.remote-expand-image`, `flow.network.remote-inspect-backup` |
+| `inspect.remote-resize` | - | - | - | yes | `flow.network.remote-expand-image` |
 | `inspect.resize` | - | - | - | yes | `flow.inspect.tools.expand-add` |
 | `inspect.resize-image` | - | yes | yes | yes | `flow.inspect.resize-image.chd`, `flow.inspect.resize-image.grow-copy` |
 | `optical.browse_contents` | yes | yes | yes | yes | `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |

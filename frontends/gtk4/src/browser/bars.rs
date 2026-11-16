@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use rusty_backup::controller::browser::ids;
+use rusty_backup::controller::browser::{ids, CLOSE_LABEL};
+use rusty_backup::controller::inspect::ids as inspect_ids;
 use rusty_backup::controller::commander::{
     format_size, BrowseCaps, BrowserPaneAction as P, CommanderAction as A, CommanderController,
     ExportBar, ModeAction, Side, SpaceReadout, ViewItemKind, ViewMenuItem,
@@ -13,6 +14,9 @@ use rusty_backup::controller::commander::{
 
 use super::SendFn;
 use crate::widgets::{flow, flow_show, plain, set_text};
+
+/// Who hears the partition switcher's pick.
+type PickFn = Rc<dyn Fn(usize)>;
 
 /// Opens the file picker and hands the chosen paths to the callback.
 pub type AddFiles = Rc<dyn Fn(Rc<dyn Fn(Vec<PathBuf>)>)>;
@@ -72,6 +76,11 @@ pub struct Header {
     deleted: gtk::CheckButton,
     full_scan: gtk::CheckButton,
     shown: RefCell<Option<HeaderShown>>,
+    /// The owner's partition switcher: its indices in list order, and who hears a pick.
+    partition: gtk::DropDown,
+    partition_ids: Rc<RefCell<Vec<usize>>>,
+    partition_sync: Rc<Cell<bool>>,
+    on_partition: Rc<RefCell<Option<PickFn>>>,
 }
 
 impl Header {
@@ -136,7 +145,29 @@ impl Header {
         view.set_create_popup_func(move |b| {
             b.set_popover(Some(&view_popover(&items(), &popup_send)));
         });
-        let close = button("Close", ids::CLOSE, send, A::Mode(ModeAction::RequestClose));
+        let close = button(CLOSE_LABEL, ids::CLOSE, send, A::Mode(ModeAction::RequestClose));
+        let partition = gtk::DropDown::from_strings(&[]);
+        partition.set_widget_name(inspect_ids::BROWSE_PARTITION);
+        partition.set_tooltip_text(Some("Browse another partition of this disk"));
+        partition.set_visible(false);
+        let partition_ids: Rc<RefCell<Vec<usize>>> = Rc::default();
+        let partition_sync: Rc<Cell<bool>> = Rc::default();
+        let on_partition: Rc<RefCell<Option<PickFn>>> = Rc::default();
+        let (held, picks, hears) = (
+            partition_sync.clone(),
+            partition_ids.clone(),
+            on_partition.clone(),
+        );
+        partition.connect_selected_notify(move |d| {
+            if held.get() {
+                return;
+            }
+            let index = picks.borrow().get(d.selected() as usize).copied();
+            let f = hears.borrow().clone();
+            if let (Some(index), Some(f)) = (index, f) {
+                f(index);
+            }
+        });
         let deleted = gtk::CheckButton::with_label("Show deleted");
         deleted.set_widget_name(ids::SHOW_DELETED);
         deleted.set_tooltip_text(Some(
@@ -153,6 +184,7 @@ impl Header {
         let info = flow();
         info.set_column_spacing(12);
         info.append(&title);
+        info.append(&partition);
         for w in [&fs, &usage, &label, &blessed, &boot] {
             info.append(w);
         }
@@ -199,11 +231,40 @@ impl Header {
             deleted,
             full_scan,
             shown: RefCell::default(),
+            partition,
+            partition_ids,
+            partition_sync,
+            on_partition,
         }
     }
 
     pub fn root(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// The owner's partitions for the switcher (hidden with fewer than two).
+    pub fn set_partitions(&self, choices: &[(usize, String)], current: Option<usize>) {
+        let show = choices.len() > 1;
+        self.partition.set_visible(show);
+        if !show {
+            return;
+        }
+        let ids: Vec<usize> = choices.iter().map(|(i, _)| *i).collect();
+        self.partition_sync.set(true);
+        if *self.partition_ids.borrow() != ids {
+            let labels: Vec<&str> = choices.iter().map(|(_, l)| l.as_str()).collect();
+            self.partition.set_model(Some(&gtk::StringList::new(&labels)));
+            *self.partition_ids.borrow_mut() = ids.clone();
+        }
+        if let Some(at) = ids.iter().position(|i| Some(*i) == current) {
+            self.partition.set_selected(at as u32);
+        }
+        self.partition_sync.set(false);
+    }
+
+    /// Who hears the switcher's pick (the owner switches, asking first about staged edits).
+    pub fn on_partition(&self, f: Rc<dyn Fn(usize)>) {
+        *self.on_partition.borrow_mut() = Some(f);
     }
 
     /// The Export Volume key: what a click on the button does.
@@ -377,7 +438,7 @@ impl DiscHeader {
         view.set_create_popup_func(move |b| {
             b.set_popover(Some(&view_popover(&items(), &popup_send)));
         });
-        let close = button("Close", ids::CLOSE, send, A::Mode(ModeAction::RequestClose));
+        let close = button(CLOSE_LABEL, ids::CLOSE, send, A::Mode(ModeAction::RequestClose));
         let root = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         root.set_margin_top(6);
         root.set_margin_start(8);

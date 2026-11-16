@@ -424,6 +424,12 @@ impl InspectScreen {
             chd_window: RefCell::default(),
         });
         *bar_target.borrow_mut() = screen.me.clone();
+        let picker = screen.me.clone();
+        screen.browse.on_partition(Rc::new(move |index| {
+            if let Some(s) = picker.upgrade() {
+                s.apply(InspectAction::SwitchBrowse(index));
+            }
+        }));
         let target = screen.me.clone();
         screen.browse.on_change(Rc::new(move || {
             if let Some(s) = target.upgrade() {
@@ -909,6 +915,11 @@ impl InspectScreen {
     fn refresh(&self) {
         let shown = self.read();
         self.sync.run(|| self.show(shown));
+        let (choices, current) = {
+            let c = self.ctrl.borrow();
+            (c.browse_choices(), c.browsing())
+        };
+        self.browse.set_partitions(&choices, current);
     }
 
     fn show(&self, s: Shown) {

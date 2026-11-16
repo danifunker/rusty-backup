@@ -18,6 +18,8 @@
 mod browse;
 mod export;
 mod layout;
+#[cfg(feature = "remote")]
+mod link;
 mod open;
 mod tools;
 
@@ -86,6 +88,8 @@ pub mod purpose {
     pub const REMOTE_BACKUP: &str = "inspect.remote_backup";
     pub const OPEN_IMAGE: &str = "inspect.open_image";
     pub const OPEN_BACKUP: &str = "inspect.open_backup";
+    /// The remote image's daemon stopped answering: reconnect, or close the image.
+    pub const REMOTE_LOST: &str = "inspect.remote_lost";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
@@ -101,6 +105,8 @@ pub mod ids {
     pub const RESIZE: &str = "inspect.resize";
     pub const CHD_INFO: &str = "inspect.chd_info";
     pub const CLOSE: &str = "inspect.close";
+    /// The partition switcher in the browse view's header.
+    pub const BROWSE_PARTITION: &str = "inspect.browse_partition";
     pub const SOURCE: &str = "inspect.source";
     pub const SOURCE_RECENT: &str = "inspect.source.recent";
     pub const SOURCE_DEVICE: &str = "inspect.source.device";
@@ -175,6 +181,8 @@ enum Source {
 pub enum UnsavedGate {
     Open,
     Close,
+    /// The browse view's partition switcher: browse this partition instead.
+    Browse(usize),
 }
 
 /// User intents.
@@ -200,6 +208,8 @@ pub enum InspectAction {
     CalcMin(usize),
     /// Browse the partition with this index.
     Browse(usize),
+    /// The browse view's partition switcher (asks first while the open volume holds edits).
+    SwitchBrowse(usize),
     /// Check the filesystem of the partition with this index.
     Check(usize),
     /// Repair the checked filesystem (asks first).
@@ -434,6 +444,8 @@ pub struct InspectController {
     tools: tools::ToolState,
     export: export::ExportState,
     browse: browse::BrowseState,
+    #[cfg(feature = "remote")]
+    link: link::LinkState,
 }
 
 impl InspectController {
@@ -453,6 +465,8 @@ impl InspectController {
             tools: tools::ToolState::default(),
             export: export::ExportState::default(),
             browse: browse::BrowseState::default(),
+            #[cfg(feature = "remote")]
+            link: link::LinkState::default(),
         }
     }
 
@@ -1040,9 +1054,14 @@ impl InspectController {
         vec![Effect::Confirm(ConfirmSpec {
             purpose: purpose::DISCARD_EDITS,
             title: "Discard unsaved edits?".into(),
-            message: "The open volume has unapplied staged edits. Switching or closing the \
+            message: match gate {
+                UnsavedGate::Browse(_) => "The open volume has unapplied staged edits. \
+                                           Browsing another partition will discard them."
+                    .into(),
+                _ => "The open volume has unapplied staged edits. Switching or closing the \
                       source will discard them."
-                .into(),
+                    .into(),
+            },
             confirm_label: "Discard & continue".into(),
             destructive: true,
         })]
@@ -1053,6 +1072,7 @@ impl InspectController {
             (UnsavedGate::Open, Some(source)) => self.load(source),
             (UnsavedGate::Open, None) => {}
             (UnsavedGate::Close, _) => self.unload(false),
+            (UnsavedGate::Browse(index), _) => self.switch_browse(index),
         }
     }
 
@@ -1133,6 +1153,8 @@ impl InspectController {
         self.tools.reset();
         self.browse.reset();
         self.export.close();
+        #[cfg(feature = "remote")]
+        self.link.reset();
     }
 
     /// Give up the elevated descriptor this controller opened, so the device can eject.
@@ -1196,6 +1218,12 @@ impl Controller for InspectController {
             InspectAction::Browse(index) => {
                 self.browse_partition(index);
                 Vec::new()
+            }
+            InspectAction::SwitchBrowse(index) => {
+                if self.browsing() == Some(index) || self.rows_locked() {
+                    return Vec::new();
+                }
+                self.gate(UnsavedGate::Browse(index), None)
             }
             InspectAction::Check(index) => {
                 self.check(index);
@@ -1292,6 +1320,8 @@ impl Controller for InspectController {
         fx.extend(self.poll_tools());
         self.poll_export();
         self.poll_browse();
+        #[cfg(feature = "remote")]
+        fx.extend(self.poll_link());
         fx
     }
 }
@@ -1386,6 +1416,8 @@ impl InspectController {
             purpose::REPAIR if yes => self.repair(),
             purpose::DEFRAGMENT => self.defragment_answered(yes),
             purpose::APPLY_TABLE => self.apply_table_answered(yes),
+            #[cfg(feature = "remote")]
+            purpose::REMOTE_LOST => self.link_answered(yes),
             _ => {}
         }
         Vec::new()

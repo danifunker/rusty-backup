@@ -43,7 +43,7 @@ fn records_disk_size(table: &PartitionTable) -> bool {
 }
 
 /// One partition's filesystem check, as both checks (before and after) report it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Verdict {
     Clean,
     /// Errors found; `repairable` when Repair can fix at least one.
@@ -137,7 +137,7 @@ pub fn disk_size_of(path: &Path) -> Result<(u64, bool)> {
 }
 
 /// What the wizard learns about a partition before it plans.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PartProbe {
     pub index: usize,
     /// `Some(name)`: a filesystem with no in-place resizer, so the partition keeps its size.
@@ -232,7 +232,7 @@ impl ResizeImageRequest {
 }
 
 /// The steps of one resize, in the order they run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Step {
     /// A CHD is decoded into a raw work file.
     Unpack,
@@ -263,7 +263,7 @@ impl Step {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StepState {
     Pending,
     Running,
@@ -272,7 +272,7 @@ pub enum StepState {
 }
 
 /// What a running resize has done so far, shared with the controller.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Progress {
     pub steps: Vec<(Step, StepState)>,
     pub lines: Vec<String>,
@@ -283,7 +283,7 @@ pub struct Progress {
 pub type SharedProgress = Arc<Mutex<Progress>>;
 
 /// Where everything stands before the write: the plan the steps carry out.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Layout {
     pub old_disk_size: u64,
     pub is_vhd: bool,
@@ -296,7 +296,7 @@ pub struct Layout {
 }
 
 /// The free space a resize needs where it writes, and how much there is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Space {
     pub dir: PathBuf,
     pub needed: u64,
@@ -1006,6 +1006,126 @@ fn check_after(path: &Path, req: &ResizeImageRequest, layout: &Layout) -> Vec<(u
             touched.then(|| (p.index, check_partition(path, offset, p)))
         })
         .collect()
+}
+
+#[cfg(feature = "remote")]
+pub mod daemon;
+
+/// Where a resize runs: on this machine's file, or by the daemon that serves a remote image.
+#[derive(Clone)]
+pub enum Backend {
+    Local,
+    /// The daemon runs each step on its copy (`model::resize_image::daemon`); in place only.
+    #[cfg(feature = "remote")]
+    Remote(crate::model::inspect_runner::RemoteImage),
+}
+
+impl Backend {
+    pub fn is_remote(&self) -> bool {
+        !matches!(self, Backend::Local)
+    }
+
+    pub fn disk_size(&self, path: &Path) -> Result<(u64, bool)> {
+        match self {
+            Backend::Local => disk_size_of(path),
+            #[cfg(feature = "remote")]
+            Backend::Remote(conn) => match remote_step(conn, WireOp::DiskSize)? {
+                Response::ResizeDiskSize { size, vhd } => Ok((size, vhd)),
+                other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
+            },
+        }
+    }
+
+    pub fn probe(
+        &self,
+        path: &Path,
+        partitions: &[PartitionInfo],
+        ctx: &JobCtx,
+    ) -> Result<Vec<PartProbe>> {
+        match self {
+            Backend::Local => probe(path, partitions, ctx),
+            #[cfg(feature = "remote")]
+            Backend::Remote(conn) => {
+                let indices = partitions.iter().map(|p| p.index).collect();
+                match remote_step(conn, WireOp::Probe { indices })? {
+                    Response::ResizeProbes { probes } => Ok(probes),
+                    other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
+                }
+            }
+        }
+    }
+
+    /// Check (or with `repair`, repair) one partition's filesystem.
+    pub fn check(&self, path: &Path, part: &PartitionInfo, repair: bool) -> Verdict {
+        match self {
+            Backend::Local if repair => repair_partition(path, part.byte_offset(), part),
+            Backend::Local => check_partition(path, part.byte_offset(), part),
+            #[cfg(feature = "remote")]
+            Backend::Remote(conn) => {
+                let index = part.index;
+                let op = match repair {
+                    true => WireOp::Repair { index },
+                    false => WireOp::Check { index },
+                };
+                match remote_step(conn, op) {
+                    Ok(Response::ResizeVerdict { verdict }) => verdict,
+                    Ok(other) => Verdict::Failed(format!("unexpected reply: {other:?}")),
+                    Err(e) => Verdict::Failed(format!("{e:#}")),
+                }
+            }
+        }
+    }
+
+    pub fn plan(&self, req: &ResizeImageRequest) -> Result<Layout> {
+        match self {
+            Backend::Local => plan(req),
+            #[cfg(feature = "remote")]
+            Backend::Remote(conn) => match remote_step(conn, WireOp::Plan(wire_job(req)))? {
+                Response::ResizeLayout { layout } => Ok(layout),
+                other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
+            },
+        }
+    }
+
+    pub fn run(
+        &self,
+        req: &ResizeImageRequest,
+        ctx: &JobCtx,
+        shared: &SharedProgress,
+    ) -> Result<()> {
+        match self {
+            Backend::Local => run(req, ctx, shared),
+            #[cfg(feature = "remote")]
+            Backend::Remote((conn, path)) => {
+                // The daemon cannot be stopped part way, as a local in-place resize cannot.
+                ctx.set_can_cancel(false);
+                let mut c = crate::model::worker::lock_status(&**conn);
+                c.resize_run(path, wire_job(req), &mut |p| {
+                    *crate::model::worker::lock_status(&**shared) = p;
+                })
+            }
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+use crate::remote::protocol::{Response, WireResizeOp as WireOp};
+
+#[cfg(feature = "remote")]
+fn remote_step(conn: &crate::model::inspect_runner::RemoteImage, op: WireOp) -> Result<Response> {
+    crate::model::worker::lock_status(&*conn.0).resize_step(conn.1.as_str(), op)
+}
+
+/// The wizard's choices as the daemon takes them, with the partitions the client saw.
+#[cfg(feature = "remote")]
+fn wire_job(req: &ResizeImageRequest) -> crate::remote::protocol::WireResizeJob {
+    crate::remote::protocol::WireResizeJob {
+        disk_size: req.disk_size,
+        sizes: req.sizes.clone(),
+        check_after: req.check_after,
+        rebuild: req.rebuild.clone(),
+        expect: daemon::expect_of(&req.partitions),
+    }
 }
 
 #[cfg(test)]

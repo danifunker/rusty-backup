@@ -59,6 +59,41 @@ impl RemoteConnection {
         &self.addr
     }
 
+    /// Why the daemon stopped answering, once a read from it failed.
+    pub fn lost(&self) -> Option<&str> {
+        self.session.lost()
+    }
+
+    /// A cheap round trip that proves the daemon still answers; a refusal counts as alive.
+    pub fn heartbeat(&mut self) -> bool {
+        let _ = self.session.host_stat("/");
+        self.session.lost().is_none()
+    }
+
+    /// The daemon offers Resize Image (it is writable and new enough).
+    pub fn can_resize(&self) -> bool {
+        self.session.offers(crate::remote::protocol::CAP_RESIZE)
+    }
+
+    /// One Resize Image step on the daemon's image at `path`.
+    pub fn resize_step(
+        &mut self,
+        path: &str,
+        op: crate::remote::protocol::WireResizeOp,
+    ) -> Result<crate::remote::protocol::Response> {
+        self.session.resize_step(path, op)
+    }
+
+    /// Resize the daemon's image at `path`, with each progress frame.
+    pub fn resize_run(
+        &mut self,
+        path: &str,
+        job: crate::remote::protocol::WireResizeJob,
+        on_progress: &mut dyn FnMut(crate::model::resize_image::Progress),
+    ) -> Result<()> {
+        self.session.resize_run(path, job, on_progress)
+    }
+
     // --- image handles (browse inside an opened image) ---------------------
 
     /// Open a disk image on the daemon and remember its handle. Many images can

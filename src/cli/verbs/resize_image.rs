@@ -23,7 +23,8 @@ use crate::model::partition_resize::stamp_mib;
 
 #[derive(Debug, Args)]
 pub struct ResizeImageArgs {
-    /// The disk image to resize (raw `.img` / `.hda` / `.vhd`).
+    /// The disk image to resize (raw `.img` / `.hda` / `.vhd`), or `rb://host[:port]/path` for
+    /// one an `rb-cli serve` daemon resizes in place (needs `--in-place`).
     pub image: PathBuf,
     /// The disk's new size (e.g. `512M`, `2G`).
     #[arg(long)]
@@ -76,6 +77,29 @@ fn settle(c: &mut ResizeImageController) {
     }
 }
 
+/// The image Inspect opens: a local file, or a daemon's image (resized there, in place).
+fn source_of(args: &ResizeImageArgs) -> Result<InspectSource> {
+    let text = args.image.to_string_lossy();
+    #[cfg(feature = "remote")]
+    if let Some(r) = crate::remote::RemoteRef::parse(&text) {
+        if !args.in_place {
+            bail!("a remote image is resized in place by its daemon: pass --in-place");
+        }
+        let addr = format!("{}:{}", r.host, r.port);
+        let conn = crate::remote::RemoteConnection::connect_shared(&addr)?;
+        return Ok(InspectSource::Remote {
+            conn: (conn, r.path),
+        });
+    }
+    if text.starts_with("rb:/") {
+        bail!("this build has no remote support");
+    }
+    Ok(InspectSource::Image {
+        path: args.image.clone(),
+        temp: None,
+    })
+}
+
 pub fn run(args: ResizeImageArgs) -> Result<()> {
     let wanted: Vec<_> = args
         .parts
@@ -86,10 +110,7 @@ pub fn run(args: ResizeImageArgs) -> Result<()> {
         jobs: JobRegistry::new(),
         notify: Arc::new(NoNotify),
     });
-    inspect.apply(InspectAction::Open(InspectSource::Image {
-        path: args.image.clone(),
-        temp: None,
-    }));
+    inspect.apply(InspectAction::Open(source_of(&args)?));
     while inspect.loading().is_some() {
         std::thread::sleep(std::time::Duration::from_millis(5));
         inspect.tick();

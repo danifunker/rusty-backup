@@ -7,6 +7,8 @@ use std::os::raw::{c_char, c_int};
 
 use rusty_backup::controller::app::ids;
 use rusty_backup::controller::inspect::ids as inspect_ids;
+#[cfg(feature = "optical")]
+use rusty_backup::controller::optical::ids as optical_ids;
 
 use crate::screens::main_window::{screen_id, tabs, ISSUES, WEBSITE};
 
@@ -54,6 +56,8 @@ pub fn build() {
         inspect_ids::OPEN_FILE,
         "o",
     );
+    #[cfg(feature = "optical")]
+    add("File", "Open CD-ROM Image...", optical_ids::BROWSE_IMAGE, "");
     add(
         "File",
         "Open Backup Folder...",
@@ -81,6 +85,11 @@ pub fn build() {
 pub fn sync(on: &dyn Fn(&str) -> Option<bool>) {
     let all = IDS.with(|v| v.borrow().clone());
     for id in all {
+        // Open CD-ROM Image shows Optical from any screen, so it never follows the hidden button.
+        #[cfg(feature = "optical")]
+        if id == optical_ids::BROWSE_IMAGE {
+            continue;
+        }
         if let Some(enabled) = on(&id) {
             let i = CString::new(id).unwrap_or_default();
             // SAFETY: the host copies the id.

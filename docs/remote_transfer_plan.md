@@ -298,6 +298,19 @@ Shared
 
 ---
 
+### 5.3 Resize Image on the daemon (`CAP_RESIZE`)
+
+Resize Image on a remote image runs on the daemon: moving partitions over the wire would send
+the disk across the network twice, and the block tier cannot grow a file. A writable daemon
+advertises `CAP_RESIZE` in its `Hello`; the client offers the wizard only then (a read-only or
+older daemon gets a message saying why). `Request::ResizeImage { path, op }` carries one step
+of the wizard (`WireResizeOp`: `DiskSize`, `Probe`, `Check`, `Repair`, `Plan`, `Run`). The
+daemon reads the partition table from its own copy (`model::resize_image::daemon`), refuses if
+it differs from what the client inspected (`WireResizeJob::expect`), and runs the same engine
+(`model::resize_image`) as a local resize. `Run` streams `ResizeProgress` frames (the engine's
+`Progress`, every 300 ms) and ends with `ResizeDone` or `Error`. A remote image is resized in
+place only; the wizard's copy choice is off. The client side is `resize_image::Backend::Remote`.
+
 ## 6. Session / staging / cache model
 
 ### 6.1 Family F — session table = the cache

@@ -100,6 +100,18 @@ fn looks_like_disk_image(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A failed connect in words a user can act on: why, then what to check.
+pub fn connect_failure(addr: &str, error: &str) -> String {
+    let why = error
+        .strip_prefix(format!("connecting to {addr}: ").as_str())
+        .unwrap_or(error);
+    let why = match why.find(" (os error") {
+        Some(at) => &why[..at],
+        None => why,
+    };
+    format!("Could not connect to {addr}: {why}. Is the machine on and running rb-cli serve?")
+}
+
 pub struct RemotePickController {
     notify: Arc<dyn Notify>,
     browser: Option<RemoteBrowser>,
@@ -112,6 +124,8 @@ pub struct RemotePickController {
     error: Option<String>,
     log: Vec<String>,
     request: Option<RemoteImage>,
+    /// The connect prompt again after a failed connect, for the next tick to show.
+    reask: Option<TextSpec>,
 }
 
 impl RemotePickController {
@@ -128,6 +142,7 @@ impl RemotePickController {
             error: None,
             log: Vec::new(),
             request: None,
+            reask: None,
         }
     }
 
@@ -376,16 +391,32 @@ impl RemotePickController {
         }
     }
 
+    /// The daemon behind the listing stopped answering: say so, and what to do.
+    fn lost_note(&self) -> Option<String> {
+        let conn = self.browser.as_ref()?.connection();
+        let lost = conn.try_lock().ok()?.lost().is_some();
+        lost.then(|| {
+            format!(
+                "Lost the connection to {}. Disconnect, then connect again once the machine \
+                 is back.",
+                self.addr
+            )
+        })
+    }
+
     fn poll(&mut self) {
         if let Some(done) = self.entering.as_ref().and_then(job_outcome) {
             self.entering = None;
             match done {
                 Ok(entered) => {
                     if let Err(e) = self.listing.finish_enter(entered) {
-                        self.error = Some(format!("{e}"));
+                        self.error = Some(self.lost_note().unwrap_or(format!("{e}")));
                     }
                 }
-                Err(_) => self.error = Some("Listing the folder failed".to_string()),
+                Err(_) => {
+                    let why = self.lost_note();
+                    self.error = Some(why.unwrap_or("Listing the folder failed".to_string()));
+                }
             }
         }
         let Some(done) = self.pending.as_ref().and_then(job_outcome) else {
@@ -420,10 +451,15 @@ impl RemotePickController {
             }
             Err(e) if had_browser => self.log.push(format!("remote operation failed: {e}")),
             Err(e) => {
-                self.error = Some(e.clone());
+                // Back to the prompt, address kept and the reason under it: retry, fix, or cancel.
                 self.mode = None;
                 self.addr.clear();
                 self.log.push(format!("remote connect failed: {e}"));
+                self.asking = true;
+                let mut again = self.connect_spec();
+                again.initial = t.addr.clone();
+                again.error = Some(connect_failure(t.addr.as_str(), e.as_str()));
+                self.reask = Some(again);
             }
         }
     }
@@ -468,6 +504,6 @@ impl Controller for RemotePickController {
 
     fn tick(&mut self) -> Vec<Effect> {
         self.poll();
-        Vec::new()
+        self.reask.take().map(Effect::AskText).into_iter().collect()
     }
 }

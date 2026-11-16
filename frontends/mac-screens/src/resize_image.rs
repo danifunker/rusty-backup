@@ -351,6 +351,8 @@ impl ResizeImageWindow {
         f.set_text(K::Review, &c.review().join("\n"));
         f.set_check(K::Copy, !c.in_place());
         f.set_check(K::InPlace, c.in_place());
+        // A remote image is resized by its daemon, in place.
+        f.enable(K::Copy, c.copy_allowed());
         let out = match c.in_place() {
             true => String::new(),
             false => c

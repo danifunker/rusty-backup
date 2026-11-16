@@ -1941,7 +1941,7 @@ impl App {
         if c.can_export() {
             keys.push("e export");
         }
-        if c.can_expand_image() {
+        if c.can_resize_image() {
             keys.push("x expand image");
         }
         if c.can_make_bootable() {

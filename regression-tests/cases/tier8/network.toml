@@ -162,3 +162,57 @@ ui = [
   { activate = "optical.remote_connect" },
   { wait_gone = "Daemon address", timeout_ms = 30000 },
 ]
+
+[[case]]
+id = "flow.network.remote-expand-image"
+description = "Open a two-partition image on a writable rb-cli serve daemon, grow it from 16 MiB to 48 MiB with partition 2 filling the new space through the Resize Image wizard (the daemon runs the resize), then read the table back with rb-cli"
+level = "full"
+area = ["network", "inspect"]
+shells = ["appkit"]
+capabilities = ["inspect.remote-open", "inspect.remote-resize"]
+timeout_ms = 300000
+
+[[case.step]]
+args = ["build", "{scratch}/disk.img", "--size", "16M", "--table", "mbr", "--partition", "6M", "--partition", "rest", "--format", "1=fat:ONE", "--format", "2=fat:TWO"]
+expect_exit = 0
+
+[[case.step]]
+args = ["serve", "--bind", "127.0.0.1:{port}", "--root", "{scratch}"]
+background = true
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { activate = "inspect.source.connect_remote" },
+  { wait = "Connect to remote" },
+  { focus = "prompt.text" },
+  { fill = "127.0.0.1:{port}" },
+  { activate = "prompt.ok" },
+  { wait = "disk.img" },
+  { focus = "disk.img" },
+  { key = "Enter" },
+  { wait = "FAT16" },
+  { activate = "inspect.expand_image" },
+  { wait = "Step 1 of 6" },
+  { focus = "resize_image.disk_size" },
+  { fill = "48M" },
+  { wait = "Grows by 32.0 MiB" },
+  { activate = "resize_image.next" },
+  { wait = "Clean", timeout_ms = 60000 },
+  { activate = "resize_image.next" },
+  { focus = "resize_image.row_mode.1" },
+  { choose = "Fill" },
+  { activate = "resize_image.next" },
+  { wait = "Step 4 of 6", timeout_ms = 60000 },
+  { expect = "Change the image in place" },
+  { activate = "resize_image.next" },
+  { activate = "Resize in Place" },
+  { wait = "Done. The resized image", timeout_ms = 120000 },
+  { activate = "resize_image.cancel" },
+  { wait = "48.0 MiB" },
+]
+
+[[case.step]]
+args = ["inspect", "{scratch}/disk.img"]
+expect_exit = 0
+stdout_contains = ["41.0 MiB"]

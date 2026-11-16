@@ -30,6 +30,9 @@ const ALWAYS: [&str; 7] = [
     ids::LOG_COPY,
 ];
 
+/// The Optical screen's Open File... button (`controller::optical::ids::BROWSE_IMAGE`).
+const OPEN_CD: &str = "optical.browse_image";
+
 thread_local! {
     static ITEMS: RefCell<Vec<(String, Retained<NSMenuItem>)>> = const { RefCell::new(Vec::new()) };
     static SOURCES: RefCell<Option<(Retained<NSMenu>, Retained<NSMenu>)>> = const { RefCell::new(None) };
@@ -158,7 +161,7 @@ pub fn build(mtm: MainThreadMarker) {
         "File",
         vec![
             ours(mtm, "Open File for Inspect...", inspect_ids::OPEN_FILE),
-            ours(mtm, "Open CD-ROM Image...", "optical.browse_image"),
+            ours(mtm, "Open CD-ROM Image...", OPEN_CD),
             ours(mtm, "Open Backup Folder...", inspect_ids::OPEN_BACKUP),
             holder(mtm, "Open Recent", &recent),
             holder(mtm, "Open Device", &devices),
@@ -302,11 +305,17 @@ pub fn set_sources(recent: &[String], devices: &[String]) {
     });
 }
 
+/// Open CD-ROM Image works from any screen: it shows Optical and switches it to an image.
+fn always_optical(id: &str) -> bool {
+    cfg!(feature = "optical") && id == OPEN_CD
+}
+
 /// Each item follows its control: on when the control with its id is on screen and enabled.
 pub fn sync(on: &dyn Fn(&str) -> Option<bool>) {
     ITEMS.with(|items| {
         for (id, it) in items.borrow().iter() {
             let want = if ALWAYS.contains(&id.as_str())
+                || always_optical(id)
                 || id.starts_with(crate::screens::inspect::RECENT_ITEM)
                 || id.starts_with(crate::screens::inspect::DEVICE_ITEM)
             {

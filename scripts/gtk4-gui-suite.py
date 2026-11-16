@@ -398,10 +398,10 @@ def case_browse(app):
     need(app, "the fixture's partition", contains="[FAT", wait=30.0)
     press(button(app, "Browse"))
     need(app, "HELLO.TXT in Browse", name="HELLO.TXT", wait=30.0)
-    # The window's own title-bar Close has the same name: take the one beside Tree.
-    close = sibling_button(app, beside="Tree", name="Close")
+    # The browse view's Close says what it closes (controller::browser::CLOSE_LABEL).
+    close = sibling_button(app, beside="Tree", name="Close Browser")
     if close is None:
-        raise Fail("no Close button in the browse view")
+        raise Fail("no Close Browser button in the browse view")
     press(close)
     need(app, "the partition table after Close", contains="[FAT", wait=20.0)
 

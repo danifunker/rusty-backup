@@ -13,7 +13,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use rusty_backup::controller::app::{CommanderRecent, Notify, Snapshot, UserConfig};
-use rusty_backup::controller::browser::{ids, TextDoc};
+use rusty_backup::controller::browser::{ids, TextDoc, CLOSE_LABEL};
 use rusty_backup::controller::commander::{
     editor_window, extract_fork_modes, journal_window, tree_window, ArchiveUse,
     BrowserPaneAction as P, CommanderAction as A, CommanderController, EditBar, ExportBar,
@@ -21,7 +21,9 @@ use rusty_backup::controller::commander::{
     PaneServices, PaneWindow, PanelActions, PanelPreview, ProdosExportMode, ResourceForkMode, Side,
     SidePanel, Tone, TreeText, VolumeLine, WindowKind, FOLLOW_DELAY,
 };
-use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen, InspectAction, InspectSource};
+use rusty_backup::controller::inspect::{
+    ids as inspect_ids, BrowseEdit, BrowseOpen, InspectAction, InspectSource,
+};
 use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{picks, Controller, Effect};
@@ -39,6 +41,9 @@ use super::sync::SyncGuard;
 const DETAIL_W: i32 = 330;
 const TREE_W: i32 = 200;
 
+/// Who hears the partition switcher's pick.
+type PickFn = Rc<dyn Fn(usize)>;
+
 /// The Mac archive formats the side panel exports to, with their menu labels.
 const MAC_FORMATS: [(ExportFormat, &str); 4] = [
     (ExportFormat::BinHex, "BinHex (.hqx)"),
@@ -51,6 +56,7 @@ const MAC_FORMATS: [(ExportFormat, &str); 4] = [
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum C {
     Title,
+    Partition,
     Volume,
     Boot,
     EditMode,
@@ -188,6 +194,9 @@ pub struct BrowseView {
     follow_set: Cell<bool>,
     edits_shown: Cell<bool>,
     on_change: RefCell<Option<Rc<dyn Fn()>>>,
+    /// The partition switcher's indices, in its order, and who hears a pick.
+    partitions: RefCell<Vec<usize>>,
+    on_partition: RefCell<Option<PickFn>>,
 }
 
 impl BrowseView {
@@ -212,6 +221,8 @@ impl BrowseView {
             );
             let f = &form;
             f.label(C::Title, "Filesystem Browser");
+            f.popup(C::Partition, &[], inspect_ids::BROWSE_PARTITION);
+            f.show(C::Partition, false);
             f.label(C::Volume, "");
             f.label(C::Boot, "");
             f.button(C::EditMode, "Edit Mode", ids::EDIT_MODE);
@@ -225,7 +236,7 @@ impl BrowseView {
             f.check(C::FullScan, "Full scan", ids::FULL_SCAN);
             f.check(C::ShowDeleted, "Show deleted", ids::SHOW_DELETED);
             f.button(C::View, "View...", ids::VIEW_MENU);
-            f.button(C::Close, "Close", ids::CLOSE);
+            f.button(C::Close, CLOSE_LABEL, ids::CLOSE);
             f.label(C::EditNote, "");
             f.set_tone(C::EditNote, Some(Tone::Warning));
             f.label(C::EditTarget, "");
@@ -328,6 +339,8 @@ impl BrowseView {
                 follow_set: Cell::new(false),
                 edits_shown: Cell::new(false),
                 on_change: RefCell::default(),
+                partitions: RefCell::default(),
+                on_partition: RefCell::default(),
             }
         })
     }
@@ -436,6 +449,31 @@ impl BrowseView {
         if self.active.get() {
             self.apply(A::Mode(ModeAction::UpgradeSeekable(path)));
         }
+    }
+
+    /// The owner's partitions for the header's switcher (hidden with fewer than two).
+    pub fn set_partitions(&self, choices: &[(usize, String)], current: Option<usize>) {
+        let show = choices.len() > 1;
+        if show {
+            let labels: Vec<String> = choices.iter().map(|(_, l)| l.clone()).collect();
+            if self.form.items(C::Partition) != labels {
+                self.form.set_items(C::Partition, &labels);
+            }
+            let at = choices.iter().position(|(i, _)| Some(*i) == current);
+            if let Some(at) = at {
+                self.form.select(C::Partition, at);
+            }
+            self.partitions.replace(choices.iter().map(|(i, _)| *i).collect());
+        }
+        if self.form.shown(C::Partition) != show {
+            self.form.show(C::Partition, show);
+            self.layout();
+        }
+    }
+
+    /// Who hears the switcher's pick (the owner switches, asking first about staged edits).
+    pub fn on_partition(&self, f: Rc<dyn Fn(usize)>) {
+        self.on_partition.replace(Some(f));
     }
 
     pub fn close(&self) {
@@ -1089,6 +1127,14 @@ impl BrowseView {
             C::FullScan => self.apply(A::Mode(ModeAction::CarveFullScan(self.checked(c)))),
             C::ShowDeleted => self.apply(A::Mode(ModeAction::ShowDeleted(self.checked(c)))),
             C::Close => self.apply(A::Mode(ModeAction::RequestClose)),
+            C::Partition => {
+                let pick = self.form.picked(c);
+                let index = pick.and_then(|p| self.partitions.borrow().get(p).copied());
+                let f = self.on_partition.borrow().clone();
+                if let (Some(index), Some(f)) = (index, f) {
+                    f(index);
+                }
+            }
             C::AddFile => self.add_files(),
             C::Import => self.apply(pane(P::ImportTar)),
             C::NewFolder => self.apply(pane(P::RequestNewFolder)),
@@ -1197,6 +1243,7 @@ impl BrowseView {
         let fixed = |c: C, h: i32| Node::leaf(c, Size::Fixed(DETAIL_W), Size::Fixed(h));
         let mut col = vec![Node::row(vec![
             Node::leaf(C::Title, Size::Fixed(130), Size::Fixed(layout::ROW - 4)),
+            Node::leaf(C::Partition, Size::Fixed(260), Size::Fixed(layout::ROW + 2)),
             line(C::Volume),
             Node::leaf(C::Boot, Size::Fixed(150), Size::Fixed(layout::ROW - 4)),
         ])];
@@ -1217,7 +1264,7 @@ impl BrowseView {
             Node::leaf(C::FullScan, Size::Fixed(100), Size::Fixed(layout::ROW)),
             Node::leaf(C::ShowDeleted, Size::Fixed(120), Size::Fixed(layout::ROW)),
             button(C::View, 80),
-            button(C::Close, 70),
+            button(C::Close, 110),
         ]));
         col.push(line(C::EditNote));
         col.push(Node::row(vec![
