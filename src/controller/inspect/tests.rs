@@ -458,3 +458,69 @@ fn a_gpt_basic_data_fat_partition_offers_browse() {
     };
     assert!(ctl.row_actions(&part).browse);
 }
+
+fn opened_two_fat() -> (tempfile::TempDir, InspectController) {
+    let (dir, img) = crate::model::commander_descend::build_two_partition_fat_image();
+    let mut ctl = controller();
+    ctl.apply(InspectAction::Load(InspectSource::Image {
+        path: img,
+        temp: None,
+    }));
+    settle(&mut ctl);
+    ctl.take_requests();
+    (dir, ctl)
+}
+
+fn browse_offset(reqs: Vec<HostRequest>) -> Option<u64> {
+    reqs.into_iter().find_map(|r| match r {
+        HostRequest::OpenBrowse(open) => Some(open.session.partition_offset),
+        _ => None,
+    })
+}
+
+#[test]
+fn the_browse_switcher_lists_each_volume_and_reopens_on_the_one_picked() {
+    let (_dir, mut ctl) = opened_two_fat();
+    let choices = ctl.browse_choices();
+    assert_eq!(choices.len(), 2, "{choices:?}");
+    assert!(choices[0].1.starts_with("1: ") && choices[1].1.starts_with("2: "));
+    let (first, second) = (choices[0].0, choices[1].0);
+    ctl.apply(InspectAction::Browse(first));
+    assert_eq!(browse_offset(ctl.take_requests()), Some(1024 * 1024));
+    assert_eq!(ctl.browsing(), Some(first));
+
+    // Picking the open one changes nothing; the other closes the view, then reopens it there.
+    assert!(ctl.apply(InspectAction::SwitchBrowse(first)).is_empty());
+    assert!(ctl.take_requests().is_empty());
+    ctl.apply(InspectAction::SwitchBrowse(second));
+    let reqs = ctl.take_requests();
+    assert!(matches!(reqs.first(), Some(HostRequest::CloseBrowse)));
+    assert_eq!(browse_offset(reqs), Some(3 * 1024 * 1024));
+    assert_eq!(ctl.browsing(), Some(second));
+}
+
+#[test]
+fn switching_partitions_with_unsaved_edits_asks_first() {
+    let (_dir, mut ctl) = opened_two_fat();
+    let choices = ctl.browse_choices();
+    ctl.apply(InspectAction::Browse(choices[0].0));
+    ctl.take_requests();
+    ctl.set_browse_dirty(true);
+    let fx = ctl.apply(InspectAction::SwitchBrowse(choices[1].0));
+    assert!(matches!(&fx[..], [Effect::Confirm(c)] if c.purpose == purpose::DISCARD_EDITS));
+    assert!(ctl.take_requests().is_empty());
+    ctl.apply(InspectAction::Confirmed {
+        purpose: purpose::DISCARD_EDITS,
+        yes: false,
+    });
+    assert!(ctl.take_requests().is_empty());
+    assert_eq!(ctl.browsing(), Some(choices[0].0));
+
+    ctl.apply(InspectAction::SwitchBrowse(choices[1].0));
+    ctl.apply(InspectAction::Confirmed {
+        purpose: purpose::DISCARD_EDITS,
+        yes: true,
+    });
+    assert_eq!(browse_offset(ctl.take_requests()), Some(3 * 1024 * 1024));
+    assert_eq!(ctl.browsing(), Some(choices[1].0));
+}

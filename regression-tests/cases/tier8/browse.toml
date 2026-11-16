@@ -86,6 +86,44 @@ expect_exit = 0
 stdout_contains = ["NEWDIR"]
 
 [[case]]
+id = "flow.browse.inspect-switch-partition"
+description = "Browse partition 1 of a two-partition MBR image from Inspect, switch to partition 2 with the browser's partition picker, then Close Browser back to Inspect"
+level = "smoke"
+area = ["inspect", "browse"]
+shells = ["gtk", "win32", "appkit"]
+capabilities = ["inspect.open-image", "inspect.browse", "browse.switch-partition"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["build", "{scratch}/d.img", "--size", "40M", "--table", "mbr", "--partition", "16M", "--partition", "rest", "--format", "1=fat:ONE", "--format", "2=fat:TWO"]
+expect_exit = 0
+
+[[case.step]]
+args = ["mkdir", "{scratch}/d.img@1", "/ONEDIR"]
+expect_exit = 0
+
+[[case.step]]
+args = ["mkdir", "{scratch}/d.img@2", "/TWODIR"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/d.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "FAT16" },
+  { activate = "inspect.row.browse" },
+  { wait = "ONEDIR" },
+  { focus = "inspect.browse_partition" },
+  { choose = "2: " },
+  { wait = "TWODIR" },
+  { expect_not = "ONEDIR" },
+  { activate = "browse.close" },
+  { wait_gone = "TWODIR" },
+  { wait = "Partition Table: MBR" },
+]
+
+[[case]]
 id = "flow.browse.inspect-edit-text"
 description = "Browse a FAT floppy from Inspect, open its only file in the text editor, replace the text, save and apply, and compare the file rb-cli reads back"
 level = "smoke"

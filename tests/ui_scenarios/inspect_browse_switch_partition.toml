@@ -1,0 +1,50 @@
+# The browse view's partition switcher: it lists every browsable volume, closes the browser and
+# reopens it on the one picked, ignores the open one, and asks first while edits are staged.
+name = "Inspect: switch the browsed partition"
+vm = "inspect"
+
+[[step]]
+action = "OpenImage"
+arg = "$two_fat"
+settle = true
+expect = { partitions = 2, browse_choices = 2, browsing = -1 }
+
+[[step]]
+action = "Browse"
+arg = 0
+expect = { browsing = 0, requests = "open" }
+
+[[step]]
+action = "SwitchBrowse"
+arg = 0
+expect = { browsing = 0, requests = "" }
+
+[[step]]
+action = "SwitchBrowse"
+arg = 1
+expect = { browsing = 1, requests = "close,open" }
+
+[[step]]
+action = "SetBrowseDirty"
+arg = true
+
+[[step]]
+action = "SwitchBrowse"
+arg = 0
+effects = ["Confirm"]
+expect = { browsing = 1, requests = "" }
+
+[[step]]
+action = "Confirm"
+arg = false
+expect = { browsing = 1, requests = "" }
+
+[[step]]
+action = "SwitchBrowse"
+arg = 0
+effects = ["Confirm"]
+
+[[step]]
+action = "Confirm"
+arg = true
+expect = { browsing = 0, requests = "close,open" }

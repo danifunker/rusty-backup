@@ -247,6 +247,9 @@ impl Target for JobProbeController {
 /// `table_can_delete` (row 0), `table_can_apply`, `table_errors`, `convert_source`, `alto_source`.
 /// The source and the list: `ChooseImage`, `ChooseBackupFolder`, `Select` (a partition index);
 /// probes `selected` (-1 for none), `row_number`, `row_volume` (row 0), `layout_segments`.
+/// The browse view's partition switcher: `OpenImage` `$two_fat` (two FAT16 partitions),
+/// `Browse` / `SwitchBrowse` (a row); probes `browse_choices`, `browsing` (a row, -1 for none),
+/// `requests` (the host requests of the last action: `close`, `open`, comma-separated).
 struct InspectTarget {
     ctl: rusty_backup::controller::inspect::InspectController,
     dir: tempfile::TempDir,
@@ -254,6 +257,7 @@ struct InspectTarget {
     log: Vec<String>,
     can_add: bool,
     layout_segments: usize,
+    requests: Vec<&'static str>,
 }
 
 impl InspectTarget {
@@ -271,6 +275,7 @@ impl InspectTarget {
             log: Vec::new(),
             can_add: false,
             layout_segments: 0,
+            requests: Vec::new(),
         }
     }
 
@@ -288,7 +293,42 @@ impl InspectTarget {
             .extend(self.ctl.take_log().into_iter().map(|(_, m)| m));
         self.can_add = self.ctl.can_add_partition();
         self.layout_segments = self.ctl.layout().len();
+        use rusty_backup::controller::inspect::HostRequest;
+        let reqs = self.ctl.take_requests().into_iter();
+        self.requests = reqs
+            .filter_map(|r| match r {
+                HostRequest::CloseBrowse => Some("close"),
+                HostRequest::OpenBrowse(_) => Some("open"),
+                _ => None,
+            })
+            .collect();
         fx
+    }
+
+    /// A 16 MiB MBR disk with two 6 MiB FAT16 partitions, ONE and TWO.
+    fn two_fat(&self) -> Result<PathBuf, String> {
+        let mut bytes = vec![0u8; 16 << 20];
+        for (i, label) in ["ONE", "TWO"].into_iter().enumerate() {
+            let vol =
+                fs_pc::fat::create_blank_fat(6 << 20, Some(label)).map_err(|e| e.to_string())?;
+            let lba = 2048 + i * (6 << 20) / 512;
+            bytes[lba * 512..lba * 512 + vol.len()].copy_from_slice(&vol);
+            let e = 0x1BE + i * 16;
+            bytes[e + 4] = 0x06;
+            bytes[e + 8..e + 12].copy_from_slice(&(lba as u32).to_le_bytes());
+            bytes[e + 12..e + 16].copy_from_slice(&((vol.len() / 512) as u32).to_le_bytes());
+        }
+        bytes[510] = 0x55;
+        bytes[511] = 0xAA;
+        let p = self.dir.path().join("two.img");
+        std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
+        Ok(p)
+    }
+
+    /// The partition index of list row `arg`.
+    fn row_index(&self, arg: Option<&Value>) -> Result<usize, String> {
+        let row = arg.and_then(Value::as_integer).ok_or("needs a row")? as usize;
+        Ok(self.ctl.partitions().get(row).ok_or("no such row")?.index)
     }
 
     /// A 16 MiB MBR disk: one 4 MiB FAT16 partition at LBA 2048, the rest free.
@@ -435,6 +475,8 @@ impl Target for InspectTarget {
                     p
                 } else if arg == "$mbr_gap" {
                     self.mbr_gap()?
+                } else if arg == "$two_fat" {
+                    self.two_fat()?
                 } else {
                     PathBuf::from(arg)
                 };
@@ -455,6 +497,8 @@ impl Target for InspectTarget {
                 let index = self.ctl.partitions().get(row).ok_or("no such row")?.index;
                 InspectAction::Check(index)
             }
+            "Browse" => InspectAction::Browse(self.row_index(arg)?),
+            "SwitchBrowse" => InspectAction::SwitchBrowse(self.row_index(arg)?),
             "SetBrowseDirty" => {
                 self.ctl
                     .set_browse_dirty(arg.and_then(Value::as_bool).ok_or("needs a bool")?);
@@ -508,6 +552,14 @@ impl Target for InspectTarget {
                 Value::Boolean(self.ctl.fsck_view().is_some_and(|v| v.result.is_clean()))
             }
             "log" => Value::String(self.log.join("\n")),
+            "browse_choices" => Value::Integer(self.ctl.browse_choices().len() as i64),
+            "browsing" => {
+                let at = self.ctl.browsing();
+                let parts = self.ctl.partitions();
+                let row = at.and_then(|i| parts.iter().position(|p| p.index == i));
+                Value::Integer(row.map_or(-1, |r| r as i64))
+            }
+            "requests" => Value::String(self.requests.join(",")),
             "can_add_partition" | "editor_open" | "table_rows" | "table_modes"
             | "table_can_delete" | "table_can_apply" | "table_errors" | "convert_source"
             | "alto_source" => self.table_probe(name)?,

@@ -376,6 +376,16 @@ impl BrowseView {
         }
     }
 
+    /// The owner's partitions for the header's switcher (hidden with fewer than two).
+    pub fn set_partitions(&self, choices: &[(usize, String)], current: Option<usize>) {
+        self.header.set_partitions(choices, current);
+    }
+
+    /// Who hears the switcher's pick.
+    pub fn on_partition(&self, f: Rc<dyn Fn(usize)>) {
+        self.header.on_partition(f);
+    }
+
     pub fn close(&self) {
         if !self.active.replace(false) {
             return;
