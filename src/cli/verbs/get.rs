@@ -238,9 +238,10 @@ pub fn run(args: GetArgs) -> Result<()> {
         summarize(&stats);
         return Ok(());
     }
-    // Single file.
+    // Single entry: a symlink or special file goes the way it does inside a recursive dump.
     let host_target = decide_single_host_target(&args.dst, &entry);
-    extract_file_to_host(&mut *fs, &entry, &host_target, opts)
+    let mut stats = ExtractStats::default();
+    extract_entry_to_host(&mut *fs, &entry, &host_target, opts, &mut stats)
         .map(|_written| ())
         .with_context(|| format!("extracting {} to {}", args.src, host_target.display()))
 }

@@ -45,6 +45,20 @@ pub fn csum_seed(uuid: &[u8; 16]) -> u32 {
     ext_crc(0xFFFF_FFFF, uuid)
 }
 
+/// The seed a volume's metadata checksums use: `s_checksum_seed` when the volume has
+/// `metadata_csum_seed` (its UUID may have changed since), else the one derived from the UUID.
+pub fn volume_seed(sb: &[u8]) -> u32 {
+    let incompat = u32::from_le_bytes(sb[0x60..0x64].try_into().unwrap());
+    if incompat & INCOMPAT_CSUM_SEED != 0 {
+        return u32::from_le_bytes(sb[0x270..0x274].try_into().unwrap());
+    }
+    let uuid: [u8; 16] = sb[0x68..0x78].try_into().unwrap();
+    csum_seed(&uuid)
+}
+
+/// `INCOMPAT_CSUM_SEED`: the checksum seed is stored in the superblock at 0x270.
+const INCOMPAT_CSUM_SEED: u32 = 0x2000;
+
 // ---- superblock ----
 
 /// The superblock checksum: `ext_crc(!0, sb[0..0x3FC])` (not UUID-seeded).

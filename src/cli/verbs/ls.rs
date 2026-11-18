@@ -118,7 +118,7 @@ impl LsRow {
         id_names: Option<&disk_core::id_names::IdNameMap>,
     ) -> Self {
         Self {
-            kind: if entry.is_directory() { "DIR" } else { "FILE" },
+            kind: kind_of(entry).trim_end(),
             name: display_name.to_string(),
             size: entry.size,
             type_code: entry.type_code_display(),
@@ -354,7 +354,12 @@ fn print_entry(
     id_names: Option<&disk_core::id_names::IdNameMap>,
     time: bool,
 ) {
-    let kind = if entry.is_directory() { "DIR " } else { "FILE" };
+    let kind = kind_of(entry);
+    // A symlink's target follows its name, as `ls -l` shows it.
+    let display_name = match (&entry.entry_type, &entry.symlink_target) {
+        (disk_core::entry::EntryType::Symlink, Some(t)) => format!("{display_name} -> {t}"),
+        _ => display_name.to_string(),
+    };
     let date = if time {
         format!("{:<19}  ", entry.modified.as_deref().unwrap_or("-"))
     } else {
@@ -388,6 +393,15 @@ fn print_entry(
         "{kind}  {:>10}  {t} {cr}  {date}{display_name}",
         entry.size
     ));
+}
+
+/// The listing's kind column: `DIR `, `LINK` or `FILE` (devices and other specials list as files).
+fn kind_of(entry: &disk_core::entry::FileEntry) -> &'static str {
+    match entry.entry_type {
+        disk_core::entry::EntryType::Directory => "DIR ",
+        disk_core::entry::EntryType::Symlink => "LINK",
+        _ => "FILE",
+    }
 }
 
 fn has_glob_chars(s: &str) -> bool {

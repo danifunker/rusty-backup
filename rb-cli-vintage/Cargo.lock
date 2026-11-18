@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-vm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "disk-core",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "fs-unix"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "byteorder",

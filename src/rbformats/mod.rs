@@ -1693,6 +1693,14 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         let mut head = [0u8; 4];
         if file.read_exact(&mut head).is_ok() && &head == vmdk_sparse::VMDK_SPARSE_MAGIC {
             if let Some(p) = path {
+                // One piece of a split disk (no descriptor of its own): open the whole disk.
+                if let Some(desc) = vmdk::descriptor_for_extent(p) {
+                    let reader = vmdk::VmdkFlatReader::open(&desc)?;
+                    return Ok(ImageFormat::VmdkFlat {
+                        path: desc,
+                        logical_size: reader.len(),
+                    });
+                }
                 // Same treatment as QCOW2 above: `KDMV` is unambiguous, so
                 // surface the reader's reason rather than falling through.
                 let reader = vmdk_sparse::VmdkSparseReader::open(File::open(p)?)?;
@@ -1714,14 +1722,15 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         let mut head = vec![0u8; vmdk::VMDK_DESCRIPTOR_MAGIC.len()];
         if file.read_exact(&mut head).is_ok() && head == vmdk::VMDK_DESCRIPTOR_MAGIC {
             if let Some(p) = path {
-                if let Ok(reader) = vmdk::VmdkFlatReader::open(p) {
-                    let logical_size = reader.len();
-                    drop(reader);
-                    return Ok(ImageFormat::VmdkFlat {
-                        path: p.to_path_buf(),
-                        logical_size,
-                    });
-                }
+                // The sentinel is unambiguous: a descriptor that cannot be opened says why,
+                // rather than being read as an 866-byte raw disk.
+                let reader = vmdk::VmdkFlatReader::open(p)?;
+                let logical_size = reader.len();
+                drop(reader);
+                return Ok(ImageFormat::VmdkFlat {
+                    path: p.to_path_buf(),
+                    logical_size,
+                });
             }
         }
     }

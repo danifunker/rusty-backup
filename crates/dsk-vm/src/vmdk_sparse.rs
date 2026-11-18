@@ -165,6 +165,9 @@ pub struct VmdkSparseReader<R: Read + Seek> {
     header: VmdkSparseHeader,
     /// Grain directory in RAM: u32 sector offsets, one per GT.
     gd: Vec<u32>,
+    /// The redundant grain directory VMware keeps beside it (empty when there is none): each
+    /// new grain is entered in both copies, so the redundant one stays a valid fallback.
+    rgd: Vec<u32>,
     /// `(gt_index, parsed_entries)` for the most recently loaded GT.
     gt_cache: Option<(usize, Vec<u32>)>,
     pos: u64,
@@ -210,6 +213,19 @@ impl<R: Read + Seek> VmdkSparseReader<R> {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
+        let rgd = match header.rgd_offset_sectors {
+            0 => Vec::new(),
+            at => {
+                inner.seek(SeekFrom::Start(at * VMDK_SECTOR))?;
+                inner.read_exact(&mut gd_buf).with_context(|| {
+                    format!("VMDK sparse: read redundant grain directory @ sector {at}")
+                })?;
+                let entries = gd_buf.chunks_exact(4);
+                entries
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect()
+            }
+        };
 
         let file_end = inner.seek(SeekFrom::End(0))?;
         let grain_size_bytes = header.grain_size_sectors * VMDK_SECTOR;
@@ -221,6 +237,7 @@ impl<R: Read + Seek> VmdkSparseReader<R> {
             inner,
             header,
             gd,
+            rgd,
             gt_cache: None,
             pos: 0,
             host_end,
@@ -328,6 +345,13 @@ impl<R: Read + Write + Seek> VmdkSparseReader<R> {
     /// entry) so the "grow a GT when its GD slot is empty" branch the QCOW2
     /// editor needs doesn't arise here.
     fn allocate_grain(&mut self, gt_index: usize, gte_index: usize) -> std::io::Result<u64> {
+        if self.gd.get(gt_index).copied().unwrap_or(0) == 0 {
+            // A GT entry at sector 0 would land in the header.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "VMDK sparse: this grain table was never allocated; editing it is not supported",
+            ));
+        }
         let grain_size_bytes = self.header.grain_size_sectors * VMDK_SECTOR;
         let new_host = self.host_end;
         // Zero-fill the grain so partial writes that come next don't expose
@@ -348,6 +372,11 @@ impl<R: Read + Write + Seek> VmdkSparseReader<R> {
         let entry_byte = gt_host_sector * VMDK_SECTOR + (gte_index as u64) * 4;
         self.inner.seek(SeekFrom::Start(entry_byte))?;
         self.inner.write_all(&new_grain_sector.to_le_bytes())?;
+        if let Some(&rgt) = self.rgd.get(gt_index).filter(|&&s| s != 0) {
+            let redundant = rgt as u64 * VMDK_SECTOR + (gte_index as u64) * 4;
+            self.inner.seek(SeekFrom::Start(redundant))?;
+            self.inner.write_all(&new_grain_sector.to_le_bytes())?;
+        }
 
         // Update cached GT if it's the one we just touched.
         if let Some((cached_idx, gt)) = &mut self.gt_cache {
