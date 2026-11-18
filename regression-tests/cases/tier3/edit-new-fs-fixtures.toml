@@ -267,3 +267,25 @@ expect_exit = 0
 [[case.step]]
 args = ["put", "{scratch}/dyn/v.vhd", "{cases}/tier3/payload.bin", "/p.bin"]
 expect_exit = 0
+
+[[case]]
+id = "edit.vmdk.split-sparse"
+description = "Edits through a twoGbMaxExtentSparse VMDK land in the right extent: a file put into partition 2 (wholly in extent 2) reads back, partition 1 is untouched, and both volumes check clean"
+fixture = "container.vmdk.split-sparse.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}@2", "{cases}/tier3/payload.bin", "/PAYLOAD.BIN"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@2", "/PAYLOAD.BIN", "{scratch}/back.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}@1", "/"]
+expect_exit = 0
+stdout_contains = ["ONE.TXT"]
+stdout_not_contains = ["PAYLOAD.BIN"]
+[[case.step]]
+args = ["fsck", "{fixture_copy}@1", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{fixture_copy}@2", "--checkonly"]
+expect_exit = 0

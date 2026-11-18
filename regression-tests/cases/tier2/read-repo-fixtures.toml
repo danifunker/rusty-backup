@@ -203,3 +203,22 @@ stdout_contains = ["734781440             flynntech12.iso", "WINDOWS", "PermTest
 args = ["get", "{fixture}", "/WINDOWS/NOTEPAD.EXE", "{scratch}/notepad.exe"]
 expect_exit = 0
 file_sha256 = [{ path = "{scratch}/notepad.exe", sha256 = "865f34fe7ba81e9622ddbdfc511547d190367bbf3dad21ceb6da3eec621044f5" }]
+
+[[case]]
+id = "read.vmdk.split-sparse"
+description = "A twoGbMaxExtentSparse VMDK opens as its whole disk from the descriptor or from a -sNNN piece; a file in each extent reads back"
+fixture = "container.vmdk.split-sparse.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["FAT32", "FAT16", "4220928"]
+[[case.step]]
+args = ["get", "{fixture}@1", "/ONE.TXT", "{scratch}/one.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture}@2", "/TWO.TXT", "{scratch}/two.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["tree", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["ONE.TXT", "TWO.TXT", "== Partition @2"]

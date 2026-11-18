@@ -1,0 +1,42 @@
+# Tier 1 — self-fixturing. `rb-cli tree` over a disk rb-cli builds: every partition under a
+# heading, one with IMG@N (its label on stderr), filesystem IDs with --ids, and an out-of-range
+# partition refused. The disk carries a symlink-free FAT pair, so the listing is deterministic.
+
+[meta]
+tier = 1
+group = "cli.tree"
+description = "rb-cli tree: the whole disk, one partition, --ids, and a bad selector."
+
+[[case]]
+id = "cli.tree.disk-and-partition"
+description = "tree lists both partitions of a two-partition MBR disk, then partition 2 alone and with IDs"
+[[case.step]]
+args = ["build", "{scratch}/d.img", "--size", "16M", "--table", "mbr", "--partition", "6M", "--partition", "rest", "--format", "1=fat:ONE", "--format", "2=fat:TWO"]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{scratch}/d.img@1", "/DOCS"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/d.img@1", "{cases}/tier8/data/hello.txt", "/DOCS/HELLO.TXT"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/d.img@2", "{cases}/tier8/data/hello.txt", "/TWO.TXT"]
+expect_exit = 0
+[[case.step]]
+args = ["tree", "{scratch}/d.img"]
+expect_exit = 0
+stdout_contains = ["== Partition @1", "DOCS", "HELLO.TXT", "== Partition @2", "TWO.TXT", "1 directories, 1 files", "0 directories, 1 files"]
+[[case.step]]
+args = ["tree", "{scratch}/d.img@2"]
+expect_exit = 0
+stdout_contains = ["TWO.TXT"]
+stdout_not_contains = ["==", "HELLO.TXT"]
+stderr_contains = ["Partition @2"]
+[[case.step]]
+args = ["tree", "{scratch}/d.img@1", "--ids"]
+expect_exit = 0
+stdout_contains = ["(ID: "]
+[[case.step]]
+args = ["tree", "{scratch}/d.img@3"]
+expect_exit = 1
+stderr_contains = ["out of range"]
