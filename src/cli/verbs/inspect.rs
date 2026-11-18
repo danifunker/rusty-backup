@@ -115,7 +115,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
             }
         })?
     };
-    let mut partitions = pt.partitions();
+    let mut partitions = crate::partition::partitions_with_volumes(&mut reader, &pt);
     // Forced dispatch: a signature-less filesystem cannot be detected, so the
     // user naming it is the only way inspect can report it. Applied only where
     // the table declared nothing, so a real type string is never overwritten.

@@ -74,6 +74,8 @@ pub struct InspectOutcome {
     pub table: PartitionTable,
     pub alignment: PartitionAlignment,
     pub partitions: Vec<PartitionInfo>,
+    /// LVM2 logical volumes inside PV partitions: browsable rows, never backed up.
+    pub volumes: Vec<PartitionInfo>,
     pub min_sizes: HashMap<usize, u64>,
     pub defrag_min_sizes: HashMap<usize, u64>,
     pub volume_labels: HashMap<usize, String>,
@@ -278,7 +280,14 @@ pub fn inspect_source(
         alignment.alignment_type, alignment.first_lba
     ));
 
-    let volume_labels = probe_volume_labels(&partitions, &table, &probe);
+    let volumes = probe()
+        .map(|mut r| crate::partition::volume_rows(&mut r, &partitions))
+        .unwrap_or_default();
+    if !volumes.is_empty() {
+        log(format!("Found {} LVM2 logical volume(s)", volumes.len()));
+    }
+    let listed: Vec<PartitionInfo> = partitions.iter().chain(&volumes).cloned().collect();
+    let volume_labels = probe_volume_labels(&listed, &table, &probe);
 
     job.set_phase("Analyzing filesystem sizes...");
     let mut min_sizes = HashMap::new();
@@ -379,6 +388,7 @@ pub fn inspect_source(
         table,
         alignment,
         partitions,
+        volumes,
         min_sizes,
         defrag_min_sizes,
         volume_labels,

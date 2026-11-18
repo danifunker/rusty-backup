@@ -289,3 +289,21 @@ expect_exit = 0
 [[case.step]]
 args = ["fsck", "{fixture_copy}@2", "--checkonly"]
 expect_exit = 0
+
+[[case]]
+id = "edit.lvm2.two-run"
+description = "A file put into a Linux LVM2 LV stored in two out-of-order runs reads back, the volume checks clean, and the swap LV between the runs is untouched"
+fixture = "part.lvm2.two-run.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}@2", "{cases}/tier3/payload.bin", "/PAYLOAD.BIN"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@2", "/PAYLOAD.BIN", "{scratch}/back.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{fixture_copy}@2", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}@3", "/"]
+expect_exit = 0
+stdout_contains = ["carved-blk000000.txt"]

@@ -201,6 +201,7 @@ impl InspectController {
         self.found.table = Some(out.table);
         self.found.alignment = Some(out.alignment);
         self.found.partitions = out.partitions;
+        self.found.volumes = out.volumes;
         self.found.min_sizes = out.min_sizes;
         self.found.defrag_min_sizes = out.defrag_min_sizes;
         self.found.volume_labels = out.volume_labels;

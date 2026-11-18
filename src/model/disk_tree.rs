@@ -65,7 +65,7 @@ fn partition_count(path: &Path, opts: &TreeOptions) -> Result<usize> {
         crate::model::source_reader::open_peeled_read_with_entry(path, pw, opts.inside)?;
     Ok(
         match crate::partition::PartitionTable::detect(&mut reader) {
-            Ok(table) => table.partitions().len(),
+            Ok(table) => crate::partition::partitions_with_volumes(&mut reader, &table).len(),
             // `--fs-type` on a disk with no table: the whole image is the volume.
             Err(_) if opts.fs_override.is_some_and(|o| o.fs_type.is_some()) => 0,
             Err(e) => return Err(anyhow!(e)),

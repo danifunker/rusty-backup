@@ -463,7 +463,7 @@ impl InspectState {
 
     /// The Explorer's title for the selected partition.
     fn browse_label(&self) -> String {
-        match self.ctl.partitions().get(self.sel) {
+        match self.ctl.listed().nth(self.sel) {
             Some(p) => {
                 let name = self
                     .ctl
@@ -485,13 +485,13 @@ impl InspectState {
     pub(super) fn row_count(&self) -> usize {
         match &self.plain {
             Some(rows) if self.ctl.partitions().is_empty() => rows.len(),
-            _ => self.ctl.partitions().len(),
+            _ => self.ctl.listed().count(),
         }
     }
 
     /// The selected partition's index in the controller's list.
     fn selected(&self) -> Option<usize> {
-        self.ctl.partitions().get(self.sel).map(|p| p.index)
+        self.ctl.listed().nth(self.sel).map(|p| p.index)
     }
 
     /// A picker's answer, to the controller that asked; a cancel is `None`.
@@ -961,7 +961,7 @@ impl InspectState {
     /// One key on the grid; `false` lets it fall through (tab switching, quit, open).
     fn grid_key(&mut self, code: KeyCode) -> bool {
         let rows = self.row_count();
-        let part = self.ctl.partitions().get(self.sel).cloned();
+        let part = self.ctl.listed().nth(self.sel).cloned();
         let actions = part.as_ref().map(|p| self.ctl.row_actions(p));
         let locked = self.ctl.rows_locked();
         match code {
@@ -1831,12 +1831,14 @@ impl App {
             ),
             pal.dim().add_modifier(Modifier::BOLD),
         ));
-        for (pos, part) in c.partitions().iter().enumerate() {
+        for (pos, part) in c.listed().enumerate() {
             let sel = pos == s.sel;
             if sel {
                 focus = lines.len();
             }
-            let num = if part.is_logical {
+            let num = if c.is_volume_row(part) {
+                format!("{}V", pos + 1)
+            } else if part.is_logical {
                 format!("{}L", pos + 1)
             } else if part.is_extended_container {
                 format!("{}E", pos + 1)
@@ -1892,7 +1894,7 @@ impl App {
     /// The selected row's extras: defragmented minimum, block size, boot flag, and its keys.
     fn inspect_row_detail(&self, s: &InspectState, pos: usize) -> String {
         let c = &s.ctl;
-        let Some(part) = c.partitions().get(pos) else {
+        let Some(part) = c.listed().nth(pos) else {
             return String::new();
         };
         let mut out = String::from("      ");

@@ -489,6 +489,65 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         }
     }
 
+    /// Physical block of each logical block, in file order; 0 for a hole or an uninitialized extent.
+    fn inode_read_map(&mut self, inode: &InodeData) -> Result<Vec<u64>, FilesystemError> {
+        if !(inode.flags & EXT4_EXTENTS_FL != 0
+            || self.has_extents && is_extent_header(&inode.block))
+        {
+            return self.read_indirect_blocks(inode);
+        }
+        let mut leaves = Vec::new();
+        self.collect_extent_leaves(&inode.block, &mut leaves, 0)?;
+        let mut map = Vec::new();
+        for leaf in leaves {
+            let (len, uninit) = match leaf.len > 32768 {
+                true => (leaf.len - 32768, true),
+                false => (leaf.len, false),
+            };
+            let at = leaf.logical_block as usize;
+            if map.len() < at + len as usize {
+                map.resize(at + len as usize, 0);
+            }
+            for j in 0..len as usize {
+                map[at + j] = if uninit {
+                    0
+                } else {
+                    leaf.physical_block + j as u64
+                };
+            }
+        }
+        Ok(map)
+    }
+
+    fn collect_extent_leaves(
+        &mut self,
+        node: &[u8],
+        out: &mut Vec<ExtentLeaf>,
+        depth: u32,
+    ) -> Result<(), FilesystemError> {
+        let header = parse_extent_header(node)?;
+        if depth > 8 {
+            return Err(FilesystemError::InvalidData(
+                "ext: extent tree too deep".into(),
+            ));
+        }
+        if header.depth == 0 {
+            for i in 0..header.entries as usize {
+                let off = 12 + i * 12;
+                if off + 12 > node.len() {
+                    break;
+                }
+                out.push(parse_one_extent_leaf(node, off));
+            }
+            return Ok(());
+        }
+        for idx in parse_extent_indices(node, header.entries) {
+            let child = self.read_block(idx.child_block)?;
+            self.collect_extent_leaves(&child, out, depth + 1)?;
+        }
+        Ok(())
+    }
+
     /// Stream inode data to a writer up to `max_bytes`. Avoids the full-file
     /// allocation in `read_inode_data`; used by `write_file_to`.
     fn write_inode_data_to(
@@ -497,16 +556,16 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         writer: &mut dyn std::io::Write,
         max_bytes: u64,
     ) -> Result<u64, FilesystemError> {
-        let blocks = self.inode_data_blocks(inode)?;
+        let blocks = self.inode_read_map(inode)?;
         let limit = inode.size.min(max_bytes);
         let block_size = self.block_size as usize;
         let zeros = vec![0u8; block_size];
         let mut written: u64 = 0;
+        let count = limit.div_ceil(block_size as u64) as usize;
 
-        for block_num in blocks {
-            if written >= limit {
-                break;
-            }
+        // Past the last extent is a hole too, up to the size.
+        for i in 0..count {
+            let block_num = blocks.get(i).copied().unwrap_or(0);
             let remaining = limit - written;
             let to_write = (block_size as u64).min(remaining) as usize;
             if block_num == 0 {
@@ -527,14 +586,13 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         inode: &InodeData,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let blocks = self.inode_data_blocks(inode)?;
+        let blocks = self.inode_read_map(inode)?;
         let mut data = Vec::new();
         let limit = (inode.size as usize).min(max_bytes);
+        let count = limit.div_ceil(self.block_size as usize);
 
-        for block_num in blocks {
-            if data.len() >= limit {
-                break;
-            }
+        for i in 0..count {
+            let block_num = blocks.get(i).copied().unwrap_or(0);
             if block_num == 0 {
                 // Sparse block — fill with zeros
                 let chunk = self.block_size as usize;
@@ -2861,7 +2919,6 @@ struct ExtentHeader {
 }
 
 struct ExtentLeaf {
-    #[allow(dead_code)] // Used for sparse file handling in compaction
     logical_block: u32,
     len: u16,
     physical_block: u64,
@@ -5608,6 +5665,46 @@ mod tests {
         let report = fs.fsck().expect("ext has fsck").unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         e2fsck_clean(fs.reader.get_ref());
+    }
+
+    /// Holes, uninitialized extents and the tail past the last extent read as zeros in place.
+    #[test]
+    fn sparse_and_uninit_extents_read_as_zeros_at_their_logical_blocks() {
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = crate::ext_format::create_blank_ext4(32 * 1024 * 1024, "Holes").unwrap();
+        let mut fs = ExtFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let data: Vec<u8> = (0..3 * 4096).map(|i| (i / 4096 + 1) as u8).collect();
+        let opts = CreateFileOptions::default();
+        let e = fs
+            .create_file(&root, "f", &mut &data[..], data.len() as u64, &opts)
+            .unwrap();
+        let mut inode = fs.read_inode(e.location as u32).unwrap();
+        let first = parse_one_extent_leaf(&inode.block, 12);
+        assert_eq!(first.len, 3, "one extent of three blocks to rewrite");
+        let set = |inode: &mut InodeData, len1: u16| {
+            inode.block[2..4].copy_from_slice(&2u16.to_le_bytes());
+            write_extent(&mut inode.block[12..24], 0, first.physical_block);
+            inode.block[16..18].copy_from_slice(&1u16.to_le_bytes());
+            write_extent(&mut inode.block[24..36], 2, first.physical_block + 2);
+            inode.block[28..30].copy_from_slice(&len1.to_le_bytes());
+            inode.size = 4 * 4096;
+        };
+        let block = |n: u8| vec![n; 4096];
+        set(&mut inode, 1);
+        let want = [block(1), block(0), block(3), block(0)].concat();
+        assert_eq!(fs.read_inode_data(&inode, usize::MAX).unwrap(), want);
+        let mut streamed = Vec::new();
+        fs.write_inode_data_to(&inode, &mut streamed, u64::MAX)
+            .unwrap();
+        assert_eq!(streamed, want, "the streaming read agrees");
+        set(&mut inode, 32768 + 1);
+        let want = [block(1), block(0), block(0), block(0)].concat();
+        assert_eq!(
+            fs.read_inode_data(&inode, usize::MAX).unwrap(),
+            want,
+            "uninit reads zero"
+        );
     }
 
     /// A file the free space is too fragmented for is refused before anything is taken: the

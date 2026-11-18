@@ -693,7 +693,7 @@ fn resolve_with_override<R: Read + Seek>(
             });
         }
     };
-    let partitions = pt.partitions();
+    let partitions = crate::partition::partitions_with_volumes(reader, &pt);
 
     // No partition table: treat as superfloppy / raw FS at byte 0.
     if partitions.is_empty() {

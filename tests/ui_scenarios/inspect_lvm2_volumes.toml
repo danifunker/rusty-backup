@@ -1,0 +1,20 @@
+# Linux LVM2: the PV partition is the table's one row; its logical volumes list after it as
+# browse-only rows, stay out of the layout bar, and a two-run LV browses like a partition.
+name = "Inspect: LVM2 logical volumes"
+vm = "inspect"
+
+[[step]]
+action = "OpenImage"
+arg = "$lvm2"
+settle = true
+expect = { partitions = 1, rows = 4, last_row_number = "  4 (LV)", browse_choices = 2, layout_segments = 1 }
+
+[[step]]
+action = "Browse"
+arg = 1
+expect = { browsing = 1, requests = "open" }
+
+[[step]]
+action = "SwitchBrowse"
+arg = 2
+expect = { browsing = 2, requests = "close,open" }

@@ -13,6 +13,7 @@ finish it. Remove an entry when its work ships.
 | BSD disklabel | Only whole-disk backup through the single-file CHD layout; per-partition layouts are refused | `backup/mod.rs` | Same as the other label schemes; unlikely to change |
 | HP-UX LVM (`PartitionTable::HpuxLvm`) | Editing, LV resize and resize-on-restore are refused; whole-disk CHD backup only | `partition/editor.rs`, `partition/restore_patch.rs` | Round-trip the VGDA (both copies, timestamps, VGSA) before touching extents |
 | HP-UX LVM, AIX LVM | Multi-disk volume groups: LVs with extents on another PV are listed but refused | `partition::lvm_rows`, `LVM_UNAVAILABLE` | Out of scope by decision (single-disk only) |
+| Linux LVM2 (`part_tables::lvm::linux`) | LV resize, and backup / shrink per LV: the PV is imaged as one partition. Thin, RAID, mirror, snapshot, cache and striped LVs are listed but refused | `partition::volume_rows`, `LVM_UNAVAILABLE` | Rewrite the VG text (seqno, both metadata copies) before moving extents; thin needs the pool's btree |
 | AIX LVM (`PartitionTable::AixLvm`) | Editing, LV resize and resize-on-restore are refused; whole-disk CHD backup only | `partition/editor.rs`, `partition/restore_patch.rs` | Round-trip both VGDA copies and the VGSA before touching partitions |
 
 ## Filesystems

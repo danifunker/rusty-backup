@@ -3156,7 +3156,7 @@ dependencies = [
 
 [[package]]
 name = "part-tables"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "byteorder",
  "crc32fast",

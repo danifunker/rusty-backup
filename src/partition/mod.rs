@@ -1108,6 +1108,78 @@ fn lvm_rows(
 /// Type-string prefix for an LV row that cannot be opened; the reason follows the colon.
 pub const LVM_UNAVAILABLE: &str = "LVM-UNAVAILABLE:";
 
+/// First index of an LV row, clear of every table's own slot numbers.
+pub const LVM2_INDEX_BASE: usize = 1000;
+
+/// Type-name prefix of a Linux LVM2 LV row, which views a PV partition and is never backed up.
+pub const LVM2_ROW: &str = "LVM2 ";
+
+fn is_lvm_type(ts: &str) -> bool {
+    ts.starts_with(LVM_UNAVAILABLE) || ts.starts_with(lvm::LVM_RUNS)
+}
+
+/// True for a row [`partitions_with_volumes`] added: an LV inside another row's PV.
+pub fn is_volume_view(p: &PartitionInfo) -> bool {
+    p.type_name.starts_with(LVM2_ROW)
+}
+
+/// The table's rows, then one per Linux LVM2 LV found in a PV partition. Browse and the CLI
+/// list these; backup, restore, resize and the editor use [`PartitionTable::partitions`].
+pub fn partitions_with_volumes<R: Read + Seek>(
+    reader: &mut R,
+    table: &PartitionTable,
+) -> Vec<PartitionInfo> {
+    let mut rows = table.partitions();
+    let extra = volume_rows(reader, &rows);
+    rows.extend(extra);
+    rows
+}
+
+/// The LVM2 LV rows for the PVs among `rows`, numbered after them.
+pub fn volume_rows<R: Read + Seek>(reader: &mut R, rows: &[PartitionInfo]) -> Vec<PartitionInfo> {
+    let mut out = Vec::new();
+    let mut next = rows
+        .iter()
+        .map(|p| p.index + 1)
+        .max()
+        .unwrap_or(0)
+        .max(LVM2_INDEX_BASE);
+    let pvs: Vec<(u64, u64)> = rows
+        .iter()
+        .filter(|p| {
+            !p.is_extended_container && !p.partition_type_string.as_deref().is_some_and(is_lvm_type)
+        })
+        .map(|p| (p.byte_offset(), p.size_bytes))
+        .collect();
+    for (start, len) in pvs {
+        let Some(found) = lvm::linux::detect(reader, start, len) else {
+            continue;
+        };
+        let vg = match found {
+            Ok(vg) => vg,
+            Err(e) => {
+                let ts = Some(format!("{LVM_UNAVAILABLE}{e}"));
+                out.push(lvm_row(next, format!("{LVM2_ROW}PV"), start, len, ts));
+                next += 1;
+                continue;
+            }
+        };
+        for lv in vg.volumes {
+            let v = &lv.volume;
+            let type_string = match (&lv.unsupported, v.contiguous_start()) {
+                (Some(why), _) => Some(format!("{LVM_UNAVAILABLE}{why}")),
+                (None, Some(_)) => None,
+                (None, None) => Some(lvm::encode_runs(&v.runs)),
+            };
+            let at = v.runs.first().map(|r| r.0).unwrap_or(vg.pe_start);
+            let name = format!("{LVM2_ROW}{}/{}", vg.vg_name, v.name);
+            out.push(lvm_row(next, name, at, v.size_bytes, type_string));
+            next += 1;
+        }
+    }
+    out
+}
+
 /// Slot index given to the LIF boot-area row, past any real BSD slot letter.
 pub const BSD_LIF_ROW_INDEX: usize = 26;
 
@@ -1455,6 +1527,20 @@ impl PartitionTable {
             }
         }
 
+        // A whole-disk LVM2 PV (`pvcreate /dev/sdb`): no table, its LVs list after it.
+        let size_bytes = reader
+            .seek(SeekFrom::End(0))
+            .map_err(RustyBackupError::Io)?;
+        if lvm::linux::detect(reader, 0, size_bytes).is_some() {
+            return Ok(PartitionTable::None {
+                size_bytes,
+                fs_hint: "Linux LVM".to_string(),
+            });
+        }
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(RustyBackupError::Io)?;
+
         // Check for superfloppy (no partition table) before MBR parsing
         if let Some(fs_hint) = detect_superfloppy(&mbr_data, reader) {
             // Get disk size via seek to end
@@ -1550,6 +1636,9 @@ impl PartitionTable {
     /// Slot number this table's platform gives `info`; `None` when it has none.
     /// GPT is `None` because the parser drops unused entries. See `@sN` docs.
     pub fn native_slot(&self, info: &PartitionInfo) -> Option<u32> {
+        if is_volume_view(info) {
+            return None;
+        }
         let raw = info.index as u32;
         match self {
             // fdisk: primaries 1-4, logicals from 5; `index` is 0-3 then 4+j.
