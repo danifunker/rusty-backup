@@ -866,15 +866,9 @@ impl BrowseView {
             }
             PaneEvent::Mark(id) => self.apply(pane(P::Mark(id))),
             PaneEvent::Toggle(id) => self.apply(pane(P::ToggleExpand(id))),
-            PaneEvent::Activate => {
-                let id = {
-                    let ctl = self.ctrl.borrow();
-                    let p = ctl.pane(Side::Left);
-                    p.cursor_index().map(|i| p.rows()[i].node_id.clone())
-                };
-                if let Some(id) = id {
-                    self.apply(pane(P::Activate(id)));
-                }
+            PaneEvent::Activate(row) => {
+                self.apply(pane(P::CursorTo(row.node_id.clone())));
+                self.apply(pane(P::Activate(row.node_id)));
             }
             PaneEvent::Key(key, mods) => {
                 if matches!(
@@ -1113,14 +1107,7 @@ impl BrowseView {
             Size::Fixed(DETAIL_W),
             Size::Stretch(1),
         ));
-        let mut body = Vec::new();
-        if ui::shown(self.pane.tree) {
-            body.push(Node::leaf(
-                self.pane.tree,
-                Size::Fixed(TREE_W),
-                Size::Stretch(1),
-            ));
-        }
+        let mut body = self.pane.tree_nodes(Size::Fixed(TREE_W));
         body.push(Node::leaf(
             self.pane.list,
             Size::Stretch(1),

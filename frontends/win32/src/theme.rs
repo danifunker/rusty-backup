@@ -22,7 +22,7 @@ use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::Controls::{
     GetComboBoxInfo, SetWindowTheme, COMBOBOXINFO, LVM_GETHEADER, LVM_SETBKCOLOR,
-    LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
+    LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, TVM_SETBKCOLOR, TVM_SETLINECOLOR, TVM_SETTEXTCOLOR,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -263,6 +263,17 @@ pub fn control(hwnd: HWND) {
         }
         if let Some(t) = theme {
             let _ = SetWindowTheme(hwnd, t, PCWSTR::null());
+        }
+        // The dark theme draws light glyphs, so the tree's own colours must follow it (#123).
+        if class == "SysTreeView32" {
+            let c = colors();
+            for (msg, color) in [
+                (TVM_SETBKCOLOR, c.field),
+                (TVM_SETTEXTCOLOR, c.text),
+                (TVM_SETLINECOLOR, c.disabled),
+            ] {
+                SendMessageW(hwnd, msg, None, Some(LPARAM(color.0 as isize)));
+            }
         }
         if class == "SysListView32" {
             let c = colors();

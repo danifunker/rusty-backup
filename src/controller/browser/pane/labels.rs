@@ -118,7 +118,8 @@ impl BrowserPaneController {
                 shift,
             })
         } else if row.is_parent() {
-            None
+            // `..` selects nothing, but the cursor follows so a double-click ascends (#124).
+            Some(BrowserPaneAction::CursorTo(node_id))
         } else {
             let name = row.name.clone();
             Some(BrowserPaneAction::Click { name, ctrl, shift })
@@ -338,7 +339,8 @@ mod tests {
             "{click:?}"
         );
         let up = row(&mut flat, "..");
-        assert_eq!(flat.row_click(&up, false, false), None);
+        let to_up = Some(BrowserPaneAction::CursorTo(up.node_id.clone()));
+        assert_eq!(flat.row_click(&up, false, false), to_up);
         assert_eq!(flat.row_context(&up), None);
     }
 }
