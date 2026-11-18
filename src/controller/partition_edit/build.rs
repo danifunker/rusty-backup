@@ -102,10 +102,10 @@ pub const ALIGN_PRESETS: [(&str, &str); 3] = [
 
 /// The alignment list: the table's default, the presets, then "Custom...".
 fn align_choices(builder: &DiskBuilder) -> Vec<String> {
-    let bytes = provision::default_align(builder.kind, builder.geometry);
-    let default = match provision::uses_cylinder_geometry(builder.kind) {
-        true => format!("Table default (one cylinder, {})", format_size(bytes)),
-        false => format!("Table default ({})", format_size(bytes)),
+    let (bytes, why) = builder.suggested_align();
+    let default = match why {
+        "" => format!("Table default ({})", format_size(bytes)),
+        why => format!("Table default ({why}, {})", format_size(bytes)),
     };
     let presets = ALIGN_PRESETS.iter().map(|(_, label)| label.to_string());
     std::iter::once(default)

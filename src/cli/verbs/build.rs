@@ -154,8 +154,8 @@ pub struct BuildArgs {
     #[arg(long = "mac-driver", value_name = "bundled|none|DISK")]
     pub mac_driver: Option<String>,
 
-    /// Partition-start alignment, e.g. `1M` or `63s`; blank uses the
-    /// table's default.
+    /// Partition-start alignment, e.g. `1M` or `63s`. Blank picks by era: APM packs after the map,
+    /// a FAT-only MBR disk up to 8 GiB takes a 63-sector track, others 1 MiB (or a cylinder).
     #[arg(long, default_value = "")]
     pub align: String,
 

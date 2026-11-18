@@ -271,7 +271,8 @@ pub mod hints {
          another disk image, at this disk's size. A label (SGI, Sun, NeXT, RDB, ...) keeps its \
          volume header or boot blocks verbatim.";
     pub const ALIGN: &str = "Where each partition may start. Modern systems want 1 MiB; DOS and \
-         Windows 9x expect partitions on a track (63 sectors).";
+         Windows 9x expect partitions on a track (63 sectors); classic Mac disks pack them after \
+         the partition map. The table default follows what the disk holds.";
     pub const ALIGN_CUSTOM: &str = "A size such as 1M or 4K, or a sector count such as 63s.";
     pub const SYSTEM_DISK: &str = "A Human68k system floppy cloned into partition 1";
     pub const NO_SYSTEM_DISK: &str = "(none: seed files)";

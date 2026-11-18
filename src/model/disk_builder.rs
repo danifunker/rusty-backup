@@ -516,10 +516,18 @@ impl DiskBuilder {
     /// is blank or malformed.
     pub fn align_bytes(&self) -> u64 {
         if self.align_text.trim().is_empty() {
-            return provision::default_align(self.kind, self.geometry);
+            return self.suggested_align().0;
         }
-        provision::parse_align(&self.align_text)
-            .unwrap_or_else(|_| provision::default_align(self.kind, self.geometry))
+        provision::parse_align(&self.align_text).unwrap_or_else(|_| self.suggested_align().0)
+    }
+
+    /// What a blank alignment means for this disk, and why ([`provision::suggested_align`]).
+    pub fn suggested_align(&self) -> (u64, &'static str) {
+        let fat = |r: &BuilderRow| {
+            r.source.is_none() && r.format.as_ref().is_some_and(|f| f.kind == FsKind::Fat)
+        };
+        let fat_only = !self.rows.is_empty() && self.rows.iter().all(fat);
+        provision::suggested_align(self.kind, self.geometry, self.disk_size, fat_only)
     }
 
     /// The rows as specs, or the first parse error.
@@ -822,5 +830,46 @@ mod tests {
         // Past the 2 MiB volume header, on a cylinder boundary.
         assert!(placed[0].start_byte() >= 2 * MIB);
         assert_eq!(placed[0].start_byte() % align, 0);
+    }
+
+    /// A blank alignment follows the era: a classic Mac disk packs after its map, a small FAT
+    /// MBR disk takes a DOS track, and anything modern (or big) keeps 1 MiB.
+    #[test]
+    fn a_blank_alignment_follows_what_the_disk_holds() {
+        let with = |kind: TableKind, size: u64, fs: Option<FsKind>| {
+            let mut b = DiskBuilder::new(kind, size);
+            b.rows[0].format = fs.map(RowFormat::new);
+            b
+        };
+        let apm = with(TableKind::Apm, 64 * MIB, Some(FsKind::Hfs));
+        assert_eq!(apm.align_bytes(), 512);
+        let placed = apm.plan().expect("plans");
+        assert_eq!(
+            placed[0].start_byte(),
+            64 * 512,
+            "right after the 64-block map"
+        );
+
+        let dos = with(TableKind::Mbr, 32 * MIB, Some(FsKind::Fat));
+        assert_eq!(dos.align_bytes(), 63 * 512);
+        assert_eq!(dos.plan().expect("plans")[0].start_byte(), 63 * 512);
+
+        assert_eq!(
+            with(TableKind::Mbr, 16 * 1024 * MIB, Some(FsKind::Fat)).align_bytes(),
+            MIB
+        );
+        assert_eq!(
+            with(TableKind::Mbr, 32 * MIB, Some(FsKind::Ext4)).align_bytes(),
+            MIB
+        );
+        assert_eq!(with(TableKind::Mbr, 32 * MIB, None).align_bytes(), MIB);
+        assert_eq!(
+            with(TableKind::Gpt, 32 * MIB, Some(FsKind::Fat)).align_bytes(),
+            MIB
+        );
+
+        let mut chosen = with(TableKind::Mbr, 32 * MIB, Some(FsKind::Fat));
+        chosen.align_text = "1M".into();
+        assert_eq!(chosen.align_bytes(), MIB, "a picked alignment still wins");
     }
 }

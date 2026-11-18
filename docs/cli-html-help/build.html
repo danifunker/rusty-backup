@@ -34,7 +34,7 @@
 <dt><code>--mac-driver</code></dt>
 <dd>The Mac driver on an APM disk: `bundled` (the default: a donor's own driver if it has one, otherwise Apple SCSI 7.3.5), `none`, or the path of an Apple-formatted disk to take the driver from. The driver serves SCSI; a Mac with the disk on IDE won't mount it</dd>
 <dt><code>--align</code></dt>
-<dd>Partition-start alignment, e.g. `1M` or `63s`; blank uses the table's default</dd>
+<dd>Partition-start alignment, e.g. `1M` or `63s`. Blank picks by era: APM packs after the map, a FAT-only MBR disk up to 8 GiB takes a 63-sector track, others 1 MiB (or a cylinder)</dd>
 <dt><code>--heads</code></dt>
 <dd>Heads for the cylinder-aligned tables (SGI, RDB, Sun, NeXT, Solaris x86)</dd>
 <dt><code>--sectors</code></dt>

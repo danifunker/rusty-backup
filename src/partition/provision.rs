@@ -312,6 +312,23 @@ pub fn default_align(kind: TableKind, geometry: Geometry) -> u64 {
     }
 }
 
+/// A new disk's default alignment by era, with why: APM packs after the map (Drive Setup), a
+/// FAT-only MBR disk up to 8 GiB (the CHS limit) takes a 63-sector track, the rest as before.
+pub fn suggested_align(
+    kind: TableKind,
+    geometry: Geometry,
+    disk_size: u64,
+    fat_only: bool,
+) -> (u64, &'static str) {
+    const CHS_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
+    match kind {
+        TableKind::Apm => (SECTOR, "classic Mac: packed after the map"),
+        TableKind::Mbr if fat_only && disk_size <= CHS_LIMIT => (63 * SECTOR, "DOS: one track"),
+        _ if uses_cylinder_geometry(kind) => (default_align(kind, geometry), "one cylinder"),
+        _ => (default_align(kind, geometry), ""),
+    }
+}
+
 /// Granularity a partition's *size* must land on, not just its start: the
 /// cylinder-based tables cannot express a part-cylinder size.
 fn size_granularity(kind: TableKind, align: u64) -> u64 {

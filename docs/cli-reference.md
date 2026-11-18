@@ -453,7 +453,7 @@ Usage: build [OPTIONS] <TARGET>
 - `--bootable` — Mark partition N bootable: the MBR active flag (one partition) or the RDB bootable flag. Repeatable on RDB
 - `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH` (repeatable). PATH is the handler's AmigaDOS load file (`L:PFS3`, `L:SmartFilesystem`); without one, a DosType the ROM lacks cannot mount unaided
 - `--mac-driver` — The Mac driver on an APM disk: `bundled` (the default: a donor's own driver if it has one, otherwise Apple SCSI 7.3.5), `none`, or the path of an Apple-formatted disk to take the driver from. The driver serves SCSI; a Mac with the disk on IDE won't mount it
-- `--align` — Partition-start alignment, e.g. `1M` or `63s`; blank uses the table's default
+- `--align` — Partition-start alignment, e.g. `1M` or `63s`. Blank picks by era: APM packs after the map, a FAT-only MBR disk up to 8 GiB takes a 63-sector track, others 1 MiB (or a cylinder)
 - `--heads` — Heads for the cylinder-aligned tables (SGI, RDB, Sun, NeXT, Solaris x86)
 - `--sectors` — Sectors per track for the cylinder-aligned tables
 - `--fs` — With no `--table`: the filesystem of the one bare volume
