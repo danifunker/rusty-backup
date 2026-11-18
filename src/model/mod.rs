@@ -28,6 +28,7 @@ pub mod container_edit;
 pub mod convert;
 pub mod dir_listing;
 pub mod disk_builder;
+pub mod disk_tree;
 pub mod disk_write_plan;
 pub mod edit_queue;
 pub mod entry_detail;

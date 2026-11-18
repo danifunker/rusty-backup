@@ -69,6 +69,7 @@ pub mod squashfs;
 pub mod swab16;
 pub mod tar;
 pub mod terminal;
+pub mod tree;
 #[cfg(feature = "tui")]
 pub mod tui_app;
 pub mod untar;

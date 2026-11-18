@@ -94,6 +94,10 @@ pub enum Command {
     /// List a directory inside a filesystem.
     Ls(verbs::ls::LsArgs),
 
+    /// A `tree`-style listing of every volume on a disk (each partition, or each filesystem of a
+    /// disc), or of one with `IMG@N`: the browser's Tree, for the whole disk at once.
+    Tree(verbs::tree::TreeArgs),
+
     /// Recursive both-fork (data + resource) disk usage of paths inside a
     /// filesystem. Unlike `ls`, which reports data-fork sizes only, `du`
     /// counts the resource fork too — essential for classic-Mac apps whose
@@ -500,6 +504,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::MacScsiBless(args) => verbs::mac_scsi_bless::run(args),
         Command::MakeBootable(args) => verbs::make_bootable::run(args),
         Command::Ls(args) => verbs::ls::run(args),
+        Command::Tree(args) => verbs::tree::run(args),
         Command::Du(args) => verbs::du::run(args),
         Command::Locate(args) => verbs::locate::run(args),
         Command::Put(args) => verbs::put::run(args),
