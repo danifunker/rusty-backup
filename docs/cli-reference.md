@@ -2391,6 +2391,26 @@ Open an interactive rb-cli shell (rustyline-based REPL)
 Usage: terminal
 ```
 
+### `tree`
+
+A `tree`-style listing of every volume on a disk (each partition, or each filesystem of a disc), or of one with `IMG@N`: the browser's Tree, for the whole disk at once
+
+```
+Usage: tree [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — The disk: `path` lists every partition (or a disc's every filesystem) under a heading, `path@N` just that one. Disk images, containers, backup folders, discs and `rb://host:port/img` work
+
+**Options**
+
+- `--ids` — Show each entry's filesystem ID too (CNID on HFS / HFS+, inode on ext, cluster on FAT)
+- `--password` — Passphrase for an encrypted volume or container (APFS, BitLocker, IMZ)
+- `--inside` — The disk image to open inside a `.zip` that holds several
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+
 ### `tui`
 
 Launch the full-screen terminal UI (preview): a menu-driven ratatui app that runs anywhere rusty-backup does, including serial consoles and vintage terminals. Needs an interactive terminal
