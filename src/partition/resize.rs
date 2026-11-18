@@ -70,8 +70,8 @@ pub fn compute_resize_plan(
         let old_start_bytes = p.start_lba * 512;
         let new_start_bytes_raw = (old_start_bytes as i64 + cumulative_shift) as u64;
 
-        // Align the new start if alignment is set and this isn't the first partition
-        let new_start_bytes = if alignment_sectors > 0 {
+        // Align a start that moves; one nothing ahead of it shifted stays where it is.
+        let new_start_bytes = if alignment_sectors > 0 && cumulative_shift != 0 {
             let align_bytes = alignment_sectors * 512;
             // Round up to alignment boundary, but keep sector 0 partitions at 0
             if new_start_bytes_raw == 0 {
@@ -692,6 +692,23 @@ mod tests {
             "the EFS superblock was not patched ({before} -> {after}) — \
              the GUI resize path still skips it"
         );
+    }
+
+    /// Growing the last partition leaves it where it starts, even off the alignment grid: only a
+    /// partition something ahead of it pushed is moved (and then aligned).
+    #[test]
+    fn an_unshifted_partition_keeps_its_start() {
+        let parts = make_partitions(&[(0, 63, 12288 * 512, false), (1, 12411, 20349 * 512, false)]);
+        let disk = 98304 * 512;
+        let grown = (98304 - 12411) * 512;
+        let plan = compute_resize_plan(&parts, &[(1, grown)], 2048, disk).unwrap();
+        let p1 = plan.iter().find(|p| p.index == 1).unwrap();
+        assert_eq!((p1.new_start_lba, p1.needs_data_move), (12411, false));
+        // Growing partition 0 pushes partition 1, which then lands on the grid.
+        let plan = compute_resize_plan(&parts, &[(0, 13000 * 512)], 2048, disk).unwrap();
+        let p1 = plan.iter().find(|p| p.index == 1).unwrap();
+        assert_eq!(p1.new_start_lba % 2048, 0);
+        assert!(p1.new_start_lba >= 63 + 13000);
     }
 
     fn make_partitions(specs: &[(usize, u64, u64, bool)]) -> Vec<PartitionInfo> {

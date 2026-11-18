@@ -93,10 +93,14 @@ pub fn detect_alignment(table: &PartitionTable) -> PartitionAlignment {
                 sectors_per_track,
             };
         }
-        // Even without multiple partitions, LBA 63 is a strong DOS indicator
+        // Even without multiple partitions, LBA 63 is a strong DOS indicator. Several that miss
+        // cylinder boundaries share what their starts do (a 63-sector track), not a cylinder.
+        let shared = gcd_of_starts(&partitions);
         return PartitionAlignment {
             first_lba,
-            alignment_sectors: if sectors_per_cylinder > 0 {
+            alignment_sectors: if partitions.len() >= 2 && shared > 1 {
+                shared
+            } else if sectors_per_cylinder > 0 {
                 sectors_per_cylinder
             } else {
                 16065
@@ -245,6 +249,21 @@ mod tests {
         assert_eq!(alignment.heads, 255);
         assert_eq!(alignment.sectors_per_track, 63);
         assert_eq!(alignment.alignment_sectors, 16065);
+    }
+
+    /// Partitions on 63-sector tracks but not cylinders (as Build Disk lays a FAT-only disk) align
+    /// on the track they share, not the MBR geometry's cylinder.
+    #[test]
+    fn track_aligned_dos_partitions_report_the_track() {
+        // 64 heads x 32 sectors: a 2048-sector cylinder that partition 2 (LBA 12411) misses.
+        let mbr_data = make_mbr_with_chs(&[
+            (0x04, 63, 12288, 1, 32, 0, 63, 32, 5),
+            (0x04, 12411, 20349, 1, 32, 6, 63, 32, 15),
+        ]);
+        let table = PartitionTable::Mbr(Mbr::parse(&mbr_data).unwrap());
+        let alignment = detect_alignment(&table);
+        assert_eq!(alignment.alignment_type, AlignmentType::DosTraditional);
+        assert_eq!(alignment.alignment_sectors, 63);
     }
 
     #[test]
