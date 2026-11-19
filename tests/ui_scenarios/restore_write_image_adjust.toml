@@ -1,0 +1,39 @@
+# Flash with resize: Write Image File's "Adjust Partitions..." opens the card image in Full Disk
+# Restore as a backup of itself, with a size per partition, and restores it shrunk to its minimum.
+name = "Restore: Write Image File hands a card image to Full Disk with sizes"
+vm = "restore"
+
+[[step]]
+action = "SetMode"
+arg = "write"
+
+[[step]]
+action = "OpenWriteImage"
+arg = "$card"
+settle = true
+
+[[step]]
+action = "AdjustWriteImage"
+settle = true
+expect = { mode = "FullDisk", backup = true, partitions = 1, modes = "~Minimum", load_error = "" }
+
+[[step]]
+action = "SetTargetIsDevice"
+arg = false
+
+[[step]]
+action = "SetTargetImage"
+arg = "$out"
+
+[[step]]
+action = "SetSize"
+arg = "minimum"
+
+[[step]]
+action = "Start"
+effects = ["Confirm"]
+
+[[step]]
+action = "Confirm"
+settle = true
+expect = { result = "ok", restored_opens = true }

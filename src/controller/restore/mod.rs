@@ -51,6 +51,7 @@ pub mod purpose {
     pub const TARGET_IMAGE: &str = "restore.target_image";
     pub const NEW_DISK_IMAGE: &str = "restore.new_disk_image";
     pub const WRITE_IMAGE: &str = "restore.write_image";
+    pub const RESIZE_IMAGE: &str = "restore.resize_image";
     pub const RESTORE: &str = "restore.confirm";
 }
 
@@ -77,6 +78,10 @@ pub mod ids {
     pub const JOB_CANCEL: &str = "restore.job_cancel";
     pub const RECENT: &str = "restore.recent";
     pub const PICK_BACKUP_FOLDER: &str = "restore.pick_backup_folder";
+    /// "Disk image..." beside the backup folder: an image restored like a backup, resizable.
+    pub const PICK_RESIZE_IMAGE: &str = "restore.pick_resize_image";
+    /// Write Image File's "Adjust partitions...": the same image, in Full Disk with sizes.
+    pub const ADJUST_WRITE_IMAGE: &str = "restore.adjust_write_image";
     pub const PICK_SOURCE_IMAGE: &str = "restore.pick_source_image";
     pub const TARGET_KIND: &str = "restore.target_kind";
     pub const PICK_TARGET_IMAGE: &str = "restore.pick_target_image";
@@ -102,6 +107,8 @@ pub mod labels {
     pub const TARGET_KIND: &str = "Target";
     pub const TARGET_IMAGE: &str = "Image File";
     pub const START: &str = "Restore";
+    pub const PICK_RESIZE_IMAGE: &str = "Disk Image...";
+    pub const ADJUST_WRITE_IMAGE: &str = "Adjust Partitions...";
     /// The confirmation's go-ahead button.
     pub const CONFIRM: &str = "I understand, proceed";
     pub const DONE: &str = "Restore complete.";
@@ -111,6 +118,8 @@ pub mod labels {
         (ids::TARGET_KIND, TARGET_KIND),
         (ids::TARGET_IMAGE, TARGET_IMAGE),
         (ids::START, START),
+        (ids::PICK_RESIZE_IMAGE, PICK_RESIZE_IMAGE),
+        (ids::ADJUST_WRITE_IMAGE, ADJUST_WRITE_IMAGE),
         (super::purpose::RESTORE, CONFIRM),
         ("restore.done", DONE),
     ];
@@ -120,6 +129,10 @@ pub mod labels {
 pub mod hints {
     pub const CLOSE_TARGET: &str =
         "Clear the selected target device so the drive can be safely removed";
+    pub const PICK_RESIZE_IMAGE: &str = "Restore a disk image (.img, .img.xz, ...) as if it \
+        were a backup, so each partition can keep its size, shrink to its minimum or grow";
+    pub const ADJUST_WRITE_IMAGE: &str = "Resize this image's partitions while writing it: \
+        opens it in Full Disk Restore with a size for each partition";
     pub const REMOTE: &str = "Restore to a remote machine (rb-cli serve)";
     pub const REMOTE_HOVER: &str = "Push the restored image to a drive or image file on a remote \
         daemon over the network";
@@ -210,6 +223,10 @@ pub enum RestoreAction {
     PickSourceImage,
     /// An image file as the single-partition / new-disk source; a wrapped image is decoded first.
     OpenSourceImage(PathBuf),
+    /// "Disk image...": pick an image to restore in full like a backup, partitions resizable.
+    PickResizeImage,
+    /// "Adjust partitions..." on Write Image File: that image, opened in Full Disk Restore.
+    AdjustWriteImage,
     /// A dropped or recent path: a folder restores in full, a file is a partition image.
     OpenDropped(PathBuf),
     /// Forget the backup (the top bar's Close Backup).
@@ -575,6 +592,22 @@ impl Controller for RestoreController {
                 ))];
             }
             RestoreAction::OpenBackup(path) => self.open_backup(path),
+            RestoreAction::PickResizeImage => {
+                return vec![Effect::PickFile(Self::picker(
+                    purpose::RESIZE_IMAGE,
+                    "Choose the disk image to restore",
+                    Self::image_filters(false),
+                    false,
+                ))];
+            }
+            RestoreAction::AdjustWriteImage => {
+                if let Some((path, size)) = self.write_image().map(|(p, n)| (p.to_path_buf(), n)) {
+                    if size > 0 {
+                        self.mode = RestoreMode::FullDisk;
+                        self.open_backup(path);
+                    }
+                }
+            }
             RestoreAction::PickSourceImage => {
                 return vec![Effect::PickFile(Self::picker(
                     purpose::SOURCE_IMAGE,
@@ -681,6 +714,10 @@ impl RestoreController {
         };
         match purpose {
             purpose::BACKUP_FOLDER => self.open_backup(path),
+            purpose::RESIZE_IMAGE => {
+                self.mode = RestoreMode::FullDisk;
+                self.open_backup(path);
+            }
             purpose::SOURCE_IMAGE => self.open_source_image(path),
             purpose::TARGET_IMAGE => self.targets.full.image = Some(path),
             purpose::NEW_DISK_IMAGE => self.targets.new_disk.image = Some(path),

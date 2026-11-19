@@ -818,6 +818,32 @@ impl RestoreTarget {
     }
 
     /// A zstd backup of a blank FAT image, made by the Backup controller.
+    /// A 32 MiB MBR card image with a 24 MiB FAT16 at 1 MiB, the shape a flash-with-resize takes.
+    fn make_card(&self) -> Result<PathBuf, String> {
+        use rusty_backup::model::format::{format_into, FsKind, Window};
+        use std::io::Write;
+        const MIB: u64 = 1024 * 1024;
+        let path = self.dir.path().join("card.img");
+        let mut f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+        f.set_len(32 * MIB).map_err(|e| e.to_string())?;
+        let mut mbr = [0u8; 512];
+        mbr[446 + 4] = 0x06;
+        mbr[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+        mbr[446 + 12..446 + 16].copy_from_slice(&((24 * MIB / 512) as u32).to_le_bytes());
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        f.write_all(&mbr).map_err(|e| e.to_string())?;
+        let opts = rusty_backup::model::disk_builder::RowFormat::new(FsKind::Fat).opts;
+        format_into(
+            &mut Window::new(&mut f, MIB, 24 * MIB),
+            24 * MIB,
+            FsKind::Fat,
+            &opts,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
     fn make_backup(&self) -> Result<PathBuf, String> {
         let bytes =
             fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).map_err(|e| e.to_string())?;
@@ -954,11 +980,13 @@ impl Target for RestoreTarget {
                         std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
                         p
                     }
+                    "$card" => self.make_card()?,
                     other => PathBuf::from(other),
                 };
                 RestoreAction::OpenWriteImage(path)
             }
             "WriteImageTarget" => RestoreAction::WriteImageTarget,
+            "AdjustWriteImage" => RestoreAction::AdjustWriteImage,
             "Start" => RestoreAction::Start,
             "Confirm" => RestoreAction::Confirmed {
                 purpose: purpose::RESTORE,
@@ -974,6 +1002,18 @@ impl Target for RestoreTarget {
     fn probe(&self, name: &str) -> Result<Value, String> {
         Ok(match name {
             "backup" => Value::Boolean(self.ctl.has_backup()),
+            "mode" => Value::String(format!("{:?}", self.ctl.mode())),
+            // The restored disk's first partition opens as a filesystem.
+            "restored_opens" => {
+                let path = self.dir.path().join("restored.img");
+                let opens = std::fs::File::open(&path).ok().and_then(|mut f| {
+                    let mut r = std::io::BufReader::new(&mut f);
+                    let t = rusty_backup::partition::PartitionTable::detect(&mut r).ok()?;
+                    let lba = t.partitions().first()?.start_lba;
+                    rusty_backup::fs::open_filesystem(f, lba * 512, 0, None).ok()
+                });
+                Value::Boolean(opens.is_some())
+            }
             "partitions" => Value::Integer(self.ctl.size_rows().len() as i64),
             "error" => Value::String(self.ctl.validate().err().unwrap_or_default()),
             "load_error" => Value::String(self.ctl.load_error().unwrap_or("").to_string()),

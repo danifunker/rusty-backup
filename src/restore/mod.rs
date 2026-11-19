@@ -1273,9 +1273,14 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                 }
                 PartitionFsType::Exfat if needs_resize => {
                     let new_sectors = export_size / 512;
-                    resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
+                    let mut info = |msg: &str| log(&progress, LogLevel::Info, msg);
+                    resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut info)?;
+                    crate::fs::grow_exfat_past_its_fat(
+                        inner_file,
+                        part_offset,
+                        export_size,
+                        &mut info,
+                    )?;
                 }
                 // HFS and HFS+ are matched without a needs_resize guard: resize handles
                 // both shrink/grow and the same-size case, always writing the alternate VH.
@@ -1542,6 +1547,13 @@ fn run_single_file_chd_restore_as_is(
                 PartitionFsType::Exfat => {
                     resize_exfat_in_place(inner_file, offset, full_size / 512, &mut local_log)
                         .with_context(|| format!("grow partition-{} exFAT", pm.index))?;
+                    crate::fs::grow_exfat_past_its_fat(
+                        inner_file,
+                        offset,
+                        full_size,
+                        &mut local_log,
+                    )
+                    .with_context(|| format!("grow partition-{} exFAT", pm.index))?;
                 }
                 _ => {}
             }
@@ -2626,9 +2638,14 @@ fn run_clonezilla_restore(
                 }
                 PartitionFsType::Exfat => {
                     let new_sectors = export_size / 512;
-                    resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
+                    let mut info = |msg: &str| log(&progress, LogLevel::Info, msg);
+                    resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut info)?;
+                    crate::fs::grow_exfat_past_its_fat(
+                        inner_file,
+                        part_offset,
+                        export_size,
+                        &mut info,
+                    )?;
                 }
                 PartitionFsType::Hfs => {
                     resize_hfs_in_place(inner_file, part_offset, export_size, &mut |msg| {

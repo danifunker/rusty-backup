@@ -2043,7 +2043,7 @@ Usage: restore [OPTIONS] <BACKUP_DIR> <TARGET>
 
 **Arguments**
 
-- `<BACKUP_DIR>` — Source backup folder (the directory containing `metadata.json`)
+- `<BACKUP_DIR>` — Source backup folder (the directory containing `metadata.json`), a `.cbk`, or a disk image (`.img`, `.img.xz`, ...) restored as a backup of itself so `--size` can resize it
 - `<TARGET>` — Target image file or block-device path
 
 **Options**

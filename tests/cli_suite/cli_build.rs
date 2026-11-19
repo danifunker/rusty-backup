@@ -690,3 +690,52 @@ fn folders_fill_formatted_partitions_without_a_mount() {
     ]);
     assert!(!ok && text.contains("formatted"), "{text}");
 }
+
+/// Flash with resize: a built card image restores onto a bigger disk with its exFAT grown to fill.
+#[test]
+fn a_card_image_restores_with_its_last_partition_grown() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("readme.txt"), b"exFAT").unwrap();
+    let card = dir.path().join("card.img");
+    let c = card.to_str().unwrap();
+    let store_arg = format!("2={}", store.display());
+    run(&[
+        "build",
+        c,
+        "--size",
+        "48M",
+        "--table",
+        "mbr",
+        "--partition",
+        "40M:0c",
+        "--partition",
+        "rest:07",
+        "--format",
+        "1=fat32:bootfs",
+        "--format",
+        "2=exfat:IMGSTORE",
+        "--folder",
+        &store_arg,
+    ]);
+    let grown = dir.path().join("grown.img");
+    let g = grown.to_str().unwrap();
+    let out = run(&[
+        "restore",
+        c,
+        g,
+        "--target-size",
+        "268435456",
+        "--size",
+        "fill",
+    ]);
+    assert!(out.contains("rebuilding it"), "{out}");
+    let info = run(&["inspect", g]);
+    assert!(
+        info.contains("215.0 MiB") || info.contains("216.0 MiB"),
+        "{info}"
+    );
+    fsck_clean(&format!("{g}@2"));
+    assert!(run(&["ls", &format!("{g}@2"), "/"]).contains("readme.txt"));
+}

@@ -40,6 +40,7 @@ pub mod fs_limits;
 pub mod fsck_runner;
 pub mod hfs_expand_runner;
 pub mod host_ops;
+pub mod image_backup;
 pub mod image_prep;
 pub mod inspect_runner;
 pub mod job;

@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use rusty_backup::controller::restore::{
-    hints, ids, RestoreAction, RestoreController, RestoreMode, SourcePartition,
+    hints, ids, labels, RestoreAction, RestoreController, RestoreMode, SourcePartition,
 };
 
 use super::ActionFn;
@@ -50,6 +50,8 @@ impl SourceShown {
 pub struct SourceRows {
     root: adw::PreferencesGroup,
     picker: Rc<SourcePicker>,
+    /// "Disk Image...": an image restored like a backup, resizable (Full Disk only).
+    disk_image: adw::ActionRow,
     image: adw::ActionRow,
     partition: adw::ComboRow,
     whole_image: gtk::Label,
@@ -88,6 +90,17 @@ impl SourceRows {
         folder.add_suffix(picker.root());
         root.add(&folder);
 
+        let pick = button(labels::PICK_RESIZE_IMAGE, ids::PICK_RESIZE_IMAGE);
+        let s = send.clone();
+        pick.connect_clicked(move |_| s(RestoreAction::PickResizeImage));
+        let disk_image = adw::ActionRow::builder()
+            .title("Or Disk Image")
+            .subtitle(hints::PICK_RESIZE_IMAGE)
+            .build();
+        pick.set_valign(gtk::Align::Center);
+        disk_image.add_suffix(&pick);
+        root.add(&disk_image);
+
         let browse = button("Browse...", ids::PICK_SOURCE_IMAGE);
         let s = send.clone();
         browse.connect_clicked(move |_| s(RestoreAction::PickSourceImage));
@@ -120,6 +133,7 @@ impl SourceRows {
         SourceRows {
             root,
             picker,
+            disk_image,
             image,
             partition,
             whole_image,
@@ -140,6 +154,7 @@ impl SourceRows {
         self.picker.show(folder, &s.recent, &[]);
 
         self.image.set_visible(!full);
+        self.disk_image.set_visible(full);
         set_subtitle(
             &self.image,
             s.image.as_deref().unwrap_or("No file selected"),
@@ -186,6 +201,7 @@ pub struct WriteImageRows {
     size: gtk::Label,
     note: gtk::Label,
     write: gtk::Button,
+    adjust: gtk::Button,
 }
 
 impl WriteImageRows {
@@ -199,17 +215,25 @@ impl WriteImageRows {
         let size = line();
         let note = line();
         let write = super::write_target_button(send);
-        write.set_halign(gtk::Align::Start);
-        write.set_margin_top(6);
+        let adjust = button(labels::ADJUST_WRITE_IMAGE, ids::ADJUST_WRITE_IMAGE);
+        adjust.set_tooltip_text(Some(hints::ADJUST_WRITE_IMAGE));
+        let s = send.clone();
+        adjust.connect_clicked(move |_| s(RestoreAction::AdjustWriteImage));
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        buttons.set_halign(gtk::Align::Start);
+        buttons.set_margin_top(6);
+        buttons.append(&write);
+        buttons.append(&adjust);
         root.add(&size);
         root.add(&note);
-        root.add(&write);
+        root.add(&buttons);
         WriteImageRows {
             root,
             image,
             size,
             note,
             write,
+            adjust,
         }
     }
 
@@ -222,6 +246,7 @@ impl WriteImageRows {
         set_subtitle(&self.image, path.as_deref().unwrap_or("(none selected)"));
         set_line(&self.size, s.line.as_deref());
         self.write.set_visible(s.line.is_some());
+        self.adjust.set_visible(s.line.is_some());
         let note = match (&s.path, &s.line) {
             (_, Some(_)) => None,
             (Some(_), None) => Some(hints::WRITE_IMAGE_UNREADABLE),

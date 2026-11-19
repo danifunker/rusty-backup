@@ -239,6 +239,8 @@ pub struct RestoreScreen {
     write_choose: HWND,
     write_line: HWND,
     write_target: HWND,
+    /// "Adjust Partitions...": the write image in Full Disk Restore.
+    write_adjust: HWND,
     kind_caption: HWND,
     kind: Combo,
     device: Combo,
@@ -362,6 +364,7 @@ impl RestoreScreen {
             write_choose: ui::button(page, "Choose...", ids::WRITE_IMAGE),
             write_line: ui::label(page, ""),
             write_target: ui::button(page, "Choose target and write...", ids::WRITE_TARGET),
+            write_adjust: ui::button(page, labels::ADJUST_WRITE_IMAGE, ids::ADJUST_WRITE_IMAGE),
             kind_caption: ui::cell_label(page, &format!("{}:", labels::TARGET_KIND)),
             kind: Combo::build(page, ids::TARGET_KIND, &KINDS),
             device: Combo::build(page, ids::TARGET_DEVICE, &[]),
@@ -571,6 +574,7 @@ impl RestoreScreen {
         if !recent.is_empty() {
             entries.push((String::new(), false));
         }
+        entries.push((labels::PICK_RESIZE_IMAGE.into(), true));
         entries.push(("Open Backup Folder...".into(), true));
         let mut r = RECT::default();
         // SAFETY: plain queries of our own windows.
@@ -583,6 +587,7 @@ impl RestoreScreen {
             Some(i) if i < recent.len() => {
                 self.apply(RestoreAction::OpenDropped(PathBuf::from(&recent[i])))
             }
+            Some(i) if i == entries.len() - 2 => self.apply(RestoreAction::PickResizeImage),
             Some(i) if i == entries.len() - 1 => self.apply(RestoreAction::PickBackupFolder),
             _ => {}
         }
@@ -799,6 +804,7 @@ impl RestoreScreen {
         };
         self.set_line(self.write_line, note.filter(|_| writing), None);
         ui::set_visible(self.write_target, writing && s.write_line.is_some());
+        ui::set_visible(self.write_adjust, writing && s.write_line.is_some());
     }
 
     fn show_target(&self, s: &Shown) {
@@ -1043,6 +1049,7 @@ impl RestoreScreen {
             self.source.h,
             self.write_choose,
             self.write_target,
+            self.write_adjust,
             self.kind.h,
             self.device.h,
             self.close_target,
@@ -1081,6 +1088,7 @@ impl RestoreScreen {
             self.write_path,
             self.write_line,
             self.write_target,
+            self.write_adjust,
             self.kind_caption,
             self.kind.h,
             self.device.h,
@@ -1179,6 +1187,7 @@ impl RestoreScreen {
         if ui::shown(self.write_target) {
             col.push(Node::row(vec![
                 Node::button(self.write_target, 200),
+                Node::button(self.write_adjust, 150),
                 Node::Space(Size::Stretch(1)),
             ]));
         }
@@ -1432,6 +1441,8 @@ impl RestoreScreen {
             RestoreAction::PickWriteImage
         } else if from == self.write_target {
             RestoreAction::WriteImageTarget
+        } else if from == self.write_adjust {
+            RestoreAction::AdjustWriteImage
         } else if from == self.close_target {
             RestoreAction::ClearDevice(slot)
         } else if from == self.scan {

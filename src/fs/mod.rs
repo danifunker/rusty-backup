@@ -157,6 +157,7 @@ pub fn resize_filesystem_for(
     human68k::resize_human68k_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     ntfs::resize_ntfs_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
     exfat::resize_exfat_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
+    grow_exfat_past_its_fat(file, partition_offset, new_size_bytes, log_cb)?;
     hfs::resize_hfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     hfsplus::resize_hfsplus_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     ext::resize_ext_in_place(file, partition_offset, new_size_bytes, log_cb)?;
@@ -168,6 +169,63 @@ pub fn resize_filesystem_for(
     efs_v1_resize::resize_efs_v1_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     qdos::resize_qdos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     prodos::resize_prodos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    Ok(())
+}
+
+/// An exFAT whose FAT capped an in-place grow, rebuilt at `new_size_bytes` by cloning its files.
+/// Files keep their bytes and names; their dates and the volume serial are new. No-op otherwise.
+pub fn grow_exfat_past_its_fat(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_size_bytes: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    file.seek(SeekFrom::Start(partition_offset))?;
+    let mut vbr = [0u8; 512];
+    file.read_exact(&mut vbr)?;
+    if &vbr[3..11] != b"EXFAT   " {
+        return Ok(());
+    }
+    let le64 = |at: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&vbr[at..at + 8]);
+        u64::from_le_bytes(b)
+    };
+    let (hidden, sectors) = (le64(0x40), le64(0x48));
+    let sector = 1u64 << vbr[0x6C];
+    let cluster = sector << vbr[0x6D];
+    let volume = sectors * sector;
+    let target = new_size_bytes - new_size_bytes % sector;
+    if target < volume + 2 * cluster {
+        return Ok(());
+    }
+    log_cb(&format!(
+        "exFAT: its FAT stops the volume at {}; rebuilding it at {} by copying its files \
+         (file dates and the volume serial are reset)",
+        disk_core::display::format_size(volume),
+        disk_core::display::format_size(target),
+    ));
+    let mut src = tempfile::tempfile()?;
+    file.seek(SeekFrom::Start(partition_offset))?;
+    let copied = std::io::copy(&mut Read::take(&mut *file, volume), &mut src)?;
+    anyhow::ensure!(
+        copied == volume,
+        "exFAT: read {copied} of the volume's {volume} bytes"
+    );
+    let mut fs = exfat::ExfatFilesystem::open(src, 0)
+        .map_err(|e| anyhow::anyhow!("exFAT: reopening the copy: {e}"))?;
+    file.seek(SeekFrom::Start(partition_offset))?;
+    let mut log = |m: &str| log_cb(m);
+    let report =
+        fs_pc::exfat_clone::stream_defragmented_exfat(&mut fs, target, file, &mut log, &mut |_| {})
+            .map_err(|e| anyhow::anyhow!("exFAT: rebuilding the volume: {e}"))?;
+    exfat::patch_exfat_hidden_sectors(file, partition_offset, hidden, log_cb)?;
+    log_cb(&format!(
+        "exFAT: rebuilt at {} with {} file(s) and {} folder(s)",
+        disk_core::display::format_size(target),
+        report.files_copied,
+        report.dirs_copied,
+    ));
     Ok(())
 }
 

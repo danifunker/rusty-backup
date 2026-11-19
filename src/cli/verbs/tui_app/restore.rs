@@ -25,7 +25,7 @@ use super::{
 use crate::controller::app::{RateTracker, RecentHandle, RecentMode};
 use crate::controller::disk_write::{DiskWriteAction, DiskWriteController, DiskWriteServices};
 use crate::controller::restore::{
-    format_size, labels, purpose, AlignmentChoice, CaveatLevel, HostRequest, JobRegistry,
+    format_size, hints, labels, purpose, AlignmentChoice, CaveatLevel, HostRequest, JobRegistry,
     LayoutFit, NewTableType, NoNotify, RestoreAction, RestoreController, RestoreMode,
     RestoreServices, SizeMode, TargetSlot,
 };
@@ -50,6 +50,8 @@ const MODES: &[(RestoreMode, &str)] = &[
 pub(super) enum Field {
     Mode,
     Backup,
+    /// "Disk Image...": an image restored like a backup, its partitions resizable.
+    BackupImage,
     SourceImage,
     SourcePartition,
     Remote,
@@ -76,6 +78,8 @@ pub(super) enum Field {
     NdBootable,
     WriteSource,
     WriteTarget,
+    /// "Adjust Partitions...": the write image, moved into Full Disk with sizes.
+    WriteAdjust,
     Start,
 }
 
@@ -356,7 +360,7 @@ impl RestoreState {
         let mut f = vec![Field::Mode];
         match c.mode() {
             RestoreMode::FullDisk => {
-                f.push(Field::Backup);
+                f.extend([Field::Backup, Field::BackupImage]);
                 if RestoreController::remote_available() {
                     f.push(Field::Remote);
                 }
@@ -428,7 +432,7 @@ impl RestoreState {
             RestoreMode::WriteImage => {
                 f.push(Field::WriteSource);
                 if c.write_image().is_some_and(|(_, n)| n > 0) {
-                    f.push(Field::WriteTarget);
+                    f.extend([Field::WriteTarget, Field::WriteAdjust]);
                 }
             }
         }
@@ -897,6 +901,7 @@ impl App {
             }
             KeyCode::Enter => match focus {
                 Field::Backup => r.act(RestoreAction::PickBackupFolder),
+                Field::BackupImage => r.act(RestoreAction::PickResizeImage),
                 Field::SourceImage => r.act(RestoreAction::PickSourceImage),
                 Field::TargetDevice => {
                     r.device_sel = r.ctl.device_row(slot).unwrap_or(0);
@@ -916,6 +921,7 @@ impl App {
                 Field::RemoteImage => r.act(RestoreAction::RemoteUseImage),
                 Field::WriteSource => r.act(RestoreAction::PickWriteImage),
                 Field::WriteTarget => r.act(RestoreAction::WriteImageTarget),
+                Field::WriteAdjust => r.act(RestoreAction::AdjustWriteImage),
                 Field::Start => r.start(),
                 _ => r.move_focus(1),
             },
@@ -1112,6 +1118,10 @@ impl App {
                         .unwrap_or_else(|| {
                             "(Enter chooses a folder, .cbk or Clonezilla image)".into()
                         }),
+                ),
+                Field::BackupImage => (
+                    "Or disk image:".into(),
+                    "(Enter chooses an .img / .img.xz to restore with resized partitions)".into(),
                 ),
                 Field::SourceImage => (
                     "Or image:".into(),
@@ -1397,6 +1407,22 @@ impl App {
                         format!("{m}[ Choose target and write... ]"),
                         style,
                     ));
+                    continue;
+                }
+                Field::WriteAdjust => {
+                    if sel {
+                        focus_line = lines.len();
+                    }
+                    let style = if sel {
+                        pal.accent()
+                            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    } else {
+                        pal.accent()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{m}[ {} ]", labels::ADJUST_WRITE_IMAGE), style),
+                        Span::styled(format!("  {}", hints::ADJUST_WRITE_IMAGE), pal.dim()),
+                    ]));
                     continue;
                 }
                 Field::Start => {

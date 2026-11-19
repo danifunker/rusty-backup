@@ -138,12 +138,18 @@ impl LoadedBackup {
     }
 }
 
-/// Read the backup at `path`; a `.cbk` file is unpacked to a temp folder first.
+/// Read the backup at `path`; a `.cbk` is unpacked, and a disk image virtualized, to a temp folder.
 pub fn load_backup(path: &Path) -> Result<LoadedBackup, String> {
     let (folder, guard) = if path.is_file() && crate::rbformats::cbk::is_cbk(path) {
         let tmp = tempfile::TempDir::new().map_err(|e| format!("Cannot open .cbk: {e}"))?;
         crate::rbformats::cbk::materialize_cbk_to_folder(path, tmp.path())
             .map_err(|e| format!("Cannot open .cbk: {e}"))?;
+        (tmp.path().to_path_buf(), Some(tmp))
+    } else if crate::model::image_backup::is_image_file(path) {
+        // A disk image reads as a backup of itself, so Restore can resize what it writes.
+        let tmp = tempfile::TempDir::new().map_err(|e| format!("Cannot open image: {e}"))?;
+        crate::model::image_backup::virtualize(path, tmp.path(), &mut |_| {})
+            .map_err(|e| format!("Cannot open {} for resizing: {e:#}", path.display()))?;
         (tmp.path().to_path_buf(), Some(tmp))
     } else {
         (path.to_path_buf(), None)

@@ -278,6 +278,20 @@ pub fn caveats(facts: &VolumeFacts, size: u64) -> Vec<Caveat> {
         .collect();
     if facts.family == FsFamily::Hfs {
         hfs_caveats(facts, size, &mut out);
+    } else if let Some(max) = facts
+        .in_place_max
+        .filter(|&max| size > max && facts.family == FsFamily::Exfat)
+    {
+        // `fs::resize_filesystem_for` rebuilds an exFAT its FAT caps, so it still fills the size.
+        out.push(Caveat {
+            level: CaveatLevel::Info,
+            text: format!(
+                "exFAT's FAT stops in-place growth at {}, so the volume is rebuilt at {} by \
+                 copying its files (their dates are reset)",
+                format_size(max),
+                format_size(size),
+            ),
+        });
     } else if let Some(max) = facts.in_place_max.filter(|&max| size > max) {
         out.push(Caveat {
             level: CaveatLevel::Warning,

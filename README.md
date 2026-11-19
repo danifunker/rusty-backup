@@ -378,6 +378,13 @@ The app has seven tabs:
   gzip-, xz- or zip-wrapped images are decoded on the way to the disk; an
   `.img.xz` streams straight onto the card with no temp copy). The
   CLI equivalent is `rb-cli write IMAGE DEVICE [--partition N] --yes`.
+  To resize while flashing, **Adjust Partitions...** (or **Disk Image...** in
+  Full Disk Restore) opens the image as if it were a backup: each partition
+  keeps its size, shrinks to its filesystem's last used byte, takes a custom
+  size, or (the last one) grows to fill the card, with the same preview and
+  confirmation as a restore. `rb-cli restore card.img.xz /dev/sdX --device --yes
+  --size fill` is the same from the CLI. MBR, GPT and APM disks; an exFAT whose
+  FAT is too small to grow is rebuilt at the new size (file dates are reset).
 - **Build Disk** — a wizard that makes a new disk from nothing. **Easy** mode
   asks only for the system and a size and lays out one partition across the
   disk: a classic Mac (HFS or HFS+ on APM, with the driver), MS-DOS (FAT16),
