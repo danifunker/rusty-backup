@@ -2227,6 +2227,24 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
         match type_str {
+            // An LV in several runs edits through them, like its read arm.
+            s if s.starts_with(part_tables::lvm::LVM_RUNS) => {
+                let runs = part_tables::lvm::decode_runs(s)
+                    .ok_or_else(|| FilesystemError::Parse(format!("bad LV run list '{s}'")))?;
+                let lv = part_tables::lvm::ExtentReader::new(reader, runs);
+                let ctx = EditContext {
+                    partition_len: Some(lv.len()),
+                    whole_file_path: None,
+                    ..edit_ctx
+                };
+                let lv: Box<dyn crate::rbformats::ReadWriteSeek> = Box::new(lv);
+                return open_editable_filesystem_with(lv, 0, ctx, 0x00, None);
+            }
+            s if s.starts_with(crate::partition::LVM_UNAVAILABLE) => {
+                return Err(FilesystemError::Unsupported(
+                    s[crate::partition::LVM_UNAVAILABLE.len()..].to_string(),
+                ));
+            }
             // "Apple_HFS" (APM) and "48465300-..." (GPT "Apple HFS/HFS+" type
             // GUID, from `hdiutil create` / UDIF DMGs) both resolve through the
             // same HFS-vs-HFS+ probe.
@@ -3398,7 +3416,9 @@ pub fn is_browsable_scheme_slice(type_name: &str) -> bool {
 /// auto-open a partition at all).
 pub fn partition_is_browsable(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool {
     // An ICON / LEXICON disk types its QNX 2 partitions 07, 08 and 09; the table names them.
+    let unavailable = type_string.is_some_and(|s| s.starts_with(crate::partition::LVM_UNAVAILABLE));
     type_name == "QNX 2"
+        || (type_name.starts_with(crate::partition::LVM2_ROW) && !unavailable)
         || is_browsable_type(ptype)
         || is_fat_name(type_name)
         || is_browsable_type_string(type_string)

@@ -453,17 +453,17 @@ Usage: build [OPTIONS] <TARGET>
 - `--bootable` — Mark partition N bootable: the MBR active flag (one partition) or the RDB bootable flag. Repeatable on RDB
 - `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH` (repeatable). PATH is the handler's AmigaDOS load file (`L:PFS3`, `L:SmartFilesystem`); without one, a DosType the ROM lacks cannot mount unaided
 - `--mac-driver` — The Mac driver on an APM disk: `bundled` (the default: a donor's own driver if it has one, otherwise Apple SCSI 7.3.5), `none`, or the path of an Apple-formatted disk to take the driver from. The driver serves SCSI; a Mac with the disk on IDE won't mount it
-- `--align` — Partition-start alignment, e.g. `1M` or `63s`; blank uses the table's default
+- `--align` — Partition-start alignment, e.g. `1M` or `63s`. Blank picks by era: APM packs after the map, a FAT-only MBR disk up to 8 GiB takes a 63-sector track, others 1 MiB (or a cylinder)
 - `--heads` — Heads for the cylinder-aligned tables (SGI, RDB, Sun, NeXT, Solaris x86)
 - `--sectors` — Sectors per track for the cylinder-aligned tables
 - `--fs` — With no `--table`: the filesystem of the one bare volume
 - `--from` — Start from this disk image's layout: its table, special partitions and their contents, at the new `--size`. Each partition is copied unless `--format N=FS` or `--empty N` says otherwise; `--partition SIZE` sets the sizes in order. A copied filesystem that can resize grows to its partition; one that can't keeps its size. A label (SGI, Sun, NeXT, RDB, AHDI, X68000) keeps its head region verbatim, resized for the new disk
 - `--empty` — With `--from`: leave partition N empty instead of copying it
-- `--preset` — Build a fixed bootable preset instead of a table or a volume: `x68k` (IPL, X68000 table, Human68k) or `sgi-efs` (volume header, EFS root). The same disks `new hd x68k` / `new hd sgi-efs` make
+- `--preset` — Build a ready-made disk instead of a table or a volume (the wizard's Easy mode): one partition across the disk for a system (`mac-hfs`, `dos`, `amiga`, ...), or the fixed `x68k` / `sgi-efs` boot disks
 - `--scsi` — `--preset x68k`: write the SCSI form (1024-byte sectors) rather than SASI
 - `--x68k-partitions` — `--preset x68k`: how many Human68k partitions, 1 to 8
 - `--system-disk` — `--preset x68k`: a Human68k system floppy cloned into partition 1
-- `--label` — With no `--table`: the volume label
+- `--label` — With no `--table`: the volume label (a volume's, or a `--preset`'s)
 - `--geometry` — With no `--table`: the fixed geometry of a floppy format, e.g. `d71` for a 1571 disk (`cbm`), `80` tracks (`dfs`, `rsdos`), `80ds` (`dragondos`). The default is the format's first
 - `--ntfs-version` — The on-disk version of every NTFS volume or partition this builds: `1.2` (alias `nt4`) for Windows NT 3.5 / 3.51 / 4.0, `3.1` (alias `xp`, the default)
 - `--container` — Container to encode an image target into: raw, vhd, vhd-dynamic, qcow2, vmdk, chd, 2mg, dc42, woz or moof. Defaults to the one the target's extension names (`.chd`, `.vhd`, ...), else raw
@@ -2390,6 +2390,26 @@ Open an interactive rb-cli shell (rustyline-based REPL)
 ```
 Usage: terminal
 ```
+
+### `tree`
+
+A `tree`-style listing of every volume on a disk (each partition, or each filesystem of a disc), or of one with `IMG@N`: the browser's Tree, for the whole disk at once
+
+```
+Usage: tree [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — The disk: `path` lists every partition (or a disc's every filesystem) under a heading, `path@N` just that one. Disk images, containers, backup folders, discs and `rb://host:port/img` work
+
+**Options**
+
+- `--ids` — Show each entry's filesystem ID too (CNID on HFS / HFS+, inode on ext, cluster on FAT)
+- `--password` — Passphrase for an encrypted volume or container (APFS, BitLocker, IMZ)
+- `--inside` — The disk image to open inside a `.zip` that holds several
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `tui`
 

@@ -24,6 +24,9 @@ ui = [
   { activate = "build_disk.next" },
   { focus = "build_disk.size" },
   { fill = "32M" },
+  # A FAT-only 32 MiB MBR disk defaults to a DOS track; this flow wants the modern 1 MiB layout.
+  { focus = "build_disk.align_pick" },
+  { choose = "1 MiB" },
   { activate = "build_disk.next" },
   { focus = "build_disk.row_content.0" },
   { choose = "FAT (12, 16" },

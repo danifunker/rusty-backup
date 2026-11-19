@@ -76,7 +76,7 @@ struct PresetRows {
 
 impl PresetRows {
     fn build(send: &ActionFn) -> PresetRows {
-        let root = group("Preset");
+        let root = group("System");
         let held: Rc<RefCell<Option<PresetView>>> = Rc::default();
         let edit = |change: Rc<dyn Fn(&mut PresetView)>| {
             let held = held.clone();

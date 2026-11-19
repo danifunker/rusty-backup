@@ -1564,6 +1564,12 @@ pub fn open_container_rw(path: &Path) -> Result<ContainerRw> {
                 .with_context(|| format!("opening dynamic VHD {} for edit", path.display()))?;
             ContainerRw::Handle(Box::new(reader))
         }
+        // A descriptor disk (split, sparse or flat): every extent opened read-write.
+        ImageFormat::VmdkFlat { path: desc, .. } => {
+            let reader = dsk_vm::vmdk::VmdkFlatReader::open_rw(&desc)
+                .with_context(|| format!("opening VMDK {} for edit", desc.display()))?;
+            ContainerRw::Handle(Box::new(reader))
+        }
         ImageFormat::VmdkSparse { .. } => {
             let reader = dsk_vm::vmdk_sparse::VmdkSparseReader::open(rw()?)
                 .with_context(|| format!("opening sparse VMDK {} for edit", path.display()))?;

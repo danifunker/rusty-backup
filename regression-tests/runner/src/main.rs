@@ -1543,8 +1543,19 @@ fn run_case(
                     .file_name()
                     .map(|n| n.to_os_string())
                     .unwrap_or_else(|| std::ffi::OsString::from("fixture.img"));
+                // A set fixture's siblings travel with it (a descriptor needs its extents).
+                let set = case.fixture.as_deref().is_some_and(|id| catalog.is_set(id));
                 let dst = scratch.join(name);
-                if let Err(e) = fs::copy(src, &dst) {
+                let copied = match (set, src.parent()) {
+                    (true, Some(dir)) => fs::read_dir(dir).and_then(|entries| {
+                        for e in entries.flatten().filter(|e| e.path().is_file()) {
+                            fs::copy(e.path(), scratch.join(e.file_name()))?;
+                        }
+                        Ok(0)
+                    }),
+                    _ => fs::copy(src, &dst),
+                };
+                if let Err(e) = copied {
                     result.verdict = Verdict::Error;
                     result.skip_reason =
                         Some(format!("could not copy fixture into scratch: {}", e));

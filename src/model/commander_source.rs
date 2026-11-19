@@ -38,7 +38,10 @@ pub fn probe_partitions(path: &Path) -> Result<Vec<PartitionInfo>> {
     let mut reader = source_reader::open_peeled_read(path, None)?;
     let table = PartitionTable::detect(&mut reader)
         .with_context(|| format!("parsing partition table of {}", path.display()))?;
-    Ok(table.partitions())
+    Ok(crate::partition::partitions_with_volumes(
+        &mut reader,
+        &table,
+    ))
 }
 
 /// Build a [`BrowseSession`] for `part` within the image at `path`. Mirrors the

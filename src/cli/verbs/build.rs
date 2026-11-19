@@ -57,12 +57,47 @@ impl BuildTable {
     }
 }
 
-/// The bootable presets `build` makes.
+/// The presets `build` makes: easy mode's one-partition disks, then the fixed boot disks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BuildPreset {
+    /// Classic Macintosh: HFS on APM, with the bundled driver.
+    #[value(name = "mac-hfs")]
+    MacHfs,
+    /// Mac OS 8.1 to 9 and OS X: HFS+ on APM.
+    #[value(name = "mac-hfsplus")]
+    MacHfsPlus,
+    /// MS-DOS and Windows 3.x: FAT16 on MBR, 2 GiB at most.
+    Dos,
+    /// Windows 95 OSR2, 98 and ME: FAT32 on MBR.
+    Win9x,
+    /// Windows NT 3.5 to 4.0: NTFS 1.2 on MBR.
+    Winnt,
+    /// Windows 2000 and XP: NTFS 3.1 on MBR.
+    Winxp,
+    /// Amiga, Kickstart 2.0 and later: FFS on RDB.
+    Amiga,
+    /// Linux: ext2 on MBR.
+    Linux,
     X68k,
     #[value(name = "sgi-efs")]
     SgiEfs,
+}
+
+impl BuildPreset {
+    fn kind(self) -> PresetKind {
+        match self {
+            BuildPreset::MacHfs => PresetKind::MacHfs,
+            BuildPreset::MacHfsPlus => PresetKind::MacHfsPlus,
+            BuildPreset::Dos => PresetKind::Dos,
+            BuildPreset::Win9x => PresetKind::Win9x,
+            BuildPreset::Winnt => PresetKind::WinNt,
+            BuildPreset::Winxp => PresetKind::WinXp,
+            BuildPreset::Amiga => PresetKind::Amiga,
+            BuildPreset::Linux => PresetKind::Linux,
+            BuildPreset::X68k => PresetKind::X68k,
+            BuildPreset::SgiEfs => PresetKind::SgiEfs,
+        }
+    }
 }
 
 /// The containers `build` can encode an image into.
@@ -154,8 +189,8 @@ pub struct BuildArgs {
     #[arg(long = "mac-driver", value_name = "bundled|none|DISK")]
     pub mac_driver: Option<String>,
 
-    /// Partition-start alignment, e.g. `1M` or `63s`; blank uses the
-    /// table's default.
+    /// Partition-start alignment, e.g. `1M` or `63s`. Blank picks by era: APM packs after the map,
+    /// a FAT-only MBR disk up to 8 GiB takes a 63-sector track, others 1 MiB (or a cylinder).
     #[arg(long, default_value = "")]
     pub align: String,
 
@@ -186,9 +221,9 @@ pub struct BuildArgs {
     #[arg(long = "empty", value_name = "N")]
     pub empty: Vec<usize>,
 
-    /// Build a fixed bootable preset instead of a table or a volume:
-    /// `x68k` (IPL, X68000 table, Human68k) or `sgi-efs` (volume header, EFS
-    /// root). The same disks `new hd x68k` / `new hd sgi-efs` make.
+    /// Build a ready-made disk instead of a table or a volume (the wizard's
+    /// Easy mode): one partition across the disk for a system (`mac-hfs`,
+    /// `dos`, `amiga`, ...), or the fixed `x68k` / `sgi-efs` boot disks.
     #[arg(long, value_enum, conflicts_with_all = ["table", "fs"])]
     pub preset: Option<BuildPreset>,
 
@@ -204,7 +239,7 @@ pub struct BuildArgs {
     #[arg(long)]
     pub system_disk: Option<PathBuf>,
 
-    /// With no `--table`: the volume label.
+    /// With no `--table`: the volume label (a volume's, or a `--preset`'s).
     #[arg(long)]
     pub label: Option<String>,
 
@@ -364,15 +399,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
     if let Some(p) = args.preset {
         act(&mut c, A::SetKind(DiskKind::Preset));
         let mut view = c.preset().clone();
-        view.kind = match p {
-            BuildPreset::X68k => PresetKind::X68k,
-            BuildPreset::SgiEfs => PresetKind::SgiEfs,
-        };
+        view.kind = p.kind();
         view.x68k_scsi = args.scsi;
         view.x68k_partitions = args.x68k_partitions;
         view.x68k_system_disk = args.system_disk.clone();
         if let Some(label) = &args.label {
             view.sgi_label = label.clone();
+            view.label = Some(label.clone());
         }
         act(&mut c, A::SetPreset(view));
         return finish(c, &args);

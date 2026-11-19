@@ -215,4 +215,5 @@ ui = [
 [[case.step]]
 args = ["inspect", "{scratch}/disk.img"]
 expect_exit = 0
-stdout_contains = ["41.0 MiB"]
+# rb-cli builds this FAT-only disk on a DOS track (partition 2 at LBA 12411); it stays put.
+stdout_contains = ["12411", "41.9 MiB"]

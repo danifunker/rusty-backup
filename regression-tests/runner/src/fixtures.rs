@@ -163,6 +163,20 @@ impl Catalog {
         }
     }
 
+    /// Whether `id` is one file of a set directory (a split VMDK, a cue sheet and its tracks),
+    /// so a private copy must take the whole directory, not the one file.
+    pub fn is_set(&self, id: &str) -> bool {
+        let Some(row) = self.rows.get(id) else {
+            return false;
+        };
+        let rel = match row.relpath.strip_prefix("repo:") {
+            Some(r) => r.strip_prefix("tests/fixtures/").unwrap_or(r),
+            None => row.relpath.as_str(),
+        };
+        let rel = rel.strip_prefix("../fixtures-large/").unwrap_or(rel);
+        Path::new(rel).parent().is_some_and(|p| !p.as_os_str().is_empty())
+    }
+
     /// Resolve an ID to a path that actually exists on this host.
     ///
     /// Returns `Err` with a human-readable reason suitable for the shopping

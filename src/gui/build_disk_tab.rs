@@ -465,6 +465,8 @@ impl BuildDiskTab {
                             );
                         });
                     }
+                    // An easy target asks only for a size.
+                    _ => {}
                 }
                 if p != before {
                     self.act(BuildDiskAction::SetPreset(p));

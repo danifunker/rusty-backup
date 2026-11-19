@@ -1,5 +1,6 @@
-//! VMDK flat reader + writer (split `monolithicFlat` / `twoGbMaxExtentFlat`,
-//! and embedded `monolithicFlat`).
+//! VMDK descriptor reader + flat writer: `monolithicFlat` / `twoGbMaxExtentFlat` (FLAT extents),
+//! embedded `monolithicFlat`, and `twoGbMaxExtentSparse` (hosted SPARSE extents, each its own
+//! `KDMV` file read by [`crate::vmdk_sparse`]).
 //!
 //! Phase 3 / Session 3.1 of `docs/virtualization-formats.md`. Sparse VMDK
 //! (`monolithicSparse`, `KDMV` magic) is Phase 4 and lives in a separate module
@@ -40,7 +41,9 @@
 //! Each extent line is `<access> <size_sectors> <type> "<filename>"
 //! [<offset_sectors>]`. We accept `RW`/`RDONLY`, types `FLAT`/`ZERO`, optional
 //! quotes around the filename, and a trailing `offset_sectors` (defaulting to
-//! 0). Unknown extent types (`SPARSE`, `VMFS`, `VMFSSPARSE`, …) error at open.
+//! 0). `SPARSE` extents (no offset) are hosted sparse files whose header capacity must match
+//! the line. The ESX types (`VMFS`, `VMFSSPARSE`, …) error at open, as does a snapshot delta
+//! (`parentCID` other than `ffffffff`): its unwritten sectors live in a parent we do not read.
 
 #[cfg(feature = "rust173-polyfill")]
 use disk_core::rust173::IntIsMultipleOf as _;
@@ -74,6 +77,8 @@ struct ExtentSpec {
 enum ExtentKind {
     Flat,
     Zero,
+    /// A hosted sparse extent (`twoGbMaxExtentSparse`): a `KDMV` file of its own.
+    Sparse,
 }
 
 const VMDK_SECTOR: u64 = 512;
@@ -98,6 +103,17 @@ impl Descriptor {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            if let Some(parent) = line.strip_prefix("parentCID=") {
+                if !parent.trim().eq_ignore_ascii_case("ffffffff") {
+                    bail!(
+                        "this VMDK is a snapshot delta (parentCID={}): its unchanged sectors \
+                         are in the parent disk. Open the base disk, or consolidate the \
+                         snapshots in VMware first",
+                        parent.trim()
+                    );
+                }
+                continue;
+            }
             // Extent lines start with an access token (RW / RDONLY / NOACCESS).
             // ddb.* / createType=… / CID=… are all `key = value` shape — skip
             // them in this minimal parser (we don't currently need them).
@@ -119,10 +135,11 @@ impl Descriptor {
             let kind = match kind_str.as_str() {
                 "FLAT" => ExtentKind::Flat,
                 "ZERO" => ExtentKind::Zero,
-                "SPARSE" | "VMFSSPARSE" | "VMFS" | "VMFSRAW" | "VMFSRDM" | "VMFSRAWDEVICEMAP" => {
+                "SPARSE" => ExtentKind::Sparse,
+                "VMFSSPARSE" | "VMFS" | "VMFSRAW" | "VMFSRDM" | "VMFSRAWDEVICEMAP" => {
                     bail!(
-                        "VMDK extent type {kind_str} is not supported by this reader \
-                         (Phase 3 covers FLAT/ZERO only)"
+                        "VMDK extent type {kind_str} (an ESX datastore disk) is not supported; \
+                         this reader covers FLAT, ZERO and hosted SPARSE extents"
                     );
                 }
                 other => bail!("VMDK descriptor: unknown extent type {other:?}"),
@@ -132,7 +149,7 @@ impl Descriptor {
                 None
             } else {
                 let fname = tokens.get(3).ok_or_else(|| {
-                    anyhow!("VMDK descriptor: FLAT extent missing filename in {raw_line:?}")
+                    anyhow!("VMDK descriptor: {kind_str} extent missing filename in {raw_line:?}")
                 })?;
                 let p = PathBuf::from(strip_quotes(fname));
                 let resolved = if p.is_absolute() {
@@ -259,62 +276,99 @@ fn read_descriptor(path: &Path) -> Result<(String, u64, PathBuf)> {
     Ok((text_owned, descriptor_byte_len, descriptor_dir))
 }
 
+/// Where an extent's bytes come from.
+enum Backend {
+    Zero,
+    /// Raw sectors at `offset` in `file`.
+    Flat {
+        file: File,
+        offset: u64,
+    },
+    /// A hosted sparse extent, addressed from its own sector 0.
+    Sparse(Box<crate::vmdk_sparse::VmdkSparseReader<File>>),
+}
+
 /// Resolved extent ready for `Read + Seek` dispatch.
 struct OpenExtent {
-    kind: ExtentKind,
     /// Logical start byte within the concatenated virtual disk.
     logical_start: u64,
     /// Length in bytes.
     length: u64,
-    /// Open file handle (None for ZERO extents).
-    file: Option<File>,
-    /// Byte offset within `file` where this extent's data starts.
-    file_offset: u64,
+    backend: Backend,
 }
 
-/// `Read + Seek` reader over a VMDK flat (descriptor + one or more FLAT/ZERO
-/// extents).
+/// `Read + Seek` (and, opened with [`VmdkFlatReader::open_rw`], `Write`) over a descriptor
+/// VMDK: its FLAT, ZERO and hosted SPARSE extents back to back, each at its own size.
 pub struct VmdkFlatReader {
     extents: Vec<OpenExtent>,
     total: u64,
     pos: u64,
+    writable: bool,
 }
 
 impl VmdkFlatReader {
     /// Open `path` — a `.vmdk` descriptor (standalone or with embedded flat
     /// data) — and resolve every extent.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, false)
+    }
+
+    /// As [`Self::open`], with every extent file opened read-write for in-place edits. A
+    /// sparse extent allocates grains as it is written; a ZERO extent refuses writes.
+    pub fn open_rw(path: &Path) -> Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    fn open_with(path: &Path, writable: bool) -> Result<Self> {
         let (text, embedded_data_start, dir) = read_descriptor(path)?;
         let descriptor = Descriptor::parse(&text, &dir)?;
+        let open_file = |p: &Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(writable)
+                .open(p)
+                .with_context(|| format!("failed to open VMDK extent {}", p.display()))
+        };
 
         let mut extents = Vec::with_capacity(descriptor.extents.len());
         let mut logical = 0u64;
         for spec in descriptor.extents {
             let length = spec.sectors * VMDK_SECTOR;
-            let (file, file_offset) = match spec.kind {
-                ExtentKind::Zero => (None, 0),
+            let backend = match spec.kind {
+                ExtentKind::Zero => Backend::Zero,
                 ExtentKind::Flat => {
                     let extent_path = spec.path.as_ref().expect("FLAT extent has path");
                     // If the extent points back at the descriptor file itself
                     // (embedded layout), the data lives past the descriptor.
                     let same_file = same_file_path(path, extent_path);
-                    let file = File::open(extent_path).with_context(|| {
-                        format!("failed to open VMDK extent {}", extent_path.display())
-                    })?;
+                    let file = open_file(extent_path)?;
                     let offset = if same_file && spec.file_byte_offset == 0 {
                         embedded_data_start
                     } else {
                         spec.file_byte_offset
                     };
-                    (Some(file), offset)
+                    Backend::Flat { file, offset }
+                }
+                ExtentKind::Sparse => {
+                    let extent_path = spec.path.as_ref().expect("SPARSE extent has path");
+                    let sparse =
+                        crate::vmdk_sparse::VmdkSparseReader::open(open_file(extent_path)?)
+                            .with_context(|| format!("VMDK extent {}", extent_path.display()))?;
+                    if sparse.len() != length {
+                        bail!(
+                            "VMDK extent {} holds {} sectors but the descriptor says {}",
+                            extent_path.display(),
+                            sparse.len() / VMDK_SECTOR,
+                            spec.sectors
+                        );
+                    }
+                    Backend::Sparse(Box::new(sparse))
                 }
             };
             extents.push(OpenExtent {
-                kind: spec.kind,
                 logical_start: logical,
                 length,
-                file,
-                file_offset,
+                backend,
             });
             logical += length;
         }
@@ -323,6 +377,7 @@ impl VmdkFlatReader {
             extents,
             total: logical,
             pos: 0,
+            writable,
         })
     }
 
@@ -339,14 +394,11 @@ impl VmdkFlatReader {
     /// Find the index of the extent that covers `logical_pos`. Returns
     /// `extents.len()` for positions at or past EOF.
     fn locate(&self, logical_pos: u64) -> usize {
-        // Linear scan — VMDKs in the wild have 1 (monolithic) or ~tens
-        // (twoGbMaxExtentFlat splits a 2 TiB disk into ~1000) extents at most.
-        for (i, e) in self.extents.iter().enumerate() {
-            if logical_pos < e.logical_start + e.length {
-                return i;
-            }
-        }
-        self.extents.len()
+        // Binary search: extents are sorted and contiguous, and a big split disk has thousands.
+        let ends = self
+            .extents
+            .partition_point(|e| e.logical_start + e.length <= logical_pos);
+        ends.min(self.extents.len())
     }
 }
 
@@ -364,20 +416,70 @@ impl Read for VmdkFlatReader {
         let remaining_in_extent = extent.length - intra;
         let to_read = (buf.len() as u64).min(remaining_in_extent) as usize;
 
-        match extent.kind {
-            ExtentKind::Zero => {
+        match &mut extent.backend {
+            Backend::Zero => {
                 for b in &mut buf[..to_read] {
                     *b = 0;
                 }
             }
-            ExtentKind::Flat => {
-                let file = extent.file.as_mut().expect("FLAT extent has file");
-                file.seek(SeekFrom::Start(extent.file_offset + intra))?;
+            Backend::Flat { file, offset } => {
+                file.seek(SeekFrom::Start(*offset + intra))?;
                 file.read_exact(&mut buf[..to_read])?;
+            }
+            Backend::Sparse(sparse) => {
+                sparse.seek(SeekFrom::Start(intra))?;
+                sparse.read_exact(&mut buf[..to_read])?;
             }
         }
         self.pos += to_read as u64;
         Ok(to_read)
+    }
+}
+
+impl Write for VmdkFlatReader {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.writable {
+            return Err(disk_core::io_other("VMDK opened read-only"));
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let idx = self.locate(self.pos);
+        if idx >= self.extents.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write past the end of the VMDK",
+            ));
+        }
+        let extent = &mut self.extents[idx];
+        let intra = self.pos - extent.logical_start;
+        let to_write = (buf.len() as u64).min(extent.length - intra) as usize;
+        match &mut extent.backend {
+            Backend::Zero => {
+                return Err(disk_core::io_other("a VMDK ZERO extent cannot be written"))
+            }
+            Backend::Flat { file, offset } => {
+                file.seek(SeekFrom::Start(*offset + intra))?;
+                file.write_all(&buf[..to_write])?;
+            }
+            Backend::Sparse(sparse) => {
+                sparse.seek(SeekFrom::Start(intra))?;
+                sparse.write_all(&buf[..to_write])?;
+            }
+        }
+        self.pos += to_write as u64;
+        Ok(to_write)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        for e in &mut self.extents {
+            match &mut e.backend {
+                Backend::Zero => {}
+                Backend::Flat { file, .. } => file.flush()?,
+                Backend::Sparse(sparse) => sparse.flush()?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -397,6 +499,41 @@ impl Seek for VmdkFlatReader {
         self.pos = new as u64;
         Ok(self.pos)
     }
+}
+
+/// The descriptor beside `extent` that lists it, when `extent` is one piece of a split disk
+/// (`Disk-s001.vmdk`): the piece alone is only a slice, so callers open the descriptor instead.
+pub fn descriptor_for_extent(extent: &Path) -> Option<PathBuf> {
+    let dir = extent
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let candidate = entry.path();
+        let is_vmdk = candidate
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("vmdk"));
+        let small = entry
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.len() < 64 * 1024);
+        if !is_vmdk || !small || same_file_path(&candidate, extent) {
+            continue;
+        }
+        let Ok((text, _, desc_dir)) = read_descriptor(&candidate) else {
+            continue;
+        };
+        let Ok(desc) = Descriptor::parse(&text, &desc_dir) else {
+            continue;
+        };
+        let lists = desc.extents.iter();
+        if lists
+            .filter_map(|e| e.path.as_deref())
+            .any(|p| same_file_path(p, extent))
+        {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn same_file_path(a: &Path, b: &Path) -> bool {
@@ -612,10 +749,128 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_sparse_extent() {
-        let text = "# Disk DescriptorFile\nRW 2048 SPARSE \"s.vmdk\" 0\n";
+    fn parse_takes_hosted_sparse_and_refuses_esx_extents() {
+        let text = "# Disk DescriptorFile\nRW 2048 SPARSE \"s.vmdk\"\n";
+        let d = Descriptor::parse(text, Path::new("/")).unwrap();
+        assert_eq!(d.extents[0].kind, ExtentKind::Sparse);
+        assert_eq!(d.extents[0].path.as_deref(), Some(Path::new("/s.vmdk")));
+        let esx = "# Disk DescriptorFile\nRW 2048 VMFSSPARSE \"s.vmdk\"\n";
+        let err = Descriptor::parse(esx, Path::new("/")).unwrap_err();
+        assert!(err.to_string().contains("ESX"), "{err}");
+    }
+
+    #[test]
+    fn parse_refuses_a_snapshot_delta() {
+        let text = "# Disk DescriptorFile\nparentCID=83044315\nRW 2048 SPARSE \"d.vmdk\"\n";
         let err = Descriptor::parse(text, Path::new("/")).unwrap_err();
-        assert!(err.to_string().contains("SPARSE"), "{err}");
+        assert!(err.to_string().contains("snapshot delta"), "{err}");
+        let base = "# Disk DescriptorFile\nparentCID=ffffffff\nRW 2048 SPARSE \"d.vmdk\"\n";
+        assert!(Descriptor::parse(base, Path::new("/")).is_ok());
+    }
+
+    /// A qemu-img `twoGbMaxExtentSparse` disk (2 GiB + 512 MiB extents): writes span the extents
+    /// and qemu-img agrees with every byte. Skipped without qemu-img.
+    #[test]
+    fn split_sparse_reads_and_writes_across_extents() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("d.vmdk");
+        let made = Command::new("qemu-img")
+            .args([
+                "create",
+                "-q",
+                "-f",
+                "vmdk",
+                "-o",
+                "subformat=twoGbMaxExtentSparse",
+            ])
+            .arg(&disk)
+            .arg("2560M")
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("qemu-img not available; skipping");
+            return;
+        }
+        let piece = dir.path().join("d-s002.vmdk");
+        assert_eq!(
+            descriptor_for_extent(&piece).as_deref(),
+            Some(disk.as_path())
+        );
+
+        // A pattern across the 2 GiB boundary and near the end, mirrored into a raw file.
+        let raw = dir.path().join("d.raw");
+        let mut flat = File::create(&raw).unwrap();
+        flat.set_len(2560 << 20).unwrap();
+        let mut v = VmdkFlatReader::open_rw(&disk).unwrap();
+        assert_eq!(v.len(), 2560 << 20);
+        let writes: [(u64, usize); 3] = [
+            ((2 << 30) - 100_000, 300_000),
+            (1 << 20, 70_000),
+            ((2560 << 20) - 4096, 4096),
+        ];
+        for (n, (at, len)) in writes.into_iter().enumerate() {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 7 + n * 13) as u8 | 1).collect();
+            v.seek(SeekFrom::Start(at)).unwrap();
+            v.write_all(&bytes).unwrap();
+            flat.seek(SeekFrom::Start(at)).unwrap();
+            flat.write_all(&bytes).unwrap();
+        }
+        v.flush().unwrap();
+        drop(v);
+        drop(flat);
+
+        let mut back = VmdkFlatReader::open(&disk).unwrap();
+        let mut got = vec![0u8; 300_000];
+        back.seek(SeekFrom::Start((2 << 30) - 100_000)).unwrap();
+        back.read_exact(&mut got).unwrap();
+        assert!(got.iter().enumerate().all(|(i, b)| *b == (i * 7) as u8 | 1));
+
+        let compare = Command::new("qemu-img")
+            .args(["compare", "-q", "-f", "vmdk", "-F", "raw"])
+            .arg(&disk)
+            .arg(&raw)
+            .status()
+            .unwrap();
+        assert!(compare.success(), "qemu-img compare found a difference");
+        assert!(crate::qemu_img_test::qemu_img_check(&disk).unwrap());
+        for piece in ["d-s001.vmdk", "d-s002.vmdk"] {
+            assert_redundant_tables_match(&dir.path().join(piece));
+        }
+    }
+
+    /// The primary and redundant grain tables of a hosted sparse extent agree entry for entry.
+    fn assert_redundant_tables_match(path: &Path) {
+        let mut f = File::open(path).unwrap();
+        let mut h = [0u8; 512];
+        f.read_exact(&mut h).unwrap();
+        let header = crate::vmdk_sparse::VmdkSparseHeader::parse(&h).unwrap();
+        assert!(
+            header.rgd_offset_sectors != 0,
+            "qemu writes a redundant directory"
+        );
+        let gts = header.num_grain_tables() as usize;
+        let table = |f: &mut File, dir_sector: u64| -> Vec<u8> {
+            let mut gd = vec![0u8; gts * 4];
+            f.seek(SeekFrom::Start(dir_sector * 512)).unwrap();
+            f.read_exact(&mut gd).unwrap();
+            let mut all = Vec::new();
+            for e in gd.chunks_exact(4) {
+                let at = u32::from_le_bytes(e.try_into().unwrap()) as u64;
+                let mut gt = vec![0u8; header.num_gtes_per_gt as usize * 4];
+                f.seek(SeekFrom::Start(at * 512)).unwrap();
+                f.read_exact(&mut gt).unwrap();
+                all.extend(gt);
+            }
+            all
+        };
+        let primary = table(&mut f, header.gd_offset_sectors);
+        let redundant = table(&mut f, header.rgd_offset_sectors);
+        assert!(
+            primary.iter().any(|b| *b != 0),
+            "{} has grains",
+            path.display()
+        );
+        assert_eq!(primary, redundant, "{}", path.display());
     }
 
     #[test]

@@ -1,19 +1,20 @@
 //! Logical volume managers, one module per OS platform.
 //!
-//! Each platform keeps its own on-disk parsing (HP-UX LVM today; AIX LVM and Linux
-//! LVM2 to follow) and shares only [`LogicalVolume`]: an LV as the runs of bytes it
+//! Each platform keeps its own on-disk parsing (HP-UX LVM, AIX LVM, Linux LVM2) and
+//! shares only [`LogicalVolume`]: an LV as the runs of bytes it
 //! occupies on this disk, in logical order. Only single-disk volume groups are
 //! supported. An LV with extents on another physical volume is still listed so the
 //! user can see it, but marked incomplete and refused when opened. An LV split into
 //! several runs opens through [`ExtentReader`], its runs carried in the partition's
 //! type string ([`encode_runs`]), so no partition-open call site has to change.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use serde::{Deserialize, Serialize};
 
 pub mod aix;
 pub mod hpux;
+pub mod linux;
 
 /// Type-string prefix for an LV made of several runs; the runs follow as `offset+len,...`.
 pub const LVM_RUNS: &str = "LVM-RUNS:";
@@ -36,7 +37,7 @@ pub fn decode_runs(type_string: &str) -> Option<Vec<(u64, u64)>> {
         .collect()
 }
 
-/// Presents an LV's runs on the disk as one contiguous, read-only volume starting at 0.
+/// Presents an LV's runs on the disk as one contiguous volume starting at 0; writes stay in it.
 pub struct ExtentReader<R> {
     inner: R,
     runs: Vec<(u64, u64)>,
@@ -66,21 +67,51 @@ impl<R: Read + Seek> ExtentReader<R> {
     }
 }
 
-impl<R: Read + Seek> Read for ExtentReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+impl<R> ExtentReader<R> {
+    /// The disk offset of the current position and the bytes left in its run.
+    fn locate(&self) -> Option<(u64, u64)> {
         let mut base = 0u64;
         for &(off, len) in &self.runs {
             if self.pos < base + len {
                 let within = self.pos - base;
-                let n = ((len - within) as usize).min(buf.len());
-                self.inner.seek(SeekFrom::Start(off + within))?;
-                let got = self.inner.read(&mut buf[..n])?;
-                self.pos += got as u64;
-                return Ok(got);
+                return Some((off + within, len - within));
             }
             base += len;
         }
-        Ok(0)
+        None
+    }
+}
+
+impl<R: Read + Seek> Read for ExtentReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let Some((at, left)) = self.locate() else {
+            return Ok(0);
+        };
+        let n = (left as usize).min(buf.len());
+        self.inner.seek(SeekFrom::Start(at))?;
+        let got = self.inner.read(&mut buf[..n])?;
+        self.pos += got as u64;
+        Ok(got)
+    }
+}
+
+impl<R: Write + Seek> Write for ExtentReader<R> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let Some((at, left)) = self.locate() else {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write past the end of the LV",
+            ));
+        };
+        let n = (left as usize).min(buf.len());
+        self.inner.seek(SeekFrom::Start(at))?;
+        let put = self.inner.write(&buf[..n])?;
+        self.pos += put as u64;
+        Ok(put)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -170,6 +201,20 @@ mod tests {
         let mut two = [0u8; 2];
         r.read_exact(&mut two).unwrap();
         assert_eq!(two, [209, 10], "a read crosses the run boundary");
+    }
+
+    #[test]
+    fn extent_reader_writes_land_in_their_runs_only() {
+        let runs = vec![(20, 4), (8, 4)];
+        let mut r = ExtentReader::new(std::io::Cursor::new(vec![0u8; 32]), runs);
+        r.seek(SeekFrom::Start(2)).unwrap();
+        r.write_all(&[1, 2, 3, 4, 5, 6]).unwrap();
+        assert!(r.write_all(&[9]).is_err(), "nothing is written past the LV");
+        let disk = r.inner.into_inner();
+        let mut want = vec![0u8; 32];
+        want[22..24].copy_from_slice(&[1, 2]);
+        want[8..12].copy_from_slice(&[3, 4, 5, 6]);
+        assert_eq!(disk, want);
     }
 
     #[test]

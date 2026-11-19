@@ -442,17 +442,11 @@ impl SideView {
             ));
             rows.push(Node::leaf(self.quick, Size::Stretch(1), Size::Stretch(1)));
         } else {
-            let mut body = Vec::new();
-            if ui::shown(self.pane.tree) {
-                body.push(Node::leaf(
-                    self.pane.tree,
-                    Size::Fixed(160),
-                    Size::Stretch(1),
-                ));
-            }
+            // The tree takes a third of the side until its splitter is dragged.
+            let mut body = self.pane.tree_nodes(Size::Stretch(1));
             body.push(Node::leaf(
                 self.pane.list,
-                Size::Stretch(1),
+                Size::Stretch(2),
                 Size::Stretch(1),
             ));
             rows.push(Node::row(body));
@@ -1016,6 +1010,7 @@ impl CommanderScreen {
             ui::set_visible(view.pane.list, !on);
             if on {
                 ui::set_visible(view.pane.tree, false);
+                ui::set_visible(view.pane.splitter, false);
             }
         }
         if let Some((side, text, hint)) = quick {
@@ -1111,16 +1106,10 @@ impl CommanderScreen {
             }
             PaneEvent::Mark(id) => self.apply(pane(P::Mark(id))),
             PaneEvent::Toggle(id) => self.apply(pane(P::ToggleExpand(id))),
-            PaneEvent::Activate => {
-                let id = {
-                    let ctl = self.ctrl.borrow();
-                    let p = ctl.pane(side);
-                    p.cursor_index().map(|i| p.rows()[i].node_id.clone())
-                };
+            PaneEvent::Activate(row) => {
                 self.apply(A::Focus(side));
-                if let Some(id) = id {
-                    self.apply(pane(P::Activate(id)));
-                }
+                self.apply(pane(P::CursorTo(row.node_id.clone())));
+                self.apply(pane(P::Activate(row.node_id)));
             }
             PaneEvent::Key(key, mods) => {
                 if self.ctrl.borrow().active() != side {

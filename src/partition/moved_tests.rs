@@ -464,3 +464,156 @@ mod bsd_alpha_build {
         }
     }
 }
+
+mod lvm_linux {
+    use crate::partition::{partitions_with_volumes, PartitionTable, LVM_UNAVAILABLE};
+    use std::io::{Read, Seek, SeekFrom};
+
+    const MIB: usize = 1 << 20;
+
+    fn fixture() -> tempfile::NamedTempFile {
+        let packed = std::fs::read("tests/fixtures/test_lvm2.img.zst").unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), zstd::decode_all(&packed[..]).unwrap()).unwrap();
+        file
+    }
+
+    fn rows(path: &std::path::Path) -> Vec<crate::partition::PartitionInfo> {
+        let mut f = std::fs::File::open(path).unwrap();
+        let table = PartitionTable::detect(&mut f).unwrap();
+        assert_eq!(
+            table.partitions().len(),
+            1,
+            "the table itself still has the PV alone"
+        );
+        partitions_with_volumes(&mut f, &table)
+    }
+
+    /// The fixture's root LV is PEs 6-8 then 0-2; a file put into it lands in those extents
+    /// only, reads back, and the stitched volume checks clean (with e2fsck when installed).
+    #[test]
+    fn a_two_run_lv_lists_reads_and_edits_in_place() {
+        let disk = fixture();
+        let rows = rows(disk.path());
+        let names: Vec<&str> = rows.iter().map(|p| p.type_name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Linux LVM",
+                "LVM2 fixvg/root",
+                "LVM2 fixvg/swap",
+                "LVM2 fixvg/pool"
+            ]
+        );
+        let pool = rows[3].partition_type_string.as_deref().unwrap();
+        assert!(
+            pool.starts_with(LVM_UNAVAILABLE) && pool.contains("thin-pool"),
+            "{pool}"
+        );
+        assert_eq!(
+            rows[2].partition_type_string, None,
+            "one run opens like a partition"
+        );
+        let root = rows[1].clone();
+        let runs = root.partition_type_string.clone().unwrap();
+
+        let rw = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(disk.path())
+            .unwrap();
+        let mut fs = crate::fs::open_editable_filesystem(rw, 0, 0, Some(&runs)).unwrap();
+        let dir = fs.root().unwrap();
+        let body = b"written through two LV runs\n".repeat(400);
+        let opts = disk_core::filesystem::CreateFileOptions::default();
+        fs.create_file(&dir, "NEW.TXT", &mut &body[..], body.len() as u64, &opts)
+            .unwrap();
+        fs.sync_metadata().unwrap();
+        drop(fs);
+
+        let ro = std::fs::File::open(disk.path()).unwrap();
+        let mut fs = crate::fs::open_filesystem(ro, 0, 0, Some(&runs)).unwrap();
+        let top = fs.root().unwrap();
+        let entries = fs.list_directory(&top).unwrap();
+        let read = |fs: &mut Box<dyn disk_core::filesystem::Filesystem>, n: &str| {
+            let e = entries.iter().find(|e| e.name == n).unwrap();
+            fs.read_file(e, usize::MAX).unwrap()
+        };
+        assert_eq!(read(&mut fs, "NEW.TXT"), body);
+        let big = read(&mut fs, "BIG.BIN");
+        let want: Vec<u8> = (0..4 * MIB + 12345)
+            .map(|i| ((i * 7 + i / 4096) & 0xFF) as u8)
+            .collect();
+        assert!(
+            big == want,
+            "BIG.BIN spans both runs and reads in logical order"
+        );
+        let report = fs.fsck().expect("ext has fsck").unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let mut raw = std::fs::File::open(disk.path()).unwrap();
+        let mut swap = vec![0u8; 2 * MIB];
+        raw.seek(SeekFrom::Start(rows[2].byte_offset())).unwrap();
+        raw.read_exact(&mut swap).unwrap();
+        assert!(
+            swap.iter().all(|&b| b == 0x5a),
+            "the swap LV between the runs is untouched"
+        );
+        let mut stitched = Vec::new();
+        let decoded = part_tables::lvm::decode_runs(&runs).unwrap();
+        part_tables::lvm::ExtentReader::new(raw, decoded)
+            .read_to_end(&mut stitched)
+            .unwrap();
+        e2fsck_clean(&stitched);
+    }
+
+    /// A PV on the whole disk (`pvcreate /dev/sdb`) has no table; its LVs list after it.
+    #[test]
+    fn a_whole_disk_pv_lists_its_volumes() {
+        let packed = std::fs::read("tests/fixtures/test_lvm2.img.zst").unwrap();
+        let disk = zstd::decode_all(&packed[..]).unwrap();
+        let mut pv = std::io::Cursor::new(disk[MIB..].to_vec());
+        let table = PartitionTable::detect(&mut pv).unwrap();
+        assert!(matches!(table, PartitionTable::None { .. }), "no table");
+        let rows = partitions_with_volumes(&mut pv, &table);
+        let names: Vec<&str> = rows.iter().map(|p| p.type_name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Linux LVM",
+                "LVM2 fixvg/root",
+                "LVM2 fixvg/swap",
+                "LVM2 fixvg/pool"
+            ]
+        );
+        let runs = rows[1].partition_type_string.clone().unwrap();
+        let fs = crate::fs::open_filesystem(pv, 0, 0, Some(&runs)).unwrap();
+        assert_eq!(fs.volume_label(), Some("fixroot"));
+    }
+
+    fn e2fsck_clean(img: &[u8]) {
+        let tool = [
+            "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
+            "/usr/sbin/e2fsck",
+            "/sbin/e2fsck",
+        ]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists());
+        let Some(tool) = tool else {
+            eprintln!("e2fsck not installed; skipping the oracle check");
+            return;
+        };
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), img).unwrap();
+        let out = std::process::Command::new(tool)
+            .arg("-fn")
+            .arg(file.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "e2fsck: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}

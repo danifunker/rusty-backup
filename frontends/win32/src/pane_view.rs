@@ -8,6 +8,7 @@
 //! that marks by clicking (Commander) shows its marks as the selection and its cursor as focus.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use rusty_backup::controller::commander::{
     format_size, BrowserPaneAction as P, CommanderController, DisplayRow, ListingStyle, Side,
@@ -15,7 +16,7 @@ use rusty_backup::controller::commander::{
 };
 use rusty_backup::controller::keys::{Key, Mods};
 use windows::core::{w, PWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::UI::Controls::{
     ImageList_Destroy, HIMAGELIST, HTREEITEM, LIST_VIEW_ITEM_STATE_FLAGS, LVCFMT_RIGHT, LVCF_FMT,
     LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVHT_ONITEMICON, LVHT_ONITEMSTATEICON,
@@ -34,17 +35,19 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
-    VK_F1, VK_F24, VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT,
-    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F24, VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT,
+    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    PostMessageW, SendMessageW, DLGC_WANTMESSAGE, MSG, WINDOW_STYLE, WM_COMMAND, WM_GETDLGCODE,
-    WM_KEYDOWN, WS_EX_CLIENTEDGE, WS_TABSTOP,
+    DispatchMessageW, GetCursorPos, GetMessageW, GetWindowRect, LoadCursorW, PostMessageW,
+    SendMessageW, SetCursor, TranslateMessage, DLGC_WANTMESSAGE, IDC_SIZEWE, MSG, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CAPTURECHANGED, WM_COMMAND, WM_GETDLGCODE, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_SETCURSOR, WM_SIZE, WS_EX_CLIENTEDGE, WS_TABSTOP,
 };
 
-use crate::layout;
+use crate::layout::{self, Node, Size};
 use crate::row_icons;
 use crate::sync::SyncGuard;
 use crate::ui;
@@ -73,8 +76,8 @@ pub enum PaneEvent {
     Mark(String),
     /// The row's +/- icon.
     Toggle(String),
-    /// A double-click: open what is under the cursor.
-    Activate,
+    /// A double-click on `row`: open it, whatever the cursor was on.
+    Activate(DisplayRow),
     Key(Key, Mods),
     Sort(SortColumn),
     /// A right-click on `row`.
@@ -113,6 +116,10 @@ pub struct PaneView {
     parent: HWND,
     pub list: HWND,
     pub tree: HWND,
+    /// The bar between the folder tree and the list; dragging it sets the tree's width.
+    pub splitter: HWND,
+    /// The tree's width in DIPs once dragged; 0 keeps the screen's default (#123).
+    tree_width: Rc<Cell<i32>>,
     sync: SyncGuard,
     rows: RefCell<Vec<DisplayRow>>,
     lines: RefCell<Vec<Line>>,
@@ -148,6 +155,98 @@ pub fn key_of(vk: u16) -> Option<Key> {
             Key::Char(c.to_ascii_lowercase())
         }
     })
+}
+
+/// The splitter's width, and the narrowest the tree and the list may be dragged to, in DIPs.
+const SPLIT_W: i32 = 6;
+const MIN_TREE: i32 = 80;
+const MIN_LIST: i32 = 160;
+
+type Split = (isize, HWND, HWND, Rc<Cell<i32>>);
+
+thread_local! {
+    /// Each splitter, the tree it sizes, the list beside it and the tree's width.
+    static SPLITS: RefCell<Vec<Split>> = const { RefCell::new(Vec::new()) };
+}
+
+fn rect_of(h: HWND) -> RECT {
+    let mut r = RECT::default();
+    // SAFETY: a plain query of our own window.
+    let _ = unsafe { GetWindowRect(h, &mut r) };
+    r
+}
+
+/// Drag the bar: the tree follows the pointer, and the page lays out again as it moves.
+unsafe extern "system" fn splitter_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    let found = SPLITS.with(|s| {
+        let s = s.borrow();
+        s.iter()
+            .find(|e| e.0 == hwnd.0 as isize)
+            .map(|e| (e.1, e.2, Rc::clone(&e.3)))
+    });
+    match (msg, found) {
+        (WM_SETCURSOR, _) => {
+            // SAFETY: a system cursor.
+            unsafe { SetCursor(LoadCursorW(None, IDC_SIZEWE).ok()) };
+            LRESULT(1)
+        }
+        (WM_LBUTTONDOWN, Some((tree, list, width))) => {
+            drag_splitter(hwnd, tree, list, &width);
+            LRESULT(0)
+        }
+        (WM_NCDESTROY, _) => {
+            SPLITS.with(|s| s.borrow_mut().retain(|e| e.0 != hwnd.0 as isize));
+            // SAFETY: the default handling.
+            unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
+        }
+        // SAFETY: everything else goes on to the static.
+        _ => unsafe { DefSubclassProc(hwnd, msg, wp, lp) },
+    }
+}
+
+fn drag_splitter(bar: HWND, tree: HWND, list: HWND, width: &Cell<i32>) {
+    // SAFETY: a capture loop on our own control; every other message is dispatched as usual.
+    unsafe {
+        let parent = windows::Win32::UI::WindowsAndMessaging::GetParent(bar).unwrap_or_default();
+        let dpi = GetDpiForWindow(bar).max(96) as i32;
+        let before = width.get();
+        let left = rect_of(tree).left;
+        let right = rect_of(list).right;
+        let _ = SetCapture(bar);
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            match msg.message {
+                WM_MOUSEMOVE => {
+                    let mut at = POINT::default();
+                    let _ = GetCursorPos(&mut at);
+                    let most = (right - left) * 96 / dpi - MIN_LIST;
+                    let dips = ((at.x - left) * 96 / dpi).min(most).max(MIN_TREE);
+                    if dips != width.get() {
+                        width.set(dips);
+                        SendMessageW(parent, WM_SIZE, None, None);
+                    }
+                }
+                WM_LBUTTONUP | WM_CAPTURECHANGED => break,
+                WM_KEYDOWN if msg.wParam.0 as u16 == VK_ESCAPE.0 => {
+                    width.set(before);
+                    SendMessageW(parent, WM_SIZE, None, None);
+                    break;
+                }
+                _ => {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
+        let _ = ReleaseCapture();
+    }
 }
 
 /// The list asks the dialog loop for Enter, Escape and Tab, which `IsDialogMessage` would keep.
@@ -222,6 +321,15 @@ impl PaneView {
             WS_EX_CLIENTEDGE,
             tree_id,
         );
+        // SS_NOTIFY (0x100), or a static passes the mouse through to its parent.
+        let splitter = ui::child(
+            parent,
+            w!("Static"),
+            "",
+            WINDOW_STYLE(0x100),
+            WINDOW_EX_STYLE(0),
+            "",
+        );
         let style = LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS | WS_TABSTOP.0;
         let list = ui::child(
             parent,
@@ -231,8 +339,13 @@ impl PaneView {
             WS_EX_CLIENTEDGE,
             list_id,
         );
-        // SAFETY: plain list-view setup; each column title outlives its insert.
+        let tree_width = Rc::new(Cell::new(0));
+        let split = (splitter.0 as isize, tree, list, Rc::clone(&tree_width));
+        SPLITS.with(|s| s.borrow_mut().push(split));
+        // SAFETY: plain list-view setup; each column title outlives its insert. The splitter's
+        // entry in SPLITS goes when it does.
         unsafe {
+            let _ = SetWindowSubclass(splitter, Some(splitter_proc), 3, 0);
             let _ = SetWindowSubclass(list, Some(list_proc), 1, usize::from(tab_keys));
             let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER;
             SendMessageW(
@@ -268,6 +381,8 @@ impl PaneView {
             parent,
             list,
             tree,
+            splitter,
+            tree_width,
             sync: SyncGuard::default(),
             rows: RefCell::default(),
             lines: RefCell::default(),
@@ -339,6 +454,7 @@ impl PaneView {
                 self.set_boxes(s.boxes);
             }
             ui::set_visible(self.tree, s.folder_tree);
+            ui::set_visible(self.splitter, s.folder_tree);
             if let Some(folders) = s.folders {
                 self.show_folders(folders);
             }
@@ -369,6 +485,21 @@ impl PaneView {
             }
             self.show_marks(s.marked);
         });
+    }
+
+    /// The folder tree and its splitter for a layout row, when the tree is up; the list follows.
+    pub fn tree_nodes(&self, default_width: Size) -> Vec<Node<HWND>> {
+        if !ui::shown(self.tree) {
+            return Vec::new();
+        }
+        let width = match self.tree_width.get() {
+            0 => default_width,
+            w => Size::Fixed(w),
+        };
+        vec![
+            Node::leaf(self.tree, width, Size::Stretch(1)),
+            Node::leaf(self.splitter, Size::Fixed(SPLIT_W), Size::Stretch(1)),
+        ]
     }
 
     pub fn focus(&self) {
@@ -730,7 +861,12 @@ impl PaneView {
                 let row = usize::try_from(nm.iItem).ok().and_then(|i| self.row_at(i));
                 (done, row.map(PaneEvent::Menu))
             }
-            NM_DBLCLK => (done, Some(PaneEvent::Activate)),
+            NM_DBLCLK => {
+                // SAFETY: NM_DBLCLK from a list view comes with an NMITEMACTIVATE.
+                let nm = unsafe { &*(lp.0 as *const NMITEMACTIVATE) };
+                let row = usize::try_from(nm.iItem).ok().and_then(|i| self.row_at(i));
+                (done, row.map(PaneEvent::Activate))
+            }
             LVN_KEYDOWN => {
                 // SAFETY: LVN_KEYDOWN comes with an NMLVKEYDOWN.
                 let nm = unsafe { &*(lp.0 as *const NMLVKEYDOWN) };

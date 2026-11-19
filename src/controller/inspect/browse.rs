@@ -53,8 +53,7 @@ impl InspectController {
         if self.rows_locked() {
             return Vec::new();
         }
-        let parts = self.found.partitions.iter();
-        parts
+        self.listed()
             .filter(|p| self.row_actions(p).browse)
             .map(|p| {
                 (
@@ -100,12 +99,12 @@ impl InspectController {
     }
 
     pub(super) fn browse_partition(&mut self, index: usize) {
-        let Some(part) = self.found.partitions.iter().find(|p| p.index == index) else {
+        let Some(part) = self.listed().find(|p| p.index == index).cloned() else {
             return;
         };
         self.browse.browsing = Some(index);
         let offset = part.byte_offset();
-        let ptype = Self::effective_type(part);
+        let ptype = Self::effective_type(&part);
         let type_string = part.partition_type_string.clone();
         // The Amiga drive name ("DH0") tells several RDB partitions apart in the header.
         let prefix = part.drv_name.clone().filter(|d| !d.is_empty());

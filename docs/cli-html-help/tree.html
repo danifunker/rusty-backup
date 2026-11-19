@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli tree</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>tree</span></nav>
+<h1><code>rb-cli tree</code></h1>
+<p>A `tree`-style listing of every volume on a disk (each partition, or each filesystem of a disc), or of one with `IMG@N`: the browser's Tree, for the whole disk at once</p>
+<h2>Usage</h2>
+<pre><code>Usage: tree [OPTIONS] &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>The disk: `path` lists every partition (or a disc's every filesystem) under a heading, `path@N` just that one. Disk images, containers, backup folders, discs and `rb://host:port/img` work</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--ids</code></dt>
+<dd>Show each entry's filesystem ID too (CNID on HFS / HFS+, inode on ext, cluster on FAT)</dd>
+<dt><code>--password</code></dt>
+<dd>Passphrase for an encrypted volume or container (APFS, BitLocker, IMZ)</dd>
+<dt><code>--inside</code></dt>
+<dd>The disk image to open inside a `.zip` that holds several</dd>
+<dt><code>--fs-type</code></dt>
+<dd>Force a specific filesystem dispatch. The main use is `cpm:&lt;preset&gt;` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch</dd>
+<dt><code>--carve-full</code></dt>
+<dd>Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga &quot;NDOS&quot; disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

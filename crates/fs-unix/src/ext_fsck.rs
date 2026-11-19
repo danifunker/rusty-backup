@@ -506,9 +506,7 @@ fn csum_audit<R: Read + Seek + Send>(
             ibm_len,
         )?;
         let mut expected = desc.clone();
-        crate::ext_csum::stamp_block_bitmap_csum(seed, &mut expected, &bbm);
-        crate::ext_csum::stamp_inode_bitmap_csum(seed, &mut expected, &ibm);
-        crate::ext_csum::stamp_group_desc(seed, gi as u32, &mut expected);
+        stamp_group(seed, gi, &mut expected, &bbm, &ibm);
         if expected != desc {
             a.err(
                 "GroupChecksumWrong",
@@ -682,12 +680,25 @@ fn reseal_group_csum<R: Read + Write + Seek + Send>(
         g.partition_offset + ib * g.block_size,
         (g.inodes_per_group / 8) as usize,
     )?;
-    // Stamp bitmap csums before bg_checksum — bg_checksum covers them.
-    crate::ext_csum::stamp_block_bitmap_csum(seed, &mut desc, &bbm);
-    crate::ext_csum::stamp_inode_bitmap_csum(seed, &mut desc, &ibm);
-    crate::ext_csum::stamp_group_desc(seed, group as u32, &mut desc);
+    stamp_group(seed, group, &mut desc, &bbm, &ibm);
     fs.write_raw(desc_off, &desc)
 }
+
+/// Stamp each initialized bitmap's crc32c, then `bg_checksum`; an `INODE_UNINIT` /
+/// `BLOCK_UNINIT` bitmap was never written, so its stored checksum is kept (as e2fsprogs).
+fn stamp_group(seed: u32, group: usize, desc: &mut [u8], bbm: &[u8], ibm: &[u8]) {
+    let flags = u16::from_le_bytes([desc[0x12], desc[0x13]]);
+    if flags & BG_BLOCK_UNINIT == 0 {
+        crate::ext_csum::stamp_block_bitmap_csum(seed, desc, bbm);
+    }
+    if flags & BG_INODE_UNINIT == 0 {
+        crate::ext_csum::stamp_inode_bitmap_csum(seed, desc, ibm);
+    }
+    crate::ext_csum::stamp_group_desc(seed, group as u32, desc);
+}
+
+const BG_INODE_UNINIT: u16 = 0x0001;
+const BG_BLOCK_UNINIT: u16 = 0x0002;
 
 /// Re-stamp the superblock crc32c.
 fn reseal_super_csum<R: Read + Write + Seek + Send>(

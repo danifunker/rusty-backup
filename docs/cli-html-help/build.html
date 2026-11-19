@@ -34,7 +34,7 @@
 <dt><code>--mac-driver</code></dt>
 <dd>The Mac driver on an APM disk: `bundled` (the default: a donor's own driver if it has one, otherwise Apple SCSI 7.3.5), `none`, or the path of an Apple-formatted disk to take the driver from. The driver serves SCSI; a Mac with the disk on IDE won't mount it</dd>
 <dt><code>--align</code></dt>
-<dd>Partition-start alignment, e.g. `1M` or `63s`; blank uses the table's default</dd>
+<dd>Partition-start alignment, e.g. `1M` or `63s`. Blank picks by era: APM packs after the map, a FAT-only MBR disk up to 8 GiB takes a 63-sector track, others 1 MiB (or a cylinder)</dd>
 <dt><code>--heads</code></dt>
 <dd>Heads for the cylinder-aligned tables (SGI, RDB, Sun, NeXT, Solaris x86)</dd>
 <dt><code>--sectors</code></dt>
@@ -46,7 +46,7 @@
 <dt><code>--empty</code></dt>
 <dd>With `--from`: leave partition N empty instead of copying it</dd>
 <dt><code>--preset</code></dt>
-<dd>Build a fixed bootable preset instead of a table or a volume: `x68k` (IPL, X68000 table, Human68k) or `sgi-efs` (volume header, EFS root). The same disks `new hd x68k` / `new hd sgi-efs` make</dd>
+<dd>Build a ready-made disk instead of a table or a volume (the wizard's Easy mode): one partition across the disk for a system (`mac-hfs`, `dos`, `amiga`, ...), or the fixed `x68k` / `sgi-efs` boot disks</dd>
 <dt><code>--scsi</code></dt>
 <dd>`--preset x68k`: write the SCSI form (1024-byte sectors) rather than SASI</dd>
 <dt><code>--x68k-partitions</code></dt>
@@ -54,7 +54,7 @@
 <dt><code>--system-disk</code></dt>
 <dd>`--preset x68k`: a Human68k system floppy cloned into partition 1</dd>
 <dt><code>--label</code></dt>
-<dd>With no `--table`: the volume label</dd>
+<dd>With no `--table`: the volume label (a volume's, or a `--preset`'s)</dd>
 <dt><code>--geometry</code></dt>
 <dd>With no `--table`: the fixed geometry of a floppy format, e.g. `d71` for a 1571 disk (`cbm`), `80` tracks (`dfs`, `rsdos`), `80ds` (`dragondos`). The default is the format's first</dd>
 <dt><code>--ntfs-version</code></dt>

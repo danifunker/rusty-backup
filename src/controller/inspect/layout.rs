@@ -251,9 +251,11 @@ impl InspectController {
     /// The partition list's rows, in list order.
     pub fn rows(&self) -> Vec<PartitionRow> {
         let locked = self.rows_locked();
-        let rows = self.partitions().iter().enumerate().map(|(pos, part)| {
+        let rows = self.listed().enumerate().map(|(pos, part)| {
             let container = part.is_extended_container;
-            let number = if part.is_logical {
+            let number = if crate::partition::is_volume_view(part) {
+                format!("  {} (LV)", pos + 1)
+            } else if part.is_logical {
                 format!("  {} (logical)", pos + 1)
             } else if container {
                 format!("{} (container)", pos + 1)
@@ -292,7 +294,7 @@ impl InspectController {
 
     /// Select a partition by index, or clear the selection; an index not listed clears it too.
     pub(super) fn select_partition(&mut self, index: Option<usize>) {
-        let listed = |i: &usize| self.found.partitions.iter().any(|p| p.index == *i);
+        let listed = |i: &usize| self.listed().any(|p| p.index == *i);
         self.found.selected = index.filter(listed);
     }
 }

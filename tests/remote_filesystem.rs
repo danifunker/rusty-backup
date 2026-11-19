@@ -3424,3 +3424,27 @@ fn a_read_only_daemon_refuses_remote_resize() {
         16 << 20
     );
 }
+
+/// `rb-cli tree rb://...`: every partition of a daemon's image, listed over the wire.
+#[test]
+fn tree_lists_every_partition_of_a_remote_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    two_fat_mbr(&root.join("disk.img"));
+    let addr = serve_dir(root, false);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rb-cli"))
+        .args(["tree", &format!("rb://{addr}/disk.img")])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains(&format!("== rb://{addr}/disk.img@1 ==")),
+        "{text}"
+    );
+    assert!(text.contains("ONE") && text.contains("TWO"), "{text}");
+}

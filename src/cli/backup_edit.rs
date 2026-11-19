@@ -230,6 +230,16 @@ fn extract_to_temp(ectx: &ArchiveEditContext, temp_path: &Path) -> Result<()> {
 /// Load `metadata.json`, validate the layout / compression is editable, and
 /// select the requested partition (1-based `FOLDER@N`; defaulted when the
 /// backup has exactly one partition).
+/// How many partitions a backup folder holds (what `@N` numbers).
+pub fn partition_count(folder: &Path) -> Result<usize> {
+    let meta_path = folder.join("metadata.json");
+    let text = std::fs::read_to_string(&meta_path)
+        .with_context(|| format!("reading {}", meta_path.display()))?;
+    let meta: BackupMetadata =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", meta_path.display()))?;
+    Ok(meta.partitions.len())
+}
+
 fn load_and_select(
     folder: &Path,
     selector: Option<PartSelector>,

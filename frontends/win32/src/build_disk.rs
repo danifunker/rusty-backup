@@ -147,7 +147,7 @@ impl DiskStep {
             heads: number(page, ids::HEADS),
             sectors_caption: ui::cell_label(page, "Sectors/track:"),
             sectors: number(page, ids::SECTORS),
-            preset_caption: ui::cell_label(page, "Disk:"),
+            preset_caption: ui::cell_label(page, "System:"),
             preset: Combo::build(page, ids::PRESET, &presets),
             x68k_scsi: Combo::build(page, ids::X68K_SCSI, &CONTROLLERS),
             x68k_parts_caption: ui::cell_label(page, "Human68k partitions:"),
@@ -490,8 +490,8 @@ impl BuildScreen {
         let at = ctrl.volume_fs_choice().index_in(&FsChoice::all());
         d.volume.select(at.unwrap_or(0));
 
-        // The size is set here unless a device fixes it (Output) or the preset sizes itself.
-        let sized = (part || vol || cd) && !ctrl.output_is_device();
+        // The size is set here unless a device fixes it (Output); an easy disk asks for nothing else.
+        let sized = (part || vol || cd || preset) && !ctrl.output_is_device();
         let fixed = vol && ctrl.volume_size_range().is_none();
         for h in [d.size_caption, d.size] {
             ui::set_visible(h, sized && !fixed);
@@ -746,7 +746,7 @@ impl BuildScreen {
             col.push(pair(d.volume_caption, fixed(d.volume.h, 280)));
         }
         if shown(d.preset.h) {
-            col.push(pair(d.preset_caption, fixed(d.preset.h, 360)));
+            col.push(pair(d.preset_caption, fixed(d.preset.h, 420)));
         }
         if shown(d.x68k_scsi.h) {
             col.push(Node::row(vec![

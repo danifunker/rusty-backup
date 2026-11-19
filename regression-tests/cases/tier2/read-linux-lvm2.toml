@@ -1,0 +1,36 @@
+# Tier 2 — Linux LVM2 on one disk.
+#
+#   part.lvm2.two-run.hd   MBR partition 1 is an LVM2 PV (VG fixvg). root is ext4 in two
+#                          runs stored out of order, swap one run, pool a thin pool.
+#
+# The LVs list after the table's partitions as @2..@4; the PV itself stays @1. The format
+# was checked against an Ubuntu 26.04 install (GPT, ubuntu-vg/ubuntu-lv) read with e2fsck.
+
+[meta]
+tier = 2
+group = "fs.read.linux-lvm2"
+description = "Linux LVM2 logical volumes on a single-PV disk."
+
+[[case]]
+id = "read.lvm2.two-run"
+description = "LVs list under their PV; a two-run ext4 LV browses and checks clean; a thin pool says why it cannot open."
+fixture = "part.lvm2.two-run.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Linux LVM", "LVM2 fixvg/root", "LVM2 fixvg/swap", "LVM2 fixvg/pool", "6.0 MiB"]
+[[case.step]]
+args = ["ls", "{fixture}@2", "/"]
+expect_exit = 0
+stdout_contains = ["BIG.BIN", "README.TXT", "etc"]
+[[case.step]]
+args = ["fsck", "{fixture}@2", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}@4", "/"]
+expect_exit = 1
+stderr_contains = ["thin-pool volumes are not supported"]
+[[case.step]]
+args = ["tree", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["LVM2 fixvg/root", "hostname"]

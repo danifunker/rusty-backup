@@ -226,6 +226,8 @@ impl BuildDiskState {
                                 r.extend([Row::X68kScsi, Row::X68kParts, Row::SystemDisk])
                             }
                             PresetKind::SgiEfs => r.push(Row::SgiLabel),
+                            // An easy target asks only for a size.
+                            _ => {}
                         }
                         if !c.output_is_device() {
                             r.push(Row::Size);
@@ -961,7 +963,7 @@ impl App {
                         format!("< {} >  {range}", c.volume_fs_choice().label()),
                     )
                 }
-                Row::Preset => ("Preset".into(), format!("< {} >", c.preset().kind.label())),
+                Row::Preset => ("System".into(), format!("< {} >", c.preset().kind.label())),
                 Row::X68kScsi => (
                     "Controller".into(),
                     if c.preset().x68k_scsi {

@@ -405,6 +405,8 @@ struct Found {
     table: Option<PartitionTable>,
     alignment: Option<PartitionAlignment>,
     partitions: Vec<PartitionInfo>,
+    /// LVM2 LV rows after the table's; browse-only, so export and resize never see them.
+    volumes: Vec<PartitionInfo>,
     backup: Option<BackupMetadata>,
     clonezilla: Option<ClonezillaImage>,
     min_sizes: HashMap<usize, u64>,
@@ -663,6 +665,16 @@ impl InspectController {
 
     pub fn partitions(&self) -> &[PartitionInfo] {
         self.found.partitions.as_slice()
+    }
+
+    /// An LVM2 logical volume row: browse-only, numbered after the table's partitions.
+    pub fn is_volume_row(&self, part: &PartitionInfo) -> bool {
+        crate::partition::is_volume_view(part)
+    }
+
+    /// The rows the list shows: the table's partitions, then any LVM2 logical volumes.
+    pub fn listed(&self) -> impl Iterator<Item = &PartitionInfo> {
+        self.found.partitions.iter().chain(&self.found.volumes)
     }
 
     pub fn table(&self) -> Option<&PartitionTable> {

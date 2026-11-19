@@ -247,6 +247,7 @@ impl Target for JobProbeController {
 /// `table_can_delete` (row 0), `table_can_apply`, `table_errors`, `convert_source`, `alto_source`.
 /// The source and the list: `ChooseImage`, `ChooseBackupFolder`, `Select` (a partition index);
 /// probes `selected` (-1 for none), `row_number`, `row_volume` (row 0), `layout_segments`.
+/// `$lvm2` is tests/fixtures/test_lvm2.img.zst; probes `rows` and `last_row_number` read the list.
 /// The browse view's partition switcher: `OpenImage` `$two_fat` (two FAT16 partitions),
 /// `Browse` / `SwitchBrowse` (a row); probes `browse_choices`, `browsing` (a row, -1 for none),
 /// `requests` (the host requests of the last action: `close`, `open`, comma-separated).
@@ -328,7 +329,7 @@ impl InspectTarget {
     /// The partition index of list row `arg`.
     fn row_index(&self, arg: Option<&Value>) -> Result<usize, String> {
         let row = arg.and_then(Value::as_integer).ok_or("needs a row")? as usize;
-        Ok(self.ctl.partitions().get(row).ok_or("no such row")?.index)
+        Ok(self.ctl.listed().nth(row).ok_or("no such row")?.index)
     }
 
     /// A 16 MiB MBR disk: one 4 MiB FAT16 partition at LBA 2048, the rest free.
@@ -477,6 +478,13 @@ impl Target for InspectTarget {
                     self.mbr_gap()?
                 } else if arg == "$two_fat" {
                     self.two_fat()?
+                } else if arg == "$lvm2" {
+                    let fixture = scenario_dir().join("../fixtures/test_lvm2.img.zst");
+                    let packed = std::fs::read(fixture).map_err(|e| e.to_string())?;
+                    let p = self.dir.path().join("lvm2.img");
+                    let raw = zstd::decode_all(&packed[..]).map_err(|e| e.to_string())?;
+                    std::fs::write(&p, raw).map_err(|e| e.to_string())?;
+                    p
                 } else {
                     PathBuf::from(arg)
                 };
@@ -553,10 +561,13 @@ impl Target for InspectTarget {
             }
             "log" => Value::String(self.log.join("\n")),
             "browse_choices" => Value::Integer(self.ctl.browse_choices().len() as i64),
+            "rows" => Value::Integer(self.ctl.rows().len() as i64),
+            "last_row_number" => {
+                Value::String(self.ctl.rows().last().ok_or("no rows")?.number.clone())
+            }
             "browsing" => {
                 let at = self.ctl.browsing();
-                let parts = self.ctl.partitions();
-                let row = at.and_then(|i| parts.iter().position(|p| p.index == i));
+                let row = at.and_then(|i| self.ctl.listed().position(|p| p.index == i));
                 Value::Integer(row.map_or(-1, |r| r as i64))
             }
             "requests" => Value::String(self.requests.join(",")),
@@ -1034,7 +1045,8 @@ impl Target for RestoreTarget {
     }
 }
 
-/// The Build Disk wizard. Actions: `Next`, `Back`, `SetKind` (`partitioned`, `volume`),
+/// The Build Disk wizard. Actions: `Next`, `Back`, `SetKind` (`easy`, `partitioned`, `volume`),
+/// `System` (an easy target's index in `PresetKind::ALL`),
 /// `OutputImage` (`$out`), `OutputDevice` (a size such as `32M`: a file of that size standing in
 /// for a device, pre-filled with 0xA5), `SetSize`, `SetTable` (a table label such as `MBR`),
 /// `RowSize` (`row:size`), `AddRow`, `RowFs` (`row:fs-id` or `row:empty`), `VolumeFs` (an fs id),
@@ -1109,7 +1121,16 @@ impl Target for BuildDiskTarget {
         let a = match action {
             "Next" => A::Next,
             "Back" => A::Back,
+            "System" => {
+                let at = arg.and_then(Value::as_integer).ok_or("needs an index")? as usize;
+                let mut p = self.ctl.preset().clone();
+                p.kind = *rusty_backup::controller::build_disk::PresetKind::ALL
+                    .get(at)
+                    .ok_or("no such system")?;
+                A::SetPreset(p)
+            }
             "SetKind" => A::SetKind(match arg_str(arg)? {
+                "easy" => DiskKind::Preset,
                 "partitioned" => DiskKind::Partitioned,
                 "volume" => DiskKind::Volume,
                 "cd" => DiskKind::Cd,
