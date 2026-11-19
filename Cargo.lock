@@ -6068,6 +6068,7 @@ dependencies = [
  "image",
  "libc",
  "libchdman-rs",
+ "liblzma",
  "libzstd-bitexact-rs",
  "log",
  "lz4_flex",

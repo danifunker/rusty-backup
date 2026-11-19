@@ -1958,6 +1958,7 @@ mod tests {
 
     /// Bulk-convert path: raw image -> HD CHD -> read back via `ChdReader`,
     /// must round-trip byte-equal up to the partition's logical size.
+    #[cfg(feature = "chd")]
     #[test]
     fn test_export_whole_disk_chd_round_trip() {
         use crate::rbformats::chd::ChdReader;

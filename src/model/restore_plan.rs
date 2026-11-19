@@ -232,7 +232,7 @@ fn partition_head(
     let mut head = Vec::with_capacity(HEAD_BYTES);
     if metadata.layout == BackupLayout::SingleFileChd {
         let chd = folder.join(metadata.container.as_deref()?);
-        let mut reader = crate::rbformats::chd::ChdReader::open(&chd).ok()?;
+        let (mut reader, _) = crate::model::source_reader::open_disk_container(&chd).ok()?;
         reader.seek(SeekFrom::Start(pm.byte_offset())).ok()?;
         reader.take(HEAD_BYTES as u64).read_to_end(&mut head).ok()?;
     } else {

@@ -98,6 +98,60 @@ fn a_rows_source_is_picked_then_measured_in_a_job_and_replaces_its_format() {
 }
 
 #[test]
+fn a_formatted_rows_folder_is_picked_measured_and_cleared_by_a_source() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kernel.img"), vec![1u8; 10_000]).unwrap();
+    let mut c = ctl();
+    act(
+        &mut c,
+        BuildDiskAction::SetRowFs {
+            row: 0,
+            fs: Some(FsKind::Fat.into()),
+        },
+    );
+    let fx = act(&mut c, BuildDiskAction::PickRowFolder(0));
+    assert!(matches!(fx.as_slice(), [Effect::PickFolder(s)] if s.purpose == purpose::ROW_FOLDER));
+    act(
+        &mut c,
+        BuildDiskAction::Picked {
+            purpose: purpose::ROW_FOLDER,
+            path: Some(dir.path().to_path_buf()),
+        },
+    );
+    c.wait();
+    let v = c.table_view();
+    assert_eq!(v.rows[0].folder.as_deref(), Some(dir.path()));
+    assert_eq!(c.row_content(0), RowContent::Format);
+    act(&mut c, BuildDiskAction::ClearRowFolder(0));
+    assert_eq!(c.table_view().rows[0].folder, None);
+
+    // A source image replaces the format, so it drops the folder too.
+    act(&mut c, BuildDiskAction::PickRowFolder(0));
+    act(
+        &mut c,
+        BuildDiskAction::Picked {
+            purpose: purpose::ROW_FOLDER,
+            path: Some(dir.path().to_path_buf()),
+        },
+    );
+    c.wait();
+    let src = dir.path().join("kernel.img");
+    act(
+        &mut c,
+        BuildDiskAction::Table(BuildAction::PickRowSource(0)),
+    );
+    act(
+        &mut c,
+        BuildDiskAction::Picked {
+            purpose: purpose::ROW_SOURCE,
+            path: Some(src),
+        },
+    );
+    c.wait();
+    assert_eq!(c.table_view().rows[0].folder, None);
+}
+
+#[test]
 fn partitioned_steps_gain_options_only_when_a_row_formats() {
     let mut c = ctl();
     assert!(!c.steps().contains(&Step::Options));
@@ -715,4 +769,18 @@ fn every_easy_target_is_one_formatted_partition_within_its_limits() {
     act(&mut c, BuildDiskAction::SetSize("3G".into()));
     let why = c.blocked_at(Step::Disk).unwrap_or_default();
     assert!(why.contains("2 GiB"), "{why}");
+}
+
+#[test]
+fn a_chd_output_is_refused_only_when_chd_is_not_built_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = ctl();
+    image_output(&mut c, &dir.path().join("disk.chd"));
+    act(&mut c, BuildDiskAction::Next);
+    let blocked = c.next_blocked().unwrap_or_default();
+    if cfg!(feature = "chd") {
+        assert!(!blocked.contains("CHD"), "{blocked}");
+    } else {
+        assert!(blocked.contains("no CHD support"), "{blocked}");
+    }
 }

@@ -109,6 +109,7 @@ struct RowCells {
     content: gtk::DropDown,
     choices: Vec<Choice>,
     image: gtk::Button,
+    folder: gtk::Button,
     source: gtk::Label,
     clear: gtk::Button,
     up: gtk::Button,
@@ -285,6 +286,9 @@ impl RowCells {
         image.set_tooltip_text(Some(hints::ROW_IMAGE));
         let s = send.clone();
         image.connect_clicked(move |_| s(table_edit(BuildAction::PickRowSource(i))));
+        let folder = small("Folder...", format!("{}.{i}", ids::ROW_FOLDER));
+        let s = send.clone();
+        folder.connect_clicked(move |_| s(BuildDiskAction::PickRowFolder(i)));
         let source = gtk::Label::builder()
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
@@ -292,7 +296,11 @@ impl RowCells {
             .build();
         let clear = small("Clear", format!("{}.{i}", ids::ROW_CLEAR));
         let s = send.clone();
-        clear.connect_clicked(move |_| s(table_edit(BuildAction::ClearRowSource(i))));
+        // Only one of the two is ever set, so Clear drops whichever the row has.
+        clear.connect_clicked(move |_| {
+            s(table_edit(BuildAction::ClearRowSource(i)));
+            s(BuildDiskAction::ClearRowFolder(i));
+        });
         let up = small("Up", format!("{}.{i}", ids::ROW_UP));
         let s = send.clone();
         up.connect_clicked(move |_| {
@@ -310,6 +318,7 @@ impl RowCells {
         lower.set_margin_bottom(8);
         lower.append(&content);
         lower.append(&image);
+        lower.append(&folder);
         lower.append(&source);
         lower.append(&clear);
         lower.append(&up);
@@ -326,6 +335,7 @@ impl RowCells {
             content,
             choices: list,
             image,
+            folder,
             source,
             clear,
             up,
@@ -366,17 +376,23 @@ impl RowCells {
             self.content.set_selected(at);
         }
         self.image.set_sensitive(!s.probing);
+        let formatted = state.content == RowContent::Format;
+        self.folder.set_visible(formatted);
+        self.folder.set_sensitive(!s.probing);
         let source = row
             .source
             .as_ref()
             .filter(|_| state.content == RowContent::Image);
-        self.clear.set_visible(source.is_some());
-        let name = source
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy());
-        let text = name.map(|n| format!("{n} ({})", format_size(row.source_size)));
+        let folder = row.folder.as_ref().filter(|_| formatted);
+        self.clear.set_visible(source.is_some() || folder.is_some());
+        let name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+        let text = match (source, folder) {
+            (Some(p), _) => name(p).map(|n| format!("{n} ({})", format_size(row.source_size))),
+            (None, Some(d)) => name(d).map(|n| format!("Copy in: {n}")),
+            _ => None,
+        };
         set_text(&self.source, text.as_deref().unwrap_or(""));
-        let path = source.map(|p| p.display().to_string());
+        let path = source.or(folder).map(|p| p.display().to_string());
         self.source
             .set_tooltip_text(path.as_deref().map(plain).as_deref());
 

@@ -142,7 +142,7 @@ pub fn start_physical_write(req: PhysicalWriteRequest) -> Arc<Mutex<PhysicalWrit
 /// Decoded length, for seeding the progress total before the worker starts.
 fn source_size_for(source: &PhysicalWriteSource) -> Option<u64> {
     match source {
-        PhysicalWriteSource::Image(p) => open_source_image(p).ok().map(|(_, len)| len),
+        PhysicalWriteSource::Image(p) => decoded_source_size(p).ok(),
     }
 }
 
@@ -250,6 +250,17 @@ pub fn write_image_into<W: Write + Seek>(
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<u64> {
+    if crate::rbformats::xz::is_xz_path(path) {
+        return write_xz_into(
+            target,
+            path,
+            extent,
+            progress_base,
+            progress_cb,
+            cancel_check,
+            log_cb,
+        );
+    }
     let (mut src, source_size) = open_source_image(path)?;
     log_cb(&format!(
         "Source: {} ({} bytes decoded)",
@@ -273,7 +284,97 @@ pub fn write_image_into<W: Write + Seek>(
 
 /// Decoded length of `path`, so a caller can total up progress before writing.
 pub fn decoded_source_size(path: &std::path::Path) -> Result<u64> {
+    if crate::rbformats::xz::is_xz_path(path) {
+        return xz_size(path);
+    }
     open_source_image(path).map(|(_, len)| len)
+}
+
+fn xz_size(path: &std::path::Path) -> Result<u64> {
+    let s = crate::rbformats::xz::file_sizes(path)
+        .with_context(|| format!("reading the xz index of {}", path.display()))?;
+    if s.uncompressed == 0 {
+        anyhow::bail!("{} decodes to zero bytes", path.display());
+    }
+    Ok(s.uncompressed)
+}
+
+/// An `.xz` image decoded straight onto the target: no temp copy of the disk.
+fn write_xz_into<W: Write + Seek>(
+    target: &mut W,
+    path: &std::path::Path,
+    extent: WriteExtent,
+    progress_base: u64,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<u64> {
+    let size = xz_size(path)?;
+    log_cb(&format!(
+        "Source: {} ({} bytes decoded, streamed from xz)",
+        path.display(),
+        size
+    ));
+    check_fits(size, extent.capacity)?;
+    target
+        .seek(SeekFrom::Start(extent.offset))
+        .with_context(|| format!("seek target to byte {}", extent.offset))?;
+    let mut sink = XzSink {
+        target,
+        written: 0,
+        limit: size,
+        cancel: cancel_check,
+        progress: &mut |n| progress_cb(progress_base + n),
+        cancelled: false,
+    };
+    let result = crate::rbformats::xz::decode_into(path, &mut sink);
+    let (written, cancelled) = (sink.written, sink.cancelled);
+    if cancelled {
+        anyhow::bail!("physical write cancelled");
+    }
+    result.with_context(|| format!("decoding {}", path.display()))?;
+    if written != size {
+        anyhow::bail!(
+            "{} decoded to {written} bytes, but its index says {size}",
+            path.display()
+        );
+    }
+    Ok(size)
+}
+
+/// Where the xz decoder pours: the target, with progress, cancel and the index's length as a cap.
+struct XzSink<'a, W, C> {
+    target: &'a mut W,
+    written: u64,
+    limit: u64,
+    cancel: &'a C,
+    progress: &'a mut dyn FnMut(u64),
+    cancelled: bool,
+}
+
+impl<W: Write, C: Fn() -> bool> Write for XzSink<'_, W, C> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if (self.cancel)() {
+            self.cancelled = true;
+            return Err(crate::compat::io_other("cancelled"));
+        }
+        if self.written + buf.len() as u64 > self.limit {
+            return Err(crate::compat::io_other(
+                "xz data runs past the size its index gives",
+            ));
+        }
+        self.target.write_all(buf)?;
+        let before = self.written / STREAM_CHUNK as u64;
+        self.written += buf.len() as u64;
+        if self.written / STREAM_CHUNK as u64 != before || self.written == self.limit {
+            (self.progress)(self.written);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.target.flush()
+    }
 }
 
 fn check_fits(source_size: u64, capacity: u64) -> Result<()> {
@@ -364,6 +465,64 @@ mod tests {
     use tempfile::NamedTempFile;
 
     const ONE_MIB: u64 = 1024 * 1024;
+
+    /// A patterned disk of `len` bytes as an `.img.xz`.
+    fn xz_image(dir: &std::path::Path, len: usize) -> (std::path::PathBuf, Vec<u8>) {
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut packed = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&data), &mut packed).unwrap();
+        let path = dir.join("disk.img.xz");
+        std::fs::write(&path, packed).unwrap();
+        (path, data)
+    }
+
+    #[test]
+    fn an_xz_image_streams_into_its_extent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, data) = xz_image(dir.path(), 3 * ONE_MIB as usize + 777);
+        assert_eq!(decoded_source_size(&path).unwrap(), data.len() as u64);
+        let mut disk = std::io::Cursor::new(vec![0xEEu8; 5 * ONE_MIB as usize]);
+        let mut last = 0;
+        let n = write_image_into(
+            &mut disk,
+            &path,
+            WriteExtent::partition_at(ONE_MIB, 4 * ONE_MIB),
+            10,
+            &mut |p| last = p,
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(last, 10 + data.len() as u64);
+        let disk = disk.into_inner();
+        assert!(disk[..ONE_MIB as usize].iter().all(|&b| b == 0xEE));
+        assert_eq!(
+            &disk[ONE_MIB as usize..ONE_MIB as usize + data.len()],
+            data.as_slice()
+        );
+    }
+
+    #[test]
+    fn an_xz_write_refuses_a_small_target_and_honours_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = xz_image(dir.path(), 2 * ONE_MIB as usize);
+        let mut disk = std::io::Cursor::new(vec![0u8; 4 * ONE_MIB as usize]);
+        let too_small = WriteExtent::partition_at(0, ONE_MIB);
+        let err = write_image_into(
+            &mut disk,
+            &path,
+            too_small,
+            0,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        );
+        assert!(format!("{:#}", err.unwrap_err()).contains("holds only"));
+        let all = WriteExtent::partition_at(0, 4 * ONE_MIB);
+        let err = write_image_into(&mut disk, &path, all, 0, &mut |_| {}, &|| true, &mut |_| {});
+        assert!(format!("{:#}", err.unwrap_err()).contains("cancelled"));
+    }
 
     fn ntfs_vbr_sector() -> [u8; 512] {
         let mut s = [0u8; 512];

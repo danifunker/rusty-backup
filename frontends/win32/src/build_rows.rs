@@ -70,6 +70,7 @@ struct RowCells {
     content: Combo,
     choices: Vec<Choice>,
     image: HWND,
+    folder: HWND,
     source: HWND,
     clear: HWND,
     up: HWND,
@@ -103,6 +104,7 @@ impl RowCells {
             content,
             choices,
             image: ui::button(page, "Image...", &id(ids::ROW_IMAGE)),
+            folder: ui::button(page, "Folder...", &id(ids::ROW_FOLDER)),
             source: ui::path_label(page, ""),
             clear: ui::button(page, "Clear", &id(ids::ROW_CLEAR)),
             up: ui::button(page, "Up", &id(ids::ROW_UP)),
@@ -111,7 +113,7 @@ impl RowCells {
         }
     }
 
-    fn all(&self) -> [HWND; 15] {
+    fn all(&self) -> [HWND; 16] {
         [
             self.number,
             self.size,
@@ -123,6 +125,7 @@ impl RowCells {
             self.start,
             self.content.h,
             self.image,
+            self.folder,
             self.source,
             self.clear,
             self.up,
@@ -265,19 +268,25 @@ impl RowsStep {
             let at = cells.choices.iter().position(|c| *c == choice).unwrap_or(0);
             cells.content.select(at);
             ui::set_enabled(cells.image, !ctrl.probing());
+            let formatted = ctrl.row_content(i) == RowContent::Format;
+            ui::set_visible(cells.folder, on && formatted);
+            ui::set_enabled(cells.folder, !ctrl.probing());
             let source = row
                 .source
                 .as_ref()
                 .filter(|_| ctrl.row_content(i) == RowContent::Image);
-            ui::set_visible(cells.clear, on && source.is_some());
-            let text = source.map(|p| {
-                let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
-                format!(
-                    "{} ({})",
-                    name.unwrap_or_default(),
-                    format_size(row.source_size)
-                )
-            });
+            let folder = row.folder.as_ref().filter(|_| formatted);
+            ui::set_visible(cells.clear, on && (source.is_some() || folder.is_some()));
+            let name = |p: &std::path::Path| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            };
+            let text = match (source, folder) {
+                (Some(p), _) => Some(format!("{} ({})", name(p), format_size(row.source_size))),
+                (None, Some(d)) => Some(format!("Copy in: {}", name(d))),
+                _ => None,
+            };
             ui::set_text(cells.source, text.as_deref().unwrap_or(""));
             ui::set_enabled(cells.up, !shape.fixed && i > 0);
             ui::set_enabled(cells.down, !shape.fixed && i + 1 < n);
@@ -369,6 +378,12 @@ impl RowsStep {
             self.rows
                 .borrow()
                 .iter()
+                .map(|r| usize::from(ui::shown(r.folder))),
+        );
+        v.extend(
+            self.rows
+                .borrow()
+                .iter()
                 .map(|r| usize::from(ui::shown(r.name))),
         );
         v
@@ -424,8 +439,11 @@ impl RowsStep {
                 Node::Space(Size::Fixed(widths[0])),
                 fixed(r.content.h, 260),
                 Node::button(r.image, 80),
-                stretch(r.source),
             ];
+            if ui::shown(r.folder) {
+                second.push(Node::button(r.folder, 80));
+            }
+            second.push(stretch(r.source));
             if ui::shown(r.clear) {
                 second.push(Node::button(r.clear, 60));
             }
@@ -543,6 +561,10 @@ impl RowsStep {
             }),
             BN_CLICKED if from == r.pick => self.pick_type(ctrl.table_view().kind, i, from),
             BN_CLICKED if from == r.image => table(BuildAction::PickRowSource(i)),
+            BN_CLICKED if from == r.folder => Some(BuildDiskAction::PickRowFolder(i)),
+            BN_CLICKED if from == r.clear && ctrl.row_content(i) == RowContent::Format => {
+                Some(BuildDiskAction::ClearRowFolder(i))
+            }
             BN_CLICKED if from == r.clear => table(BuildAction::ClearRowSource(i)),
             BN_CLICKED if from == r.up => table(BuildAction::MoveRow { row: i, delta: -1 }),
             BN_CLICKED if from == r.down => table(BuildAction::MoveRow { row: i, delta: 1 }),

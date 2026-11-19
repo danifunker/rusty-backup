@@ -33,6 +33,17 @@ pub use crate::rbformats::export::ExportFormat;
 pub use disk_core::display::format_size;
 
 /// A label the user typed on `old`, kept when switching to `fs` if it fits there.
+/// Measures a row's folder: its path and projected bytes, or why it could not.
+type FolderJob = Job<Result<(PathBuf, u64), String>>;
+
+/// A row folder's path and the bytes it should take on a fresh volume (4 KiB blocks assumed).
+fn measure_folder(path: PathBuf) -> Result<(PathBuf, u64), String> {
+    let (files, dirs, bytes) = crate::fs::dir_import::measure_dir(path.as_path(), false, false)
+        .map_err(|e| format!("measuring {}: {e:#}", path.display()))?;
+    let need = crate::fs::dir_import::projected_volume_bytes(files, dirs, bytes, 4096);
+    Ok((path, need))
+}
+
 fn typed_label(old: &RowFormat, fs: FsKind) -> Option<String> {
     let label = old.opts.label.as_str();
     let max = fs.caps().label_max;
@@ -59,6 +70,12 @@ pub fn containers() -> Vec<ExportFormat> {
         ExportFormat::Moof,
     ]);
     v
+}
+
+fn has_ext(path: &Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
 /// The container a file name's extension asks for, if it names one.
@@ -127,6 +144,7 @@ pub mod purpose {
     pub const SYSTEM_DISK: &str = "build_disk.system_disk";
     pub const DONOR: &str = "build_disk.donor";
     pub const CD_FOLDER: &str = "build_disk.cd_folder";
+    pub const ROW_FOLDER: &str = "build_disk.row_folder";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
@@ -168,6 +186,9 @@ pub mod ids {
     pub const ROW_NAME: &str = "build_disk.row_name";
     pub const ROW_BOOT: &str = "build_disk.row_boot";
     pub const ROW_IMAGE: &str = "build_disk.row_image";
+    /// "Copy folder..." on a formatted row, and its clear button.
+    pub const ROW_FOLDER: &str = "build_disk.row_folder";
+    pub const ROW_FOLDER_CLEAR: &str = "build_disk.row_folder_clear";
     pub const ROW_CLEAR: &str = "build_disk.row_clear";
     pub const ROW_UP: &str = "build_disk.row_up";
     pub const ROW_DOWN: &str = "build_disk.row_down";
@@ -629,6 +650,9 @@ pub enum BuildDiskAction {
         row: usize,
         opts: FormatOptions,
     },
+    /// "Copy folder...": a host folder copied into the formatted row, measured in a job.
+    PickRowFolder(usize),
+    ClearRowFolder(usize),
     SetVolumeFs(FsChoice),
     SetVolumeOptions(FormatOptions),
     /// The preset and its fields, edited as one.
@@ -705,6 +729,9 @@ pub struct BuildDiskController {
     mac_driver: MacDriver,
     source_row: Option<usize>,
     probe: Option<(usize, Job<(PathBuf, u64)>)>,
+    /// The folder a row will copy in, being measured.
+    folder_probe: Option<(usize, FolderJob)>,
+    folder_row: Option<usize>,
     donor_job: Option<Job<Result<crate::model::disk_builder::Donor, String>>>,
     donor_error: Option<String>,
     job: Option<Job<Result<(), String>>>,
@@ -746,6 +773,8 @@ impl BuildDiskController {
             mac_driver: MacDriver::Bundled,
             source_row: None,
             probe: None,
+            folder_probe: None,
+            folder_row: None,
             donor_job: None,
             donor_error: None,
             job: None,
@@ -1025,7 +1054,7 @@ impl BuildDiskController {
 
     /// The source image of a row is being measured.
     pub fn probing(&self) -> bool {
-        self.probe.is_some()
+        self.probe.is_some() || self.folder_probe.is_some()
     }
 
     /// Every formatted row (or the volume), with its options, for the Options step.
@@ -1173,7 +1202,11 @@ impl BuildDiskController {
             return Some("A CD-ROM image is saved as a file; choose Image file.".to_string());
         }
         if !self.output_is_device {
-            return match self.image {
+            return match &self.image {
+                Some(p) if !cfg!(feature = "chd") && has_ext(p, "chd") => Some(
+                    "This build has no CHD support; save as .img (or another container) instead."
+                        .to_string(),
+                ),
                 Some(_) => None,
                 None => Some("Choose where to save the image file.".to_string()),
             };
@@ -1633,6 +1666,7 @@ impl BuildDiskController {
     fn picked(&mut self, which: &'static str, path: Option<PathBuf>) {
         let Some(path) = path else {
             self.source_row = None;
+            self.folder_row = None;
             return;
         };
         match which {
@@ -1644,6 +1678,17 @@ impl BuildDiskController {
             }
             purpose::SYSTEM_DISK => self.preset.x68k_system_disk = Some(path),
             purpose::CD_FOLDER => self.cd.from_dir = Some(path),
+            purpose::ROW_FOLDER => {
+                let Some(row) = self.folder_row.take() else {
+                    return;
+                };
+                let job = Job::spawn(
+                    "Measuring the folder...",
+                    Arc::clone(&self.notify),
+                    move |_| Ok(measure_folder(path)),
+                );
+                self.folder_probe = Some((row, job));
+            }
             purpose::DONOR => {
                 self.donor_error = None;
                 self.donor_job = Some(Job::spawn(
@@ -1824,6 +1869,7 @@ impl BuildDiskController {
                         geometry: builder.geometry,
                         sources: builder.sources(),
                         formats: builder.formats(),
+                        folders: builder.folders(),
                         full_write: self.output_is_device,
                         rdb_handlers: if self.takes_handlers() {
                             self.handlers.clone()
@@ -1917,6 +1963,19 @@ impl BuildDiskController {
                 }
             }
         }
+        if let Some(done) = self.folder_probe.as_ref().and_then(|(_, j)| job_outcome(j)) {
+            if let Some((row, _)) = self.folder_probe.take() {
+                match done.and_then(|r| r) {
+                    Ok((path, bytes)) => {
+                        if let Some(r) = self.builder.rows.get_mut(row) {
+                            r.folder = Some(path);
+                            r.folder_bytes = bytes;
+                        }
+                    }
+                    Err(e) => self.push(LogLevel::Error, format!("Partition {}: {e}", row + 1)),
+                }
+            }
+        }
         if let Some(done) = self.job.as_ref().and_then(job_outcome) {
             self.finished = self.job.take().map(|j| j.snapshot());
             let outcome = done.and_then(|r| r);
@@ -1931,6 +1990,9 @@ impl BuildDiskController {
     /// Block until the running build ends; for a headless shell or a test.
     pub fn wait(&mut self) {
         if let Some(j) = self.probe.as_ref() {
+            j.1.wait();
+        }
+        if let Some(j) = self.folder_probe.as_ref() {
             j.1.wait();
         }
         if let Some(j) = self.donor_job.as_ref() {
@@ -2062,6 +2124,25 @@ impl Controller for BuildDiskController {
                 let offered = CdSidecars::choices(self.cd.layout).contains(&choice);
                 if offered && self.cd_sidecars_unavailable().is_none() {
                     choice.apply(&mut self.cd.import);
+                }
+            }
+            BuildDiskAction::PickRowFolder(row) => {
+                if row >= self.builder.rows.len() || self.folder_probe.is_some() {
+                    return Vec::new();
+                }
+                self.folder_row = Some(row);
+                return vec![Effect::PickFolder(PickSpec {
+                    purpose: purpose::ROW_FOLDER,
+                    title: format!("Copy this folder into partition {}", row + 1),
+                    filters: Vec::new(),
+                    save: false,
+                    file_name: String::new(),
+                })];
+            }
+            BuildDiskAction::ClearRowFolder(row) => {
+                if let Some(r) = self.builder.rows.get_mut(row) {
+                    r.folder = None;
+                    r.folder_bytes = 0;
                 }
             }
             BuildDiskAction::PickCdFolder => {

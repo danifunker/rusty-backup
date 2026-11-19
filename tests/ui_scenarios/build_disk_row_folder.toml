@@ -1,0 +1,72 @@
+# Build Disk copying host folders into formatted rows, the usbode card shape: FAT boot and
+# exFAT store. A folder needs a formatted row; Clear drops it; both partitions get the files.
+name = "Build Disk: formatted rows filled from host folders"
+vm = "build_disk"
+
+[[step]]
+action = "OutputImage"
+
+[[step]]
+action = "SetSize"
+arg = "96M"
+
+[[step]]
+action = "Next"
+
+[[step]]
+action = "Next"
+
+[[step]]
+action = "Next"
+expect = { step = "Partitions", rows = 1 }
+
+[[step]]
+action = "RowSize"
+arg = "0:48M"
+
+[[step]]
+action = "AddRow"
+expect = { rows = 2, layout = "ok" }
+
+[[step]]
+action = "RowFs"
+arg = "0:fat"
+
+[[step]]
+action = "RowFs"
+arg = "1:exfat"
+
+[[step]]
+action = "RowFolder"
+arg = 0
+settle = true
+expect = { row_folder = true }
+
+[[step]]
+action = "ClearRowFolder"
+arg = 0
+expect = { row_folder = false }
+
+[[step]]
+action = "RowFolder"
+arg = 0
+settle = true
+expect = { row_folder = true }
+
+[[step]]
+action = "RowFolder"
+arg = 1
+settle = true
+
+[[step]]
+action = "Next"
+expect = { step = "Options" }
+
+[[step]]
+action = "Next"
+expect = { step = "Review", blocked = "" }
+
+[[step]]
+action = "Next"
+settle = true
+expect = { step = "Build", result = "ok", opens = 2, copied = 2 }

@@ -17,7 +17,7 @@
 //! GUI polls. See `docs/progress_pattern.md`.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -68,6 +68,8 @@ pub struct ProvisionRequest {
     pub sources: Vec<Option<PathBuf>>,
     /// Filesystem to format per entry of `partitions` (a source wins); empty means none.
     pub formats: Vec<Option<RowFormat>>,
+    /// Host folder copied into each formatted partition, per entry of `partitions`; empty means none.
+    pub folders: Vec<Option<PathBuf>>,
     /// Write every byte of a formatted partition: the target may hold old data (a device).
     pub full_write: bool,
     /// Amiga filesystem handlers to embed in an RDB: `(DosType text, AmigaDOS load file)`.
@@ -643,7 +645,7 @@ pub fn run_volume(
     let handle = open_target_preserving(target)
         .with_context(|| format!("opening target {} for writing", target.display()))?;
     let mut dev = SectorAlignedWriter::new(handle.file);
-    format_through_temp(&mut dev, 0, size, f, 0, &status)?;
+    format_through_temp(&mut dev, 0, size, f, None, 0, &status)?;
     dev.flush().context("flushing target after build")?;
     dev.sync_all().context("syncing the target")?;
     log("Disk build complete".to_string());
@@ -651,11 +653,13 @@ pub fn run_volume(
 }
 
 /// Format into a sparse temp image, then write every byte of it over `[offset, offset + size)`.
+#[allow(clippy::too_many_arguments)]
 fn format_through_temp<W: Write + std::io::Seek>(
     target: &mut W,
     offset: u64,
     size: u64,
     f: &RowFormat,
+    folder: Option<&Path>,
     progress_base: u64,
     status: &Arc<Mutex<PhysicalWriteStatus>>,
 ) -> Result<u64> {
@@ -678,6 +682,14 @@ fn format_through_temp<W: Write + std::io::Seek>(
         f.kind.display_name(),
         done.summary
     ));
+    if let Some(folder) = folder {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tmp)
+            .context("reopening the temporary volume")?;
+        push(&import_folder(file, 0, size, folder)?);
+    }
     let mut progress = |n: u64| {
         if let Ok(mut s) = status.lock() {
             s.current_bytes = n;
@@ -694,6 +706,31 @@ fn format_through_temp<W: Write + std::io::Seek>(
         &cancel,
         &mut log,
     )
+}
+
+/// Copy the host folder `dir` into the volume just formatted at `offset` of `file`.
+fn import_folder(file: std::fs::File, offset: u64, size: u64, dir: &Path) -> Result<String> {
+    let ctx = crate::fs::EditContext {
+        partition_len: Some(size),
+        ..Default::default()
+    };
+    let mut efs = crate::fs::open_editable_filesystem_with(file, offset, ctx, 0, None)
+        .map_err(|e| anyhow::anyhow!("opening the new volume for the copy: {e}"))?;
+    let root = efs
+        .as_filesystem_mut()
+        .root()
+        .map_err(|e| anyhow::anyhow!("reading the new volume's root: {e}"))?;
+    let opts = crate::fs::dir_import::DirImportOptions::default();
+    let stats = crate::fs::dir_import::import_dir(&mut *efs, &root, dir, &opts, &|_| {})
+        .with_context(|| format!("copying {} in", dir.display()))?;
+    efs.sync_metadata()
+        .map_err(|e| anyhow::anyhow!("saving the copied files: {e}"))?;
+    Ok(format!(
+        "Copied {} file(s) and {} folder(s) from {}",
+        stats.files,
+        stats.dirs_created,
+        dir.display()
+    ))
 }
 
 /// Worker function. Public for unit testing — call this inline with a
@@ -870,6 +907,16 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
             req.formats.len(),
         );
     }
+    for (i, dir) in req.folders.iter().enumerate() {
+        let formatted = req.formats.get(i).is_some_and(|f| f.is_some());
+        let sourced = req.sources.get(i).is_some_and(|s| s.is_some());
+        if dir.is_some() && (!formatted || sourced) {
+            anyhow::bail!(
+                "partition {}: a folder copy needs the partition formatted, not filled",
+                i + 1
+            );
+        }
+    }
     let full = writes_in_full(req.target_path.as_path(), req.full_write);
     let jobs: Vec<(usize, Placed, RowFormat)> = req
         .partitions
@@ -893,22 +940,32 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
             i + 1,
             f.kind.display_name()
         ));
+        let folder = req.folders.get(*i).and_then(|d| d.as_deref());
         if full {
             done += format_through_temp(
                 &mut target,
                 placed.start_byte(),
                 placed.size_bytes,
                 f,
+                folder,
                 done,
                 &status,
             )
             .with_context(|| format!("formatting partition {}", i + 1))?;
         } else {
             let file = target.inner_mut().context("flushing before the format")?;
-            let mut w = Window::new(file, placed.start_byte(), placed.size_bytes);
+            let mut w = Window::new(&mut *file, placed.start_byte(), placed.size_bytes);
             let r = format::format_into(&mut w, placed.size_bytes, f.kind, &f.opts)
                 .with_context(|| format!("formatting partition {}", i + 1))?;
             log_cb(&format!("Partition {}: {}", i + 1, r.summary));
+            if let Some(folder) = folder {
+                let handle = file
+                    .try_clone()
+                    .context("opening the target for the copy")?;
+                let msg = import_folder(handle, placed.start_byte(), placed.size_bytes, folder)
+                    .with_context(|| format!("filling partition {}", i + 1))?;
+                log_cb(&format!("Partition {}: {}", i + 1, msg));
+            }
         }
         let file = target.inner_mut().context("flushing before the fit")?;
         crate::fs::fit_apple_volume_to_partition(
@@ -971,6 +1028,7 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::format::FsKind;
     use crate::partition::provision::PartSpec;
     use crate::partition::PartitionTable;
     use byteorder::{BigEndian, ByteOrder};
@@ -1028,6 +1086,7 @@ mod tests {
             partitions: placed.clone(),
             sources: vec![Some(src.path().to_path_buf()), None],
             formats: Vec::new(),
+            folders: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
             mac_driver: MacDriver::Off,
@@ -1077,6 +1136,7 @@ mod tests {
             partitions: placed.clone(),
             sources: vec![Some(src.path().to_path_buf()), None],
             formats: Vec::new(),
+            folders: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
             mac_driver: MacDriver::Off,
@@ -1124,6 +1184,104 @@ mod tests {
         assert_eq!(&alternate[0..2], b"BD");
     }
 
+    /// Build the usbode layout (FAT32 boot + exFAT store), each filled from a host folder.
+    fn build_with_folders(full_write: bool) {
+        let disk = 72 * MIB;
+        let specs = vec![spec(Some(40 * MIB), "0c"), spec(None, "07")];
+        let placed =
+            provision::place(&specs, TableKind::Mbr, disk, MIB, Geometry::default()).unwrap();
+        let boot = tempfile::tempdir().unwrap();
+        std::fs::create_dir(boot.path().join("sub")).unwrap();
+        std::fs::write(boot.path().join("config.txt"), b"arm_64bit=1\n").unwrap();
+        std::fs::write(boot.path().join("sub").join("a.bin"), vec![0x5A; 70_000]).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        std::fs::write(store.path().join("readme.txt"), b"exFAT").unwrap();
+
+        let mut fat = RowFormat::new(FsKind::Fat);
+        fat.opts.fat32 = true;
+        fat.opts.label = "bootfs".into();
+        let mut exfat = RowFormat::new(FsKind::Exfat);
+        exfat.opts.label = "IMGSTORE".into();
+        let target = tempfile::NamedTempFile::new().unwrap();
+        let req = ProvisionRequest {
+            target_path: target.path().to_path_buf(),
+            target_size_bytes: disk,
+            kind: TableKind::Mbr,
+            geometry: Geometry::default(),
+            partitions: placed.clone(),
+            sources: vec![None, None],
+            formats: vec![Some(fat), Some(exfat)],
+            folders: vec![Some(boot.path().into()), Some(store.path().into())],
+            full_write,
+            rdb_handlers: Vec::new(),
+            mac_driver: MacDriver::Off,
+            head: None,
+            donor: None,
+            copies: Vec::new(),
+        };
+        run_worker(&req, new_status(0)).expect("build");
+
+        let read = |p: &Placed, path: &[&str]| -> Vec<u8> {
+            let f = std::fs::File::open(target.path()).unwrap();
+            let mut fs = crate::fs::open_filesystem(f, p.start_byte(), 0, None).unwrap();
+            let mut at = fs.root().unwrap();
+            for name in path {
+                let kids = fs.list_directory(&at).unwrap();
+                at = kids.into_iter().find(|e| e.name == *name).expect(name);
+            }
+            fs.read_file(&at, usize::MAX).unwrap()
+        };
+        assert_eq!(read(&placed[0], &["config.txt"]), b"arm_64bit=1\n");
+        assert_eq!(read(&placed[0], &["sub", "a.bin"]), vec![0x5A; 70_000]);
+        assert_eq!(read(&placed[1], &["readme.txt"]), b"exFAT");
+    }
+
+    #[test]
+    fn copies_host_folders_into_formatted_partitions() {
+        build_with_folders(false);
+    }
+
+    #[test]
+    fn copies_host_folders_through_the_full_write_path() {
+        build_with_folders(true);
+    }
+
+    #[test]
+    fn refuses_a_folder_on_an_unformatted_partition() {
+        let disk = 16 * MIB;
+        let placed = provision::place(
+            &[spec(None, "0c")],
+            TableKind::Mbr,
+            disk,
+            MIB,
+            Geometry::default(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::NamedTempFile::new().unwrap();
+        let req = ProvisionRequest {
+            target_path: target.path().to_path_buf(),
+            target_size_bytes: disk,
+            kind: TableKind::Mbr,
+            geometry: Geometry::default(),
+            partitions: placed,
+            sources: vec![None],
+            formats: vec![None],
+            folders: vec![Some(dir.path().into())],
+            full_write: false,
+            rdb_handlers: Vec::new(),
+            mac_driver: MacDriver::Off,
+            head: None,
+            donor: None,
+            copies: Vec::new(),
+        };
+        let err = run_worker(&req, new_status(0)).expect_err("must refuse");
+        assert!(
+            format!("{err:#}").contains("needs the partition formatted"),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn refuses_a_source_too_big_for_its_partition() {
         let disk = 64 * MIB;
@@ -1144,6 +1302,7 @@ mod tests {
             partitions: placed,
             sources: vec![Some(src.path().to_path_buf())],
             formats: Vec::new(),
+            folders: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
             mac_driver: MacDriver::Off,
@@ -1176,6 +1335,7 @@ mod tests {
             partitions: placed,
             sources: vec![None],
             formats: Vec::new(),
+            folders: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
             mac_driver: MacDriver::Off,

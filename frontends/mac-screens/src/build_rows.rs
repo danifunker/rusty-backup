@@ -82,6 +82,7 @@ fn is_row_key(k: &K) -> bool {
             | K::RowStart(_)
             | K::RowContent(_)
             | K::RowImage(_)
+            | K::RowFolder(_)
             | K::RowSource(_)
             | K::RowClear(_)
             | K::RowUp(_)
@@ -163,6 +164,7 @@ impl Rows {
             f.label(K::RowStart(i), "");
             f.popup(K::RowContent(i), &names, &id(ids::ROW_CONTENT));
             f.button(K::RowImage(i), "Image...", &id(ids::ROW_IMAGE));
+            f.button(K::RowFolder(i), "Folder...", &id(ids::ROW_FOLDER));
             f.label(K::RowSource(i), "");
             f.button(K::RowClear(i), "Clear", &id(ids::ROW_CLEAR));
             f.button(K::RowUp(i), "Up", &id(ids::ROW_UP));
@@ -249,19 +251,25 @@ impl Rows {
             let at = list.iter().position(|c| *c == choice).unwrap_or(0);
             f.select(K::RowContent(i), at);
             f.enable(K::RowImage(i), !ctrl.probing());
+            let formatted = ctrl.row_content(i) == RowContent::Format;
+            f.show(K::RowFolder(i), on && formatted);
+            f.enable(K::RowFolder(i), !ctrl.probing());
             let source = row
                 .source
                 .as_ref()
                 .filter(|_| ctrl.row_content(i) == RowContent::Image);
-            f.show(K::RowClear(i), on && source.is_some());
-            let text = source.map(|p| {
-                let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
-                format!(
-                    "{} ({})",
-                    name.unwrap_or_default(),
-                    format_size(row.source_size)
-                )
-            });
+            let folder = row.folder.as_ref().filter(|_| formatted);
+            f.show(K::RowClear(i), on && (source.is_some() || folder.is_some()));
+            let name = |p: &std::path::Path| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            };
+            let text = match (source, folder) {
+                (Some(p), _) => Some(format!("{} ({})", name(p), format_size(row.source_size))),
+                (None, Some(d)) => Some(format!("Copy in: {}", name(d))),
+                _ => None,
+            };
             f.set_text(K::RowSource(i), text.as_deref().unwrap_or(""));
             f.enable(K::RowUp(i), !shape.fixed && i > 0);
             f.enable(K::RowDown(i), !shape.fixed && i + 1 < n);
@@ -376,8 +384,11 @@ impl Rows {
                 Node::Space(Size::Fixed(WIDTHS[0])),
                 pop(K::RowContent(i), 260),
                 Node::button(K::RowImage(i), 85),
-                stretch(K::RowSource(i)),
             ];
+            if f.shown(K::RowFolder(i)) {
+                second.push(Node::button(K::RowFolder(i), 85));
+            }
+            second.push(stretch(K::RowSource(i)));
             if f.shown(K::RowClear(i)) {
                 second.push(Node::button(K::RowClear(i), 65));
             }
@@ -457,6 +468,10 @@ impl Rows {
                 table(BuildAction::SetRowType { row, text })
             }
             K::RowImage(i) => table(BuildAction::PickRowSource(i)),
+            K::RowFolder(i) => Some(BuildDiskAction::PickRowFolder(i)),
+            K::RowClear(i) if ctrl.row_content(i) == RowContent::Format => {
+                Some(BuildDiskAction::ClearRowFolder(i))
+            }
             K::RowClear(i) => table(BuildAction::ClearRowSource(i)),
             K::RowUp(row) => table(BuildAction::MoveRow { row, delta: -1 }),
             K::RowDown(row) => table(BuildAction::MoveRow { row, delta: 1 }),

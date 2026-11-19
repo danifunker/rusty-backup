@@ -1092,6 +1092,33 @@ impl BuildDiskTarget {
     }
 }
 
+impl BuildDiskTarget {
+    fn copied(&self) -> i64 {
+        let Some(path) = &self.out else { return 0 };
+        let parts = std::fs::File::open(path).ok().and_then(|f| {
+            let mut r = std::io::BufReader::new(f);
+            rusty_backup::partition::PartitionTable::detect(&mut r).ok()
+        });
+        let has_readme = |off: u64| -> bool {
+            let Some(f) = std::fs::File::open(path).ok() else {
+                return false;
+            };
+            let Ok(mut fs) = rusty_backup::fs::open_filesystem(f, off, 0, None) else {
+                return false;
+            };
+            let Ok(root) = fs.root() else { return false };
+            let kids = fs.list_directory(&root).unwrap_or_default();
+            kids.iter().any(|e| e.name == "README")
+        };
+        parts
+            .map(|t| t.partitions())
+            .unwrap_or_default()
+            .iter()
+            .filter(|p| has_readme(p.start_lba * 512))
+            .count() as i64
+    }
+}
+
 impl Target for BuildDiskTarget {
     fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
         use rusty_backup::controller::build_disk::{
@@ -1238,6 +1265,23 @@ impl Target for BuildDiskTarget {
                     path: Some(src),
                 }
             }
+            // "Copy folder..." on row N, answered with a folder holding README and sub/data.
+            "RowFolder" => {
+                let row = arg.and_then(Value::as_integer).ok_or("needs a row")? as usize;
+                let src = self.dir.path().join(format!("row-{row}"));
+                std::fs::create_dir_all(src.join("sub")).map_err(|e| e.to_string())?;
+                std::fs::write(src.join("README"), b"hello card\n").map_err(|e| e.to_string())?;
+                std::fs::write(src.join("sub/data"), vec![7u8; 5000]).map_err(|e| e.to_string())?;
+                self.ctl.apply(A::PickRowFolder(row));
+                A::Picked {
+                    purpose: purpose::ROW_FOLDER,
+                    path: Some(src),
+                }
+            }
+            "ClearRowFolder" => {
+                let row = arg.and_then(Value::as_integer).ok_or("needs a row")? as usize;
+                A::ClearRowFolder(row)
+            }
             "TypeDevicePath" => A::SetConfirmText(self.ctl.confirm_expected().unwrap_or_default()),
             other => return Err(format!("BuildDiskController has no action {other:?}")),
         };
@@ -1279,6 +1323,15 @@ impl Target for BuildDiskTarget {
                 None => String::new(),
             }),
             "opens" => Value::Integer(self.opens()),
+            // Partitions whose root holds the README a `RowFolder` copied in.
+            "copied" => Value::Integer(self.copied()),
+            "row_folder" => Value::Boolean(
+                self.ctl
+                    .table_view()
+                    .rows
+                    .first()
+                    .is_some_and(|r| r.folder.is_some()),
+            ),
             // The Review line naming the volume or the first partition's contents.
             "review" => Value::String(
                 self.ctl

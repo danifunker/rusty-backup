@@ -158,6 +158,7 @@ pub fn run(args: BsdAlphaHdArgs) -> Result<()> {
         partitions: placed.clone(),
         sources: vec![None; placed.len()],
         formats,
+        folders: Vec::new(),
         full_write: false,
         rdb_handlers: Vec::new(),
         mac_driver: provision_runner::MacDriver::Off,

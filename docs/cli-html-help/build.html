@@ -24,9 +24,11 @@
 <dt><code>--partition</code></dt>
 <dd>A partition, in disk order: `SIZE[:TYPE[:NAME]]`, where SIZE is `20M` / `1G` / bytes or `rest`, and TYPE is the table's own type value (MBR byte, GPT GUID, `Apple_HFS`, `DOS\3`, ...). Repeat for each partition; the default is one `rest` partition</dd>
 <dt><code>--format</code></dt>
-<dd>Format partition N blank: `N=FS[:LABEL]`, where FS is a `new volume` / `new floppy` filesystem name (`fat`, `hfs`, `pfs3`, `ufs-solaris`, ...). The partition's type follows the filesystem unless the `--partition` spec gave one</dd>
+<dd>Format partition N blank: `N=FS[:LABEL]`, where FS is a `new volume` / `new floppy` filesystem name (`fat`, `hfs`, `pfs3`, `ufs-solaris`, ...), or `fat32` for FAT32 at any size. The partition's type follows the filesystem unless the `--partition` spec gave one</dd>
 <dt><code>--fill</code></dt>
 <dd>Pour an image into partition N after the table is written: `N=PATH`. Any image Rusty Backup can read works</dd>
+<dt><code>--folder</code></dt>
+<dd>Copy a host folder into partition N once it is formatted: `N=DIR`. Needs `--format N=FS`. No mounting, so no root or sudo</dd>
 <dt><code>--bootable</code></dt>
 <dd>Mark partition N bootable: the MBR active flag (one partition) or the RDB bootable flag. Repeatable on RDB</dd>
 <dt><code>--filesystem</code></dt>

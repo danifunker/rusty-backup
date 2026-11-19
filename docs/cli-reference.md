@@ -448,8 +448,9 @@ Usage: build [OPTIONS] <TARGET>
 - `--size` — Disk (or volume) size for an image target, e.g. `64M`, `2G`. Ignored for a device and for a fixed-geometry volume
 - `--table` — Partition table to write. Leave it out for one bare volume (give `--fs`)
 - `--partition` — A partition, in disk order: `SIZE[:TYPE[:NAME]]`, where SIZE is `20M` / `1G` / bytes or `rest`, and TYPE is the table's own type value (MBR byte, GPT GUID, `Apple_HFS`, `DOS\3`, ...). Repeat for each partition; the default is one `rest` partition
-- `--format` — Format partition N blank: `N=FS[:LABEL]`, where FS is a `new volume` / `new floppy` filesystem name (`fat`, `hfs`, `pfs3`, `ufs-solaris`, ...). The partition's type follows the filesystem unless the `--partition` spec gave one
+- `--format` — Format partition N blank: `N=FS[:LABEL]`, where FS is a `new volume` / `new floppy` filesystem name (`fat`, `hfs`, `pfs3`, `ufs-solaris`, ...), or `fat32` for FAT32 at any size. The partition's type follows the filesystem unless the `--partition` spec gave one
 - `--fill` — Pour an image into partition N after the table is written: `N=PATH`. Any image Rusty Backup can read works
+- `--folder` — Copy a host folder into partition N once it is formatted: `N=DIR`. Needs `--format N=FS`. No mounting, so no root or sudo
 - `--bootable` — Mark partition N bootable: the MBR active flag (one partition) or the RDB bootable flag. Repeatable on RDB
 - `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH` (repeatable). PATH is the handler's AmigaDOS load file (`L:PFS3`, `L:SmartFilesystem`); without one, a DosType the ROM lacks cannot mount unaided
 - `--mac-driver` — The Mac driver on an APM disk: `bundled` (the default: a donor's own driver if it has one, otherwise Apple SCSI 7.3.5), `none`, or the path of an Apple-formatted disk to take the driver from. The driver serves SCSI; a Mac with the disk on IDE won't mount it
