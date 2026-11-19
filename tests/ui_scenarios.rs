@@ -479,8 +479,8 @@ impl Target for InspectTarget {
                 } else if arg == "$two_fat" {
                     self.two_fat()?
                 } else if arg == "$lvm2" {
-                    let packed = std::fs::read("tests/fixtures/test_lvm2.img.zst")
-                        .map_err(|e| e.to_string())?;
+                    let fixture = scenario_dir().join("../fixtures/test_lvm2.img.zst");
+                    let packed = std::fs::read(fixture).map_err(|e| e.to_string())?;
                     let p = self.dir.path().join("lvm2.img");
                     let raw = zstd::decode_all(&packed[..]).map_err(|e| e.to_string())?;
                     std::fs::write(&p, raw).map_err(|e| e.to_string())?;
