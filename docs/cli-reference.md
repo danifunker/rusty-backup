@@ -459,11 +459,11 @@ Usage: build [OPTIONS] <TARGET>
 - `--fs` — With no `--table`: the filesystem of the one bare volume
 - `--from` — Start from this disk image's layout: its table, special partitions and their contents, at the new `--size`. Each partition is copied unless `--format N=FS` or `--empty N` says otherwise; `--partition SIZE` sets the sizes in order. A copied filesystem that can resize grows to its partition; one that can't keeps its size. A label (SGI, Sun, NeXT, RDB, AHDI, X68000) keeps its head region verbatim, resized for the new disk
 - `--empty` — With `--from`: leave partition N empty instead of copying it
-- `--preset` — Build a fixed bootable preset instead of a table or a volume: `x68k` (IPL, X68000 table, Human68k) or `sgi-efs` (volume header, EFS root). The same disks `new hd x68k` / `new hd sgi-efs` make
+- `--preset` — Build a ready-made disk instead of a table or a volume (the wizard's Easy mode): one partition across the disk for a system (`mac-hfs`, `dos`, `amiga`, ...), or the fixed `x68k` / `sgi-efs` boot disks
 - `--scsi` — `--preset x68k`: write the SCSI form (1024-byte sectors) rather than SASI
 - `--x68k-partitions` — `--preset x68k`: how many Human68k partitions, 1 to 8
 - `--system-disk` — `--preset x68k`: a Human68k system floppy cloned into partition 1
-- `--label` — With no `--table`: the volume label
+- `--label` — With no `--table`: the volume label (a volume's, or a `--preset`'s)
 - `--geometry` — With no `--table`: the fixed geometry of a floppy format, e.g. `d71` for a 1571 disk (`cbm`), `80` tracks (`dfs`, `rsdos`), `80ds` (`dragondos`). The default is the format's first
 - `--ntfs-version` — The on-disk version of every NTFS volume or partition this builds: `1.2` (alias `nt4`) for Windows NT 3.5 / 3.51 / 4.0, `3.1` (alias `xp`, the default)
 - `--container` — Container to encode an image target into: raw, vhd, vhd-dynamic, qcow2, vmdk, chd, 2mg, dc42, woz or moof. Defaults to the one the target's extension names (`.chd`, `.vhd`, ...), else raw

@@ -641,3 +641,78 @@ fn the_fat32_entry_forces_fat32_and_its_type_byte() {
     assert!(!c.format_targets()[0].opts.fat32);
     assert_ne!(c.table_view().rows[0].type_text, "0C");
 }
+
+/// Easy mode: a system and a size. A classic Mac disk is APM, the bundled driver and one HFS
+/// partition across the rest of the disk; only the size is asked for.
+#[test]
+fn easy_mode_builds_a_classic_mac_disk_from_a_size_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("mac.img");
+    let mut c = ctl();
+    assert_eq!(
+        DiskKind::ALL[0],
+        DiskKind::Preset,
+        "easy mode is listed first"
+    );
+    act(&mut c, BuildDiskAction::SetKind(DiskKind::Preset));
+    assert_eq!(c.preset().kind, PresetKind::MacHfs);
+    let steps = [
+        Step::Kind,
+        Step::Output,
+        Step::Disk,
+        Step::Review,
+        Step::Build,
+    ];
+    assert_eq!(c.steps(), steps);
+    act(&mut c, BuildDiskAction::SetSize("40M".into()));
+    image_output(&mut c, &img);
+    walk_to(&mut c, Step::Review);
+    let review = c.review_lines().join("\n");
+    assert!(
+        review.contains("One partition across the whole disk: HFS"),
+        "{review}"
+    );
+    act(&mut c, BuildDiskAction::Next);
+    c.wait();
+    let log = c.take_log();
+    assert_eq!(c.outcome(), Some(&Ok(())), "{log:?}");
+    let mut f = std::fs::File::open(&img).unwrap();
+    let table = crate::partition::PartitionTable::detect(&mut f).unwrap();
+    assert_eq!(table.type_name(), "APM");
+    let parts = table.partitions();
+    let hfs = parts.last().unwrap();
+    assert_eq!(hfs.partition_type_string.as_deref(), Some("Apple_HFS"));
+    let fs = crate::fs::open_filesystem(f, hfs.byte_offset(), 0, Some("Apple_HFS")).unwrap();
+    assert_eq!(fs.volume_label(), Some("Macintosh HD"));
+    assert!(hfs.size_bytes > 39 * MIB, "the partition fills the disk");
+}
+
+/// Each easy target lays out one formatted row, and a system's own size limit blocks Next.
+#[test]
+fn every_easy_target_is_one_formatted_partition_within_its_limits() {
+    for kind in PresetKind::ALL {
+        let Some(e) = kind.easy() else {
+            continue;
+        };
+        let b = e.builder(300 * MIB, None);
+        assert_eq!(b.rows.len(), 1, "{kind:?}");
+        assert!(
+            b.rows[0].is_rest() && b.rows[0].format.is_some(),
+            "{kind:?}"
+        );
+        let mut checked = b.clone();
+        assert!(
+            checked.validate().is_some(),
+            "{kind:?}: {:?}",
+            checked.errors
+        );
+    }
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetKind(DiskKind::Preset));
+    let mut p = c.preset().clone();
+    p.kind = PresetKind::Dos;
+    act(&mut c, BuildDiskAction::SetPreset(p));
+    act(&mut c, BuildDiskAction::SetSize("3G".into()));
+    let why = c.blocked_at(Step::Disk).unwrap_or_default();
+    assert!(why.contains("2 GiB"), "{why}");
+}

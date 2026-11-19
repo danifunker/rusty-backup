@@ -8,10 +8,12 @@
 //! `model::format`, and the build is one job over `model::provision_runner`. The CLI's `rb-cli
 //! build` fills the same request without the steps. See docs/build_disk_plan.md § 7.
 
+mod easy;
 mod options;
 #[cfg(test)]
 mod tests;
 
+pub use easy::EasyDisk;
 pub use options::{FsChoice, OptionEdit, AFFS_VARIANTS, NTFS_VERSIONS, SECTOR_SIZES};
 
 use std::path::{Path, PathBuf};
@@ -336,10 +338,11 @@ pub enum DiskKind {
 }
 
 impl DiskKind {
+    /// Easy first: a system and a size, nothing else. The rest is the advanced wizard.
     pub const ALL: [DiskKind; 4] = [
+        DiskKind::Preset,
         DiskKind::Partitioned,
         DiskKind::Volume,
-        DiskKind::Preset,
         DiskKind::Cd,
     ];
 
@@ -347,7 +350,7 @@ impl DiskKind {
         match self {
             DiskKind::Partitioned => "Partitioned disk",
             DiskKind::Volume => "Single volume (no partition table)",
-            DiskKind::Preset => "Bootable preset (X68000, SGI IRIX)",
+            DiskKind::Preset => "Easy: a ready-made disk for one system",
             DiskKind::Cd => "CD-ROM image (IRIX EFS, Mac HFS / HFS+, NeXTSTEP UFS)",
         }
     }
@@ -363,8 +366,9 @@ impl DiskKind {
                  superfloppy, or a bare volume for an emulator."
             }
             DiskKind::Preset => {
-                "A ready-to-boot disk in a fixed shape: a Sharp X68000 Human68k disk, or an SGI \
-                 IRIX disk with its volume header and an EFS root."
+                "Pick the computer and a size: one partition across the whole disk in the table and \
+                 filesystem it reads (a classic Mac's HFS on APM, DOS's FAT16, an Amiga's FFS), or \
+                 a fixed X68000 or SGI IRIX boot disk."
             }
             DiskKind::Cd => {
                 "A CD-ROM image (.iso) in a platform's own layout, blank or filled from a folder. \
@@ -374,18 +378,45 @@ impl DiskKind {
     }
 }
 
-/// The presets, as the Disk step lists them.
+/// Easy mode's targets, as the Disk step lists them; most are [`PresetKind::easy`] disks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresetKind {
+    MacHfs,
+    MacHfsPlus,
+    Dos,
+    Win9x,
+    WinNt,
+    WinXp,
+    Amiga,
+    Linux,
     X68k,
     SgiEfs,
 }
 
 impl PresetKind {
-    pub const ALL: [PresetKind; 2] = [PresetKind::X68k, PresetKind::SgiEfs];
+    pub const ALL: [PresetKind; 10] = [
+        PresetKind::MacHfs,
+        PresetKind::MacHfsPlus,
+        PresetKind::Dos,
+        PresetKind::Win9x,
+        PresetKind::WinNt,
+        PresetKind::WinXp,
+        PresetKind::Amiga,
+        PresetKind::Linux,
+        PresetKind::X68k,
+        PresetKind::SgiEfs,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
+            PresetKind::MacHfs => "Classic Macintosh, System 6 to Mac OS 9 (HFS on APM)",
+            PresetKind::MacHfsPlus => "Mac OS 8.1 to 9 and Mac OS X (HFS+ on APM)",
+            PresetKind::Dos => "MS-DOS and Windows 3.x (FAT16 on MBR)",
+            PresetKind::Win9x => "Windows 95 OSR2, 98 and ME (FAT32 on MBR)",
+            PresetKind::WinNt => "Windows NT 3.5 to 4.0 (NTFS 1.2 on MBR)",
+            PresetKind::WinXp => "Windows 2000 and XP (NTFS 3.1 on MBR)",
+            PresetKind::Amiga => "Amiga, Kickstart 2.0 and later (FFS on RDB)",
+            PresetKind::Linux => "Linux (ext2 on MBR)",
             PresetKind::X68k => "Sharp X68000 (IPL, X68000 table, Human68k)",
             PresetKind::SgiEfs => "SGI IRIX (volume header, EFS root)",
         }
@@ -404,6 +435,8 @@ pub struct PresetView {
     pub x68k_system_disk: Option<PathBuf>,
     /// SGI: the EFS volume label (6 bytes).
     pub sgi_label: String,
+    /// An easy target's volume name; `None` keeps the target's own ("Macintosh HD").
+    pub label: Option<String>,
 }
 
 pub use crate::model::cd_build::{CdImport, CdLayout};
@@ -689,11 +722,12 @@ impl BuildDiskController {
             builder: DiskBuilder::new(TableKind::Mbr, 0),
             volume: RowFormat::new(FsKind::Fat),
             preset: PresetView {
-                kind: PresetKind::X68k,
+                kind: PresetKind::MacHfs,
                 x68k_scsi: false,
                 x68k_partitions: 1,
                 x68k_system_disk: None,
                 sgi_label: "irix".to_string(),
+                label: None,
             },
             cd: CdView {
                 layout: CdLayout::MacHfs,
@@ -1204,12 +1238,26 @@ impl BuildDiskController {
     fn preset_size(&self, size: u64) -> u64 {
         match self.preset.kind {
             PresetKind::X68k => size / (1024 * 1024) * (1024 * 1024),
-            PresetKind::SgiEfs => size,
+            _ => size,
         }
+    }
+
+    /// An easy target's disk, laid out for `size` bytes.
+    fn easy_builder(&self, size: u64) -> Option<DiskBuilder> {
+        let e = self.preset.kind.easy()?;
+        Some(e.builder(size, self.preset.label.as_deref()))
     }
 
     fn preset_blocked(&self, size: u64) -> Option<String> {
         let p = &self.preset;
+        if let Some(e) = p.kind.easy() {
+            if let Some(why) = e.refuses(size) {
+                return Some(why);
+            }
+            let mut b = self.easy_builder(size)?;
+            b.validate();
+            return b.errors.into_iter().find(|e| !e.starts_with("Warning:"));
+        }
         match p.kind {
             PresetKind::X68k => {
                 if !(1..=8).contains(&p.x68k_partitions) {
@@ -1230,6 +1278,8 @@ impl BuildDiskController {
                     .err()
                     .map(|e| format!("{e:#}"))
             }
+            // Answered above, by the easy disk's own builder.
+            _ => None,
         }
     }
 
@@ -1297,6 +1347,18 @@ impl BuildDiskController {
             DiskKind::Preset => {
                 let p = &self.preset;
                 v.push(p.kind.label().to_string());
+                let size = self.disk_size().unwrap_or(0);
+                if let Some(row) = self
+                    .easy_builder(size)
+                    .and_then(|b| b.rows.into_iter().next())
+                {
+                    let fs = row
+                        .format
+                        .as_ref()
+                        .map(RowFormat::describe)
+                        .unwrap_or_default();
+                    v.push(format!("One partition across the whole disk: {fs}"));
+                }
                 match p.kind {
                     PresetKind::X68k => {
                         v.push(format!(
@@ -1309,6 +1371,7 @@ impl BuildDiskController {
                         }
                     }
                     PresetKind::SgiEfs => v.push(format!("EFS label {:?}", p.sgi_label)),
+                    _ => {}
                 }
             }
             DiskKind::Cd => {
@@ -1499,6 +1562,7 @@ impl BuildDiskController {
             DiskKind::Preset => match self.preset.kind {
                 PresetKind::X68k => "x68000.hds".to_string(),
                 PresetKind::SgiEfs => "irix.img".to_string(),
+                k => k.easy().map_or("disk.img", |e| e.file_name).to_string(),
             },
             DiskKind::Cd => "disc.iso".to_string(),
         };
@@ -1711,10 +1775,15 @@ impl BuildDiskController {
         let Ok(size) = size else {
             return;
         };
+        // An easy target is an ordinary partitioned disk, laid out here rather than by the user.
+        let easy = match self.kind {
+            DiskKind::Preset => self.easy_builder(size),
+            _ => None,
+        };
         let request = match self.kind {
             // Started above, before the size was required.
             DiskKind::Cd => return,
-            DiskKind::Preset => {
+            DiskKind::Preset if easy.is_none() => {
                 let p = &self.preset;
                 crate::model::provision_runner::BuildRequest::Preset {
                     target_path: target.clone(),
@@ -1728,6 +1797,7 @@ impl BuildDiskController {
                         PresetKind::SgiEfs => crate::model::provision_runner::Preset::SgiEfs {
                             label: p.sgi_label.clone(),
                         },
+                        _ => return,
                     },
                 }
             }
@@ -1737,35 +1807,40 @@ impl BuildDiskController {
                 format: self.volume.clone(),
                 full_write: self.output_is_device,
             },
-            DiskKind::Partitioned => {
-                let Some(placed) = self.builder.validate() else {
+            DiskKind::Partitioned | DiskKind::Preset => {
+                let mac_driver = match easy {
+                    Some(_) => MacDriver::Bundled,
+                    None => self.mac_driver.clone(),
+                };
+                let mut builder = easy.unwrap_or_else(|| self.builder.clone());
+                let Some(placed) = builder.validate() else {
                     return;
                 };
                 crate::model::provision_runner::BuildRequest::Partitioned(
                     crate::model::provision_runner::ProvisionRequest {
                         target_path: target.clone(),
                         target_size_bytes: size,
-                        kind: self.builder.kind,
-                        geometry: self.builder.geometry,
-                        sources: self.builder.sources(),
-                        formats: self.builder.formats(),
+                        kind: builder.kind,
+                        geometry: builder.geometry,
+                        sources: builder.sources(),
+                        formats: builder.formats(),
                         full_write: self.output_is_device,
                         rdb_handlers: if self.takes_handlers() {
                             self.handlers.clone()
                         } else {
                             Vec::new()
                         },
-                        head: match self.builder.patched_head() {
+                        head: match builder.patched_head() {
                             Ok(h) => h.map(|(head, _)| head),
                             Err(e) => {
                                 self.push(LogLevel::Error, format!("{e:#}"));
                                 return;
                             }
                         },
-                        donor: self.builder.donor.as_ref().map(|d| d.path.clone()),
-                        copies: self.builder.copies(placed.as_slice()),
+                        donor: builder.donor.as_ref().map(|d| d.path.clone()),
+                        copies: builder.copies(placed.as_slice()),
                         partitions: placed,
-                        mac_driver: self.mac_driver.clone(),
+                        mac_driver,
                     },
                 )
             }

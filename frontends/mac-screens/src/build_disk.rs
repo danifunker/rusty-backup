@@ -222,7 +222,7 @@ impl BuildScreen {
             f.label(K::SectorsCaption, "Sectors/track:");
             f.field(K::Sectors, ids::SECTORS, "Sectors/track", false);
             let presets: Vec<&str> = PresetKind::ALL.iter().map(|p| p.label()).collect();
-            f.label(K::PresetCaption, "Disk:");
+            f.label(K::PresetCaption, "System:");
             f.popup(K::Preset, &strings(&presets), ids::PRESET);
             f.popup(K::X68kScsi, &strings(&CONTROLLERS), ids::X68K_SCSI);
             f.label(K::X68kPartsCaption, "Human68k partitions:");
@@ -489,8 +489,8 @@ impl BuildScreen {
         let at = ctrl.volume_fs_choice().index_in(&FsChoice::all());
         f.select(K::Volume, at.unwrap_or(0));
 
-        // The size is set here unless a device fixes it (Output) or the preset sizes itself.
-        let sized = (part || vol || cd) && !ctrl.output_is_device();
+        // The size is set here unless a device fixes it (Output); an easy disk asks for nothing else.
+        let sized = (part || vol || cd || preset) && !ctrl.output_is_device();
         let fixed = vol && ctrl.volume_size_range().is_none();
         f.show(K::SizeCaption, sized && !fixed);
         f.show(K::Size, sized && !fixed);
@@ -676,7 +676,7 @@ impl BuildScreen {
             col.push(pair(K::VolumeCaption, pop(K::Volume, Size::Fixed(300))));
         }
         if shown(K::Preset) {
-            col.push(pair(K::PresetCaption, pop(K::Preset, Size::Fixed(360))));
+            col.push(pair(K::PresetCaption, pop(K::Preset, Size::Fixed(420))));
         }
         if shown(K::X68kScsi) {
             col.push(Node::row(vec![

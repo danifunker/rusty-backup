@@ -1,0 +1,47 @@
+# Easy mode: pick the system and a size, nothing else. A classic Mac disk (APM, driver, one HFS
+# partition) builds after Kind, Output, Disk and Review; DOS refuses a disk FAT16 cannot hold.
+name = "Build Disk: easy mode"
+vm = "build_disk"
+
+[[step]]
+action = "SetKind"
+arg = "easy"
+expect = { steps = "Kind,Output,Disk,Review,Build" }
+
+[[step]]
+action = "Next"
+
+[[step]]
+action = "OutputImage"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Disk" }
+
+[[step]]
+action = "System"
+arg = 2
+
+[[step]]
+action = "SetSize"
+arg = "3G"
+expect = { blocked = "~2 GiB" }
+
+[[step]]
+action = "System"
+arg = 0
+
+[[step]]
+action = "SetSize"
+arg = "64M"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Review", review = "~One partition across the whole disk: HFS" }
+
+[[step]]
+action = "Next"
+settle = true
+expect = { step = "Build", result = "ok", opens = 1 }

@@ -377,7 +377,12 @@ The app has seven tabs:
   Rusty Backup can read works (raw, DMG, CHD, VHD, 2MG, GHO, IMZ, and
   gzip- or zip-wrapped images are decoded on the way to the disk). The
   CLI equivalent is `rb-cli write IMAGE DEVICE [--partition N] --yes`.
-- **Build Disk** — a wizard that makes a new disk from nothing: a partitioned
+- **Build Disk** — a wizard that makes a new disk from nothing. **Easy** mode
+  asks only for the system and a size and lays out one partition across the
+  disk: a classic Mac (HFS or HFS+ on APM, with the driver), MS-DOS (FAT16),
+  Windows 9x (FAT32), NT / 2000 / XP (NTFS), an Amiga (FFS on RDB) or Linux
+  (ext2); `rb-cli build disk.img --preset mac-hfs --size 500M` is the same.
+  Advanced mode builds a partitioned
   disk (MBR / GPT / APM / RDB / SGI volume header / SGI disk label / Sun /
   NeXT / Solaris x86 / X68000 / Atari AHDI), one bare volume, or a bootable
   preset (a Sharp X68000 Human68k disk, an SGI IRIX EFS disk), saved as an

@@ -366,6 +366,31 @@ the same `BuildRequest`; the same validators run.
 | 6 | **Review** | always | a summary of every choice, the warnings (fs vs scheme pairings, a missing Amiga handler), and for a device the typed device-name confirmation | the device name does not match |
 | 7 | **Build** | always | progress and log of the one build job; on success "Open in Inspect" and "Build another" | (running) |
 
+### Easy and advanced (asked 2026-11-18)
+
+The user asked for an easy mode beside today's wizard, which becomes the advanced one. Easy is the
+first kind on the Kind step (`DiskKind::Preset`, labelled "Easy: a ready-made disk for one
+system"): its Disk step asks only for the system and the size, and its steps are Kind, Output,
+Disk, Review, Build. Each system is a `PresetKind` whose `easy()` names a table, a filesystem, a
+volume name and any size limit of that era (`controller/build_disk/easy.rs`):
+
+| System | Disk |
+|---|---|
+| Classic Macintosh, System 6 to Mac OS 9 | APM with the bundled driver, one HFS partition |
+| Mac OS 8.1 to 9 and Mac OS X | APM with the bundled driver, one HFS+ partition |
+| MS-DOS and Windows 3.x | MBR, one FAT16 partition, 2 GiB at most |
+| Windows 95 OSR2, 98, ME | MBR, one FAT32 partition |
+| Windows NT 3.5 to 4.0 / 2000 and XP | MBR, one NTFS 1.2 / 3.1 partition |
+| Amiga, Kickstart 2.0 and later | RDB, one FFS (international) partition |
+| Linux | MBR, one ext2 partition |
+
+An easy disk builds as an ordinary partitioned disk from a `DiskBuilder` with one `rest` row, so
+its alignment (packed for APM, a track for DOS), types and size checks are the advanced wizard's.
+The X68000 and SGI IRIX boot disks are listed with them and keep their own fields. The CLI is
+`rb-cli build --preset mac-hfs|mac-hfsplus|dos|win9x|winnt|winxp|amiga|linux --size N`, with
+`--label` for the volume name. The wizard still opens on "Partitioned disk": the shells' flow
+suites start from it.
+
 ### Starting from an existing disk's layout (asked 2026-11-05)
 
 Step 2 for a partitioned disk asks **Start from: a blank table, or an existing disk's layout**.

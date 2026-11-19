@@ -1045,7 +1045,8 @@ impl Target for RestoreTarget {
     }
 }
 
-/// The Build Disk wizard. Actions: `Next`, `Back`, `SetKind` (`partitioned`, `volume`),
+/// The Build Disk wizard. Actions: `Next`, `Back`, `SetKind` (`easy`, `partitioned`, `volume`),
+/// `System` (an easy target's index in `PresetKind::ALL`),
 /// `OutputImage` (`$out`), `OutputDevice` (a size such as `32M`: a file of that size standing in
 /// for a device, pre-filled with 0xA5), `SetSize`, `SetTable` (a table label such as `MBR`),
 /// `RowSize` (`row:size`), `AddRow`, `RowFs` (`row:fs-id` or `row:empty`), `VolumeFs` (an fs id),
@@ -1120,7 +1121,16 @@ impl Target for BuildDiskTarget {
         let a = match action {
             "Next" => A::Next,
             "Back" => A::Back,
+            "System" => {
+                let at = arg.and_then(Value::as_integer).ok_or("needs an index")? as usize;
+                let mut p = self.ctl.preset().clone();
+                p.kind = *rusty_backup::controller::build_disk::PresetKind::ALL
+                    .get(at)
+                    .ok_or("no such system")?;
+                A::SetPreset(p)
+            }
             "SetKind" => A::SetKind(match arg_str(arg)? {
+                "easy" => DiskKind::Preset,
                 "partitioned" => DiskKind::Partitioned,
                 "volume" => DiskKind::Volume,
                 "cd" => DiskKind::Cd,
