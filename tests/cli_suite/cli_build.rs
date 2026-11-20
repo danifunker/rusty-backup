@@ -626,3 +626,116 @@ fn an_apm_donor_keeps_its_driver() {
     assert_eq!(drivers(&p("b.img")), 1);
     fsck_clean(&format!("{}@1", p("b.img")));
 }
+
+/// The usbode card: FAT32 boot and exFAT store, each filled from a host folder with no mount.
+#[test]
+fn folders_fill_formatted_partitions_without_a_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let boot = dir.path().join("dist");
+    std::fs::create_dir_all(boot.join("sub")).unwrap();
+    std::fs::write(boot.join("config.txt"), b"arm_64bit=1\n").unwrap();
+    std::fs::write(boot.join("sub").join("a.txt"), b"x").unwrap();
+    let store = dir.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("readme.txt"), b"exFAT").unwrap();
+    let img = dir.path().join("card.img");
+    let s = img.to_str().unwrap();
+    let boot_arg = format!("1={}", boot.display());
+    let store_arg = format!("2={}", store.display());
+    run(&[
+        "build",
+        s,
+        "--size",
+        "205M",
+        "--table",
+        "mbr",
+        "--partition",
+        "200M:0c",
+        "--partition",
+        "rest:07",
+        "--format",
+        "1=fat32:bootfs",
+        "--format",
+        "2=exfat:IMGSTORE",
+        "--bootable",
+        "1",
+        "--folder",
+        &boot_arg,
+        "--folder",
+        &store_arg,
+    ]);
+    let info = run(&["inspect", s]);
+    assert!(
+        info.contains("FAT32 (LBA)") && info.contains("boot"),
+        "{info}"
+    );
+    fsck_clean(&format!("{s}@1"));
+    fsck_clean(&format!("{s}@2"));
+    let p1 = format!("{s}@1");
+    assert!(run(&["ls", &p1, "/"]).contains("config.txt"));
+    assert!(run(&["ls", &p1, "/sub"]).contains("a.txt"));
+    assert!(run(&["ls", &format!("{s}@2"), "/"]).contains("readme.txt"));
+
+    // A folder on a partition that is not formatted is refused up front.
+    let bad = dir.path().join("bad.img");
+    let (ok, text) = run_raw(&[
+        "build",
+        bad.to_str().unwrap(),
+        "--size",
+        "64M",
+        "--table",
+        "mbr",
+        "--folder",
+        &boot_arg,
+    ]);
+    assert!(!ok && text.contains("formatted"), "{text}");
+}
+
+/// Flash with resize: a built card image restores onto a bigger disk with its exFAT grown to fill.
+#[test]
+fn a_card_image_restores_with_its_last_partition_grown() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("readme.txt"), b"exFAT").unwrap();
+    let card = dir.path().join("card.img");
+    let c = card.to_str().unwrap();
+    let store_arg = format!("2={}", store.display());
+    run(&[
+        "build",
+        c,
+        "--size",
+        "48M",
+        "--table",
+        "mbr",
+        "--partition",
+        "40M:0c",
+        "--partition",
+        "rest:07",
+        "--format",
+        "1=fat32:bootfs",
+        "--format",
+        "2=exfat:IMGSTORE",
+        "--folder",
+        &store_arg,
+    ]);
+    let grown = dir.path().join("grown.img");
+    let g = grown.to_str().unwrap();
+    let out = run(&[
+        "restore",
+        c,
+        g,
+        "--target-size",
+        "268435456",
+        "--size",
+        "fill",
+    ]);
+    assert!(out.contains("rebuilding it"), "{out}");
+    let info = run(&["inspect", g]);
+    assert!(
+        info.contains("215.0 MiB") || info.contains("216.0 MiB"),
+        "{info}"
+    );
+    fsck_clean(&format!("{g}@2"));
+    assert!(run(&["ls", &format!("{g}@2"), "/"]).contains("readme.txt"));
+}

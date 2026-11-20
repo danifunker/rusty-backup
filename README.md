@@ -375,8 +375,16 @@ The app has seven tabs:
   plain disk image onto a device, or into one of its partitions, leaving
   the partition table and the rest of the disk untouched; any format
   Rusty Backup can read works (raw, DMG, CHD, VHD, 2MG, GHO, IMZ, and
-  gzip- or zip-wrapped images are decoded on the way to the disk). The
+  gzip-, xz- or zip-wrapped images are decoded on the way to the disk; an
+  `.img.xz` streams straight onto the card with no temp copy). The
   CLI equivalent is `rb-cli write IMAGE DEVICE [--partition N] --yes`.
+  To resize while flashing, **Adjust Partitions...** (or **Disk Image...** in
+  Full Disk Restore) opens the image as if it were a backup: each partition
+  keeps its size, shrinks to its filesystem's last used byte, takes a custom
+  size, or (the last one) grows to fill the card, with the same preview and
+  confirmation as a restore. `rb-cli restore card.img.xz /dev/sdX --device --yes
+  --size fill` is the same from the CLI. MBR, GPT and APM disks; an exFAT whose
+  FAT is too small to grow is rebuilt at the new size (file dates are reset).
 - **Build Disk** — a wizard that makes a new disk from nothing. **Easy** mode
   asks only for the system and a size and lays out one partition across the
   disk: a classic Mac (HFS or HFS+ on APM, with the driver), MS-DOS (FAT16),
@@ -389,7 +397,11 @@ The app has seven tabs:
   image file or written straight to a physical disk such as an SD or CF card.
   Each partition is formatted blank with any of the 39 filesystems Rusty
   Backup can create, filled from a source image, or left empty; its type
-  follows the filesystem. A build can also start from an existing disk image's
+  follows the filesystem. A formatted partition can also take a host folder's
+  files ("Folder...", `rb-cli build --folder N=DIR`), copied in with no mount,
+  so building a ready-to-boot card image needs no root: `rb-cli build card.img
+  --size 205M --table mbr --partition 200M:0c --partition rest:07 --format
+  1=fat32:bootfs --format 2=exfat:IMGSTORE --bootable 1 --folder 1=dist/`. A build can also start from an existing disk image's
   layout at a new size, for example a bigger SGI disk from a small one: its
   table, volume header or boot blocks and partitions come along (each copied,
   formatted afresh or left empty), and the label is rewritten for the new
@@ -671,6 +683,7 @@ readable.
 | Norton Ghost   | `.gho`, `.ghs`  | Yes            | No              | File-aware FAT/NTFS browse, sector + spanned sets, Ghost 7.5, password-protected images decrypted automatically. An NTFS-compressed image's MFT is parsed as it streams in, not gathered into memory |
 | WinImage       | `.imz`          | Yes            | No              | Including password-protected archives |
 | ZIP (raw disk) | `.zip`          | Yes            | No              | A RAW disk image inside a plain ZIP. Auto-picks the disk entry (`--inside NAME` to choose one of several); inflated sparsely to a temp file at open, so a mostly-empty multi-GB image only uses its real content. Picker-visible but not OS-associated |
+| xz (raw disk) | `.img.xz`, `.xz` | Yes | No | A raw disk image in an xz stream (the Raspberry Pi / usbode release shape). Its size comes from the xz index; a write to a device streams it, while browsing decodes it to a temp file first. Builds without `native-xz` (the vintage ones) decode blocks of up to 256 MiB, so an image from a single-threaded `xz` needs `xz -T0` there. Picker-visible but not OS-associated |
 | BasiliskII HFV | `.hfv`          | Yes            | Yes             | Flat classic-HFS volume (≤ 4063 MB; past 2 GB needs System 7.5 or later) for 68k Mac emulators |
 | Apple 2MG      | `.2mg`          | Yes            | No              | Apple II / IIgs disk images |
 | Apple II DSK   | `.dsk`, `.do`, `.po` | Yes       | No              | DOS-order, ProDOS-order, and auto-detect sector orderings |

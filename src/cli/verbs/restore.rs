@@ -32,7 +32,8 @@ pub enum AlignmentMode {
 
 #[derive(Debug, Args)]
 pub struct RestoreArgs {
-    /// Source backup folder (the directory containing `metadata.json`).
+    /// Source backup folder (the directory containing `metadata.json`), a `.cbk`, or a disk
+    /// image (`.img`, `.img.xz`, ...) restored as a backup of itself so `--size` can resize it.
     pub backup_dir: PathBuf,
 
     /// Target image file or block-device path.
@@ -78,7 +79,37 @@ pub struct RestoreArgs {
     pub no_mac_driver: bool,
 }
 
+/// Turn a `.cbk` or a disk image into a backup folder in a temp dir the caller keeps alive.
+fn prepare_source(backup_dir: &mut PathBuf) -> Result<Option<tempfile::TempDir>> {
+    if !backup_dir.is_file() {
+        return Ok(None);
+    }
+    let tmp = tempfile::TempDir::new().context("creating a temp folder for the restore source")?;
+    if crate::rbformats::cbk::is_cbk(backup_dir) {
+        // The resize-on-restore path consumes the native folder (cb_dos_network_and_state.md §2b).
+        crate::rbformats::cbk::materialize_cbk_to_folder(backup_dir, tmp.path())
+            .context("materializing .cbk container")?;
+        log_stderr(format!(
+            "rb-cli restore: materialized {} (.cbk) to a temp folder",
+            backup_dir.display()
+        ));
+    } else if crate::model::image_backup::is_image_file(backup_dir) {
+        crate::model::image_backup::virtualize(backup_dir, tmp.path(), &mut |m| log_stderr(m))
+            .with_context(|| format!("reading {} as a restore source", backup_dir.display()))?;
+        log_stderr(format!(
+            "rb-cli restore: reading {} as a backup of itself",
+            backup_dir.display()
+        ));
+    } else {
+        return Ok(None);
+    }
+    *backup_dir = tmp.path().to_path_buf();
+    Ok(Some(tmp))
+}
+
 pub fn run(args: RestoreArgs) -> Result<()> {
+    let mut args = args;
+    let _source_guard = prepare_source(&mut args.backup_dir)?;
     // Remote target (`rb://host[:port]/path`): restore over the block tier. The
     // local device-safety preflight below is for local device paths only; a
     // remote device is gated on the daemon side, so dispatch before it.
@@ -87,26 +118,6 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         return run_remote(args, remote);
     }
     crate::os::ensure_physical_allowed(&args.target)?;
-
-    // A `.cbk` container restores natively: materialize it into a temp folder and
-    // restore from that. The desktop's resize-on-restore path consumes the native
-    // PerPartition folder (cb_dos_network_and_state.md §2b option a). The TempDir
-    // guard is held until `run_restore` returns.
-    let mut args = args;
-    let _cbk_guard: Option<tempfile::TempDir> =
-        if args.backup_dir.is_file() && crate::rbformats::cbk::is_cbk(&args.backup_dir) {
-            let tmp = tempfile::TempDir::new().context("creating temp dir for .cbk restore")?;
-            crate::rbformats::cbk::materialize_cbk_to_folder(&args.backup_dir, tmp.path())
-                .context("materializing .cbk container")?;
-            log_stderr(format!(
-                "rb-cli restore: materialized {} (.cbk) to a temp folder",
-                args.backup_dir.display()
-            ));
-            args.backup_dir = tmp.path().to_path_buf();
-            Some(tmp)
-        } else {
-            None
-        };
 
     if device_target_needs_flag(&args.target, args.device) {
         bail!(

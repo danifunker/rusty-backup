@@ -926,6 +926,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("cancelled"));
     }
 
+    #[cfg(feature = "chd")]
     #[test]
     fn test_chd_decompress_round_trip() {
         // Compress raw bytes to a CHD, then stream them back through

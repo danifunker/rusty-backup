@@ -603,7 +603,7 @@ pub fn run_backup_from(
 /// performs, and reports a length of zero. And it must not decode a **raw**
 /// image, which would copy the whole disk to a scratch file for nothing. Hence
 /// the `is_file` gate first and the `Raw` check last.
-fn container_needing_decode(path: &std::path::Path) -> Option<&'static str> {
+pub(crate) fn container_needing_decode(path: &std::path::Path) -> Option<&'static str> {
     if !path.is_file() {
         return None; // a device, or nothing we can stat — leave it alone
     }

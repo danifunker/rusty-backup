@@ -19,6 +19,7 @@ fn hybrid_disc(dir: &Path) -> PathBuf {
     path
 }
 
+#[cfg(feature = "chd")]
 #[test]
 fn start_waits_for_a_source_and_an_output() {
     let mut ctl = controller();
@@ -535,6 +536,7 @@ fn a_chd_split_into_tracks_counts_its_track_files() {
 }
 
 #[cfg(feature = "native-zstd")]
+#[cfg(feature = "chd")]
 #[test]
 fn the_output_name_follows_the_format_unless_the_user_named_it_otherwise() {
     let dir = tempfile::tempdir().unwrap();

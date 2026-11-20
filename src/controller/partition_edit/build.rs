@@ -55,6 +55,8 @@ pub struct BuildRowView {
     pub planned_size: Option<u64>,
     pub source: Option<PathBuf>,
     pub source_size: u64,
+    /// Host folder copied into the formatted partition.
+    pub folder: Option<PathBuf>,
     pub bootable: bool,
 }
 
@@ -216,6 +218,8 @@ pub(crate) fn set_row_source(builder: &mut DiskBuilder, row: usize, path: PathBu
     if let Some(r) = builder.rows.get_mut(row) {
         r.source = Some(path);
         r.source_size = size;
+        r.folder = None;
+        r.folder_bytes = 0;
     }
 }
 
@@ -237,6 +241,7 @@ pub(crate) fn build_view(builder: &DiskBuilder) -> BuildView {
                 planned_size: p.map(|p| p.size_bytes),
                 source: r.source.clone(),
                 source_size: r.source_size,
+                folder: r.folder.clone(),
                 bootable: r.bootable,
             }
         })

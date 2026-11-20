@@ -398,6 +398,7 @@ mod bsd_alpha_build {
             sources: vec![None; placed.len()],
             partitions: placed.clone(),
             formats,
+            folders: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
             mac_driver: MacDriver::Off,

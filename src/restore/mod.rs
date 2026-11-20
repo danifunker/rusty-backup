@@ -1273,9 +1273,14 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                 }
                 PartitionFsType::Exfat if needs_resize => {
                     let new_sectors = export_size / 512;
-                    resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
+                    let mut info = |msg: &str| log(&progress, LogLevel::Info, msg);
+                    resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut info)?;
+                    crate::fs::grow_exfat_past_its_fat(
+                        inner_file,
+                        part_offset,
+                        export_size,
+                        &mut info,
+                    )?;
                 }
                 // HFS and HFS+ are matched without a needs_resize guard: resize handles
                 // both shrink/grow and the same-size case, always writing the alternate VH.
@@ -1398,14 +1403,12 @@ fn run_single_file_chd_restore_as_is(
     progress: Arc<Mutex<RestoreProgress>>,
     metadata: &BackupMetadata,
 ) -> Result<()> {
-    use crate::rbformats::chd::ChdReader;
-
     let container_name = metadata.container.as_deref().unwrap_or("disk.chd");
-    let chd_path = config.backup_folder.join(container_name);
-    if !chd_path.exists() {
+    let container_path = config.backup_folder.join(container_name);
+    if !container_path.exists() {
         bail!(
             "single-file-CHD backup is missing its container: {}",
-            chd_path.display()
+            container_path.display()
         );
     }
 
@@ -1414,17 +1417,16 @@ fn run_single_file_chd_restore_as_is(
         LogLevel::Info,
         format!(
             "Single-file-CHD restore (as-is): {} -> {}",
-            chd_path.display(),
+            container_path.display(),
             config.target_path.display(),
         ),
     );
 
-    set_operation(&progress, "Opening CHD container...");
-    let mut reader = ChdReader::open(&chd_path)
-        .with_context(|| format!("failed to open {}", chd_path.display()))?;
-    let logical_size = metadata
-        .container_logical_size
-        .unwrap_or_else(|| reader.logical_size());
+    set_operation(&progress, "Opening the disk image...");
+    let (mut reader, decoded_len) =
+        crate::model::source_reader::open_disk_container(&container_path)
+            .with_context(|| format!("failed to open {}", container_path.display()))?;
+    let logical_size = metadata.container_logical_size.unwrap_or(decoded_len);
 
     if logical_size > config.target_size {
         bail!(
@@ -1545,6 +1547,13 @@ fn run_single_file_chd_restore_as_is(
                 PartitionFsType::Exfat => {
                     resize_exfat_in_place(inner_file, offset, full_size / 512, &mut local_log)
                         .with_context(|| format!("grow partition-{} exFAT", pm.index))?;
+                    crate::fs::grow_exfat_past_its_fat(
+                        inner_file,
+                        offset,
+                        full_size,
+                        &mut local_log,
+                    )
+                    .with_context(|| format!("grow partition-{} exFAT", pm.index))?;
                 }
                 _ => {}
             }
@@ -1591,14 +1600,12 @@ fn run_single_file_chd_restore_resize(
     progress: Arc<Mutex<RestoreProgress>>,
     metadata: &BackupMetadata,
 ) -> Result<()> {
-    use crate::rbformats::chd::ChdReader;
-
     let container_name = metadata.container.as_deref().unwrap_or("disk.chd");
-    let chd_path = config.backup_folder.join(container_name);
-    if !chd_path.exists() {
+    let container_path = config.backup_folder.join(container_name);
+    if !container_path.exists() {
         bail!(
             "single-file-CHD backup is missing its container: {}",
-            chd_path.display()
+            container_path.display()
         );
     }
 
@@ -1607,7 +1614,7 @@ fn run_single_file_chd_restore_resize(
         LogLevel::Info,
         format!(
             "Single-file-CHD restore (re-resize): {} -> {}",
-            chd_path.display(),
+            container_path.display(),
             config.target_path.display(),
         ),
     );
@@ -1678,9 +1685,9 @@ fn run_single_file_chd_restore_resize(
         }
     }
 
-    set_operation(&progress, "Opening CHD container...");
-    let mut chd_reader = ChdReader::open(&chd_path)
-        .with_context(|| format!("failed to open {}", chd_path.display()))?;
+    set_operation(&progress, "Opening the disk image...");
+    let (mut image, _) = crate::model::source_reader::open_disk_container(&container_path)
+        .with_context(|| format!("failed to open {}", container_path.display()))?;
 
     // A disk label rides verbatim in the CHD's head region. Rewrite it for the
     // new layout, and copy the bodies to wherever the label now says they go.
@@ -1694,7 +1701,7 @@ fn run_single_file_chd_restore_resize(
                 continue;
             }
             if let crate::fs::InPlaceResize::Unsupported(name) = crate::fs::in_place_resize_support(
-                &mut chd_reader,
+                &mut image,
                 pm.start_lba * 512,
                 pm.partition_type_string.as_deref(),
             ) {
@@ -1713,10 +1720,10 @@ fn run_single_file_chd_restore_resize(
             .unwrap_or(512)
             .max(512);
         let mut head = vec![0u8; head_len as usize];
-        chd_reader
+        image
             .seek(SeekFrom::Start(0))
             .context("seek CHD to its head region")?;
-        chd_reader
+        image
             .read_exact(&mut head)
             .context("read the head region from the CHD")?;
         let mut local_log = |m: &str| log(&progress, LogLevel::Info, m);
@@ -1829,10 +1836,10 @@ fn run_single_file_chd_restore_resize(
         // 4b patches from backup time) and re-patch with the new
         // overrides for restore-time changes.
         let mut mbr = [0u8; 512];
-        chd_reader
+        image
             .seek(SeekFrom::Start(0))
             .context("failed to seek CHD to sector 0")?;
-        chd_reader
+        image
             .read_exact(&mut mbr)
             .context("failed to read MBR from CHD")?;
         patch_mbr_entries(&mut mbr, &overrides);
@@ -2001,7 +2008,7 @@ fn run_single_file_chd_restore_resize(
         target
             .seek(SeekFrom::Start(new_offset))
             .with_context(|| format!("seek target to partition-{} offset", pm.index))?;
-        chd_reader
+        image
             .seek(SeekFrom::Start(chd_offset))
             .with_context(|| format!("seek CHD to partition-{} source", pm.index))?;
 
@@ -2011,7 +2018,7 @@ fn run_single_file_chd_restore_resize(
                 bail!("restore cancelled");
             }
             let want = (remaining as usize).min(buf.len());
-            chd_reader
+            image
                 .read_exact(&mut buf[..want])
                 .with_context(|| format!("read partition-{} body from CHD", pm.index))?;
             target
@@ -2055,7 +2062,7 @@ fn run_single_file_chd_restore_resize(
     }
     if let Some(apm) = &chd_apm {
         crate::backup::apm_extras::copy_from(
-            &mut chd_reader,
+            &mut image,
             apm,
             &overrides,
             config.target_size,
@@ -2631,9 +2638,14 @@ fn run_clonezilla_restore(
                 }
                 PartitionFsType::Exfat => {
                     let new_sectors = export_size / 512;
-                    resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
+                    let mut info = |msg: &str| log(&progress, LogLevel::Info, msg);
+                    resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut info)?;
+                    crate::fs::grow_exfat_past_its_fat(
+                        inner_file,
+                        part_offset,
+                        export_size,
+                        &mut info,
+                    )?;
                 }
                 PartitionFsType::Hfs => {
                     resize_hfs_in_place(inner_file, part_offset, export_size, &mut |msg| {
@@ -3243,6 +3255,7 @@ pub(crate) fn detect_partition_fs_type(
 mod tests {
     use super::*;
     use crate::backup::metadata::{AlignmentMetadata, BackupLayout, PartitionMetadata};
+    #[cfg(feature = "chd")]
     use crate::backup::single_file_chd::{self, SingleFileChdInputs};
     use crate::partition::PartitionTable;
     use std::io::BufReader;
@@ -3437,6 +3450,7 @@ mod tests {
         mbr
     }
 
+    #[cfg(feature = "chd")]
     #[test]
     fn single_file_chd_as_is_restore_round_trips() {
         // Build a synthetic 4 MiB MBR disk → CHD backup folder → restore to
@@ -3585,6 +3599,7 @@ mod tests {
 
     /// A packed FAT body sits shrunk inside its extent in the CHD; the as-is
     /// restore grows it back, so the disk comes back exactly as it was.
+    #[cfg(feature = "chd")]
     #[test]
     fn single_file_chd_as_is_restore_grows_a_compacted_fat_partition() {
         use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
@@ -3760,6 +3775,7 @@ mod tests {
     /// growth is the in-bounds resize on this path. Verify the resulting
     /// target carries a patched MBR + the partition body's leading half
     /// (matching the CHD) + zero-padded grow region.
+    #[cfg(feature = "chd")]
     #[test]
     fn single_file_chd_re_resize_restore_grows_partition() {
         const TOTAL_SECTORS: u32 = 8192;
@@ -3929,6 +3945,7 @@ mod tests {
     /// as-is restore → byte-equal target. Also asserts the CHD's logical
     /// stream length equals the source disk size exactly (sector-by-sector
     /// is a verbatim copy by definition).
+    #[cfg(feature = "chd")]
     #[test]
     fn single_file_chd_sector_by_sector_round_trips_through_restore() {
         const TOTAL_SECTORS: u32 = 8192;
@@ -4071,11 +4088,134 @@ mod tests {
         );
     }
 
+    /// A single-file backup whose container is a raw `disk.img`: an MBR disk with one FAT16.
+    fn raw_container_backup(dir: &std::path::Path) -> (PathBuf, u64) {
+        use crate::backup::metadata::{AlignmentMetadata, BackupLayout, PartitionMetadata};
+        const MIB: u64 = 1024 * 1024;
+        let (disk, part) = (32 * MIB, 16 * MIB);
+        let folder = dir.join("backup");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut f = std::fs::File::create(folder.join("disk.img")).unwrap();
+        f.set_len(disk).unwrap();
+        let mut mbr = [0u8; 512];
+        mbr[446 + 4] = 0x06;
+        mbr[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+        mbr[446 + 12..446 + 16].copy_from_slice(&((part / 512) as u32).to_le_bytes());
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        f.write_all(&mbr).unwrap();
+        let mut w = crate::model::format::Window::new(&mut f, 2048 * 512, part);
+        let kind = crate::model::format::FsKind::Fat;
+        let opts = crate::model::disk_builder::RowFormat::new(kind).opts;
+        crate::model::format::format_into(&mut w, part, kind, &opts).unwrap();
+        drop(f);
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-11-19T00:00:00Z".to_string(),
+            source_device: "disk.img".to_string(),
+            source_size_bytes: disk,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "none".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::SingleFileChd,
+            container: Some("disk.img".to_string()),
+            container_logical_size: Some(disk),
+            container_sha1: None,
+            size_policy: None,
+            alignment: AlignmentMetadata {
+                detected_type: "Modern1MB".to_string(),
+                first_partition_lba: 2048,
+                alignment_sectors: 2048,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: vec![PartitionMetadata {
+                index: 0,
+                type_name: "FAT16".to_string(),
+                partition_type_byte: 0x06,
+                start_lba: 2048,
+                start_byte: None,
+                original_size_bytes: part,
+                imaged_size_bytes: part,
+                compressed_files: vec![],
+                checksum: String::new(),
+                resized: false,
+                compacted: true,
+                is_logical: false,
+                partition_type_string: None,
+                minimum_size_bytes: None,
+                defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
+                defragmented_clone: false,
+            }],
+            bad_sectors: vec![],
+            extended_container: None,
+        };
+        let json = serde_json::to_string_pretty(&metadata).unwrap();
+        std::fs::write(folder.join("metadata.json"), json).unwrap();
+        (folder, disk)
+    }
+
+    /// Needs no `chd`: the container is opened by the image readers, not `ChdReader`.
+    #[test]
+    fn a_raw_single_file_container_restores_as_is_and_grows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (folder, disk) = raw_container_backup(tmp.path());
+        let source = std::fs::read(folder.join("disk.img")).unwrap();
+
+        let as_is = tmp.path().join("as-is.img");
+        let cfg = RestoreConfig {
+            backup_folder: folder.clone(),
+            target_path: as_is.clone(),
+            target_is_device: false,
+            target_size: disk,
+            alignment: RestoreAlignment::Original,
+            partition_sizes: vec![],
+            write_zeros_to_unused: false,
+            install_mac_driver: true,
+        };
+        run_restore(cfg, Arc::new(Mutex::new(RestoreProgress::new()))).expect("as-is restore");
+        assert_eq!(std::fs::read(&as_is).unwrap(), source);
+
+        let grown = tmp.path().join("grown.img");
+        let cfg = RestoreConfig {
+            backup_folder: folder,
+            target_path: grown.clone(),
+            target_is_device: false,
+            target_size: 2 * disk,
+            alignment: RestoreAlignment::Original,
+            partition_sizes: vec![RestorePartitionSize {
+                index: 0,
+                size_choice: RestoreSizeChoice::FillRemaining,
+            }],
+            write_zeros_to_unused: false,
+            install_mac_driver: true,
+        };
+        run_restore(cfg, Arc::new(Mutex::new(RestoreProgress::new()))).expect("fill restore");
+        let mut f = std::fs::File::open(&grown).unwrap();
+        let table = crate::partition::PartitionTable::detect(&mut BufReader::new(&mut f)).unwrap();
+        let p = table.partitions()[0].clone();
+        assert!(
+            p.size_bytes > 16 * 1024 * 1024,
+            "partition grew: {}",
+            p.size_bytes
+        );
+        let fs = crate::fs::open_filesystem(f, p.start_lba * 512, 0, None).expect("FAT opens");
+        assert!(
+            fs.total_size() > 16 * 1024 * 1024,
+            "volume grew: {}",
+            fs.total_size()
+        );
+    }
+
     /// CHD backup with logical partitions in an extended container, then
     /// restore-resize that shrinks the first logical. Asserts:
     ///   - the rebuilt MBR's primary + extended-container entries are right,
     ///   - the EBR chain is rebuilt at the new positions,
     ///   - each logical's body lands at its new offset.
+    #[cfg(feature = "chd")]
     #[test]
     fn single_file_chd_re_resize_restore_handles_logical_partitions() {
         use crate::backup::metadata::ExtendedContainerMetadata;

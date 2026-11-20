@@ -96,6 +96,8 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "dsk44",
     "zip",
     "gz",
+    // `.img.xz`, the Raspberry Pi / usbode release shape.
+    "xz",
     "cbk",
     "dart",
     "sparseimage",
@@ -112,7 +114,7 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
 /// `.zip` holding a RAW disk image, but it must not become the system
 /// handler for *every* `.zip` the user double-clicks. Filtered out of
 /// [`association_exts`].
-pub const NON_ASSOCIATED_EXTS: &[&str] = &["zip", "gz"];
+pub const NON_ASSOCIATED_EXTS: &[&str] = &["zip", "gz", "xz"];
 
 /// Extensions excluded from OS file-association registration **on macOS only**,
 /// because macOS itself owns the format. `.dmg` is Apple's disk-image type
@@ -287,6 +289,13 @@ mod tests {
             !association_exts().contains(&"gz".to_string()),
             "gz must NOT be registered as an OS file association"
         );
+    }
+
+    #[test]
+    fn xz_is_picker_only_not_associated() {
+        // `.img.xz` flashes and browses, but most `.xz` files are `.tar.xz`: no OS association.
+        assert!(DISK_IMAGE_EXTS.contains(&"xz"));
+        assert!(!association_exts().contains(&"xz".to_string()));
     }
 
     #[test]

@@ -776,6 +776,7 @@ mod tests {
         assert!(p.log_messages.is_empty());
     }
 
+    #[cfg(feature = "chd")]
     #[test]
     fn test_iso_to_chd_native() {
         // Single-track MODE1/2048 ISO → CHD via the new libchdman-rs
@@ -805,6 +806,7 @@ mod tests {
         assert_eq!(restored_bytes, iso_data, "ISO -> CHD -> ISO mismatch");
     }
 
+    #[cfg(feature = "chd")]
     #[test]
     fn test_bincue_to_chd_native() {
         // Build a BIN/CUE from a synthetic ISO via iso_to_bincue, then
@@ -847,6 +849,7 @@ mod tests {
         assert_eq!(restored_bytes, iso_data, "BIN/CUE -> CHD -> ISO mismatch");
     }
 
+    #[cfg(feature = "chd")]
     #[test]
     fn test_chd_to_iso_native() {
         // Single-track MODE1 CHD -> ISO via the new libchdman-rs path.
@@ -878,6 +881,7 @@ mod tests {
         assert_eq!(std::fs::read(&restored).unwrap(), iso_data);
     }
 
+    #[cfg(feature = "chd")]
     #[test]
     fn test_chd_to_bincue_native() {
         // BIN/CUE -> CHD -> BIN/CUE via the native pipeline. The
@@ -964,6 +968,7 @@ mod tests {
     /// but built inline so we don't depend on that crate's test-fixture
     /// extraction. After round-trip we must end up with one .bin per track
     /// (named `<stem> (Track NN).bin`) and a multi-FILE cue.
+    #[cfg(feature = "chd")]
     #[test]
     fn test_chd_to_bincue_multi_round_trip() {
         let dir = tempfile::tempdir().unwrap();

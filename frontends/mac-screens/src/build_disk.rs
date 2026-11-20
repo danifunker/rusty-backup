@@ -102,6 +102,8 @@ pub enum K {
     RowStart(usize),
     RowContent(usize),
     RowImage(usize),
+    /// "Folder...": a host folder copied into the formatted row.
+    RowFolder(usize),
     RowSource(usize),
     RowClear(usize),
     RowUp(usize),

@@ -72,7 +72,7 @@ required-features = ["mock_gui"]
 # builds and `cargo run --features gui`); the native shells under frontends/ pick their own.
 # The slim rb-cli-mini build is `cargo build --bin rb-cli --no-default-features` (plus
 # `--features chd` / `optical` for one of those).
-default = ["chd", "optical", "cd-audio", "audio", "native-zlib", "native-zstd", "seekable-zstd", "remote", "tui", "tui-update", "crypto", "yaml"]
+default = ["chd", "optical", "cd-audio", "audio", "native-zlib", "native-zstd", "native-xz", "seekable-zstd", "remote", "tui", "tui-update", "crypto", "yaml"]
 # Block-cipher decryption for encrypted inputs: APFS FileVault, encrypted DMG,
 # and the AES-CBC WinImage IMZ variant. Pulls the `aes` / `cbc` / `des` crates
 # (RustCrypto, edition 2024). ON BY DEFAULT — the desktop ships it. It's split
@@ -104,6 +104,8 @@ gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:reqwest", "dep:webbrowser", "re
 # desktop perf. Leave it OFF for the slim/cross builds (rb-cli-mini, i586/i486
 # Linux, armv7/MiSTer) so flate2 stays pure Rust — no zlib-ng C cross-compile.
 native-zlib = ["flate2/zlib-ng"]
+# `.img.xz` through liblzma, which streams; without it lzma-rs decodes blocks up to 256 MiB.
+native-xz = ["dep:liblzma"]
 # zstd backend selection (exactly one must be on; `native-zstd` is in `default`).
 # `native-zstd` = the C libzstd (zstd + zeekstd crates), fast, for the desktop.
 # `pure-zstd`   = the pure-Rust, bit-exact `libzstd-bitexact-rs` for slim/cross
@@ -316,6 +318,8 @@ rustyline = { version = "19.0.0", features = ["with-file-history"] }
 crossterm = "0.29"
 shell-words = "1.1.1"
 lzma-rs = "0.3.0"
+# Streaming .xz decode (liblzma); optional so the vintage builds fall back to lzma-rs.
+liblzma = { version = "0.3", optional = true }
 lzfse_rust = "0.2.1"
 des = { version = "0.9.0", optional = true }
 

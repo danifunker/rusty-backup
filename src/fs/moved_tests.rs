@@ -17,6 +17,60 @@ mod exfat_clone {
             crate::fs::DefragCloneShape::Exfat
         );
     }
+
+    /// A grow its FAT caps is rebuilt at the full size, files and the partition offset kept.
+    #[test]
+    fn a_capped_exfat_grow_is_rebuilt_at_the_full_size() {
+        use disk_core::filesystem::{EditableFilesystem, Filesystem};
+        use fs_pc::exfat::{create_blank_exfat, ExfatFilesystem, ExfatFormatTemplate};
+        use std::io::{Seek, SeekFrom, Write};
+        const MIB: u64 = 1024 * 1024;
+        let (offset, target) = (MIB, 64 * MIB);
+        let mut disk = tempfile::tempfile().unwrap();
+        disk.set_len(offset + target).unwrap();
+        let mut vol = Cursor::new(Vec::new());
+        let template = ExfatFormatTemplate {
+            bytes_per_sector: 512,
+            sectors_per_cluster: 8,
+            label: Some("STORE".into()),
+        };
+        create_blank_exfat(&mut vol, &template, 4 * MIB).unwrap();
+        disk.seek(SeekFrom::Start(offset)).unwrap();
+        disk.write_all(&vol.into_inner()).unwrap();
+        let data = vec![0x5Au8; 300_000];
+        {
+            let mut fs = ExfatFilesystem::open(disk.try_clone().unwrap(), offset).unwrap();
+            let root = fs.root().unwrap();
+            let opts = Default::default();
+            let len = data.len() as u64;
+            fs.create_file(&root, "a.iso", &mut Cursor::new(&data), len, &opts)
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        fs_pc::exfat::patch_exfat_hidden_sectors(&mut disk, offset, 2048, &mut |_| {}).unwrap();
+
+        crate::fs::resize_filesystem_for(&mut disk, offset, target, &mut |_| {}).unwrap();
+
+        let mut fs = ExfatFilesystem::open(disk.try_clone().unwrap(), offset).unwrap();
+        assert!(fs.total_size() > 60 * MIB, "volume is {}", fs.total_size());
+        let root = fs.root().unwrap();
+        let iso = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "a.iso");
+        assert_eq!(
+            fs.read_file(&iso.expect("a.iso"), usize::MAX).unwrap(),
+            data
+        );
+        let mut vbr = [0u8; 512];
+        disk.seek(SeekFrom::Start(offset)).unwrap();
+        disk.read_exact(&mut vbr).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(vbr[0x40..0x48].try_into().unwrap()),
+            2048
+        );
+    }
 }
 
 mod hfsplus {

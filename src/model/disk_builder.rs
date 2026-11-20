@@ -40,6 +40,10 @@ pub struct BuilderRow {
     pub source_size: u64,
     /// Format this partition blank; ignored when `source` is set.
     pub format: Option<RowFormat>,
+    /// Host folder copied into the freshly formatted partition.
+    pub folder: Option<PathBuf>,
+    /// Projected bytes `folder` takes on a volume, cached by the caller like `source_size`.
+    pub folder_bytes: u64,
     /// Boot from this partition, where the table has a flag for it.
     pub bootable: bool,
     /// Copy the donor's partition at this position into the row (its bytes, verbatim).
@@ -605,6 +609,16 @@ impl DiskBuilder {
             .collect()
     }
 
+    /// Host folder per row, in the shape the build request wants: only a formatted row copies one.
+    pub fn folders(&self) -> Vec<Option<PathBuf>> {
+        let formats = self.formats();
+        self.rows
+            .iter()
+            .zip(formats.iter())
+            .map(|(r, f)| f.as_ref().and(r.folder.clone()))
+            .collect()
+    }
+
     /// Plan the layout and check every assigned source fits. Populates
     /// `errors` and `status`; returns the plan when it is clean.
     pub fn validate(&mut self) -> Option<Vec<Placed>> {
@@ -653,6 +667,19 @@ impl DiskBuilder {
                 if let Err(e) = f.fits(p.size_bytes).and_then(|()| f.check()) {
                     self.errors.push(format!("Partition {}: {e}", i + 1));
                 }
+            }
+            if row.folder.is_some() && (row.source.is_some() || row.format.is_none()) {
+                self.errors.push(format!(
+                    "Partition {}: copying a folder in needs the partition formatted",
+                    i + 1
+                ));
+            } else if row.folder.is_some() && row.folder_bytes > p.size_bytes {
+                self.errors.push(format!(
+                    "Partition {}: the folder needs about {} but the partition is only {}",
+                    i + 1,
+                    format_size(row.folder_bytes),
+                    format_size(p.size_bytes),
+                ));
             }
             if !row.type_text.trim().is_empty()
                 && !type_catalog::choices(self.kind).is_empty()

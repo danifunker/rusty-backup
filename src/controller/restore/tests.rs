@@ -717,3 +717,41 @@ fn a_resized_chd_comes_back_at_its_original_sizes() {
     assert_eq!(lba(446) * 512, first);
     assert_eq!(lba(462) * 512, second);
 }
+
+#[test]
+fn a_disk_image_opens_as_a_resizable_backup_from_both_entry_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = crate::model::image_backup::tests::fat_disk(dir.path());
+
+    // Write Image File's "Adjust partitions..." moves the image into Full Disk Restore.
+    let mut ctl = controller();
+    ctl.apply(RestoreAction::SetMode(RestoreMode::WriteImage));
+    ctl.apply(RestoreAction::OpenWriteImage(img.clone()));
+    ctl.wait_idle();
+    ctl.apply(RestoreAction::AdjustWriteImage);
+    ctl.wait_idle();
+    assert_eq!(ctl.mode(), RestoreMode::FullDisk);
+    assert!(ctl.has_native_backup(), "{:?}", ctl.load_error());
+    let rows = ctl.size_rows();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].minimum_size < rows[0].original_size,
+        "{:?}",
+        rows[0]
+    );
+    assert!(ctl
+        .size_mode_choices(rows[0].index)
+        .contains(&SizeMode::FillRemaining));
+
+    // "Disk image..." asks for a file, then opens it the same way.
+    let mut ctl = controller();
+    let fx = ctl.apply(RestoreAction::PickResizeImage);
+    assert!(matches!(fx.as_slice(), [Effect::PickFile(p)] if p.purpose == purpose::RESIZE_IMAGE));
+    ctl.apply(RestoreAction::Picked {
+        purpose: purpose::RESIZE_IMAGE,
+        path: Some(img),
+    });
+    ctl.wait_idle();
+    assert_eq!(ctl.mode(), RestoreMode::FullDisk);
+    assert!(ctl.has_native_backup());
+}

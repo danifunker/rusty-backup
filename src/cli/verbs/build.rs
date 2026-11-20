@@ -160,8 +160,8 @@ pub struct BuildArgs {
 
     /// Format partition N blank: `N=FS[:LABEL]`, where FS is a `new volume`
     /// / `new floppy` filesystem name (`fat`, `hfs`, `pfs3`, `ufs-solaris`,
-    /// ...). The partition's type follows the filesystem unless the
-    /// `--partition` spec gave one.
+    /// ...), or `fat32` for FAT32 at any size. The partition's type follows
+    /// the filesystem unless the `--partition` spec gave one.
     #[arg(long = "format", value_name = "N=FS[:LABEL]")]
     pub formats: Vec<String>,
 
@@ -169,6 +169,11 @@ pub struct BuildArgs {
     /// `N=PATH`. Any image Rusty Backup can read works.
     #[arg(long = "fill", value_name = "N=PATH")]
     pub fills: Vec<String>,
+
+    /// Copy a host folder into partition N once it is formatted: `N=DIR`.
+    /// Needs `--format N=FS`. No mounting, so no root or sudo.
+    #[arg(long = "folder", value_name = "N=DIR")]
+    pub folders: Vec<String>,
 
     /// Mark partition N bootable: the MBR active flag (one partition) or the
     /// RDB bootable flag. Repeatable on RDB.
@@ -394,6 +399,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 }
             }
         }
+        set_folders(&mut c, &args, rows)?;
         return finish(c, &args);
     }
     if let Some(p) = args.preset {
@@ -415,8 +421,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
             let fs = args.fs.as_deref().ok_or_else(|| {
                 anyhow!("give --table for a partitioned disk, or --fs for a volume")
             })?;
-            if !args.partitions.is_empty() || !args.formats.is_empty() || !args.fills.is_empty() {
-                bail!("--partition / --format / --fill need --table");
+            if !args.partitions.is_empty()
+                || !args.formats.is_empty()
+                || !args.fills.is_empty()
+                || !args.folders.is_empty()
+            {
+                bail!("--partition / --format / --fill / --folder need --table");
             }
             act(&mut c, A::SetKind(DiskKind::Volume));
             act(&mut c, A::SetVolumeFs(fs_named(fs)?.into()));
@@ -499,7 +509,7 @@ fn finish(mut c: BuildDiskController, args: &BuildArgs) -> Result<()> {
     }
 }
 
-/// The `--partition`, `--format` and `--fill` rows.
+/// The `--partition`, `--format`, `--fill` and `--folder` rows.
 fn set_rows(c: &mut BuildDiskController, args: &BuildArgs) -> Result<()> {
     let specs: Vec<String> = if args.partitions.is_empty() {
         vec!["rest".to_string()]
@@ -545,23 +555,32 @@ fn set_rows(c: &mut BuildDiskController, args: &BuildArgs) -> Result<()> {
             None => (v, None),
         };
         let typed_type = typed[row].then(|| c.table_view().rows[row].type_text.clone());
+        let fat32 = fs.eq_ignore_ascii_case("fat32");
+        let kind = if fat32 {
+            FsKind::Fat
+        } else {
+            fs_named(fs.as_str())?
+        };
         c.apply(A::SetRowFs {
             row,
-            fs: Some(fs_named(fs.as_str())?.into()),
+            fs: Some(kind.into()),
         });
-        // A type the spec named wins over the one the filesystem suggests.
-        if let Some(t) = typed_type {
-            c.apply(A::Table(BuildAction::SetRowType { row, text: t }));
-        }
-        if let Some(label) = label {
+        if label.is_some() || fat32 {
             let t = c
                 .format_targets()
                 .into_iter()
                 .find(|t| t.row == Some(row))
                 .ok_or_else(|| anyhow!("partition {} does not format", row + 1))?;
             let mut opts = t.opts;
-            opts.label = label;
+            if let Some(label) = label {
+                opts.label = label;
+            }
+            opts.fat32 |= fat32;
             c.apply(A::SetRowOptions { row, opts });
+        }
+        // A type the spec named wins over the one the filesystem suggests.
+        if let Some(t) = typed_type {
+            c.apply(A::Table(BuildAction::SetRowType { row, text: t }));
         }
     }
     for &n in &args.bootable {
@@ -616,6 +635,24 @@ fn set_rows(c: &mut BuildDiskController, args: &BuildArgs) -> Result<()> {
         c.apply(A::Table(BuildAction::PickRowSource(row)));
         c.apply(A::Picked {
             purpose: purpose::ROW_SOURCE,
+            path: Some(path),
+        });
+        c.wait();
+    }
+    set_folders(c, args, specs.len())
+}
+
+/// The `--folder N=DIR` copies, after the rows are formatted.
+fn set_folders(c: &mut BuildDiskController, args: &BuildArgs, rows: usize) -> Result<()> {
+    for spec in &args.folders {
+        let (row, path) = numbered(spec.as_str(), "--folder", rows)?;
+        let path = PathBuf::from(path);
+        if !path.is_dir() {
+            bail!("--folder {} is not a directory", path.display());
+        }
+        c.apply(A::PickRowFolder(row));
+        c.apply(A::Picked {
+            purpose: purpose::ROW_FOLDER,
             path: Some(path),
         });
         c.wait();

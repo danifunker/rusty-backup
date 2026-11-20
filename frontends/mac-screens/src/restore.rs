@@ -99,6 +99,8 @@ enum K {
     JobProgress,
     FolderCaption,
     Folder,
+    /// "Disk Image...": an image restored like a backup, resizable.
+    DiskImage,
     Recent,
     RecentItem(usize),
     ImageCaption,
@@ -113,6 +115,8 @@ enum K {
     WriteChoose,
     WriteLine,
     WriteTarget,
+    /// "Adjust Partitions...": the write image in Full Disk Restore.
+    WriteAdjust,
     RemoteSwitch,
     RemoteCaption,
     RemoteAddress,
@@ -229,6 +233,11 @@ impl RestoreScreen {
             form.label(K::FolderCaption, &format!("{}:", labels::BACKUP_FOLDER));
             form.button(K::Folder, "No folder selected", ids::BACKUP_FOLDER);
             form.pulldown(K::Recent, ids::RECENT);
+            form.button(
+                K::DiskImage,
+                labels::PICK_RESIZE_IMAGE,
+                ids::PICK_RESIZE_IMAGE,
+            );
             form.label(K::ImageCaption, "Or Image File:");
             form.label(K::Image, "");
             form.button(K::PickImage, "Browse...", ids::PICK_SOURCE_IMAGE);
@@ -244,6 +253,11 @@ impl RestoreScreen {
                 K::WriteTarget,
                 "Choose target and write...",
                 ids::WRITE_TARGET,
+            );
+            form.button(
+                K::WriteAdjust,
+                labels::ADJUST_WRITE_IMAGE,
+                ids::ADJUST_WRITE_IMAGE,
             );
             form.check(K::RemoteSwitch, hints::REMOTE, ids::REMOTE_TARGET);
             form.label(K::RemoteCaption, "Host:");
@@ -557,6 +571,7 @@ impl RestoreScreen {
         for k in [K::FolderCaption, K::Folder, K::Recent] {
             f.show(k, !writing);
         }
+        f.show(K::DiskImage, full);
         f.set_title(K::Folder, folder.as_deref().unwrap_or("No folder selected"));
         let recent = self.recent_files.borrow().clone();
         let mut items: Vec<(String, Option<K>, bool)> = recent
@@ -616,6 +631,7 @@ impl RestoreScreen {
         };
         self.line(K::WriteLine, note.filter(|_| writing), None);
         f.show(K::WriteTarget, writing && write_line.is_some());
+        f.show(K::WriteAdjust, writing && write_line.is_some());
 
         // The target: a device, an image file or a partition the scan found.
         let slot = slot_of(mode);
@@ -1010,6 +1026,7 @@ impl RestoreScreen {
             K::RemoteUseImage,
             K::Mode,
             K::Folder,
+            K::DiskImage,
             K::Recent,
             K::PickImage,
             K::Source,
@@ -1065,6 +1082,7 @@ impl RestoreScreen {
                 cap(K::FolderCaption),
                 stretch(K::Folder),
                 pop(K::Recent, Size::Fixed(100)),
+                Node::button(K::DiskImage, 110),
             ]),
             Node::row(vec![
                 cap(K::ImageCaption),
@@ -1085,6 +1103,7 @@ impl RestoreScreen {
             lines(K::WriteLine),
             Node::row(vec![
                 Node::button(K::WriteTarget, 220),
+                Node::button(K::WriteAdjust, 160),
                 Node::Space(Size::Stretch(1)),
             ]),
             Node::row(vec![
@@ -1229,6 +1248,8 @@ impl RestoreScreen {
                 .and_then(|i| MODES.get(i))
                 .map(|m| RestoreAction::SetMode(m.0)),
             K::Folder => Some(RestoreAction::PickBackupFolder),
+            K::DiskImage => Some(RestoreAction::PickResizeImage),
+            K::WriteAdjust => Some(RestoreAction::AdjustWriteImage),
             K::RecentItem(i) => self
                 .recent_files
                 .borrow()

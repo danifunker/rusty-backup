@@ -69,6 +69,8 @@ pub(super) enum Row {
     PType(usize),
     PName(usize),
     PContent(usize),
+    /// The host folder copied into a formatted row.
+    PFolder(usize),
     PBoot(usize),
     AddPartition,
     /// An embedded RDB handler (Enter removes it).
@@ -265,6 +267,9 @@ impl BuildDiskState {
                         r.push(Row::PName(i));
                     }
                     r.push(Row::PContent(i));
+                    if c.row_content(i) == RowContent::Format {
+                        r.push(Row::PFolder(i));
+                    }
                     if v.boot.is_some() {
                         r.push(Row::PBoot(i));
                     }
@@ -510,6 +515,17 @@ impl BuildDiskState {
                 };
                 self.act(BuildDiskAction::SetMacDriver(next));
             }
+            Row::PFolder(i) => {
+                if c.table_view()
+                    .rows
+                    .get(i)
+                    .is_some_and(|r| r.folder.is_some())
+                {
+                    self.act(BuildDiskAction::ClearRowFolder(i));
+                } else {
+                    self.act(BuildDiskAction::PickRowFolder(i));
+                }
+            }
             Row::PBoot(i) => {
                 let on = !c.table_view().rows.get(i).is_some_and(|r| r.bootable);
                 self.act(BuildDiskAction::Table(BuildAction::SetRowBootable {
@@ -707,6 +723,7 @@ impl App {
                         | Row::PType(i)
                         | Row::PName(i)
                         | Row::PContent(i)
+                        | Row::PFolder(i)
                         | Row::PBoot(i),
                     ) => i,
                     _ => return true,
@@ -1059,6 +1076,13 @@ impl App {
                             let size = r.map(|r| format_size(r.source_size)).unwrap_or_default();
                             format!("< Image: {path} ({size}) >")
                         }
+                    },
+                ),
+                Row::PFolder(p) => (
+                    "  Copy folder".into(),
+                    match v.rows.get(*p).and_then(|r| r.folder.as_ref()) {
+                        Some(dir) => format!("{}  (Enter: clear)", dir.display()),
+                        None => "[ Choose... ]".into(),
                     },
                 ),
                 Row::PBoot(p) => (

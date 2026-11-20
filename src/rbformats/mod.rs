@@ -191,6 +191,7 @@ use dsk_dmg::sparseimage;
 pub mod swab;
 use dsk_apple::twomg;
 pub mod vhd;
+pub mod xz;
 use dsk_apple::woz;
 use dsk_apple::woz_write;
 use dsk_vm::vmdk;

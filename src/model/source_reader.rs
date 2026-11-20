@@ -915,6 +915,18 @@ pub fn open_read(path: &Path) -> Result<Box<dyn ReadSeek>> {
     open_read_dispatch(path, None, None)
 }
 
+/// A single-file backup's disk image and its decoded length: `ChdReader` only for a `.chd`,
+/// the image readers for anything else, so a CHD-less build restores a raw or `.xz` container.
+pub fn open_disk_container(path: &Path) -> Result<(Box<dyn ReadSeek>, u64)> {
+    let mut r = open_read(path).with_context(|| format!("open disk image {}", path.display()))?;
+    let len = r
+        .seek(SeekFrom::End(0))
+        .with_context(|| format!("measure {}", path.display()))?;
+    r.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewind {}", path.display()))?;
+    Ok((r, len))
+}
+
 /// Variant of [`open_read`] that accepts an optional password for
 /// container formats that support encryption (IMZ, GHO, and password-
 /// protected `.zip` disks; CHD's scheme is not wired here). Pass `None` to
@@ -1141,6 +1153,23 @@ fn open_read_dispatch(
         let flat = open_apple_ii_dsk(bytes, ext.as_deref())
             .with_context(|| format!("decode Apple-II disk {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if crate::rbformats::xz::is_xz_path(path) {
+        // .img.xz: random access needs the decoded disk, so it goes to a temp file.
+        let mut temp = tempfile::Builder::new()
+            .prefix(".rb-xz-image-")
+            .tempfile()
+            .context("create xz-decode tempfile")?;
+        let mut w = std::io::BufWriter::new(temp.as_file_mut());
+        crate::rbformats::xz::decode_into(path, &mut w)
+            .and_then(|()| std::io::Write::flush(&mut w))
+            .with_context(|| format!("decompress xz image {}", path.display()))?;
+        drop(w);
+        let temp_path = temp.into_temp_path();
+        let file = File::open(&temp_path).context("reopen decoded xz image")?;
+        Ok(Box::new(GzipTempReader {
+            file,
+            _temp: temp_path,
+        }))
     } else if is_gzip_wrapped_path(path) {
         // .adz/.hdz/.gz: gzip-wrapped image. Decode to a temp file (an .hdf
         // can be large, so don't hold it all in RAM) and read from there.
@@ -1637,6 +1666,12 @@ pub fn is_squashfs_bearing_iso(path: &Path) -> bool {
 
 /// Decoded length of an image, peeling any container/wrapper layer.
 pub fn decoded_image_size(path: &Path) -> Option<u64> {
+    if crate::rbformats::xz::is_xz_path(path) {
+        return crate::rbformats::xz::file_sizes(path)
+            .ok()
+            .map(|s| s.uncompressed)
+            .filter(|n| *n > 0);
+    }
     let mut r = open_peeled_read_with_entry(path, None, None).ok()?;
     r.seek(std::io::SeekFrom::End(0)).ok().filter(|n| *n > 0)
 }
@@ -1650,6 +1685,7 @@ pub fn is_container_path(path: &Path) -> bool {
         || is_imz_path(path)
         || is_zip_image_path(path)
         || is_gzip_wrapped_path(path)
+        || crate::rbformats::xz::is_xz_path(path)
         || is_woz_path(path)
         || is_moof_path(path)
         || is_dsd_path(path)

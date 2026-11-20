@@ -204,6 +204,7 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
         partitions: placed.clone(),
         sources,
         formats: Vec::new(),
+        folders: Vec::new(),
         full_write: false,
         rdb_handlers: handler_specs(&args.filesystems)?,
         mac_driver: crate::model::provision_runner::MacDriver::Off,
