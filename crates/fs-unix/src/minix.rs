@@ -1407,6 +1407,15 @@ pub fn write_blank_minix_into<W: Write + Seek>(
         ));
     }
 
+    // These superblock fields are 16 bits on every version: a volume needing more cannot be
+    // described, and a truncated value would put data over the inode table (UNX-013).
+    if imap_blocks > 0xFFFF || zmap_blocks > 0xFFFF || firstdatazone > 0xFFFF {
+        return Err(FilesystemError::Unsupported(format!(
+            "a Minix volume this size needs {imap_blocks} / {zmap_blocks} map blocks and data at \
+             zone {firstdatazone}, past the 16-bit superblock fields"
+        )));
+    }
+
     let (magic, name_len) = blank_magic(version);
     let dir_entry_size = if version == MinixVersion::V3 {
         4 + name_len

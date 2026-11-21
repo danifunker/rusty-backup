@@ -2230,8 +2230,25 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 start + count
             )));
         }
-        let (mut bm, _ndblk) = self.read_cg_free_bitmap(cg as u32)?;
+        let (mut bm, ndblk) = self.read_cg_free_bitmap(cg as u32)?;
+        // A pointer read from disk: refuse a run past the group's fragments, and a fragment that
+        // is already free (a cross-link), rather than freeing it twice (UNX-006).
+        if in_cg + count > ndblk {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs free_frag_run: run [{start}..{}) is past CG {cg}'s {ndblk} fragments",
+                start + count
+            )));
+        }
         let before = bm.clone();
+        for i in 0..count {
+            let bit = in_cg + i;
+            if bm[(bit / 8) as usize] & (1 << (bit % 8)) != 0 {
+                return Err(FilesystemError::InvalidData(format!(
+                    "ufs free_frag_run: fragment {} is already free (cross-linked?)",
+                    start + i
+                )));
+            }
+        }
         for i in 0..count {
             bitmap_set_bit(&mut bm, in_cg + i);
         }

@@ -1083,11 +1083,12 @@ impl BTree {
             } else {
                 node.overflow
             };
+            // An internal split moves its last key's child to the left half's overflow; that key,
+            // the largest the left half now covers, is the separator to promote (UNX-011).
+            let mut promoted = None;
             if !is_leaf {
-                // The left half's new overflow is the child of its last key,
-                // which stops being a separator when it becomes the boundary.
                 node.overflow = node.values.pop().unwrap_or(BPLUSTREE_NULL);
-                node.keys.pop();
+                promoted = node.keys.pop();
             }
             right.left = node.offset;
             right.right = node.right;
@@ -1099,10 +1100,9 @@ impl BTree {
                 sibling.left = new_off;
                 self.store(&sibling)?;
             }
-            let separator =
-                node.keys.last().cloned().ok_or_else(|| {
-                    FilesystemError::Parse("bfs: split left half has no keys".into())
-                })?;
+            let separator = promoted
+                .or_else(|| node.keys.last().cloned())
+                .ok_or_else(|| FilesystemError::Parse("bfs: split left half has no keys".into()))?;
             self.store(&node)?;
             self.store(&right)?;
 
@@ -1375,6 +1375,31 @@ mod tests {
         }
     }
 
+    /// Enough keys to split internal nodes too: every key stays reachable, so each one can be
+    /// removed and none twice (UNX-011).
+    #[test]
+    fn internal_splits_keep_every_key_reachable() {
+        let mut t = tree();
+        let n = 6000;
+        for i in 0..n {
+            t.insert(&format!("name-{i:05}"), i as i64 + 1).unwrap();
+        }
+        for i in 0..n {
+            assert_eq!(
+                t.find(&format!("name-{i:05}")),
+                Some(i as i64 + 1),
+                "name-{i:05}"
+            );
+        }
+        for i in (0..n).rev() {
+            assert!(
+                t.remove(&format!("name-{i:05}")).unwrap(),
+                "name-{i:05} not removable"
+            );
+        }
+        assert!(!t.remove("name-00000").unwrap());
+    }
+
     #[test]
     fn leaf_chain_visits_every_key_once_after_splits() {
         let mut t = tree();
@@ -1514,6 +1539,12 @@ pub fn write_blank_bfs_into<W: Write + Seek>(
         .max(log_start_block + log_blocks)
         .max(indices_block + 1 + root_tree_blocks)
         .max(root_block + 1 + root_tree_blocks);
+    if last_marked > num_blocks {
+        // The AG count rounds up, so a volume just past 8 AGs would put the root past its end (UNX-012).
+        return Err(FilesystemError::InvalidData(format!(
+            "bfs: {num_blocks} blocks is too small: the root directory needs {last_marked}"
+        )));
+    }
     let mut img = vec![0u8; (bs + last_marked.div_ceil(32) * 4) as usize];
     let ag_mask = ag_blocks - 1;
     let run = |block: u64, len: u16| BlockRun {
