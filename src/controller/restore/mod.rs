@@ -35,6 +35,7 @@ use crate::model::restore_plan::LoadedBackup;
 // Plain data the views need, so they never name the model (CONTRIBUTING.md MVC).
 pub use crate::model::disk_write_plan::WriteOpen;
 pub use crate::model::fs_limits::{Caveat, CaveatLevel};
+pub use crate::model::image_backup::SwapFile;
 pub use crate::model::job::{JobRegistry, NoNotify, Snapshot};
 pub use crate::model::restore_plan::{
     AlignmentChoice, ExpandPlan, LayoutFit, NewDiskChoice, PlanSegment, RowCaveat, SizeRow,
@@ -52,6 +53,7 @@ pub mod purpose {
     pub const NEW_DISK_IMAGE: &str = "restore.new_disk_image";
     pub const WRITE_IMAGE: &str = "restore.write_image";
     pub const RESIZE_IMAGE: &str = "restore.resize_image";
+    pub const DROP_SWAP: &str = "restore.drop_swap";
     pub const RESTORE: &str = "restore.confirm";
 }
 
@@ -82,6 +84,8 @@ pub mod ids {
     pub const PICK_RESIZE_IMAGE: &str = "restore.pick_resize_image";
     /// Write Image File's "Adjust partitions...": the same image, in Full Disk with sizes.
     pub const ADJUST_WRITE_IMAGE: &str = "restore.adjust_write_image";
+    /// "Drop Swap Files...": delete Windows' rebuildable swap files so a partition can shrink.
+    pub const DROP_SWAP: &str = "restore.drop_swap";
     pub const PICK_SOURCE_IMAGE: &str = "restore.pick_source_image";
     pub const TARGET_KIND: &str = "restore.target_kind";
     pub const PICK_TARGET_IMAGE: &str = "restore.pick_target_image";
@@ -109,6 +113,7 @@ pub mod labels {
     pub const START: &str = "Restore";
     pub const PICK_RESIZE_IMAGE: &str = "Disk Image...";
     pub const ADJUST_WRITE_IMAGE: &str = "Adjust Partitions...";
+    pub const DROP_SWAP: &str = "Drop Swap Files...";
     /// The confirmation's go-ahead button.
     pub const CONFIRM: &str = "I understand, proceed";
     pub const DONE: &str = "Restore complete.";
@@ -120,6 +125,7 @@ pub mod labels {
         (ids::START, START),
         (ids::PICK_RESIZE_IMAGE, PICK_RESIZE_IMAGE),
         (ids::ADJUST_WRITE_IMAGE, ADJUST_WRITE_IMAGE),
+        (ids::DROP_SWAP, DROP_SWAP),
         (super::purpose::RESTORE, CONFIRM),
         ("restore.done", DONE),
     ];
@@ -227,6 +233,8 @@ pub enum RestoreAction {
     PickResizeImage,
     /// "Adjust partitions..." on Write Image File: that image, opened in Full Disk Restore.
     AdjustWriteImage,
+    /// "Drop Swap Files...": asks, then deletes the image's swap files from Restore's own copy.
+    DropSwapFiles,
     /// A dropped or recent path: a folder restores in full, a file is a partition image.
     OpenDropped(PathBuf),
     /// Forget the backup (the top bar's Close Backup).
@@ -685,9 +693,12 @@ impl Controller for RestoreController {
             RestoreAction::RemoteSetImageName(name) => self.remote.image_name = name,
             RestoreAction::RemoteUseImage => self.remote_use_image(),
             RestoreAction::Picked { purpose, path } => self.picked(purpose, path),
+            RestoreAction::DropSwapFiles => return self.ask_drop_swap(),
             RestoreAction::Confirmed { purpose, yes } => {
                 if purpose == purpose::RESTORE {
                     self.answered(yes);
+                } else if purpose == purpose::DROP_SWAP && yes {
+                    self.drop_swap();
                 }
             }
             RestoreAction::Answered { .. } => {}
@@ -697,6 +708,7 @@ impl Controller for RestoreController {
 
     fn tick(&mut self) -> Vec<Effect> {
         self.poll_load();
+        self.poll_drop_swap();
         self.poll_decode();
         self.poll_image_facts();
         self.poll_write_probe();

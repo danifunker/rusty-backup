@@ -2056,6 +2056,7 @@ Usage: restore [OPTIONS] <BACKUP_DIR> <TARGET>
 - `--write-to-system-disk` — Allow writing to the system boot disk (refused by default; only meaningful with `--device`)
 - `--write-zeros-to-unused` — Write zeros to unused filesystem space
 - `--no-mac-driver` — Leave out the bundled Mac driver a backup that lost its own would otherwise get
+- `--drop-swap-files` — With a disk image source: delete Windows' swap and hibernation files (PAGEFILE.SYS, HIBERFIL.SYS, WIN386.SWP, ...) first, from a temporary copy, so `--size minimum` can shrink past them. Windows recreates them at boot; the image file itself is not changed
 
 ### `rm`
 

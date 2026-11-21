@@ -80,6 +80,8 @@ pub(super) enum Field {
     WriteTarget,
     /// "Adjust Partitions...": the write image, moved into Full Disk with sizes.
     WriteAdjust,
+    /// "Drop Swap Files...": delete a disk image's Windows swap files so it can shrink.
+    DropSwap,
     Start,
 }
 
@@ -391,6 +393,9 @@ impl RestoreState {
                     }
                 }
                 f.extend(c.size_rows().iter().map(|r| Field::Size(r.index)));
+                if c.swap_files_line().is_some() {
+                    f.push(Field::DropSwap);
+                }
                 if c.mac_driver_missing() {
                     f.push(Field::MacDriver);
                 }
@@ -922,6 +927,7 @@ impl App {
                 Field::WriteSource => r.act(RestoreAction::PickWriteImage),
                 Field::WriteTarget => r.act(RestoreAction::WriteImageTarget),
                 Field::WriteAdjust => r.act(RestoreAction::AdjustWriteImage),
+                Field::DropSwap => r.act(RestoreAction::DropSwapFiles),
                 Field::Start => r.start(),
                 _ => r.move_focus(1),
             },
@@ -1407,6 +1413,28 @@ impl App {
                         format!("{m}[ Choose target and write... ]"),
                         style,
                     ));
+                    continue;
+                }
+                Field::DropSwap => {
+                    let line = c.swap_files_line().unwrap_or_default();
+                    lines.push(Line::styled(format!("{m}{line}"), pal.dim()));
+                    if sel {
+                        focus_line = lines.len();
+                    }
+                    let style = if sel {
+                        pal.accent()
+                            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    } else {
+                        pal.accent()
+                    };
+                    let busy = c
+                        .dropping_swap()
+                        .map(|s| format!("  {}", s.label))
+                        .unwrap_or_default();
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{m}[ {} ]", labels::DROP_SWAP), style),
+                        Span::styled(busy, pal.dim()),
+                    ]));
                     continue;
                 }
                 Field::WriteAdjust => {

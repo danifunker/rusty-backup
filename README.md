@@ -385,6 +385,10 @@ The app has seven tabs:
   confirmation as a restore. `rb-cli restore card.img.xz /dev/sdX --device --yes
   --size fill` is the same from the CLI. MBR, GPT and APM disks; an exFAT whose
   FAT is too small to grow is rebuilt at the new size (file dates are reset).
+  A Windows swap file (`PAGEFILE.SYS`, `HIBERFIL.SYS`, `WIN386.SWP`, ...) near
+  the end of a volume pins its minimum there; **Drop Swap Files...** (or
+  `--drop-swap-files`) deletes it, after asking, from a temporary copy so the
+  partition can shrink. Windows recreates it at boot; the image is not changed.
 - **Build Disk** — a wizard that makes a new disk from nothing. **Easy** mode
   asks only for the system and a size and lays out one partition across the
   disk: a classic Mac (HFS or HFS+ on APM, with the driver), MS-DOS (FAT16),

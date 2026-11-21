@@ -195,6 +195,8 @@ struct Shown {
     expand_line: String,
     preview: ExpandPreview,
     mac_driver: Option<bool>,
+    swap_line: Option<String>,
+    dropping_swap: bool,
     caveats: Option<(Option<Tone>, String)>,
     write_target: Option<String>,
     running: bool,
@@ -277,6 +279,8 @@ pub struct RestoreScreen {
     cells: RefCell<Vec<SizeCells>>,
     notes: HWND,
     mac_driver: HWND,
+    swap_line: HWND,
+    drop_swap: HWND,
     caveats: HWND,
     target_line: HWND,
     outcome: HWND,
@@ -405,6 +409,8 @@ impl RestoreScreen {
             cells: RefCell::default(),
             notes: ui::label(page, ""),
             mac_driver: ui::checkbox(page, hints::MAC_DRIVER, ids::MAC_DRIVER),
+            swap_line: ui::label(page, ""),
+            drop_swap: ui::button(page, labels::DROP_SWAP, ids::DROP_SWAP),
             caveats: ui::label(page, ""),
             target_line: ui::path_label(page, ""),
             outcome: ui::label(page, ""),
@@ -681,6 +687,10 @@ impl RestoreScreen {
             expand_line: ctrl.expand_size_line(),
             preview: ctrl.expand_preview(),
             mac_driver: ctrl.mac_driver_missing().then(|| ctrl.install_mac_driver()),
+            swap_line: ctrl
+                .swap_files_line()
+                .filter(|_| mode == RestoreMode::FullDisk),
+            dropping_swap: ctrl.dropping_swap().is_some(),
             caveats,
             write_target: ctrl.write_target(),
             running: ctrl.is_running(),
@@ -744,6 +754,9 @@ impl RestoreScreen {
         let mac = s.mac_driver.is_some();
         ui::set_visible(self.mac_driver, mac && s.mode != RestoreMode::WriteImage);
         set_check(self.mac_driver, s.mac_driver.unwrap_or(false));
+        self.set_line(self.swap_line, s.swap_line.as_deref(), None);
+        ui::set_visible(self.drop_swap, s.swap_line.is_some());
+        ui::set_enabled(self.drop_swap, !s.dropping_swap);
         let (tone, text) = s.caveats.clone().unzip();
         self.set_line(self.caveats, text.as_deref(), tone.flatten());
         self.show_footer(&s);
@@ -1067,6 +1080,7 @@ impl RestoreScreen {
             self.align.h,
             self.custom,
             self.mac_driver,
+            self.drop_swap,
         ]);
         for c in self.cells.borrow().iter() {
             v.push(c.mode.h);
@@ -1108,6 +1122,8 @@ impl RestoreScreen {
             self.custom,
             self.notes,
             self.mac_driver,
+            self.swap_line,
+            self.drop_swap,
             self.caveats,
             self.target_line,
             self.run,
@@ -1298,6 +1314,12 @@ impl RestoreScreen {
         }
         drop(cells);
         put(&mut col, self.notes);
+        if ui::shown(self.drop_swap) {
+            col.push(Node::row(vec![
+                stretch(self.swap_line),
+                Node::button(self.drop_swap, 140),
+            ]));
+        }
         if ui::shown(self.mac_driver) {
             col.push(Node::row(vec![stretch(self.mac_driver)]));
         }
@@ -1456,6 +1478,8 @@ impl RestoreScreen {
             RestoreAction::SetExpand(checked(from))
         } else if from == self.mac_driver {
             RestoreAction::SetInstallMacDriver(checked(from))
+        } else if from == self.drop_swap {
+            RestoreAction::DropSwapFiles
         } else if from == self.start {
             // Start only asks; the controller's own question begins the write.
             if !self.may_start() {

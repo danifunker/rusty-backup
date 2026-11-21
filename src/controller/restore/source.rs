@@ -22,6 +22,8 @@ pub(super) struct SourceState {
     pub loaded: Option<LoadedBackup>,
     pub load_error: Option<String>,
     load: Option<Job<LoadOutcome>>,
+    /// Dropping the image's swap files, then reading the backup again.
+    drop_swap: Option<Job<LoadOutcome>>,
     /// Load `folder` once the running restore ends.
     pub load_deferred: bool,
     /// Keeps a `.cbk`'s unpacked folder alive, shared with a restore reading it.
@@ -65,6 +67,7 @@ impl SourceState {
     /// A load, decode or probe runs.
     pub fn busy(&self) -> bool {
         self.load.is_some()
+            || self.drop_swap.is_some()
             || self.decode.is_some()
             || self.probe.is_some()
             || self.facts_probe.is_some()
@@ -275,6 +278,108 @@ impl RestoreController {
                 self.src.loaded = Some(loaded);
             }
             Ok(Err(msg)) | Err(msg) => self.src.load_error = Some(msg),
+        }
+    }
+
+    /// Windows swap files in the loaded disk image, which "Drop Swap Files..." deletes.
+    pub fn swap_files(&self) -> &[super::SwapFile] {
+        self.src
+            .loaded
+            .as_ref()
+            .map_or(&[], |l| l.swap_files.as_slice())
+    }
+
+    /// The line under the size table naming them, or `None` when there are none.
+    pub fn swap_files_line(&self) -> Option<String> {
+        let files = self.swap_files();
+        if files.is_empty() {
+            return None;
+        }
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} ({}) on partition {}",
+                    f.name,
+                    format_size(f.size),
+                    f.partition + 1
+                )
+            })
+            .collect();
+        Some(format!(
+            "{} {} rebuilt by Windows at boot; dropping {} may let a partition shrink further.",
+            names.join(", "),
+            if files.len() == 1 { "is" } else { "are" },
+            if files.len() == 1 { "it" } else { "them" },
+        ))
+    }
+
+    /// The swap-file drop in progress.
+    pub fn dropping_swap(&self) -> Option<Snapshot> {
+        self.src.drop_swap.as_ref().map(|j| j.snapshot())
+    }
+
+    pub(super) fn ask_drop_swap(&mut self) -> Vec<crate::controller::Effect> {
+        if self.swap_files().is_empty() || self.src.busy() || self.run.running() {
+            return Vec::new();
+        }
+        let names: Vec<&str> = self.swap_files().iter().map(|f| f.name.as_str()).collect();
+        let in_place = self
+            .src
+            .metadata()
+            .and_then(|m| m.container.as_deref())
+            .is_some_and(|c| !c.ends_with(crate::model::image_backup::DECODED_NAME));
+        let copy = if in_place {
+            format!(
+                " The image is copied to a temporary file first ({}); your file is not changed.",
+                format_size(self.source_size().unwrap_or(0))
+            )
+        } else {
+            " This edits Restore's temporary copy; your file is not changed.".to_string()
+        };
+        vec![crate::controller::Effect::Confirm(
+            crate::controller::ConfirmSpec {
+                purpose: super::purpose::DROP_SWAP,
+                title: "Drop Swap Files".to_string(),
+                message: format!(
+                "Delete {} from the disk being restored? Windows recreates swap files at the next \
+                 boot.{copy}",
+                names.join(", ")
+            ),
+                confirm_label: "Drop them".to_string(),
+                destructive: false,
+            },
+        )]
+    }
+
+    pub(super) fn drop_swap(&mut self) {
+        let Some(folder) = self.src.loaded.as_ref().map(|l| l.folder.clone()) else {
+            return;
+        };
+        self.src.drop_swap = Some(self.spawn("Dropping swap files", move |ctx| {
+            ctx.set_can_cancel(false);
+            ctx.set_phase("Dropping swap files...");
+            let mut log = |m: String| ctx.set_phase(m);
+            Ok(
+                crate::model::image_backup::drop_swap_files(folder.as_path(), &mut log)
+                    .map_err(|e| format!("{e:#}"))
+                    .and_then(|()| crate::model::restore_plan::load_backup(folder.as_path())),
+            )
+        }));
+    }
+
+    pub(super) fn poll_drop_swap(&mut self) {
+        let Some(done) = self.src.drop_swap.as_ref().and_then(finished) else {
+            return;
+        };
+        self.src.drop_swap = None;
+        match done {
+            // The folder stays the one the first load made, so its guard is kept.
+            Ok(Ok(loaded)) => {
+                self.info("Swap files dropped; the minimum sizes are recomputed.");
+                self.src.loaded = Some(loaded);
+            }
+            Ok(Err(msg)) | Err(msg) => self.error(format!("Could not drop the swap files: {msg}")),
         }
     }
 
