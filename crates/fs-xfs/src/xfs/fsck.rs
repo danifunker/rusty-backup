@@ -14,8 +14,7 @@
 //!   * **Phase 3** — directory connectivity: BFS from root, flag orphaned
 //!     (allocated-but-unreachable) inodes and dangling directory entries.
 //!
-//! Behavioural reference: `xfs_repair` @ v3.1.11, validated against `xfs_repair -n` (`repair/agheader.c`,
-//! `repair/sb.c`) under `~/efs-xfs-refs/xfsprogs/`. v4 on-disk layout per
+//! Behavioural reference: `xfs_repair`, validated against `xfs_repair -n`. v4 on-disk layout per
 //! "XFS Algorithms & Data Structures" 3rd ed.
 
 use std::collections::HashSet;

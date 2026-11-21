@@ -36,7 +36,6 @@ use crate::ui;
 
 const OUTPUTS: [&str; 2] = ["Image file", "Physical disk"];
 const CONTROLLERS: [&str; 2] = ["SASI (256-byte sectors)", "SCSI (1024-byte sectors)"];
-const SGI_FORMATS: [&str; 2] = ["Volume header and EFS", "Volume header only"];
 
 pub(crate) fn checked(h: HWND) -> bool {
     // SAFETY: a plain button query.
@@ -160,8 +159,8 @@ impl DiskStep {
             system_clear: ui::button(page, "Clear", ids::SYSTEM_DISK_CLEAR),
             sgi_caption: ui::cell_label(page, "EFS label:"),
             sgi_label: ui::edit(page, ids::SGI_LABEL),
-            sgi_format_caption: ui::cell_label(page, "Format:"),
-            sgi_format: Combo::build(page, ids::SGI_FORMAT, &SGI_FORMATS),
+            sgi_format_caption: ui::cell_label(page, &format!("{}:", labels::SGI_FORMAT)),
+            sgi_format: Combo::build(page, ids::SGI_FORMAT, &labels::SGI_FORMATS),
             cd_layout_caption: ui::cell_label(page, &format!("{}:", labels::CD_LAYOUT)),
             cd_layout: Combo::build(page, ids::CD_LAYOUT, &layouts),
             cd_name_caption: ui::cell_label(page, "Volume name:"),

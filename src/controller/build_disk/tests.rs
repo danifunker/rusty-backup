@@ -784,3 +784,47 @@ fn a_chd_output_is_refused_only_when_chd_is_not_built_in() {
         assert!(blocked.contains("no CHD support"), "{blocked}");
     }
 }
+
+/// The SGI preset on a device fits inside it: refused up front when too small, rounded down otherwise.
+#[test]
+fn the_sgi_preset_on_a_device_stays_within_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let small = fake_device(&dir.path().join("small.bin"), 2 * MIB);
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetKind(DiskKind::Preset));
+    let mut p = c.preset().clone();
+    p.kind = PresetKind::SgiEfs;
+    act(&mut c, BuildDiskAction::SetPreset(p));
+    act(&mut c, BuildDiskAction::SetOutputIsDevice(true));
+    act(
+        &mut c,
+        BuildDiskAction::SelectDevice {
+            row: 0,
+            device: small,
+        },
+    );
+    let why = c.blocked_at(Step::Disk).unwrap_or_default();
+    assert!(why.contains("needs at least"), "{why}");
+
+    let dev = dir.path().join("card.bin");
+    let device = fake_device(&dev, 8 * MIB);
+    act(&mut c, BuildDiskAction::SelectDevice { row: 0, device });
+    assert!(c.blocked_at(Step::Disk).is_none());
+    walk_to(&mut c, Step::Review);
+    act(
+        &mut c,
+        BuildDiskAction::SetConfirmText(dev.display().to_string()),
+    );
+    act(&mut c, BuildDiskAction::Next);
+    c.wait();
+    let log = c.take_log();
+    assert_eq!(c.outcome(), Some(&Ok(())), "{log:?}");
+    let bytes = std::fs::read(&dev).unwrap();
+    assert_eq!(bytes.len() as u64, 8 * MIB);
+    let vh = part_tables::sgi::SgiVolumeHeader::parse(&bytes[..512]).unwrap();
+    assert!(
+        vh.partitions[10].blocks <= 16384,
+        "{}",
+        vh.partitions[10].blocks
+    );
+}

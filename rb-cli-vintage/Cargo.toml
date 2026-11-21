@@ -64,7 +64,7 @@ chd = ["dep:libchdman-rs"]
 optical = ["dep:opticaldiscs"]
 # C libzstd, compiled from source by zstd-sys — honors MACOSX_DEPLOYMENT_TARGET,
 # unlike the CHD/optical *prebuilts*. MSRV 1.64, so it builds on 1.73.
-native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd", "fs-squashfs/native-zstd", "fs-tar/native-zstd"]
+native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd", "fs-squashfs/native-zstd", "fs-tar/native-zstd", "rb-fsimporter/native-zstd"]
 # rb-cli serve daemon + rb:// refs. Pure std::net + serde_json, no extra dep.
 remote = []
 # Full-screen ratatui TUI. ratatui 0.29 (below) builds on 1.73; `ratatui-legacy`
@@ -105,7 +105,7 @@ dsk-imz = { path = "../crates/dsk-imz", default-features = false }
 arc-mac = { path = "../crates/arc-mac" }
 fs-tar = { path = "../crates/fs-tar", default-features = false, features = ["appledouble", "zip"] }
 rb-fsexporter = { path = "../crates/rb-fsexporter" }
-rb-fsimporter = { path = "../crates/rb-fsimporter", features = ["mac"] }
+rb-fsimporter = { path = "../crates/rb-fsimporter", default-features = false, features = ["mac"] }
 fs-adfs = { path = "../crates/fs-adfs" }
 dsk-ghost = { path = "../crates/dsk-ghost" }
 dsk-vm = { path = "../crates/dsk-vm" }

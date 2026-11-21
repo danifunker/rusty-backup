@@ -3,12 +3,12 @@
 //! this shim keeps the app's signatures and plugs in what only the app has: Mac
 //! archives (through `arc-mac`) and disk images (through the app's dispatcher).
 
-use std::path::Path;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 
+use crate::partition::PartitionInfo;
 use anyhow::Result;
-use disk_core::entry::FileEntry;
-use disk_core::filesystem::EditableFilesystem;
-use fs_tar::import_sink::{ImportOptions, ImportPreflight, ImportStats, Importer};
+use rb_fsimporter::{EditableFilesystem, FileEntry, ImportOptions, ImportStats, Importer};
 
 pub use rb_fsimporter::{
     projected_volume_bytes, Cancelled, DirImportOptions, DirImportPreflight, DirImportStats,
@@ -18,8 +18,25 @@ pub use rb_fsimporter::{
 /// Largest zip read whole to look for MacZip fields; MacZip archives are floppy-era small.
 const MACZIP_PROBE_MAX: u64 = 256 * 1024 * 1024;
 
+/// An image's browsable volumes, each with the subfolder it lands in.
+type Volumes = Vec<(Option<String>, PartitionInfo)>;
+
 /// Mac archives and disk images, expanded the way the rest of the app opens them.
-pub struct AppExpander;
+#[derive(Default)]
+pub struct AppExpander {
+    /// The last image `image_has_volumes` probed, kept for the `import_image` that follows.
+    probed: RefCell<Option<(PathBuf, Volumes)>>,
+}
+
+impl AppExpander {
+    /// The image's volumes: the ones `image_has_volumes` just probed, else a fresh probe.
+    fn volumes(&self, path: &Path) -> Volumes {
+        match self.probed.borrow_mut().take() {
+            Some((p, vols)) if p == path => vols,
+            _ => super::image_import::volumes(path),
+        }
+    }
+}
 
 impl Expander for AppExpander {
     fn is_mac_archive(&self, path: &Path) -> bool {
@@ -56,7 +73,10 @@ impl Expander for AppExpander {
     }
 
     fn image_has_volumes(&self, path: &Path) -> bool {
-        !super::image_import::volumes(path).is_empty()
+        let vols = super::image_import::volumes(path);
+        let any = !vols.is_empty();
+        *self.probed.borrow_mut() = Some((path.to_path_buf(), vols));
+        any
     }
 
     fn measure_image(&self, path: &Path) -> Result<Option<(u64, u64, u64)>> {
@@ -72,17 +92,24 @@ impl Expander for AppExpander {
         opts: &ImportOptions,
         progress: &dyn Fn(&ImportStats),
     ) -> Result<ImportStats> {
-        let vols = super::image_import::volumes(path);
+        let vols = self.volumes(path);
         super::image_import::import_image_into(efs, sink, comps, path, &vols, opts, progress)
     }
 }
 
-/// A progress callback as a [`Host`] that never cancels.
-struct ProgressHost<'a>(&'a dyn Fn(&ImportStats));
+/// A progress callback and a cancel check as a [`Host`].
+struct ProgressHost<'a> {
+    progress: &'a dyn Fn(&ImportStats),
+    cancel: &'a dyn Fn() -> bool,
+}
 
 impl Host for ProgressHost<'_> {
+    fn cancelled(&self) -> bool {
+        (self.cancel)()
+    }
+
     fn progress(&self, stats: &ImportStats) {
-        (self.0)(stats)
+        (self.progress)(stats)
     }
 }
 
@@ -94,13 +121,25 @@ pub fn import_dir(
     opts: &DirImportOptions,
     progress: &dyn Fn(&ImportStats),
 ) -> Result<ImportStats> {
+    import_dir_cancellable(efs, dest, root, opts, progress, &|| false)
+}
+
+/// [`import_dir`] that stops between entries once `cancel` says so, with a [`Cancelled`] error.
+pub fn import_dir_cancellable(
+    efs: &mut dyn EditableFilesystem,
+    dest: &FileEntry,
+    root: &Path,
+    opts: &DirImportOptions,
+    progress: &dyn Fn(&ImportStats),
+    cancel: &dyn Fn() -> bool,
+) -> Result<ImportStats> {
     rb_fsimporter::import_dir_with(
         efs,
         dest,
         root,
         opts,
-        Some(&AppExpander),
-        &ProgressHost(progress),
+        Some(&AppExpander::default()),
+        &ProgressHost { progress, cancel },
     )
 }
 
@@ -109,25 +148,23 @@ pub fn preflight_dir(
     efs: &dyn EditableFilesystem,
     root: &Path,
     opts: &DirImportOptions,
-) -> Result<ImportPreflight> {
-    rb_fsimporter::preflight_dir_with(efs, root, opts, Some(&AppExpander))
+) -> Result<DirImportPreflight> {
+    rb_fsimporter::preflight_dir_with(efs, root, opts, Some(&AppExpander::default()))
 }
 
 /// `(files, dirs, bytes)` under `root`, archives measured as they unpack when `expand_archives`.
 pub fn measure_dir(root: &Path, expand_archives: bool, flatten: bool) -> Result<(u64, u64, u64)> {
-    measure_dir_for(
+    rb_fsimporter::measure_dir(
         root,
-        &DirImportOptions {
-            expand_archives,
-            flatten_archives: flatten,
-            ..Default::default()
-        },
+        expand_archives,
+        flatten,
+        Some(&AppExpander::default()),
     )
 }
 
 /// [`measure_dir`] driven by the import options themselves.
 pub fn measure_dir_for(root: &Path, opts: &DirImportOptions) -> Result<(u64, u64, u64)> {
-    rb_fsimporter::measure_dir_with(root, opts, Some(&AppExpander))
+    rb_fsimporter::measure_dir_with(root, opts, Some(&AppExpander::default()))
 }
 
 #[cfg(test)]
@@ -394,5 +431,25 @@ mod tests {
         assert_eq!(out, b"from the floppy");
         let (files, _, _) = measure_dir_for(tmp.path(), &opts(false, true)).unwrap();
         assert_eq!(files, 2, "the floppy's file plus junk.img");
+    }
+
+    /// The cancel-aware entry stops before the first entry and says it was cancelled.
+    #[test]
+    fn a_cancelled_import_stops_with_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"a").unwrap();
+        let mut efs = blank_next_ufs();
+        let root = efs.root().unwrap();
+        let err = import_dir_cancellable(
+            &mut *efs,
+            &root,
+            tmp.path(),
+            &opts(false, false),
+            &|_| {},
+            &|| true,
+        )
+        .unwrap_err();
+        assert!(err.downcast_ref::<Cancelled>().is_some(), "{err:#}");
+        assert_eq!(names(&mut *efs, &[]), Vec::<String>::new());
     }
 }

@@ -8,7 +8,9 @@
 //!   what the IRIS emulator's SCSI disk reports.
 //! - [`read_volume_header`], [`filesystem_partitions`], [`open_partition`] /
 //!   [`open_partition_editable`]: find and open EFS or XFS partitions over any
-//!   `Read + Seek (+ Write) + Send` reader.
+//!   `Read + Seek (+ Write) + Send` reader, refusing one larger than its partition.
+//! - [`build_header`]: a volume header from explicit partitions; [`disk_bytes_for_root`]:
+//!   the disk size a host tree needs; [`SgiFit`]: round to cylinders up or within a target.
 //!
 //! Errors are `anyhow::Error`, as the builder has always returned.
 
@@ -19,10 +21,10 @@ pub mod build;
 pub mod open;
 
 pub use build::{
-    build_sgi_disk, build_sgi_efs_hdd, build_volume_header, compute_sgi_layout, write_sgi_disk,
-    write_sgi_efs_hdd, SgiHddLayout, SgiHddOptions, SgiMedia, SgiPartitionLayout, SgiRootFs,
-    CDROM_HEADS, CDROM_SECTORS_PER_TRACK, DEFAULT_HEADS, DEFAULT_SECTORS_PER_TRACK,
-    DEFAULT_SWAP_BYTES,
+    build_header, build_sgi_disk, build_volume_header, compute_sgi_layout, disk_bytes_for_root,
+    write_sgi_disk, SgiFit, SgiHddLayout, SgiHddOptions, SgiHeaderSpec, SgiMedia,
+    SgiPartitionLayout, SgiRootFs, SgiSlot, CDROM_HEADS, CDROM_SECTORS_PER_TRACK, DEFAULT_HEADS,
+    DEFAULT_SECTORS_PER_TRACK, DEFAULT_SWAP_BYTES,
 };
 pub use open::{
     filesystem_partitions, open_kind, open_kind_editable, open_partition, open_partition_editable,

@@ -129,3 +129,43 @@ fn sgi_efs_cdrom_create_put_get_roundtrip() {
         "EFS CD round-trip is byte-identical"
     );
 }
+
+/// `--size auto` with `--swap` and `--fs xfs` sizes past the swap and the XFS log, so the
+/// import that follows lands in full (it once failed DiskFull with the swap carved out).
+#[test]
+fn sgi_hdd_auto_size_with_swap_and_xfs_takes_the_tree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = dir.path().join("tree");
+    for d in 0..4 {
+        let sub = tree.join(format!("d{d}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        for f in 0..12 {
+            std::fs::write(
+                sub.join(format!("f{f}.bin")),
+                vec![d as u8 ^ f as u8; 1 << 20],
+            )
+            .unwrap();
+        }
+    }
+    let img = dir.path().join("sys.img");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new",
+        "hd",
+        "sgi-efs",
+        img_s,
+        "--size",
+        "auto",
+        "--from-dir",
+        tree.to_str().unwrap(),
+        "--swap",
+        "64M",
+        "--fs",
+        "xfs",
+    ]);
+    let ls = run(&["ls", &format!("{img_s}@1"), "/d3"]);
+    assert!(
+        String::from_utf8_lossy(&ls.stdout).contains("f11.bin"),
+        "the last file landed"
+    );
+}

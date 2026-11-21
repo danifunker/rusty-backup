@@ -1006,12 +1006,8 @@ impl App {
                 ),
                 Row::SgiLabel => ("EFS label".into(), c.preset().sgi_label.clone()),
                 Row::SgiFormat => (
-                    "Format".into(),
-                    if c.preset().sgi_label_only {
-                        "< Volume header only >".into()
-                    } else {
-                        "< Volume header and EFS >".into()
-                    },
+                    labels::SGI_FORMAT.into(),
+                    format!("< {} >", labels::sgi_format(c.preset().sgi_label_only)),
                 ),
                 Row::CdLayout => (
                     labels::CD_LAYOUT.into(),

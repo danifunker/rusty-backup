@@ -6,6 +6,11 @@
 //! `Write` to edit), so a block device, a file or an in-memory image all do. The
 //! partition's `first` / `blocks` count 512-byte sectors.
 //!
+//! Every opener takes the partition's length and refuses a filesystem that
+//! declares more (EFS: `fs_size` and the replica superblock; XFS: `dblocks`
+//! blocks), read-only too: a corrupt label or a label-only relabel over an old,
+//! larger volume would otherwise be read, or edited, past the partition end.
+//!
 //! The rule that picks the filesystem lives in [`SgiFsKind::of`]: EFS for type 7
 //! and for SYSV (5), which IRIX uses for EFS CD-ROMs; XFS for type 10. Every other
 //! type (volume header, whole-volume, swap / raw, XFS log, XLV, XVM, ...) holds no
@@ -15,7 +20,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use anyhow::{anyhow, bail, Context, Result};
 use disk_core::filesystem::{EditableFilesystem, Filesystem};
-use fs_unix::efs::EfsFilesystem;
+use fs_unix::efs::{EfsFilesystem, EfsSuperblock};
 use part_tables::sgi::{SgiPartitionType, SgiVolumeHeader, SGI_VOLHDR_MAGIC};
 
 const SECTOR_SIZE: u64 = 512;
@@ -28,6 +33,14 @@ pub enum SgiFsKind {
 }
 
 impl SgiFsKind {
+    /// "EFS" or "XFS".
+    pub fn name(self) -> &'static str {
+        match self {
+            SgiFsKind::Efs => "EFS",
+            SgiFsKind::Xfs => "XFS",
+        }
+    }
+
     /// EFS for type 7 and SYSV (EFS CD-ROMs), XFS for type 10, `None` otherwise.
     pub fn of(ptype: SgiPartitionType) -> Option<Self> {
         if ptype.is_efs() {
@@ -109,28 +122,37 @@ pub fn partition(header: &SgiVolumeHeader, index: usize) -> Result<SgiPartition>
         })
 }
 
-/// Open the filesystem at `offset` read-only (EFS CD-ROMs, write-protected images).
+/// Open the filesystem at `offset` read-only (EFS CD-ROMs, write-protected images); `len` is
+/// the partition's length in bytes, and a filesystem that declares more is refused.
 pub fn open_kind<'a, R: Read + Seek + Send + 'a>(
     kind: SgiFsKind,
-    reader: R,
+    mut reader: R,
     offset: u64,
+    len: u64,
 ) -> Result<Box<dyn Filesystem + 'a>> {
-    match kind {
-        SgiFsKind::Efs => Ok(Box::new(EfsFilesystem::open(reader, offset)?)),
-        SgiFsKind::Xfs => open_xfs(reader, offset),
-    }
+    let floor = efs_replica_end(kind, &mut reader, offset)?;
+    let fs: Box<dyn Filesystem + 'a> = match kind {
+        SgiFsKind::Efs => Box::new(EfsFilesystem::open(reader, offset)?),
+        SgiFsKind::Xfs => open_xfs(reader, offset)?,
+    };
+    ensure_fits(kind, fs.total_size().max(floor), len)?;
+    Ok(fs)
 }
 
-/// Open the filesystem at `offset` for editing.
+/// Open the filesystem at `offset` for editing; `len` bounds it as in [`open_kind`].
 pub fn open_kind_editable<'a, R: Read + Write + Seek + Send + 'a>(
     kind: SgiFsKind,
-    reader: R,
+    mut reader: R,
     offset: u64,
+    len: u64,
 ) -> Result<Box<dyn EditableFilesystem + 'a>> {
-    match kind {
-        SgiFsKind::Efs => Ok(Box::new(EfsFilesystem::open(reader, offset)?)),
-        SgiFsKind::Xfs => open_xfs_editable(reader, offset),
-    }
+    let floor = efs_replica_end(kind, &mut reader, offset)?;
+    let fs: Box<dyn EditableFilesystem + 'a> = match kind {
+        SgiFsKind::Efs => Box::new(EfsFilesystem::open(reader, offset)?),
+        SgiFsKind::Xfs => open_xfs_editable(reader, offset)?,
+    };
+    ensure_fits(kind, fs.total_size().max(floor), len)?;
+    Ok(fs)
 }
 
 /// Read the volume header from `reader` and open partition `index` read-only.
@@ -139,7 +161,7 @@ pub fn open_partition<'a, R: Read + Seek + Send + 'a>(
     index: usize,
 ) -> Result<Box<dyn Filesystem + 'a>> {
     let p = partition(&read_volume_header(&mut reader)?, index)?;
-    open_kind(p.kind, reader, p.offset)
+    open_kind(p.kind, reader, p.offset, p.len)
 }
 
 /// Read the volume header from `reader` and open partition `index` for editing.
@@ -148,7 +170,37 @@ pub fn open_partition_editable<'a, R: Read + Write + Seek + Send + 'a>(
     index: usize,
 ) -> Result<Box<dyn EditableFilesystem + 'a>> {
     let p = partition(&read_volume_header(&mut reader)?, index)?;
-    open_kind_editable(p.kind, reader, p.offset)
+    open_kind_editable(p.kind, reader, p.offset, p.len)
+}
+
+/// Refuse a filesystem larger than its partition: an edit would write past the partition end.
+fn ensure_fits(kind: SgiFsKind, declared: u64, len: u64) -> Result<()> {
+    if declared > len {
+        bail!(
+            "the {} filesystem declares {declared} bytes but its partition holds {len}: the label \
+             and the filesystem disagree, so it is not opened",
+            kind.name()
+        );
+    }
+    Ok(())
+}
+
+/// End of an EFS volume's replica superblock, which `fs_size` does not cover; 0 for XFS.
+fn efs_replica_end<R: Read + Seek>(kind: SgiFsKind, reader: &mut R, offset: u64) -> Result<u64> {
+    if kind != SgiFsKind::Efs {
+        return Ok(0);
+    }
+    let mut sector = [0u8; SECTOR_SIZE as usize];
+    reader.seek(SeekFrom::Start(offset + SECTOR_SIZE))?;
+    reader
+        .read_exact(&mut sector)
+        .context("reading the EFS superblock")?;
+    let sb = EfsSuperblock::parse(&sector)?;
+    Ok(if sb.replsb == 0 {
+        0
+    } else {
+        (u64::from(sb.replsb) + 1) * SECTOR_SIZE
+    })
 }
 
 #[cfg(feature = "xfs")]
@@ -178,4 +230,40 @@ fn open_xfs_editable<'a, R: Read + Write + Seek + Send + 'a>(
     _: u64,
 ) -> Result<Box<dyn EditableFilesystem + 'a>> {
     bail!("this build of sgi-disk has no XFS support (feature `xfs`)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build::{build_sgi_disk, SgiHddOptions};
+    use std::io::Cursor;
+
+    /// A 16 MiB EFS disk whose label is shrunk to 2 cylinders: the volume overruns its slot.
+    #[test]
+    fn a_filesystem_larger_than_its_partition_is_refused() {
+        let (mut img, layout) =
+            build_sgi_disk(&SgiHddOptions::new(16 * 1024 * 1024, "BIG")).unwrap();
+        let mut vh = SgiVolumeHeader::parse(&img[..512]).unwrap();
+        vh.partitions[0].blocks = 2 * layout.cylinder_sectors as u32;
+        img[..512].copy_from_slice(&vh.to_bytes());
+        let before = img.clone();
+
+        let err = open_partition_editable(Cursor::new(&mut img[..]), 0)
+            .err()
+            .expect("an overrunning volume is refused")
+            .to_string();
+        assert!(err.contains("declares"), "{err}");
+        assert!(open_partition(Cursor::new(&img[..]), 0).is_err());
+        let end = (vh.partitions[0].first as usize + vh.partitions[0].blocks as usize) * 512;
+        assert_eq!(
+            &img[end..],
+            &before[end..],
+            "nothing past the partition changed"
+        );
+        assert_eq!(img, before);
+
+        // The same disk with its true label opens.
+        let (good, _) = build_sgi_disk(&SgiHddOptions::new(16 * 1024 * 1024, "BIG")).unwrap();
+        assert!(open_partition(Cursor::new(good), 0).is_ok());
+    }
 }

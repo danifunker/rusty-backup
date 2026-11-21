@@ -16,8 +16,7 @@
 //! belong to the Track B edit work, which needs the §3 write primitives that
 //! repair does not. They return `Unsupported` so the GUI/CLI can gate them.
 //!
-//! Behavioural reference: `xfs_repair` @ v3.1.11, validated against `xfs_repair -n`; `repair/agheader.c`
-//! (`secondary_sb_whack`) under `~/efs-xfs-refs/xfsprogs/`.
+//! Behavioural reference: `xfs_repair`, validated against `xfs_repair -n`.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 

@@ -683,34 +683,23 @@ fn write_apm<W: Write + Seek>(out: &mut W, placed: &[Placed], disk_size: u64) ->
     Ok(())
 }
 
-/// SGI volume header: data partitions in the low slots, the volume-header
-/// region in slot 8 and the whole-disk entry in slot 10, as IRIX expects.
+/// SGI volume header through `sgi_disk`: data partitions in the low slots, VOLHDR in 8 and the
+/// whole disk in 10; cylinders round down and slot 1 is always named as swap.
 fn write_sgi<W: Write + Seek>(
     out: &mut W,
     placed: &[Placed],
     disk_size: u64,
     geometry: Geometry,
 ) -> Result<()> {
-    use part_tables::sgi::{
-        SgiPartitionEntry, SgiPartitionType, SgiVolumeDirEntry, SgiVolumeHeader,
-        SGI_NUM_PARTITIONS, SGI_NUM_VOL_DIR, SGI_VOLHDR_MAGIC,
-    };
+    use part_tables::sgi::SGI_NUM_PARTITIONS;
+    use sgi_disk::build::{build_header, SgiHeaderSpec, SgiSlot};
 
     let cyl_sectors = u64::from(geometry.heads) * u64::from(geometry.sectors_per_track);
     if cyl_sectors == 0 {
         bail!("heads and sectors-per-track must both be non-zero");
     }
     let total_sectors = disk_size / SECTOR;
-    let volhdr_sectors = reserved_head(TableKind::Sgi, geometry).div_ceil(SECTOR);
-
-    let mut partitions: Vec<SgiPartitionEntry> = (0..SGI_NUM_PARTITIONS)
-        .map(|_| SgiPartitionEntry {
-            blocks: 0,
-            first: 0,
-            partition_type_raw: SgiPartitionType::VolHdr.as_u32(),
-        })
-        .collect();
-
+    let mut partitions = Vec::with_capacity(placed.len());
     let mut slot = 0usize;
     for p in placed {
         // Slots 8 and 10 are spoken for by the volume header and whole volume.
@@ -720,47 +709,27 @@ fn write_sgi<W: Write + Seek>(
         if slot >= SGI_NUM_PARTITIONS {
             bail!("ran out of SGI partition slots");
         }
-        partitions[slot] = SgiPartitionEntry {
-            blocks: (p.size_bytes / SECTOR) as u32,
-            first: p.start_lba as u32,
-            partition_type_raw: sgi_type_raw(&p.type_text),
-        };
+        partitions.push(SgiSlot {
+            index: slot,
+            first_sector: p.start_lba,
+            sectors: p.size_bytes / SECTOR,
+            type_raw: sgi_type_raw(&p.type_text),
+        });
         slot += 1;
     }
-    partitions[8] = SgiPartitionEntry {
-        blocks: volhdr_sectors as u32,
-        first: 0,
-        partition_type_raw: SgiPartitionType::VolHdr.as_u32(),
-    };
-    partitions[10] = SgiPartitionEntry {
-        blocks: total_sectors as u32,
-        first: 0,
-        partition_type_raw: SgiPartitionType::Volume.as_u32(),
-    };
-
-    let vh = SgiVolumeHeader {
-        magic: SGI_VOLHDR_MAGIC,
+    let header = build_header(&SgiHeaderSpec {
+        disk_sectors: total_sectors,
+        volhdr_sectors: reserved_head(TableKind::Sgi, geometry).div_ceil(SECTOR),
+        cylinders: u32::try_from(total_sectors / cyl_sectors)
+            .context("too many cylinders for an SGI volume header")?,
+        heads: geometry.heads,
+        sectors_per_track: geometry.sectors_per_track,
         root_part_num: 0,
         swap_part_num: 1,
-        device_parameters: part_tables::sgi::SgiDeviceParameters::for_geometry(
-            (total_sectors / cyl_sectors) as u32,
-            geometry.heads,
-            geometry.sectors_per_track,
-        ),
-        bootfile: "/unix".to_string(),
-        volume_directory: (0..SGI_NUM_VOL_DIR)
-            .map(|_| SgiVolumeDirEntry {
-                name: String::new(),
-                block_num: 0,
-                bytes: 0,
-            })
-            .collect(),
         partitions,
-        checksum: 0,
-        checksum_valid: true,
-    };
+    })?;
     out.seek(SeekFrom::Start(0))?;
-    out.write_all(&vh.to_bytes())
+    out.write_all(&header)
         .context("writing the SGI volume header")?;
     Ok(())
 }

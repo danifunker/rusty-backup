@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
+use rusty_backup::controller::build_disk::labels as build_labels;
 use rusty_backup::controller::build_disk::{
     format_size, hints, ids, BuildDiskAction, BuildDiskController, CdLayout, CdOption, CdOptionRow,
     CdSidecars, CdView, DiskKind, FsChoice, PresetKind, PresetView, TableKind, CD_AUTO_SIZE,
@@ -18,7 +19,6 @@ use crate::form::{
 use crate::widgets::set_text;
 
 const CONTROLLERS: [&str; 2] = ["SASI (256-byte sectors)", "SCSI (1024-byte sectors)"];
-const SGI_FORMATS: [&str; 2] = ["Volume header and EFS", "Volume header only"];
 
 /// What the step shows.
 pub struct DiskShown {
@@ -138,7 +138,11 @@ impl PresetRows {
         label.connect_changed(move |_| apply());
         root.add(&label);
 
-        let sgi_format = combo("Format", ids::SGI_FORMAT, &SGI_FORMATS);
+        let sgi_format = combo(
+            build_labels::SGI_FORMAT,
+            ids::SGI_FORMAT,
+            &build_labels::SGI_FORMATS,
+        );
         let picked = sgi_format.clone();
         let apply = edit(Rc::new(move |p| p.sgi_label_only = picked.selected() == 1));
         sgi_format.connect_selected_notify(move |_| apply());

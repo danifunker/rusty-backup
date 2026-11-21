@@ -309,6 +309,18 @@ pub fn fill(
     dir: &Path,
     progress: &dyn Fn(&ImportStats),
 ) -> Result<ImportStats> {
+    fill_cancellable(path, req, fs_offset, dir, progress, &|| false)
+}
+
+/// [`fill`] that stops between entries once `cancel` says so.
+pub fn fill_cancellable(
+    path: &Path,
+    req: &CdRequest,
+    fs_offset: u64,
+    dir: &Path,
+    progress: &dyn Fn(&ImportStats),
+    cancel: &dyn Fn() -> bool,
+) -> Result<ImportStats> {
     if !dir.is_dir() {
         anyhow::bail!("not a folder: {}", dir.display());
     }
@@ -324,19 +336,23 @@ pub fn fill(
         .root()
         .map_err(|e| anyhow::anyhow!("resolving the volume root: {e}"))?;
     let opts = import_options(req.layout, &req.import);
-    let stats = crate::fs::dir_import::import_dir(&mut *fs, &root, dir, &opts, progress)
-        .map_err(|e| anyhow::anyhow!("importing {}: {e}", dir.display()))?;
+    let stats = crate::fs::dir_import::import_dir_cancellable(
+        &mut *fs, &root, dir, &opts, progress, cancel,
+    )
+    .map_err(|e| anyhow::anyhow!("importing {}: {e}", dir.display()))?;
     fs.sync_metadata()
         .map_err(|e| anyhow::anyhow!("writing the volume's metadata: {e}"))?;
     Ok(stats)
 }
 
-/// Master `req` into `path`: size it, lay the blank disc, then fill it from its folder.
+/// Master `req` into `path`: size it, lay the blank disc, then fill it from its folder,
+/// stopping between entries once `cancel` says so.
 pub fn build_cd(
     path: &Path,
     req: &CdRequest,
     log: &mut dyn FnMut(&str),
     progress: &dyn Fn(&ImportStats),
+    cancel: &dyn Fn() -> bool,
 ) -> Result<CdWritten> {
     if req.name.len() > req.layout.name_limit() {
         log(&format!(
@@ -365,7 +381,7 @@ pub fn build_cd(
         log("Info: larger than a 700 MB CD-R - fine for an emulator, too big to burn");
     }
     if let Some(dir) = &req.from_dir {
-        let stats = fill(path, req, written.fs_offset, dir, progress)?;
+        let stats = fill_cancellable(path, req, written.fs_offset, dir, progress, cancel)?;
         log(&format!(
             "Copied {}: {} files, {} folders, {} bytes",
             dir.display(),
@@ -400,7 +416,7 @@ mod tests {
             let mut req = CdRequest::new(layout);
             req.size = None;
             req.from_dir = Some(src.clone());
-            let written = build_cd(&out, &req, &mut |_| {}, &|_| {})
+            let written = build_cd(&out, &req, &mut |_| {}, &|_| {}, &|| false)
                 .unwrap_or_else(|e| panic!("{layout:?}: {e:#}"));
             let file = std::fs::File::open(&out).unwrap();
             let mut fs = crate::fs::open_filesystem(file, written.fs_offset, 0, None)
@@ -437,7 +453,7 @@ mod tests {
             req.size = None;
             req.from_dir = Some(src.clone());
             req.import.ignore_appledouble = leave_out;
-            let written = build_cd(&out, &req, &mut |_| {}, &|_| {}).unwrap();
+            let written = build_cd(&out, &req, &mut |_| {}, &|_| {}, &|| false).unwrap();
             let file = std::fs::File::open(&out).unwrap();
             let mut fs = crate::fs::open_filesystem(file, written.fs_offset, 0, None).unwrap();
             let root = fs.root().unwrap();
@@ -456,7 +472,7 @@ mod tests {
         let out = dir.path().join("x.iso");
         let mut req = CdRequest::new(CdLayout::MacHfs);
         req.size = None;
-        assert!(build_cd(&out, &req, &mut |_| {}, &|_| {}).is_err());
+        assert!(build_cd(&out, &req, &mut |_| {}, &|_| {}, &|| false).is_err());
         assert!(!out.exists());
     }
 }

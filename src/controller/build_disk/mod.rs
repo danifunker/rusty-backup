@@ -227,6 +227,14 @@ pub mod labels {
     pub const CD_AUTO_SIZE: &str = "Size to the folder";
     pub const CD_FOLDER: &str = "Choose Folder...";
     pub const DONE: &str = "Disk build complete.";
+    pub const SGI_FORMAT: &str = "Format";
+    /// The SGI preset's Format choices, indexed by `sgi_label_only as usize`.
+    pub const SGI_FORMATS: [&str; 2] = ["Volume header and EFS", "Volume header only"];
+
+    /// The SGI Format choice `label_only` selects.
+    pub fn sgi_format(label_only: bool) -> &'static str {
+        SGI_FORMATS[usize::from(label_only)]
+    }
     /// Id to label, with `<task>.done` naming the outcome message, for drivers that find by label.
     pub const TABLE: &[(&str, &str)] = &[
         (ids::KIND, KIND),
@@ -1307,11 +1315,12 @@ impl BuildDiskController {
                     .then(|| "An X68000 disk needs at least 4 MiB.".to_string())
             }
             PresetKind::SgiEfs => {
-                let mut opts = crate::partition::sgi_hdd_builder::SgiHddOptions::new(
+                let opts = crate::model::provision_runner::sgi_preset_options(
                     size,
                     p.sgi_label.as_str(),
+                    p.sgi_label_only,
+                    self.output_is_device,
                 );
-                opts.format_root = !p.sgi_label_only;
                 crate::partition::sgi_hdd_builder::compute_sgi_layout(&opts)
                     .err()
                     .map(|e| format!("{e:#}"))
@@ -1853,6 +1862,7 @@ impl BuildDiskController {
                         },
                         _ => return,
                     },
+                    on_device: self.output_is_device,
                 }
             }
             DiskKind::Volume => crate::model::provision_runner::BuildRequest::Volume {

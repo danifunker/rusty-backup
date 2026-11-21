@@ -228,3 +228,5 @@ crates/dsk-imz/*	case:imz
 crates/dsk-tape/*	case:sun-tape,tape
 crates/dsk-vm/*	case:vmdk,vhd,qcow,backup.container
 crates/rb-fsexporter/*	case:export
+crates/rb-fsimporter/*	case:import,flow.build,optical.new
+crates/sgi-disk/*	case:sgi,efs,xfs,irix

@@ -39,15 +39,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 
 use disk_core::attrs::AttrOverrides;
-use disk_core::entry::FileEntry;
-use disk_core::filesystem::EditableFilesystem;
-use fs_tar::import_sink::{
-    is_appledouble, ImportItem, ImportOptions, ImportPreflight, ImportStats, Importer,
-};
+use fs_tar::import_sink::{is_appledouble, ImportItem, ImportPreflight};
 
 pub use fs_tar::import_sink::{
-    ImportConflict, ImportPreflight as DirImportPreflight, ImportStats as DirImportStats,
+    ImportConflict, ImportOptions, ImportPreflight as DirImportPreflight,
+    ImportStats as DirImportStats, Importer,
 };
+// What an `Expander` implementer is handed, so it needs no direct fs-tar or disk-core dependency.
+pub use disk_core::entry::FileEntry;
+pub use disk_core::filesystem::EditableFilesystem;
+pub use fs_tar::import_sink::ImportStats;
 
 /// What a GUI (or any caller) supplies to watch and stop an import.
 pub trait Host {
@@ -75,7 +76,13 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-/// Expansion this crate leaves to its caller: Mac archives and disk images.
+/// The error an [`Expander`] method returns when the caller did not implement it.
+fn unsupported(what: &str, path: &Path) -> anyhow::Error {
+    anyhow!("{}: this importer cannot expand {what}", path.display())
+}
+
+/// Expansion this crate leaves to its caller: Mac archives and disk images. Every method has a
+/// default (no detection, an "unsupported" error), so a caller implements only what it handles.
 pub trait Expander {
     /// A Mac archive (StuffIt, Compact Pro, BinHex, ...) the caller can expand.
     fn is_mac_archive(&self, _path: &Path) -> bool {
@@ -86,34 +93,45 @@ pub trait Expander {
         false
     }
     /// `(files, dirs, bytes)` a Mac archive expands to.
-    fn measure_mac_archive(&self, path: &Path) -> Result<(u64, u64, u64)>;
+    fn measure_mac_archive(&self, path: &Path) -> Result<(u64, u64, u64)> {
+        Err(unsupported("Mac archives", path))
+    }
     /// Expand a Mac archive into `dest`.
     fn import_mac_archive(
         &self,
-        efs: &mut dyn EditableFilesystem,
-        dest: &FileEntry,
+        _efs: &mut dyn EditableFilesystem,
+        _dest: &FileEntry,
         path: &Path,
-        opts: &ImportOptions,
-        progress: &dyn Fn(&ImportStats),
-    ) -> Result<ImportStats>;
+        _opts: &ImportOptions,
+        _progress: &dyn Fn(&ImportStats),
+    ) -> Result<ImportStats> {
+        Err(unsupported("Mac archives", path))
+    }
     /// A disk image the caller can open (`.dsk`, `.img`, DiskCopy, `.dmg`, ...).
     fn is_disk_image(&self, _path: &Path) -> bool {
         false
     }
-    /// Whether the image holds a browsable volume; one that does not is copied as a file.
-    fn image_has_volumes(&self, path: &Path) -> bool;
+    /// Whether the image holds a browsable volume (one that does not is copied as a file); asked
+    /// right before [`import_image`](Self::import_image), which may reuse what this probed.
+    fn image_has_volumes(&self, _path: &Path) -> bool {
+        false
+    }
     /// `(files, dirs, bytes)` the image's volumes expand to; `None` with no volume.
-    fn measure_image(&self, path: &Path) -> Result<Option<(u64, u64, u64)>>;
+    fn measure_image(&self, path: &Path) -> Result<Option<(u64, u64, u64)>> {
+        Err(unsupported("disk images", path))
+    }
     /// Copy the image's volumes into the folder at `comps` (created by `sink`).
     fn import_image(
         &self,
-        efs: &mut dyn EditableFilesystem,
-        sink: &mut Importer,
-        comps: &[String],
+        _efs: &mut dyn EditableFilesystem,
+        _sink: &mut Importer,
+        _comps: &[String],
         path: &Path,
-        opts: &ImportOptions,
-        progress: &dyn Fn(&ImportStats),
-    ) -> Result<ImportStats>;
+        _opts: &ImportOptions,
+        _progress: &dyn Fn(&ImportStats),
+    ) -> Result<ImportStats> {
+        Err(unsupported("disk images", path))
+    }
 }
 
 /// Mac fork rejoining, present only with the `mac` feature.
@@ -893,14 +911,22 @@ pub fn preflight_dir_with(
 /// per-archive directory from the count. It does not try to predict how many
 /// entries several archives share once merged, so a flattened estimate errs
 /// high — the safe direction for sizing.
-pub fn measure_dir(root: &Path, expand_archives: bool, flatten: bool) -> Result<(u64, u64, u64)> {
-    measure_dir_for(
+///
+/// `x` measures Mac archives and disk images, as in [`measure_dir_with`].
+pub fn measure_dir(
+    root: &Path,
+    expand_archives: bool,
+    flatten: bool,
+    x: Option<&dyn Expander>,
+) -> Result<(u64, u64, u64)> {
+    measure_dir_with(
         root,
         &DirImportOptions {
             expand_archives,
             flatten_archives: flatten,
             ..Default::default()
         },
+        x,
     )
 }
 
@@ -1128,7 +1154,7 @@ mod tests {
         }
         drop(f);
 
-        let (files, _, bytes) = measure_dir(tmp.path(), true, false).unwrap();
+        let (files, _, bytes) = measure_dir(tmp.path(), true, false, None).unwrap();
         assert_eq!((files, bytes), (2, 300_006));
 
         let img = blank_fat();
@@ -1314,7 +1340,7 @@ mod tests {
     fn expand_gunzip_measures_the_decompressed_size() {
         let tmp = tempfile::tempdir().unwrap();
         write_gz(&tmp.path().join("big.bin.gz"), &vec![0u8; 1 << 20]);
-        let (_, _, packed) = measure_dir(tmp.path(), false, false).unwrap();
+        let (_, _, packed) = measure_dir(tmp.path(), false, false, None).unwrap();
         let opts = DirImportOptions {
             expand_gunzip: true,
             ..Default::default()
@@ -1451,8 +1477,8 @@ mod tests {
             &[("blob", &vec![0u8; 200_000])],
         );
 
-        let (_, _, packed) = measure_dir(tmp.path(), false, false).unwrap();
-        let (_, _, expanded) = measure_dir(tmp.path(), true, false).unwrap();
+        let (_, _, packed) = measure_dir(tmp.path(), false, false, None).unwrap();
+        let (_, _, expanded) = measure_dir(tmp.path(), true, false, None).unwrap();
         assert!(
             expanded > packed * 4,
             "expanded ({expanded}) should dwarf the compressed size ({packed})"
@@ -1487,7 +1513,7 @@ mod tests {
     fn measure_and_projection_leave_room_for_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         tree(tmp.path());
-        let (files, dirs, bytes) = measure_dir(tmp.path(), false, false).unwrap();
+        let (files, dirs, bytes) = measure_dir(tmp.path(), false, false, None).unwrap();
         assert_eq!(files, 3);
         assert_eq!(dirs, 2);
         assert_eq!(bytes, 5010);
@@ -1495,6 +1521,19 @@ mod tests {
         let projected = projected_volume_bytes(files, dirs, bytes, 512);
         assert!(projected > bytes);
         assert_eq!(projected % (1024 * 1024), 0);
+    }
+
+    /// An expander that implements nothing still compiles, and says what it cannot do.
+    #[test]
+    fn an_empty_expander_refuses_with_an_unsupported_error() {
+        struct Nothing;
+        impl Expander for Nothing {}
+        let p = Path::new("x.sit");
+        assert!(!Nothing.is_mac_archive(p) && !Nothing.is_disk_image(p));
+        assert!(!Nothing.image_has_volumes(p));
+        let err = Nothing.measure_mac_archive(p).unwrap_err().to_string();
+        assert!(err.contains("cannot expand Mac archives"), "{err}");
+        assert!(Nothing.measure_image(p).is_err());
     }
 
     /// A host that cancels after `n` progress reports, and counts them.

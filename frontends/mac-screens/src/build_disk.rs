@@ -31,7 +31,6 @@ use super::sync::SyncGuard;
 
 const OUTPUTS: [&str; 2] = ["Image file", "Physical disk"];
 const CONTROLLERS: [&str; 2] = ["SASI (256-byte sectors)", "SCSI (1024-byte sectors)"];
-const SGI_FORMATS: [&str; 2] = ["Volume header and EFS", "Volume header only"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum K {
@@ -237,8 +236,12 @@ impl BuildScreen {
             f.button(K::SystemClear, "Clear", ids::SYSTEM_DISK_CLEAR);
             f.label(K::SgiCaption, "EFS label:");
             f.field(K::SgiLabel, ids::SGI_LABEL, "EFS label", false);
-            f.label(K::SgiFormatCaption, "Format:");
-            f.popup(K::SgiFormat, &strings(&SGI_FORMATS), ids::SGI_FORMAT);
+            f.label(K::SgiFormatCaption, &format!("{}:", labels::SGI_FORMAT));
+            f.popup(
+                K::SgiFormat,
+                &strings(&labels::SGI_FORMATS),
+                ids::SGI_FORMAT,
+            );
             let layouts: Vec<&str> = CdLayout::ALL.iter().map(|l| l.label()).collect();
             f.label(K::CdLayoutCaption, &format!("{}:", labels::CD_LAYOUT));
             f.popup(K::CdLayout, &strings(&layouts), ids::CD_LAYOUT);

@@ -68,6 +68,8 @@ const NULL_DATAPTR: u32 = 0;
 const DATA_FREE_TAG: u16 = 0xFFFF;
 /// Deepest hash tree accepted while descending; guards against loops on a corrupt tree.
 const MAX_TREE_DEPTH: usize = 16;
+/// Smallest live data entry: inumber, namelen, a one-byte name and the tag, rounded to 8.
+const MIN_DATA_ENTRY: usize = 16;
 
 /// Directory geometry (doc ch. Directories, intro and sec. Leaf Directories).
 #[derive(Clone, Copy, Debug)]
@@ -222,6 +224,9 @@ fn data_records(geo: &Geo, blk: &[u8]) -> Result<Vec<(usize, usize, bool)>, File
             return Err(corrupt(format!("record at {pos} runs past the block")));
         }
         let unused = BigEndian::read_u16(&blk[pos..pos + 2]) == DATA_FREE_TAG;
+        if !unused && pos + MIN_DATA_ENTRY > blk.len() {
+            return Err(corrupt(format!("entry at {pos} runs past the block")));
+        }
         let len = if unused {
             BigEndian::read_u16(&blk[pos + 2..pos + 4]) as usize
         } else {
@@ -243,7 +248,7 @@ fn data_get_entry(
     off: usize,
 ) -> Result<(u64, Vec<u8>, u8, usize), FilesystemError> {
     if off < geo.data_hdr()
-        || off + 8 > blk.len()
+        || off + MIN_DATA_ENTRY > blk.len()
         || BigEndian::read_u16(&blk[off..off + 2]) == DATA_FREE_TAG
     {
         return Err(corrupt(format!("no entry at data offset {off}")));
@@ -484,24 +489,44 @@ fn new_da_block(geo: &Geo, magic: u16, level: u16) -> Vec<u8> {
     blk
 }
 
+/// Start of a leaf1 block's `bests` table for `n` bests, or corrupt when they overlap the header.
+fn leaf1_bests_start(geo: &Geo, len: usize, n: usize) -> Result<usize, FilesystemError> {
+    let tail = n
+        .checked_mul(2)
+        .and_then(|t| t.checked_add(4 + geo.da_hdr()));
+    match tail {
+        Some(t) if t <= len => Ok(len - 4 - 2 * n),
+        _ => Err(corrupt(format!("leaf1 bestcount {n} overflows the block"))),
+    }
+}
+
 /// A leaf1 block's `bests` table, one per data block (sec. Leaf Directories).
-fn leaf1_bests(blk: &[u8]) -> Vec<u16> {
+fn leaf1_bests(geo: &Geo, blk: &[u8]) -> Result<Vec<u16>, FilesystemError> {
     let n = leaf1_bestcount(blk);
-    let start = blk.len() - 4 - 2 * n;
-    (0..n)
+    let start = leaf1_bests_start(geo, blk.len(), n)?;
+    Ok((0..n)
         .map(|i| BigEndian::read_u16(&blk[start + i * 2..start + i * 2 + 2]))
-        .collect()
+        .collect())
 }
 
 /// Lay out a leaf1 block: entries after the header, `bests` then `bestcount` at the end.
-fn leaf1_write(geo: &Geo, blk: &mut [u8], ents: &[(u32, u32)], bests: &[u16]) {
+fn leaf1_write(
+    geo: &Geo,
+    blk: &mut [u8],
+    ents: &[(u32, u32)],
+    bests: &[u16],
+) -> Result<(), FilesystemError> {
     let len = blk.len();
-    let start = len - 4 - 2 * bests.len();
+    let start = leaf1_bests_start(geo, len, bests.len())?;
+    if geo.da_hdr() + ents.len() * 8 > start {
+        return Err(corrupt("leaf1 entries overlap its bests table"));
+    }
     da_set_ents(geo, blk, ents, start);
     for (i, b) in bests.iter().enumerate() {
         BigEndian::write_u16(&mut blk[start + i * 2..start + i * 2 + 2], *b);
     }
     BigEndian::write_u32(&mut blk[len - 4..], bests.len() as u32);
+    Ok(())
 }
 
 // ---- freeindex blocks (ch. Directories, sec. Node Directories) ----
@@ -624,7 +649,7 @@ impl<'a, S: Dir2Store> Dir2Op<'a, S> {
         let new_best = if emptied { NULLDATAOFF } else { best };
 
         if is_leaf1_magic(da_read_hdr(&geo, &leaf).magic) {
-            let mut bests = leaf1_bests(&leaf);
+            let mut bests = leaf1_bests(&geo, &leaf)?;
             let Some(b) = bests.get_mut(db as usize) else {
                 return Err(corrupt(format!("data block {db} has no leaf1 best")));
             };
@@ -632,7 +657,7 @@ impl<'a, S: Dir2Store> Dir2Op<'a, S> {
             while bests.last() == Some(&NULLDATAOFF) {
                 bests.pop();
             }
-            leaf1_write(&geo, &mut leaf, &ents, &bests);
+            leaf1_write(&geo, &mut leaf, &ents, &bests)?;
             self.put(leaf_d, leaf);
             if emptied {
                 self.trim_size();
@@ -844,7 +869,7 @@ impl<'a, S: Dir2Store> Dir2Op<'a, S> {
         let geo = self.geo;
         let need = dir2_data_entsize(name.len(), geo.has_ftype);
         let mut ents = da_ents(&geo, &leaf);
-        let mut bests = leaf1_bests(&leaf);
+        let mut bests = leaf1_bests(&geo, &leaf)?;
         let fits = bests
             .iter()
             .position(|&b| b != NULLDATAOFF && b as usize >= need);
@@ -877,7 +902,7 @@ impl<'a, S: Dir2Store> Dir2Op<'a, S> {
             bests[db] = best;
         }
         add_leaf_entry(&mut ents, dir_hashname(name), addr);
-        leaf1_write(&geo, &mut leaf, &ents, &bests);
+        leaf1_write(&geo, &mut leaf, &ents, &bests)?;
         self.put(geo.leaf_off, leaf);
         Ok(Outcome::Done { shrink: false })
     }
@@ -1005,6 +1030,11 @@ impl<'a, S: Dir2Store> Dir2Op<'a, S> {
             (b, false)
         };
         let (firstdb, mut nvalid, mut nused) = free_read_hdr(&geo, &fb);
+        if nvalid as usize > geo.free_max_bests() || nused > nvalid {
+            return Err(corrupt(format!(
+                "freeindex block {fdb} has nvalid {nvalid}, nused {nused}"
+            )));
+        }
         if u64::from(firstdb) != fdb * max {
             return Err(corrupt(format!(
                 "freeindex block {fdb} has firstdb {firstdb}"
@@ -1066,8 +1096,8 @@ impl<'a, S: Dir2Store> Dir2Op<'a, S> {
         let h = da_read_hdr(&geo, &blk);
         if ents.len() <= leaf_capacity(&geo, &blk) {
             if is_leaf1_magic(h.magic) {
-                let bests = leaf1_bests(&blk);
-                leaf1_write(&geo, &mut blk, &ents, &bests);
+                let bests = leaf1_bests(&geo, &blk)?;
+                leaf1_write(&geo, &mut blk, &ents, &bests)?;
             } else {
                 da_set_ents(&geo, &mut blk, &ents, geo.dirblksize);
             }
@@ -1185,19 +1215,36 @@ impl<'a, S: Dir2Store> Dir2Op<'a, S> {
     /// While the root is a node with one child, copy that child into the root.
     fn collapse_root(&mut self) -> Result<(), FilesystemError> {
         let geo = self.geo;
-        loop {
+        for _ in 0..MAX_TREE_DEPTH {
             let root = self.get_tree(geo.leaf_off)?;
             let h = da_read_hdr(&geo, &root);
             if !is_node_magic(h.magic) || h.count != 1 {
                 return Ok(());
             }
             let child = u64::from(da_ents(&geo, &root)[0].1);
+            if child == geo.leaf_off || !geo.is_leaf_space(child) {
+                return Err(corrupt(format!("root's only child is block {child}")));
+            }
             let mut cb = self.get_tree(child)?;
+            let ch = da_read_hdr(&geo, &cb);
+            let level_ok = if is_node_magic(ch.magic) {
+                ch.aux.checked_add(1) == Some(h.aux)
+            } else {
+                is_leafn_magic(ch.magic) && h.aux == 1
+            };
+            if !level_ok {
+                return Err(corrupt(format!(
+                    "child {child} is out of level under the root"
+                )));
+            }
             set_forw(&mut cb, 0);
             set_back(&mut cb, 0);
             self.free(child);
             self.put(geo.leaf_off, cb);
         }
+        Err(corrupt(
+            "hash tree root collapses deeper than any valid tree",
+        ))
     }
 
     // ---- shrink checks ----
@@ -1596,5 +1643,90 @@ mod tests {
             }
         }
         assert_eq!(check(&store), model);
+    }
+
+    /// A leaf-form directory holding `.` and `..`: data block 0 and a leaf1 root.
+    fn leaf1_dir(dirblksize: usize) -> MemStore {
+        let geo = Geo::synthetic(dirblksize);
+        let built = build_leaf_data_block(&[], 128, 128, 0, dirblksize, true, true, true).unwrap();
+        let mut ents = built.leaf_index.clone();
+        ents.sort_by_key(|e| e.0);
+        let mut leaf = new_da_block(&geo, XFS_DIR3_LEAF1_MAGIC, 0);
+        leaf1_write(&geo, &mut leaf, &ents, &[built.best]).unwrap();
+        let mut blocks = BTreeMap::new();
+        blocks.insert(0, built.bytes);
+        blocks.insert(geo.leaf_off, leaf);
+        MemStore {
+            geo,
+            blocks,
+            size: dirblksize as u64,
+        }
+    }
+
+    #[test]
+    fn a_corrupt_leaf1_bestcount_is_refused() {
+        let mut store = leaf1_dir(512);
+        let leaf_off = store.geo.leaf_off;
+        let leaf = store.blocks.get_mut(&leaf_off).unwrap();
+        BigEndian::write_u32(&mut leaf[508..], 1000);
+        let mut op = Dir2Op::new(&mut store);
+        assert!(matches!(
+            op.insert(b"new.txt", 200, 1),
+            Err(FilesystemError::Parse(_))
+        ));
+        let geo = Geo::synthetic(512);
+        let mut blk = vec![0u8; 512];
+        assert!(leaf1_write(&geo, &mut blk, &[], &[0u16; 250]).is_err());
+    }
+
+    #[test]
+    fn a_live_record_in_the_last_bytes_of_a_data_block_is_refused() {
+        let geo = Geo::synthetic(512);
+        let mut blk = build_leaf_data_block(&[], 128, 128, 0, 512, true, true, true)
+            .unwrap()
+            .bytes;
+        let hdr = geo.data_hdr();
+        write_unused(&mut blk, hdr, 504 - hdr);
+        blk[504..].fill(0);
+        assert!(data_records(&geo, &blk).is_err());
+        assert!(data_get_entry(&geo, &blk, 504).is_err());
+    }
+
+    #[test]
+    fn a_corrupt_freeindex_count_is_refused() {
+        for (nvalid, nused) in [(10_000u32, 1u32), (1, 5)] {
+            let mut store = empty_node_dir(512);
+            let geo = store.geo;
+            let free = store.blocks.get_mut(&geo.free_off).unwrap();
+            free_write_hdr(&geo, free, 0, nvalid, nused);
+            let mut op = Dir2Op::new(&mut store);
+            assert!(
+                matches!(
+                    op.insert(b"new.txt", 200, 1),
+                    Err(FilesystemError::Parse(_))
+                ),
+                "nvalid {nvalid} nused {nused}"
+            );
+        }
+    }
+
+    #[test]
+    fn collapse_root_refuses_a_looping_or_misleveled_root() {
+        let mut store = empty_node_dir(512);
+        let geo = store.geo;
+        let leaf_off = geo.leaf_off;
+        let mut root = new_da_block(&geo, XFS_DA3_NODE_MAGIC, 1);
+        da_set_ents(&geo, &mut root, &[(u32::MAX, leaf_off as u32)], 512);
+        store.blocks.insert(leaf_off, root);
+        assert!(Dir2Op::new(&mut store).collapse_root().is_err());
+
+        // A level-3 root whose only child is a leaf.
+        let mut store = empty_node_dir(512);
+        let leaf = store.blocks.remove(&leaf_off).unwrap();
+        store.blocks.insert(leaf_off + 1, leaf);
+        let mut root = new_da_block(&geo, XFS_DA3_NODE_MAGIC, 3);
+        da_set_ents(&geo, &mut root, &[(u32::MAX, (leaf_off + 1) as u32)], 512);
+        store.blocks.insert(leaf_off, root);
+        assert!(Dir2Op::new(&mut store).collapse_root().is_err());
     }
 }

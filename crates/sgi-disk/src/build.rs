@@ -19,6 +19,16 @@
 //! [`SgiHddOptions::format_root`] `= false` writes the volume header only (the
 //! label-only stage): the partition table is in place, the partitions are left as
 //! they were. All geometry is big-endian; sectors are always 512 bytes.
+//!
+//! [`SgiHddOptions::fit`] says how `size_bytes` becomes whole cylinders: rounded up
+//! for an image file ([`SgiFit::RoundUp`]), or down for a fixed target such as a
+//! device or an emulator's disk ([`SgiFit::WithinSize`]), so the label never
+//! describes sectors the target does not have.
+//!
+//! [`build_header`] writes a volume header from explicit partitions (any slots,
+//! types and geometry) after checking that they fit; [`build_volume_header`] is
+//! that for a layout from [`compute_sgi_layout`]. [`disk_bytes_for_root`] sizes a
+//! disk to a host tree, for `--size auto`.
 
 use anyhow::{ensure, Result};
 use std::io::{Cursor, Seek, SeekFrom, Write};
@@ -50,6 +60,16 @@ const VOLHDR_REGION_BYTES: u64 = 2 * 1024 * 1024;
 const MIN_EFS_SECTORS: u64 = (32 * 1024) / SECTOR_SIZE;
 /// XFS minimum: two allocation groups of 4096 4-KiB blocks (`write_blank_xfs`'s floor).
 const MIN_XFS_SECTORS: u64 = (32 * 1024 * 1024) / SECTOR_SIZE;
+/// XFS geometry `write_blank_xfs` uses, for [`disk_bytes_for_root`]: 4 KiB blocks, 512-byte inodes.
+const XFS_BLOCK_BYTES: u64 = 4096;
+const XFS_INODE_BYTES: u64 = 512;
+/// The XFS log floor: 2560 blocks of 4 KiB.
+const XFS_LOG_MIN_BYTES: u64 = 2560 * XFS_BLOCK_BYTES;
+/// AG headers, btree roots, the AGFL reserve and the root inode chunk, with room to spare.
+const XFS_FIXED_OVERHEAD: u64 = 2 * 1024 * 1024;
+/// EFS inode size, and the superblock pair, reserved blocks and slack every volume spends.
+const EFS_INODE_BYTES: u64 = 128;
+const EFS_FIXED_OVERHEAD: u64 = 64 * 1024;
 /// Default swap for [`SgiPartitionLayout::RootSwap`]: 64 MiB, rounded up to whole cylinders.
 pub const DEFAULT_SWAP_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -93,6 +113,17 @@ pub enum SgiRootFs {
     Xfs,
 }
 
+/// How `size_bytes` becomes a whole number of cylinders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SgiFit {
+    /// Round up, and grow to the filesystem's minimum: an image file sized to the disk.
+    #[default]
+    RoundUp,
+    /// Round down to what fits in `size_bytes` (a device or a fixed emulator disk); refuse a
+    /// target too small for the minimum disk.
+    WithinSize,
+}
+
 /// How the hard disk is partitioned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SgiPartitionLayout {
@@ -106,7 +137,7 @@ pub enum SgiPartitionLayout {
 /// Inputs for [`write_sgi_disk`] / [`build_sgi_disk`].
 #[derive(Debug, Clone)]
 pub struct SgiHddOptions {
-    /// Requested disk size in bytes. Rounded **up** to a whole cylinder.
+    /// Requested disk size in bytes; [`fit`](Self::fit) rounds it to whole cylinders.
     pub size_bytes: u64,
     /// Filesystem volume label (EFS keeps up to 6 bytes, XFS 12).
     pub name: String,
@@ -126,6 +157,8 @@ pub struct SgiHddOptions {
     pub layout: SgiPartitionLayout,
     /// Format the root partition. `false` writes the volume header only (label only).
     pub format_root: bool,
+    /// Round the disk up (an image file, the default) or down within `size_bytes` (a device).
+    pub fit: SgiFit,
 }
 
 impl SgiHddOptions {
@@ -141,6 +174,7 @@ impl SgiHddOptions {
             root_fs: SgiRootFs::Efs,
             layout: SgiPartitionLayout::DataOnly,
             format_root: true,
+            fit: SgiFit::RoundUp,
         }
     }
 
@@ -183,6 +217,11 @@ pub struct SgiHddLayout {
 pub fn compute_sgi_layout(opts: &SgiHddOptions) -> Result<SgiHddLayout> {
     ensure!(opts.heads > 0, "heads must be > 0");
     ensure!(opts.sectors_per_track > 0, "sectors-per-track must be > 0");
+    #[cfg(not(feature = "xfs"))]
+    ensure!(
+        !(opts.format_root && opts.root_fs == SgiRootFs::Xfs),
+        "this build of sgi-disk has no XFS support (feature `xfs`)"
+    );
     if opts.media == SgiMedia::CdRom {
         ensure!(
             opts.root_fs == SgiRootFs::Efs,
@@ -219,13 +258,26 @@ pub fn compute_sgi_layout(opts: &SgiHddOptions) -> Result<SgiHddLayout> {
         (true, SgiRootFs::Xfs) => MIN_XFS_SECTORS,
     };
 
-    // Total disk rounded up to a whole cylinder, and at least big enough for
-    // the VOLHDR region, swap and a minimum root partition.
-    let requested_sectors = opts.size_bytes.div_ceil(SECTOR_SIZE);
     let min_disk_sectors = volhdr_sectors + swap_sectors + min_root_sectors;
-    let disk_cyls = requested_sectors
-        .max(min_disk_sectors)
-        .div_ceil(cylinder_sectors);
+    let disk_cyls = match opts.fit {
+        // Rounded up to a whole cylinder and floored at the VOLHDR region, swap and a minimum root.
+        SgiFit::RoundUp => opts
+            .size_bytes
+            .div_ceil(SECTOR_SIZE)
+            .max(min_disk_sectors)
+            .div_ceil(cylinder_sectors),
+        SgiFit::WithinSize => {
+            let cyls = opts.size_bytes / SECTOR_SIZE / cylinder_sectors;
+            let min_bytes = min_disk_sectors.div_ceil(cylinder_sectors) * cylinder_bytes;
+            ensure!(
+                cyls * cylinder_sectors >= min_disk_sectors,
+                "a {}-byte target holds {cyls} whole cylinder(s); this SGI disk needs at least \
+                 {min_bytes} bytes",
+                opts.size_bytes
+            );
+            cyls
+        }
+    };
     let disk_sectors = disk_cyls * cylinder_sectors;
 
     ensure!(
@@ -267,11 +319,52 @@ pub fn compute_sgi_layout(opts: &SgiHddOptions) -> Result<SgiHddLayout> {
     })
 }
 
-/// Build the 512-byte SGI volume header (sector 0) for the given layout.
-pub fn build_volume_header(
-    opts: &SgiHddOptions,
-    layout: &SgiHddLayout,
-) -> [u8; SECTOR_SIZE as usize] {
+/// One partition-table slot for [`build_header`]; `first_sector` / `sectors` are 512-byte sectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SgiSlot {
+    pub index: usize,
+    pub first_sector: u64,
+    pub sectors: u64,
+    pub type_raw: u32,
+}
+
+/// A volume header described from its parts, for [`build_header`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SgiHeaderSpec {
+    /// Slot 10 (VOLUME): the whole disk, in sectors.
+    pub disk_sectors: u64,
+    /// Slot 8 (VOLHDR) length, from sector 0.
+    pub volhdr_sectors: u64,
+    pub cylinders: u32,
+    pub heads: u16,
+    pub sectors_per_track: u16,
+    pub root_part_num: u16,
+    pub swap_part_num: u16,
+    /// Every other slot that holds a partition; slots 8 and 10 are filled from the fields above.
+    pub partitions: Vec<SgiSlot>,
+}
+
+/// Build the 512-byte SGI volume header for `spec`, refusing one that overlaps, overflows or
+/// names a slot that does not exist.
+pub fn build_header(spec: &SgiHeaderSpec) -> Result<[u8; SECTOR_SIZE as usize]> {
+    ensure!(
+        spec.heads > 0 && spec.sectors_per_track > 0,
+        "heads and sectors-per-track must both be non-zero"
+    );
+    ensure!(
+        spec.disk_sectors <= u32::MAX as u64,
+        "disk too large for an SGI volume header: {} sectors exceeds the 32-bit block range",
+        spec.disk_sectors
+    );
+    ensure!(
+        spec.cylinders <= 0x00FF_FFFF,
+        "cylinder count {} exceeds the 24-bit cylinder range",
+        spec.cylinders
+    );
+    ensure!(
+        spec.volhdr_sectors <= spec.disk_sectors,
+        "the volume header region ends past the disk"
+    );
     let mut partitions: Vec<SgiPartitionEntry> = (0..SGI_NUM_PARTITIONS)
         .map(|_| SgiPartitionEntry {
             blocks: 0,
@@ -279,36 +372,42 @@ pub fn build_volume_header(
             partition_type_raw: 0,
         })
         .collect();
-    // Hard disks put the root in slot 0 typed by its filesystem; EFS CDs put it in
-    // slot 7 typed SYSV (the IRIX EFS-CD convention, mounted `… s7`).
-    let root_type = match (opts.media, opts.root_fs) {
-        (SgiMedia::CdRom, _) => SgiPartitionType::SysV,
-        (SgiMedia::HardDisk, SgiRootFs::Efs) => SgiPartitionType::Efs,
-        (SgiMedia::HardDisk, SgiRootFs::Xfs) => SgiPartitionType::Xfs,
-    };
-    partitions[layout.root_slot] = SgiPartitionEntry {
-        blocks: layout.root_sectors as u32,
-        first: layout.root_first_sector as u32,
-        partition_type_raw: root_type.as_u32(),
-    };
-    if layout.swap_sectors > 0 {
-        partitions[SLOT_SWAP] = SgiPartitionEntry {
-            blocks: layout.swap_sectors as u32,
-            first: layout.swap_first_sector as u32,
-            partition_type_raw: SgiPartitionType::Raw.as_u32(),
+    let mut used = [false; SGI_NUM_PARTITIONS];
+    for p in &spec.partitions {
+        ensure!(
+            p.index < SGI_NUM_PARTITIONS && p.index != SLOT_VOLHDR && p.index != SLOT_VOLUME,
+            "SGI partition slot {} is not free for a partition",
+            p.index
+        );
+        ensure!(
+            !used[p.index],
+            "SGI partition slot {} is used twice",
+            p.index
+        );
+        used[p.index] = true;
+        let end = p.first_sector.checked_add(p.sectors);
+        ensure!(
+            end.is_some_and(|e| e <= spec.disk_sectors),
+            "SGI partition {} ends past the disk's {} sectors",
+            p.index,
+            spec.disk_sectors
+        );
+        partitions[p.index] = SgiPartitionEntry {
+            blocks: p.sectors as u32,
+            first: p.first_sector as u32,
+            partition_type_raw: p.type_raw,
         };
     }
     partitions[SLOT_VOLHDR] = SgiPartitionEntry {
-        blocks: layout.volhdr_sectors as u32,
+        blocks: spec.volhdr_sectors as u32,
         first: 0,
         partition_type_raw: SgiPartitionType::VolHdr.as_u32(),
     };
     partitions[SLOT_VOLUME] = SgiPartitionEntry {
-        blocks: layout.disk_sectors as u32,
+        blocks: spec.disk_sectors as u32,
         first: 0,
         partition_type_raw: SgiPartitionType::Volume.as_u32(),
     };
-
     let volume_directory: Vec<SgiVolumeDirEntry> = (0..SGI_NUM_VOL_DIR)
         .map(|_| SgiVolumeDirEntry {
             name: String::new(),
@@ -316,20 +415,14 @@ pub fn build_volume_header(
             bytes: 0,
         })
         .collect();
-
     let vh = SgiVolumeHeader {
         magic: SGI_VOLHDR_MAGIC,
-        root_part_num: layout.root_slot as u16,
-        // A data disk has no separate swap partition (0, as rb-cli always wrote); a system disk names slot 1.
-        swap_part_num: if layout.swap_sectors > 0 {
-            SLOT_SWAP as u16
-        } else {
-            0
-        },
+        root_part_num: spec.root_part_num,
+        swap_part_num: spec.swap_part_num,
         device_parameters: SgiDeviceParameters::for_geometry(
-            layout.cylinders,
-            opts.heads,
-            opts.sectors_per_track,
+            spec.cylinders,
+            spec.heads,
+            spec.sectors_per_track,
         ),
         bootfile: "/unix".to_string(),
         volume_directory,
@@ -337,7 +430,111 @@ pub fn build_volume_header(
         checksum: 0,
         checksum_valid: true,
     };
-    vh.to_bytes() // 512 bytes, checksum zero-summed
+    Ok(vh.to_bytes()) // 512 bytes, checksum zero-summed
+}
+
+/// Build the 512-byte SGI volume header (sector 0) for a layout from [`compute_sgi_layout`].
+pub fn build_volume_header(
+    opts: &SgiHddOptions,
+    layout: &SgiHddLayout,
+) -> Result<[u8; SECTOR_SIZE as usize]> {
+    ensure!(
+        layout.root_slot != SLOT_SWAP || layout.swap_sectors == 0,
+        "the root and the swap partition both claim slot {SLOT_SWAP}"
+    );
+    ensure!(
+        u64::from(layout.cylinders) * layout.cylinder_sectors == layout.disk_sectors,
+        "the layout's disk is not a whole number of its cylinders"
+    );
+    // Hard disks put the root in slot 0 typed by its filesystem; EFS CDs put it in
+    // slot 7 typed SYSV (the IRIX EFS-CD convention, mounted `... s7`).
+    let root_type = match (opts.media, opts.root_fs) {
+        (SgiMedia::CdRom, _) => SgiPartitionType::SysV,
+        (SgiMedia::HardDisk, SgiRootFs::Efs) => SgiPartitionType::Efs,
+        (SgiMedia::HardDisk, SgiRootFs::Xfs) => SgiPartitionType::Xfs,
+    };
+    let mut partitions = vec![SgiSlot {
+        index: layout.root_slot,
+        first_sector: layout.root_first_sector,
+        sectors: layout.root_sectors,
+        type_raw: root_type.as_u32(),
+    }];
+    if layout.swap_sectors > 0 {
+        partitions.push(SgiSlot {
+            index: SLOT_SWAP,
+            first_sector: layout.swap_first_sector,
+            sectors: layout.swap_sectors,
+            type_raw: SgiPartitionType::Raw.as_u32(),
+        });
+    }
+    build_header(&SgiHeaderSpec {
+        disk_sectors: layout.disk_sectors,
+        volhdr_sectors: layout.volhdr_sectors,
+        cylinders: layout.cylinders,
+        heads: opts.heads,
+        sectors_per_track: opts.sectors_per_track,
+        root_part_num: layout.root_slot as u16,
+        // A data disk has no separate swap partition (0, as rb-cli always wrote); a system disk names slot 1.
+        swap_part_num: if layout.swap_sectors > 0 {
+            SLOT_SWAP as u16
+        } else {
+            0
+        },
+        partitions,
+    })
+}
+
+/// A disk size whose root holds `files` files and `dirs` folders of `content_bytes` in all, on
+/// top of the volume header, the swap of `opts.layout` and the root filesystem's own overhead.
+pub fn disk_bytes_for_root(files: u64, dirs: u64, content_bytes: u64, opts: &SgiHddOptions) -> u64 {
+    let entries = files.saturating_add(dirs);
+    let block = match opts.root_fs {
+        SgiRootFs::Efs => SECTOR_SIZE,
+        SgiRootFs::Xfs => XFS_BLOCK_BYTES,
+    };
+    // Per entry a block of tail slack and a block of directory space, plus an eighth for headroom.
+    let data = content_bytes
+        .saturating_add(entries.saturating_mul(2 * block))
+        .saturating_add(content_bytes / 8);
+    let root = match opts.root_fs {
+        SgiRootFs::Efs => {
+            // Inode tables at the chosen density, with an inode for every entry, and the bitmap.
+            let bpi = opts.bytes_per_inode.max(SECTOR_SIZE);
+            let data = data.max(entries.saturating_add(16).saturating_mul(bpi));
+            let inodes = data / bpi * EFS_INODE_BYTES;
+            data.saturating_add(inodes)
+                .saturating_add(data / (8 * SECTOR_SIZE))
+                .saturating_add(EFS_FIXED_OVERHEAD)
+                .max(MIN_EFS_SECTORS * SECTOR_SIZE)
+        }
+        SgiRootFs::Xfs => {
+            // The log (the larger of its floor and 1/2048 of the volume), AG headers and inode chunks.
+            let log = (data / 2048).max(XFS_LOG_MIN_BYTES);
+            let inodes = entries.saturating_mul(XFS_INODE_BYTES);
+            data.saturating_add(log)
+                .saturating_add(inodes)
+                .saturating_add(XFS_FIXED_OVERHEAD)
+                .max(MIN_XFS_SECTORS * SECTOR_SIZE)
+        }
+    };
+    let cylinder_bytes =
+        (opts.heads.max(1) as u64 * opts.sectors_per_track.max(1) as u64) * SECTOR_SIZE;
+    let volhdr = match opts.media {
+        SgiMedia::HardDisk => VOLHDR_REGION_BYTES.div_ceil(cylinder_bytes) * cylinder_bytes,
+        SgiMedia::CdRom => CDROM_VOLHDR_SECTORS * SECTOR_SIZE,
+    };
+    let swap = match opts.layout {
+        SgiPartitionLayout::DataOnly => 0,
+        SgiPartitionLayout::RootSwap { swap_bytes } => {
+            swap_bytes.div_ceil(cylinder_bytes) * cylinder_bytes
+        }
+    };
+    let mib = 1024 * 1024;
+    volhdr
+        .saturating_add(swap)
+        .saturating_add(root)
+        .div_ceil(mib)
+        .saturating_mul(mib)
 }
 
 /// Stream an SGI disk into `sink`: the volume header at sector 0 and, unless
@@ -359,26 +556,13 @@ pub fn build_sgi_disk(opts: &SgiHddOptions) -> Result<(Vec<u8>, SgiHddLayout)> {
     Ok((image, layout))
 }
 
-/// The name rb-cli and the provisioning runner have always called; same as [`write_sgi_disk`].
-pub fn write_sgi_efs_hdd<W: Write + Seek>(
-    sink: &mut W,
-    opts: &SgiHddOptions,
-) -> Result<SgiHddLayout> {
-    write_sgi_disk(sink, opts)
-}
-
-/// The name rb-cli and the tests have always called; same as [`build_sgi_disk`].
-pub fn build_sgi_efs_hdd(opts: &SgiHddOptions) -> Result<(Vec<u8>, SgiHddLayout)> {
-    build_sgi_disk(opts)
-}
-
 /// Write the dvh and the root filesystem into `sink` using a precomputed layout.
 fn write_sgi_disk_into<W: Write + Seek>(
     sink: &mut W,
     opts: &SgiHddOptions,
     layout: &SgiHddLayout,
 ) -> Result<()> {
-    let sector0 = build_volume_header(opts, layout);
+    let sector0 = build_volume_header(opts, layout)?;
     sink.seek(SeekFrom::Start(0))?;
     sink.write_all(&sector0)?;
     if !opts.format_root {
@@ -425,8 +609,7 @@ mod tests {
     /// VOLHDR region rounds 2 MiB up to whole cylinders, and EFS fills the rest.
     #[test]
     fn builds_expected_layout() {
-        let (img, layout) =
-            build_sgi_efs_hdd(&SgiHddOptions::new(50 * 1024 * 1024, "IRIX")).unwrap();
+        let (img, layout) = build_sgi_disk(&SgiHddOptions::new(50 * 1024 * 1024, "IRIX")).unwrap();
         assert_eq!(layout.heads, 16);
         assert_eq!(layout.sectors_per_track, 63);
         assert_eq!(layout.cylinder_sectors, 1008); // 16 × 63 = 504 KiB
@@ -449,8 +632,7 @@ mod tests {
     /// spanning the disk, 0 EFS after VOLHDR), with sane geometry.
     #[test]
     fn header_round_trips_and_matches_fixture_structure() {
-        let (img, layout) =
-            build_sgi_efs_hdd(&SgiHddOptions::new(20 * 1024 * 1024, "ROOT")).unwrap();
+        let (img, layout) = build_sgi_disk(&SgiHddOptions::new(20 * 1024 * 1024, "ROOT")).unwrap();
         let vh = SgiVolumeHeader::parse(&img[..512]).expect("synthesized header parses");
         assert_eq!(vh.magic, SGI_VOLHDR_MAGIC);
         assert!(vh.checksum_valid, "checksum must zero-sum");
@@ -483,8 +665,7 @@ mod tests {
     /// EFS with a readable, empty root directory.
     #[test]
     fn detects_and_opens_the_efs_partition() {
-        let (img, layout) =
-            build_sgi_efs_hdd(&SgiHddOptions::new(16 * 1024 * 1024, "DATA")).unwrap();
+        let (img, layout) = build_sgi_disk(&SgiHddOptions::new(16 * 1024 * 1024, "DATA")).unwrap();
         let vh = SgiVolumeHeader::parse(&img[..512]).unwrap();
         let parts = filesystem_partitions(&vh);
         assert_eq!(parts.len(), 1, "only the EFS partition holds a filesystem");
@@ -509,7 +690,7 @@ mod tests {
     /// and the EFS partition meets the 32 KiB minimum.
     #[test]
     fn tiny_request_is_floored_to_a_valid_disk() {
-        let (_img, layout) = build_sgi_efs_hdd(&SgiHddOptions::new(1024, "T")).unwrap();
+        let (_img, layout) = build_sgi_disk(&SgiHddOptions::new(1024, "T")).unwrap();
         assert!(layout.root_sectors >= MIN_EFS_SECTORS);
         assert_eq!(layout.disk_sectors % layout.cylinder_sectors, 0);
     }
@@ -520,7 +701,7 @@ mod tests {
     #[test]
     fn cdrom_layout_matches_irix_efs_cd_shape() {
         let (img, layout) =
-            build_sgi_efs_hdd(&SgiHddOptions::new_cdrom(64 * 1024 * 1024, "CDVOL")).unwrap();
+            build_sgi_disk(&SgiHddOptions::new_cdrom(64 * 1024 * 1024, "CDVOL")).unwrap();
         assert_eq!(layout.heads, 1);
         assert_eq!(layout.sectors_per_track, 32);
         assert_eq!(layout.cylinder_sectors, 32);
@@ -546,17 +727,17 @@ mod tests {
         assert!(fs.list_directory(&root).expect("list").is_empty());
     }
 
-    /// Streaming to a (sparse) file via `write_sgi_efs_hdd` produces bytes
-    /// identical to the in-memory `build_sgi_efs_hdd` — the untouched regions
+    /// Streaming to a (sparse) file via `write_sgi_disk` produces bytes
+    /// identical to the in-memory `build_sgi_disk` — the untouched regions
     /// must read back as zero, and the file must be exactly `disk_bytes`.
     #[test]
     fn streamed_file_matches_in_memory_image() {
         use std::io::{Read, Seek, SeekFrom};
         let opts = SgiHddOptions::new(40 * 1024 * 1024, "STREAM");
-        let (mut mem, layout) = build_sgi_efs_hdd(&opts).unwrap();
+        let (mut mem, layout) = build_sgi_disk(&opts).unwrap();
 
         let mut file = tempfile::tempfile().expect("tempfile");
-        let streamed_layout = write_sgi_efs_hdd(&mut file, &opts).expect("stream");
+        let streamed_layout = write_sgi_disk(&mut file, &opts).expect("stream");
         file.set_len(streamed_layout.disk_bytes).unwrap();
         assert_eq!(streamed_layout, layout);
 
@@ -593,7 +774,7 @@ mod tests {
         dense.bytes_per_inode = 2048; // ~1 inode / 2 KiB
 
         let inodes = |opts: &SgiHddOptions| {
-            let (img, layout) = build_sgi_efs_hdd(opts).unwrap();
+            let (img, layout) = build_sgi_disk(opts).unwrap();
             let sb_off = (layout.root_first_sector * 512 + 512) as usize;
             let sb = fs_unix::efs::EfsSuperblock::parse(&img[sb_off..]).unwrap();
             sb.ncg as u32 * sb.cgisize as u32 * 4
@@ -769,5 +950,142 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(err.contains("byte-swapped"), "{err}");
+    }
+
+    /// A fixed 8 MiB target: the label rounds down inside it instead of past it.
+    #[test]
+    fn within_size_rounds_down_into_the_target() {
+        let mut opts = SgiHddOptions::new(8 * 1024 * 1024, "FIT");
+        opts.fit = SgiFit::WithinSize;
+        let (img, layout) = build_sgi_disk(&opts).unwrap();
+        let vh = SgiVolumeHeader::parse(&img[..512]).unwrap();
+        assert!(vh.partitions[SLOT_VOLUME].blocks <= 16384);
+        assert_eq!(layout.disk_sectors, 16 * 1008);
+        assert_eq!(
+            layout.root_first_sector + layout.root_sectors,
+            layout.disk_sectors
+        );
+        // RoundUp still rounds up, to 17 cylinders.
+        opts.fit = SgiFit::RoundUp;
+        assert_eq!(compute_sgi_layout(&opts).unwrap().cylinders, 17);
+    }
+
+    /// A target that cannot hold even the minimum disk is refused, not overrun.
+    #[test]
+    fn within_size_refuses_a_target_below_the_minimum() {
+        let mut opts = SgiHddOptions::new(2 * 1024 * 1024, "TINY");
+        opts.fit = SgiFit::WithinSize;
+        let err = compute_sgi_layout(&opts).unwrap_err().to_string();
+        assert!(err.contains("needs at least"), "{err}");
+    }
+
+    /// Without feature `xfs`, an XFS root is refused before a byte is written.
+    #[cfg(not(feature = "xfs"))]
+    #[test]
+    fn an_xfs_root_without_the_feature_writes_nothing() {
+        let mut opts = SgiHddOptions::new(64 * 1024 * 1024, "X");
+        opts.root_fs = SgiRootFs::Xfs;
+        assert!(compute_sgi_layout(&opts).is_err());
+        let mut disk = vec![0xA5u8; 1024 * 1024];
+        assert!(write_sgi_disk(&mut Cursor::new(&mut disk[..]), &opts).is_err());
+        assert!(disk.iter().all(|&b| b == 0xA5), "nothing was written");
+        opts.format_root = false;
+        assert!(
+            compute_sgi_layout(&opts).is_ok(),
+            "a label-only XFS disk needs no XFS code"
+        );
+    }
+
+    /// A hand-built layout or spec that does not fit is an error, never a panic or a truncation.
+    #[test]
+    fn hand_built_headers_are_checked() {
+        let opts = SgiHddOptions::new(16 * 1024 * 1024, "H");
+        let good = compute_sgi_layout(&opts).unwrap();
+        assert!(build_volume_header(&opts, &good).is_ok());
+        let past_end = SgiHddLayout {
+            root_sectors: good.root_sectors + 1,
+            ..good
+        };
+        assert!(build_volume_header(&opts, &past_end).is_err());
+        let bad_slot = SgiHddLayout {
+            root_slot: 16,
+            ..good
+        };
+        assert!(build_volume_header(&opts, &bad_slot).is_err());
+        let huge = SgiHddLayout {
+            disk_sectors: u64::from(u32::MAX) + 1,
+            ..good
+        };
+        assert!(build_volume_header(&opts, &huge).is_err());
+        let spec = SgiHeaderSpec {
+            disk_sectors: 1000,
+            volhdr_sectors: 100,
+            cylinders: 1,
+            heads: 16,
+            sectors_per_track: 63,
+            root_part_num: 0,
+            swap_part_num: 1,
+            partitions: vec![SgiSlot {
+                index: SLOT_VOLUME,
+                first_sector: 100,
+                sectors: 10,
+                type_raw: SgiPartitionType::Efs.as_u32(),
+            }],
+        };
+        assert!(build_header(&spec).is_err(), "slot 10 is the whole volume");
+    }
+
+    /// Create `files` files of `each` bytes in `dirs` folders on the root of `slot`.
+    fn fill_root(file: &mut std::fs::File, dirs: u64, files: u64, each: usize) {
+        use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+        let mut fs = open_partition_editable(file, 0).expect("open editable");
+        let root = fs.root().unwrap();
+        let body = vec![0x5Au8; each];
+        let folders: Vec<_> = (0..dirs)
+            .map(|d| {
+                fs.create_directory(&root, &format!("d{d}"), &CreateDirectoryOptions::default())
+                    .expect("mkdir")
+            })
+            .collect();
+        for i in 0..files {
+            let dir = &folders[(i % dirs) as usize];
+            fs.create_file(
+                dir,
+                &format!("f{i}"),
+                &mut &body[..],
+                each as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("file {i}: {e}"));
+        }
+        fs.sync_metadata().expect("sync");
+    }
+
+    /// An auto-sized system disk (swap in slot 1) takes the tree it was sized for.
+    fn auto_sized_disk_takes_its_tree(root_fs: SgiRootFs, dirs: u64, files: u64, each: usize) {
+        let mut opts = SgiHddOptions::new(0, "AUTO");
+        opts.root_fs = root_fs;
+        opts.layout = SgiPartitionLayout::RootSwap {
+            swap_bytes: DEFAULT_SWAP_BYTES,
+        };
+        opts.size_bytes = disk_bytes_for_root(files, dirs, files * each as u64, &opts);
+        let mut file = tempfile::tempfile().unwrap();
+        let layout = write_sgi_disk(&mut file, &opts).unwrap();
+        file.set_len(layout.disk_bytes).unwrap();
+        assert!(layout.swap_sectors * 512 >= DEFAULT_SWAP_BYTES);
+        fill_root(&mut file, dirs, files, each);
+    }
+
+    #[test]
+    fn auto_sized_efs_with_swap_holds_its_tree() {
+        auto_sized_disk_takes_its_tree(SgiRootFs::Efs, 20, 1500, 1024);
+        auto_sized_disk_takes_its_tree(SgiRootFs::Efs, 4, 96, 256 * 1024);
+    }
+
+    #[cfg(feature = "xfs")]
+    #[test]
+    fn auto_sized_xfs_with_swap_holds_its_tree() {
+        auto_sized_disk_takes_its_tree(SgiRootFs::Xfs, 8, 192, 256 * 1024);
+        auto_sized_disk_takes_its_tree(SgiRootFs::Xfs, 20, 600, 4096);
     }
 }

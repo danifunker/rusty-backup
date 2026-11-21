@@ -150,24 +150,25 @@ shell diffs). 12 findings confirmed by a temporary test, a CLI run or `cargo tre
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| SD-001 | S1 | confirmed | crates/sgi-disk/src/open.rs | The opener passes only the partition start to EFS / XFS and never compares the filesystem's own size with the label's partition length; a filesystem larger than its partition (corrupt label, label-only relabel over an old volume) is edited past the partition end (7.8 MB past it in the test). | open |
-| XF-001 | S2 | confirmed | crates/fs-xfs/src/xfs/edit/dir2_tree.rs (`leaf1_bests`, `leaf1_write`) | `bestcount` from disk is unchecked: `len - 4 - 2*n` underflows, inserting into a leaf-form dir with a corrupt bestcount panics. | open |
-| XF-002 | S2 | confirmed | dir2_tree.rs (`data_records`) | Guard `pos + 8 > len` then reads `blk[pos + 8]`: a record in the last 8 bytes indexes out of bounds. | open |
-| XF-003 | S2 | confirmed | dir2_tree.rs (`set_free_best`) | freeindex `nvalid` unclamped; the trim loop reads past the block. | open |
-| XF-004 | S2 | confirmed | dir2_tree.rs (`collapse_root`) | No depth cap or self-reference check: a root whose single entry points at itself loops forever. | open |
-| BD-001 | S2 | confirmed | src/cli/verbs/new_sgi_hdd.rs (`--size auto`) | Auto size covers EFS content only; `--swap` is carved out of it and `--fs xfs` overhead is not counted, so the import fails DiskFull with a half-built image. | open |
-| SD-002 | S2 | confirmed | crates/sgi-disk/src/build.rs, src/model/provision_runner.rs | The disk size always rounds up to whole cylinders, so on a fixed-size target (a device, an emulator's disk) the label describes up to ~504 KiB past the end; Build Disk's device path then fails `check_fits` after building. Predates this work for EFS; the label-only stage inherits it. | open |
-| FI-001 | S3 | confirmed | Cargo.toml + rb-cli-{vintage,ppc,sol9} | The app takes rb-fsimporter with default features, whose `native-zstd` turns on fs-tar's C libzstd in the "zero C" pure-zstd builds (MiSTer armv7, headless, musl / ppc). | open |
-| SD-003 | S3 | confirmed | crates/sgi-disk/src/build.rs | Without feature `xfs`, an XFS root is refused only after the volume header has been written. | open |
-| BD-003 | S4 | confirmed | five Build Disk views | The "Format" choice labels are copied into five views; they belong in the controller. | open |
-| SD-004 | S4 | confirmed | build.rs, src/partition/provision.rs | Two SGI header writers (`provision::write_sgi` rounds down, always swap slot 1); legacy alias names in the crate's 0.1.0 API; public `build_volume_header` panics / truncates on a hand-built layout. | open |
-| FI-002 | S4 | confirmed | crates/rb-fsimporter, src/fs/dir_import.rs | `Expander` needs fs-tar types that are not re-exported; every method required; the app probes each image twice; the shim's `measure_dir` duplicates the crate's. | open |
-| AP-001 | S4 | confirmed | regression-tests/data/change-map.tsv | No rows for crates/sgi-disk or crates/rb-fsimporter. | open |
-| XF-005 | S4 | confirmed | crates/fs-xfs/src/xfs/repair.rs:19 | Still cites an xfsprogs file path as a reference; reword like the other modules. | open |
-| BD-004 | S4 | confirmed | src/cli/verbs/new_sgi_hdd.rs | `--help` text and an error message still say EFS only. | open |
+| SD-001 | S1 | confirmed | crates/sgi-disk/src/open.rs | The opener passes only the partition start to EFS / XFS and never compares the filesystem's own size with the label's partition length; a filesystem larger than its partition (corrupt label, label-only relabel over an old volume) is edited past the partition end (7.8 MB past it in the test). | fixed |
+| XF-001 | S2 | confirmed | crates/fs-xfs/src/xfs/edit/dir2_tree.rs (`leaf1_bests`, `leaf1_write`) | `bestcount` from disk is unchecked: `len - 4 - 2*n` underflows, inserting into a leaf-form dir with a corrupt bestcount panics. | fixed |
+| XF-002 | S2 | confirmed | dir2_tree.rs (`data_records`) | Guard `pos + 8 > len` then reads `blk[pos + 8]`: a record in the last 8 bytes indexes out of bounds. | fixed |
+| XF-003 | S2 | confirmed | dir2_tree.rs (`set_free_best`) | freeindex `nvalid` unclamped; the trim loop reads past the block. | fixed |
+| XF-004 | S2 | confirmed | dir2_tree.rs (`collapse_root`) | No depth cap or self-reference check: a root whose single entry points at itself loops forever. | fixed |
+| BD-001 | S2 | confirmed | src/cli/verbs/new_sgi_hdd.rs (`--size auto`) | Auto size covers EFS content only; `--swap` is carved out of it and `--fs xfs` overhead is not counted, so the import fails DiskFull with a half-built image. | fixed |
+| SD-002 | S2 | confirmed | crates/sgi-disk/src/build.rs, src/model/provision_runner.rs | The disk size always rounds up to whole cylinders, so on a fixed-size target (a device, an emulator's disk) the label describes up to ~504 KiB past the end; Build Disk's device path then fails `check_fits` after building. Predates this work for EFS; the label-only stage inherits it. | fixed |
+| FI-001 | S3 | confirmed | Cargo.toml + rb-cli-{vintage,ppc,sol9} | The app takes rb-fsimporter with default features, whose `native-zstd` turns on fs-tar's C libzstd in the "zero C" pure-zstd builds (MiSTer armv7, headless, musl / ppc). | fixed |
+| SD-003 | S3 | confirmed | crates/sgi-disk/src/build.rs | Without feature `xfs`, an XFS root is refused only after the volume header has been written. | fixed |
+| BD-003 | S4 | confirmed | five Build Disk views | The "Format" choice labels are copied into five views; they belong in the controller. | fixed |
+| SD-004 | S4 | confirmed | build.rs, src/partition/provision.rs | Two SGI header writers (`provision::write_sgi` rounds down, always swap slot 1); legacy alias names in the crate's 0.1.0 API; public `build_volume_header` panics / truncates on a hand-built layout. | fixed |
+| FI-002 | S4 | confirmed | crates/rb-fsimporter, src/fs/dir_import.rs | `Expander` needs fs-tar types that are not re-exported; every method required; the app probes each image twice; the shim's `measure_dir` duplicates the crate's. | fixed |
+| AP-001 | S4 | confirmed | regression-tests/data/change-map.tsv | No rows for crates/sgi-disk or crates/rb-fsimporter. | fixed |
+| XF-005 | S4 | confirmed | crates/fs-xfs/src/xfs/repair.rs:19 | Still cites an xfsprogs file path as a reference; reword like the other modules. | fixed |
+| BD-004 | S4 | confirmed | src/cli/verbs/new_sgi_hdd.rs | `--help` text and an error message still say EFS only. | fixed |
 
 Also noted, not recorded: the new `Host` cancel is not wired into the app's own imports
-(provision_runner, cd_build still use a never-cancelling host); XFS volumes with the ASCII
+(provision_runner, cd_build still use a never-cancelling host; since wired through
+`dir_import::import_dir_cancellable`); XFS volumes with the ASCII
 case-insensitive directory feature are not refused by the editor (plausible wrong hashes; would
 need a `mkfs.xfs -n version=ci` image to confirm).
 

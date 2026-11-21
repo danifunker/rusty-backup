@@ -466,13 +466,10 @@ impl BuildDiskTab {
                         });
                         ui.push_id(ids::SGI_FORMAT, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label("Format:");
-                                ui.radio_value(
-                                    &mut p.sgi_label_only,
-                                    false,
-                                    "Volume header and EFS",
-                                );
-                                ui.radio_value(&mut p.sgi_label_only, true, "Volume header only");
+                                ui.label(format!("{}:", labels::SGI_FORMAT));
+                                for (i, text) in labels::SGI_FORMATS.iter().enumerate() {
+                                    ui.radio_value(&mut p.sgi_label_only, i == 1, *text);
+                                }
                             });
                         });
                     }
