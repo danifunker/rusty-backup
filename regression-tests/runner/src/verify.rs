@@ -248,7 +248,7 @@ pub fn verify(
 
     for (meta, image) in &artifacts {
         if let Some(f) = filter {
-            if !meta.format.contains(f) {
+            if !crate::id_matches_filter(f, &meta.format) {
                 continue;
             }
         }

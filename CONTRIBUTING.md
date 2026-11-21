@@ -234,6 +234,14 @@ never copy it sideways.
   `tests/ui_scenarios/`), the matching `rb-regress run --filter` cases, and, when
   it changes how a filesystem is written, the emulator scenario where the real
   operating system judges it (`regression-tests/emulator/`).
+  `scripts/regress-changed.py` picks and runs these from the diff against `main`
+  (`--plan` prints them). Its path-to-test table is
+  `regression-tests/data/change-map.tsv`, and a path the table does not know
+  escalates to the batch level. Add a row when you add a crate, module or case
+  family.
+- **A batch** (one review cluster, one PR's worth of fixes) runs
+  `scripts/regress-changed.py --level batch`: `scripts/preflight.sh`, the layer
+  check, and every case with oracles, without emulators.
 - **A milestone** (the end of a phase, before merging to `main`) runs the full
   suite: `regression-tests/scripts/regress-local.sh` on Linux, plus the Windows
   and macOS legs and `rb-regress parity` / `verify` across all three.

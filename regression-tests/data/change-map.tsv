@@ -1,0 +1,227 @@
+# Which tests a changed path needs. Read by scripts/regress-changed.py.
+#
+#   <glob>	<action> [<action> ...]
+#
+# Every row whose glob matches a changed path contributes its actions (a union,
+# not first-match). Globs are fnmatch patterns on repo-relative paths, so `*`
+# also crosses `/`. Actions:
+#
+#   case:S[,S]   rb-regress run cases whose ID contains S (see cases/**.toml ids)
+#   emu:S        regress-emulators.sh scenarios whose ID contains S (emulator/cases.txt)
+#   lib:F        cargo test --lib, filtered to test paths containing F
+#   test:T       cargo test --test T (an integration target under tests/)
+#   front:N      the front-end's own tests (gtk4, appkit, win32), where this host can build it
+#   check:N      boundaries (scripts/check-boundaries.sh), docparity (tests/doc_parity.rs),
+#                matrix (scripts/check-platform-matrix.py), runner (rb-regress tests + clippy)
+#   wide         too central to select from: run the batch level instead
+#   skip         needs no tests (stops the "unmapped path" fallback)
+#
+# Some actions need no row: a crate under crates/ always gets `cargo test -p` and
+# its 1.73 run, a file under src/ always gets `lib:` for its module path, a
+# tests/ target gets `test:`, a case manifest gets `case:` for its own IDs, and an
+# emulator script gets `emu:` for the scenarios that run it (all, for a shared one).
+# A path matching no row and no automatic rule escalates to the batch level.
+
+# ---- never tested ---------------------------------------------------------
+*.md	skip
+docs/*	skip
+LICENSE*	skip
+assets/*	skip
+.github/ci-targets	skip
+.gitignore	skip
+regression-tests/runs/*	skip
+regression-tests/artifacts/*	skip
+regression-tests/verifications/*	skip
+regression-tests/scratch/*	skip
+scripts/regress-changed.py	skip
+scripts/test_regress_changed.py	skip
+scripts/similar-fns/*	skip
+regression-tests/data/change-map.tsv	skip
+
+# ---- docs that tests check -------------------------------------------------
+README.md	check:docparity
+CONTRIBUTING.md	check:docparity
+CLAUDE.md	check:docparity
+docs/platform_matrix.md	check:matrix
+docs/cli-reference.md	test:cli_help_snapshot
+
+# ---- build and workspace: everything depends on these ------------------------
+Cargo.toml	wide
+Cargo.lock	wide
+build.rs	wide
+.cargo/*	wide
+rust-toolchain*	wide
+.github/workflows/*	wide
+crates/disk-core/*	wide
+src/lib.rs	wide
+src/main.rs	wide
+src/compat*	wide
+src/rust173_compat*	wide
+src/error.rs	wide
+
+# ---- harness and its data ----------------------------------------------------
+regression-tests/runner/*	check:runner
+regression-tests/data/*	check:runner
+regression-tests/emulator/*	skip
+regression-tests/scripts/*	skip
+regression-tests/*.toml	skip
+regression-tests/*.tsv	skip
+regression-tests/fixtures*	skip
+regression-tests/drivers/*	skip
+regression-tests/oracles/*	check:runner
+scripts/check-boundaries.sh	check:boundaries
+scripts/check-platform-matrix.py	check:matrix
+scripts/*	skip
+tests/fixtures/*	skip
+tests/ui_scenarios/*	test:ui_scenarios
+rb-cli-vintage/*	wide
+
+# ---- front-ends --------------------------------------------------------------
+frontends/gtk4/*	front:gtk4 check:boundaries
+frontends/appkit/*	front:appkit check:boundaries
+frontends/mac-screens/*	front:appkit check:boundaries
+frontends/win32/*	front:win32 check:boundaries
+src/gui/*	front:egui check:boundaries
+src/cli/verbs/tui*	case:flow. check:boundaries
+
+# ---- controllers and view-models: every shell drives these --------------------
+src/controller/*	test:ui_scenarios check:boundaries
+src/controller/backup/*	case:flow.backup,roundtrip,backup.
+src/controller/restore/*	case:flow.restore,roundtrip,chd.
+src/controller/inspect/*	case:flow.inspect
+src/controller/browser/*	case:flow.browse,flow.files
+src/controller/commander/*	case:flow.commander
+src/controller/convert*	case:flow.convert,convert
+src/controller/optical/*	case:flow.optical,optical.
+src/controller/build_disk/*	case:flow.build
+src/controller/archives.rs	case:flow.archives,archive
+src/controller/settings.rs	case:flow.settings
+src/controller/remote_pick.rs	case:flow.network
+src/controller/resize*	case:resize,shrink,expand
+src/controller/expand_hfs.rs	case:expand,hfs
+
+# ---- model ------------------------------------------------------------------
+src/model/*	test:ui_scenarios
+src/model/job.rs	wide
+src/model/worker.rs	wide
+src/model/source_reader.rs	wide
+src/model/file_types.rs	test:doc_parity
+src/model/backup*	case:backup.,roundtrip,flow.backup
+src/model/restore*	case:roundtrip,flow.restore,chd.
+src/model/image_backup.rs	case:roundtrip,flow.restore
+src/model/physical_write_runner.rs	case:flow.restore
+src/model/provision_runner.rs	case:flow.build,flow.restore
+src/model/disk_builder.rs	case:flow.build,fs.new-volume
+src/model/cd_build.rs	case:flow.build,optical.
+src/model/optical*	case:optical.,flow.optical
+src/model/commander*	case:flow.commander,cp
+src/model/convert/*	case:convert,flow.convert,floppy.
+src/model/bulk_convert_runner.rs	case:convert,flow.convert
+src/model/fsck_runner.rs	case:edit.,churn
+src/model/edit_queue.rs	case:edit.,churn
+src/model/container_edit.rs	case:edit.,floppy.
+src/model/archive*	case:archive,flow.archives
+src/model/mac_archive*	case:mac.,read.archive
+src/model/resize*	case:resize,shrink,chd.label-resize
+src/model/partition_resize.rs	case:resize,partition.
+src/model/partition_editor.rs	case:partition.,part.
+src/model/hfs_expand_runner.rs	case:expand,hfs
+src/model/chd*	case:chd.,backup.container.chd
+src/model/remote*	case:flow.network
+src/model/backup_remote.rs	case:flow.network
+src/model/restore_remote.rs	case:flow.network
+src/model/resize_remote.rs	case:flow.network
+
+# ---- engine glue in src/ ---------------------------------------------------
+src/fs/mod.rs	wide
+src/fs/*	case:fs.detect,fs.read,edit.real
+src/partition/mod.rs	case:partition.,part.,roundtrip,fs.detect
+src/partition/*	case:partition.,part.,roundtrip.label
+src/rbformats/*	case:roundtrip,backup.,chd.
+src/rbformats/chd*	case:chd.,backup.container.chd
+src/backup/*	case:roundtrip,backup.,flow.backup
+src/restore/*	case:roundtrip,flow.restore,chd.,resize
+src/optical/*	case:optical.,read.optical,flow.optical
+src/remote/*	case:flow.network test:remote_filesystem test:remote_optical
+src/os/*	case:cli.
+src/cli/*	test:cli_suite test:cli_flat test:cli_tree test:cli_help_snapshot case:cli.
+src/cli/verbs/new*	case:fs.new-volume,floppy.new
+src/cli/verbs/fsck.rs	case:edit.,churn
+src/cli/verbs/convert.rs	case:convert,floppy.
+src/cli/verbs/backup.rs	case:backup.,roundtrip
+src/cli/verbs/restore.rs	case:roundtrip,chd.
+src/cli/verbs/optical.rs	case:optical.
+src/cli/verbs/resize*	case:resize,shrink
+src/cli/verbs/shrink.rs	case:shrink,resize
+src/cli/verbs/expand.rs	case:expand
+src/cli/verbs/cp.rs	case:cp,subcmd
+src/cli/verbs/put*	case:edit.,mac.
+src/cli/verbs/get.rs	case:edit.,read.
+src/cli/verbs/ls.rs	case:read.,cli.
+src/cli/verbs/inspect.rs	case:read.,fs.detect,cli.
+src/cli/verbs/floppy.rs	case:floppy.
+src/cli/verbs/partmap.rs	case:partition.,part.
+src/cli/verbs/batch*	case:batch
+src/cli/verbs/repack.rs	case:repack
+src/cli/verbs/build.rs	case:flow.build,fs.new-volume
+src/cli/verbs/serve.rs	case:flow.network test:remote_filesystem
+
+# ---- crates: which cases and emulator scenarios exercise each ----------------
+crates/part-tables/*	wide
+crates/fs-unix/src/ufs*	case:ufs emu:ufs
+crates/fs-unix/src/ext*	case:ext
+crates/fs-unix/src/bfs*	case:bfs
+crates/fs-unix/src/btrfs*	case:btrfs
+crates/fs-unix/src/efs*	case:efs
+crates/fs-unix/src/jfs*	case:jfs
+crates/fs-unix/src/minix*	case:minix
+crates/fs-unix/src/ofs*	case:ofs
+crates/fs-unix/src/reiserfs*	case:reiser
+crates/fs-unix/src/vxfs*	case:vxfs
+crates/fs-unix/src/unix_common*	case:ufs,ext,bfs,efs,jfs,minix,ofs,vxfs,xfs emu:ufs
+crates/fs-unix/Cargo.toml	case:ufs,ext,bfs,efs,jfs,minix,ofs,vxfs
+crates/fs-unix/src/lib.rs	case:ufs,ext,bfs,efs,jfs,minix,ofs,vxfs
+crates/fs-mac/src/hfsplus*	case:hfsplus,hfs+,mac.
+crates/fs-mac/src/hfs*	case:hfs,hfv,mac.
+crates/fs-mac/src/hfv*	case:hfv
+crates/fs-mac/src/mfs*	case:mfs
+crates/fs-mac/src/lisa*	case:lisa
+crates/fs-mac/src/binhex*	case:binhex,mac.
+crates/fs-mac/src/resource_fork*	case:mac.,fork
+crates/fs-mac/src/fork_export*	case:mac.,fork
+crates/fs-mac/src/mac_*	case:hfs,mac.
+crates/fs-mac/Cargo.toml	case:hfs,mfs,lisa,mac.
+crates/fs-mac/src/lib.rs	case:hfs,mfs,lisa,mac.
+crates/fs-pc/src/fat*	case:fat emu:fat
+crates/fs-pc/src/exfat*	case:exfat
+crates/fs-pc/src/ntfs*	case:ntfs emu:ntfs
+crates/fs-pc/src/human68k*	case:human68k,x68k
+crates/fs-pc/src/layout_preserving*	case:fat,ntfs,exfat,roundtrip
+crates/fs-pc/src/patch*	case:fat,ntfs,roundtrip,resize
+crates/fs-pc/Cargo.toml	case:fat,exfat,ntfs,human68k
+crates/fs-pc/src/lib.rs	case:fat,exfat,ntfs,human68k
+crates/fs-8bit/*	case:cbm,dfs,atari-dos,os9,qdos,lif,dragon,rsdos,trdos,ti99,oric,floppy. test:fs_e2e_suite
+crates/fs-amiga/*	case:affs,pfs3,sfs,adf,rdb
+crates/fs-apfs/*	case:apfs
+crates/fs-apple2/*	case:prodos,apple-dos,ucsd,woz test:fs_e2e_suite
+crates/fs-cpm/*	case:cpm test:fs_e2e_suite
+crates/fs-adfs/*	case:adfs
+crates/fs-hpfs/*	case:hpfs
+crates/fs-mac-unicode/*	case:hfsplus,hfs
+crates/fs-qnx/*	case:qnx4,qnx6
+crates/qnx2fs/*	case:qnx2 emu:qnx2
+crates/fs-squashfs/*	case:squashfs
+crates/fs-tar/*	case:tar,archive
+crates/fs-xerox/*	case:alto,xerox
+crates/fs-xfs/*	case:xfs
+crates/arc-mac/*	case:read.archive,mac.,issue10
+crates/dsk-apple/*	case:woz,dc42,moof,2mg,floppy.
+crates/dsk-clonezilla/*	case:clonezilla
+crates/dsk-dmg/*	case:dmg,ndif,sparseimage
+crates/dsk-floppy/*	case:floppy.,fmt.,ima,d88,g64
+crates/dsk-flux/*	case:flux,kryoflux
+crates/dsk-ghost/*	case:gho
+crates/dsk-imz/*	case:imz
+crates/dsk-tape/*	case:sun-tape,tape
+crates/dsk-vm/*	case:vmdk,vhd,qcow,backup.container
+crates/rb-fsexporter/*	case:export
