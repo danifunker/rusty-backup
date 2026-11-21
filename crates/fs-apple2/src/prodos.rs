@@ -1225,7 +1225,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         }
 
         // Max ProDOS file size: 16MB
-        if data_len > 16 * 1024 * 1024 {
+        if data_len > 0xFF_FFFF {
+            // EOF is a 3-byte field: 16 MiB itself would be stored as 0 (AP2-003).
             return Err(FilesystemError::InvalidData(
                 "ProDOS file size cannot exceed 16MB".into(),
             ));

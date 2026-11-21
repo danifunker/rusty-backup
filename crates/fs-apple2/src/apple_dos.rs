@@ -572,14 +572,9 @@ impl<R: Read + Seek + Send> Filesystem for AppleDosFilesystem<R> {
             .get(idx)
             .ok_or_else(|| FilesystemError::NotFound(format!("entry idx {idx} out of range")))?
             .clone();
+        // `read_file_bytes` already strips a binary file's 4-byte header; stripping again
+        // would cut payloads that start with plausible header bytes (AP2-001).
         let mut data = self.read_file_bytes(&de)?;
-        // For binary files, strip the 4-byte header so the bytes the
-        // user gets back are the actual payload (matching what
-        // CiderPress2's "Extract Raw" does on binary files).
-        if de.type_code == TYPE_B {
-            let payload = Self::strip_binary_header(&data).to_vec();
-            data = payload;
-        }
         data.truncate(max_bytes);
         Ok(data)
     }
@@ -1047,6 +1042,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AppleDosFilesystem<R>
         // for arbitrary bytes, so the length is recoverable by anything that
         // reads the disk, not just by us.
         let type_code = TYPE_B;
+        if payload.len() > 0xFFFF {
+            // The B header's length is 16 bits: a longer file would read back truncated (AP2-002).
+            return Err(FilesystemError::InvalidData(format!(
+                "DOS 3.3 binary files hold at most 65535 bytes; this one is {}",
+                payload.len()
+            )));
+        }
         let mut stored = Vec::with_capacity(payload.len() + BINARY_HEADER_LEN);
         stored.extend_from_slice(&0u16.to_le_bytes()); // load address
         stored.extend_from_slice(&(payload.len() as u16).to_le_bytes());
