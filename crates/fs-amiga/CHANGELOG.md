@@ -13,10 +13,14 @@ All notable changes to this crate are documented here. This project follows
   growth are rewritten from the on-disk rules.
 
 ### Changed (review, 2026-11-21)
-- SFS volumes are read-only: create, delete and rename never maintained the
-  directory hash tables the SFS handler looks names up in, so files made here
-  did not open by name on an Amiga and a delete cut other names' chains. They
-  come back once the name hash is verified against a real SFS volume.
+- SFS create, delete and rename now maintain the directory hash tables the SFS
+  handler looks names up in (before, files made here did not open by name on an
+  Amiga and a delete cut other names' chains). The name hash was measured on a
+  Workbench volume the handler wrote; new directories get their own table.
+- SFS delete frees every extent of a file's chain (it freed one contiguous run
+  from the first block, which on a fragmented file freed other files' blocks);
+  files over 65,535 blocks are stored as linked extents; file data that starts
+  like a block tag is no longer re-checksummed.
 - AFFS DirCache volumes (DOS\4 / DOS\5) are read-only and are not resized:
   the cache blocks are not updated.
 - Names are ISO-8859-1 on all three filesystems, read and written; a name with

@@ -273,6 +273,7 @@ struct SfsSnapshot {
     root: SfsRootBlock,
     free_blocks_cached: u64,
     dirty: HashMap<u32, Vec<u8>>,
+    dirty_data: std::collections::HashSet<u32>,
     cache: HashMap<u32, Vec<u8>>,
 }
 
@@ -288,6 +289,9 @@ pub struct SfsFilesystem<R: Read + Seek> {
     /// observe the in-memory mutation. Checksums are re-stamped at flush
     /// time so callers don't need to keep them current.
     dirty: HashMap<u32, Vec<u8>>,
+    /// Dirty blocks holding file data: never checksum-stamped, whatever their first bytes
+    /// look like (AMI-006).
+    dirty_data: std::collections::HashSet<u32>,
     /// Computed at open(); used by the &self `used_size` accessor.
     free_blocks_cached: u64,
 }
@@ -404,6 +408,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
             root,
             cache: HashMap::new(),
             dirty: HashMap::new(),
+            dirty_data: std::collections::HashSet::new(),
             free_blocks_cached: 0,
         };
         // Best-effort: compute free block count once at open so the &self
@@ -428,7 +433,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         // blocks (no header) flow through untouched.
         if self.dirty.contains_key(&blk) {
             let buf = self.dirty.get_mut(&blk).unwrap();
-            if is_metadata_block(buf) {
+            if !self.dirty_data.contains(&blk) && is_metadata_block(buf) {
                 stamp_checksum(buf);
             }
             return Ok(buf.as_slice());
@@ -1492,6 +1497,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
             root: self.root.clone(),
             free_blocks_cached: self.free_blocks_cached,
             dirty: self.dirty.clone(),
+            dirty_data: self.dirty_data.clone(),
             cache: self.cache.clone(),
         }
     }
@@ -1500,6 +1506,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         self.root = snap.root;
         self.free_blocks_cached = snap.free_blocks_cached;
         self.dirty = snap.dirty;
+        self.dirty_data = snap.dirty_data;
         self.cache = snap.cache;
     }
 
@@ -1661,6 +1668,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
                     write_u32(dbuf, o + 4, updated);
                     let bs = self.root.blocksize as usize;
                     self.dirty.insert(blk, vec![0u8; bs]);
+                    self.dirty_data.remove(&blk);
                     return Ok(blk);
                 }
                 o += ADMC_ENTRY_SIZE;
@@ -1698,6 +1706,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
                     write_u32(dbuf, o + 4, updated);
                     let bs = self.root.blocksize as usize;
                     self.dirty.insert(space + i, vec![0u8; bs]);
+                    self.dirty_data.remove(&(space + i));
                     return Ok(space + i);
                 }
                 o += ADMC_ENTRY_SIZE;
@@ -1756,6 +1765,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         write_u32(&mut container, ADMC_ADMINSPACE, start);
         write_u32(&mut container, ADMC_ADMINSPACE + 4, 1 << 31); // the container's own block
         self.dirty.insert(start, container);
+        self.dirty_data.remove(&start);
         self.ensure_dirty(last)?;
         write_u32(self.dirty.get_mut(&last).unwrap(), ADMC_NEXT, start);
         Ok(())
@@ -2260,11 +2270,19 @@ impl<R: Read + Seek> SfsFilesystem<R> {
     /// Insert an extent record `(key=start_block, blocks=count)`, splitting and
     /// growing the tree as needed. `next`/`prev` are left zero: they chain a
     /// file's extents together and our reader consults the tree by key.
-    fn extent_btree_insert(&mut self, key: u32, blocks: u32) -> Result<(), FilesystemError> {
+    fn extent_btree_insert(
+        &mut self,
+        key: u32,
+        blocks: u16,
+        next: u32,
+        prev: u32,
+    ) -> Result<(), FilesystemError> {
         let (leaf, path) = self.extent_btree_descend(key)?;
         let mut record = [0u8; FS_EXTENTBNODE_SIZE];
         write_u32(&mut record, 0, key);
-        write_u16(&mut record, 12, blocks as u16);
+        write_u32(&mut record, 4, next);
+        write_u32(&mut record, 8, prev);
+        write_u16(&mut record, 12, blocks);
         if self.node_try_insert(leaf, key, &record)? {
             return Ok(());
         }
@@ -2591,6 +2609,88 @@ fn build_object(
 }
 
 impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
+    /// The hash-table block of directory `dir_node`; 0 when it has none.
+    fn dir_hashtable(&mut self, dir_node: u32) -> Result<u32, FilesystemError> {
+        let (blk, off) = self.locate_dir_object(dir_node)?;
+        let buf = self.read_block(blk)?.to_vec();
+        let (obj, _) =
+            parse_object(&buf, off).ok_or_else(|| parse_err("directory object unreadable"))?;
+        Ok(obj.data_or_hashtable)
+    }
+
+    /// Byte offset of `node`'s fsObjectNode (data, next, hash16) in its leaf container.
+    fn object_node_entry(&mut self, node: u32) -> Result<(u32, usize), FilesystemError> {
+        let (leaf, slot) = self.find_object_node_slot(node)?;
+        Ok((leaf, NDC_ENTRIES_OFF + slot * FS_OBJECTNODE_SIZE))
+    }
+
+    /// Put `node` at the head of its bucket in `dir_node`'s hash table, the chain the SFS
+    /// handler looks names up in (AMI-007).
+    fn htab_link(&mut self, dir_node: u32, node: u32, name: &str) -> Result<(), FilesystemError> {
+        let htab = self.dir_hashtable(dir_node)?;
+        if htab == 0 {
+            return Ok(());
+        }
+        let hash = sfs_name_hash(name)?;
+        let slot_off = 16 + (hash as usize % self.htab_entries()) * 4;
+        let head = rd_u32(self.read_block(htab)?, slot_off);
+        let (leaf, e) = self.object_node_entry(node)?;
+        self.ensure_dirty(leaf)?;
+        let lb = self.dirty.get_mut(&leaf).unwrap();
+        write_u32(lb, e + 4, head);
+        write_u16(lb, e + 8, hash);
+        self.ensure_dirty(htab)?;
+        write_u32(self.dirty.get_mut(&htab).unwrap(), slot_off, node);
+        Ok(())
+    }
+
+    /// Take `node` out of `dir_node`'s hash table. The bucket comes from the hash stored in the
+    /// node, which the SFS handler leaves unchanged on rename; failing that, every chain is searched.
+    fn htab_unlink(&mut self, dir_node: u32, node: u32) -> Result<(), FilesystemError> {
+        let htab = self.dir_hashtable(dir_node)?;
+        if htab == 0 {
+            return Ok(());
+        }
+        let (leaf, e) = self.object_node_entry(node)?;
+        let (next, stored) = {
+            let lb = self.read_block(leaf)?;
+            (rd_u32(lb, e + 4), rd_u16(lb, e + 8))
+        };
+        let n = self.htab_entries();
+        let first = stored as usize % n;
+        for bucket in std::iter::once(first).chain((0..n).filter(|&b| b != first)) {
+            let slot_off = 16 + bucket * 4;
+            let mut prev: Option<(u32, usize)> = None;
+            let mut cur = rd_u32(self.read_block(htab)?, slot_off);
+            let mut seen = std::collections::HashSet::new();
+            while cur != 0 && seen.insert(cur) {
+                if cur == node {
+                    match prev {
+                        None => {
+                            self.ensure_dirty(htab)?;
+                            write_u32(self.dirty.get_mut(&htab).unwrap(), slot_off, next);
+                        }
+                        Some((pleaf, pe)) => {
+                            self.ensure_dirty(pleaf)?;
+                            write_u32(self.dirty.get_mut(&pleaf).unwrap(), pe + 4, next);
+                        }
+                    }
+                    return Ok(());
+                }
+                let (cl, ce) = self.object_node_entry(cur)?;
+                let nx = rd_u32(self.read_block(cl)?, ce + 4);
+                prev = Some((cl, ce));
+                cur = nx;
+            }
+        }
+        Ok(())
+    }
+
+    /// Buckets in a hash-table block: everything after the 16-byte header.
+    fn htab_entries(&self) -> usize {
+        (self.root.blocksize as usize - 16) / 4
+    }
+
     fn do_create_directory(
         &mut self,
         parent: &FileEntry,
@@ -2621,13 +2721,21 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
             obj_bytes_probe.len(),
         )?;
         let new_node = self.alloc_object_node(chain_blk)?;
+        self.htab_link(parent_node, new_node, name)?;
+        // Every directory has its own hash table (HTAB: id, checksum, own block, parent node).
+        let htab = self.alloc_admin_block()?;
+        {
+            let hb = self.dirty.get_mut(&htab).unwrap();
+            write_u32(hb, 0, HASHTABLE_ID);
+            write_u32(hb, 8, htab);
+            write_u32(hb, 12, new_node);
+        }
 
-        // Final fsObject carries the real objectnode. hashtable=0,
-        // firstdirblock=0 → empty directory.
+        // Final fsObject carries the real objectnode; firstdirblock=0 → empty directory.
         let obj_bytes = build_object(
             new_node,
             FIBF_READ | FIBF_WRITE | FIBF_EXECUTE | FIBF_DELETE,
-            0,
+            htab,
             0,
             sfs_date,
             OTYPE_DIR,
@@ -2678,9 +2786,20 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
                 let to_read = remaining.min(bs) as usize;
                 data.read_exact(&mut buf[..to_read])?;
                 self.dirty.insert(first_data + i, buf);
+                self.dirty_data.insert(first_data + i);
                 written += to_read as u64;
             }
-            self.extent_btree_insert(first_data, blocks)?;
+            // An extent's length is 16 bits: a longer run is a chain of linked extents (AMI-005).
+            let starts: Vec<u32> = (0..blocks)
+                .step_by(0xFFFF)
+                .map(|o| first_data + o)
+                .collect();
+            for (i, &key) in starts.iter().enumerate() {
+                let len = (blocks - (key - first_data)).min(0xFFFF) as u16;
+                let next = starts.get(i + 1).copied().unwrap_or(0);
+                let prev = if i == 0 { 0 } else { starts[i - 1] };
+                self.extent_btree_insert(key, len, next, prev)?;
+            }
         }
 
         // Reserve room in parent's chain; the block that ends up
@@ -2703,6 +2822,7 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
             obj_bytes_probe.len(),
         )?;
         let new_node = self.alloc_object_node(chain_blk)?;
+        self.htab_link(parent_node, new_node, name)?;
         let obj_bytes = build_object(
             new_node,
             FIBF_READ | FIBF_WRITE | FIBF_EXECUTE | FIBF_DELETE,
@@ -2790,6 +2910,9 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
             new_name,
             &obj.comment,
         )?;
+        // The name changes, so does its hash-table bucket (AMI-007).
+        self.htab_unlink(parent_node, entry_node)?;
+        self.htab_link(parent_node, entry_node, new_name)?;
 
         if new_bytes.len() == consumed {
             // Same encoded length — overwrite the object bytes in place.
@@ -2935,12 +3058,17 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
             }
         } else {
             // File: free data blocks + extent record.
-            let bs = self.root.blocksize as u64;
-            let size = obj.size_or_firstdirblock as u64;
-            if obj.data_or_hashtable != 0 && size > 0 {
-                let blocks = size.div_ceil(bs) as u32;
-                self.free_data_blocks(obj.data_or_hashtable, blocks)?;
-                let _ = self.extent_btree_remove(obj.data_or_hashtable);
+            // Free every extent of the chain, not one contiguous run from the first: a file
+            // the SFS handler wrote may be fragmented anywhere on the volume.
+            let mut key = obj.data_or_hashtable;
+            let mut seen = std::collections::HashSet::new();
+            while key != 0 && seen.insert(key) {
+                let Some((next, _prev, blocks)) = self.lookup_extent(key)? else {
+                    break;
+                };
+                self.free_data_blocks(key, blocks)?;
+                self.extent_btree_remove(key)?;
+                key = next;
             }
         }
 
@@ -2954,6 +3082,7 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
             *b = 0;
         }
 
+        self.htab_unlink(parent_node, entry_node)?;
         self.free_object_node(entry_node)?;
 
         // If the chain block is now empty (no fsObjects) and it isn't
@@ -3070,7 +3199,7 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
         let bs64 = bs as u64;
         for k in keys {
             let mut buf = self.dirty.remove(&k).unwrap();
-            if is_metadata_block(&buf) {
+            if !self.dirty_data.remove(&k) && is_metadata_block(&buf) {
                 stamp_checksum(&mut buf);
             }
             let off = self.partition_offset + k as u64 * bs64;
@@ -3095,16 +3224,20 @@ fn check_no_duplicate<R: Read + Seek + Send>(
     Ok(())
 }
 
-/// SFS finds objects by name through each directory's hash table (HTAB), which these edits
-/// do not maintain yet (the name hash is unverified without a real SFS volume): a file made
-/// here would not open by name on an Amiga, and a delete cuts other names' chains (AMI-007).
-fn refuse_sfs_edit() -> Result<(), FilesystemError> {
-    if cfg!(test) {
-        return Ok(());
-    }
-    Err(FilesystemError::Unsupported(
-        "SFS volumes are read-only here: directory hash tables are not maintained yet".into(),
-    ))
+/// The SFS name hash: the name's length, then for each ISO-8859-1 byte times 13 plus its
+/// uppercase, in 16 bits. Measured on a volume the SFS handler wrote: every name matches.
+fn sfs_name_hash(name: &str) -> Result<u16, FilesystemError> {
+    let bytes = crate::affs_common::string_to_latin1(name)?;
+    let upper = |c: u8| {
+        if c.is_ascii_lowercase() || (0xE0..=0xFE).contains(&c) && c != 0xF7 {
+            c - 32
+        } else {
+            c
+        }
+    };
+    Ok(bytes.iter().fold(bytes.len() as u16, |h, &c| {
+        h.wrapping_mul(13).wrapping_add(u16::from(upper(c)))
+    }))
 }
 
 impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem for SfsFilesystem<R> {
@@ -3122,7 +3255,6 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
         data_len: u64,
         options: &disk_core::filesystem::CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        refuse_sfs_edit()?;
         // SFS stores its datemodified as seconds since 1978-01-01 (the Amiga
         // epoch). Cross-fs copy passes source mtime through unix_times, or an
         // explicit amiga_dates gives (days, mins, ticks) since 1978.
@@ -3143,7 +3275,6 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
         name: &str,
         options: &disk_core::filesystem::CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        refuse_sfs_edit()?;
         let sfs_date = sfs_date_from_options(options.amiga_dates, options.unix_times);
         let snap = self.snapshot();
         match self.do_create_directory(parent, name, sfs_date) {
@@ -3160,7 +3291,6 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
-        refuse_sfs_edit()?;
         let snap = self.snapshot();
         match self.do_delete_entry(parent, entry) {
             Ok(()) => Ok(()),
@@ -3177,7 +3307,6 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
         entry: &FileEntry,
         new_name: &str,
     ) -> Result<(), FilesystemError> {
-        refuse_sfs_edit()?;
         if new_name == entry.name {
             return Ok(());
         }
@@ -4318,6 +4447,161 @@ mod tests {
             leaf_slots: 1,
         };
         assert_eq!(wide.pointer_to(u32::MAX).unwrap(), u32::MAX);
+    }
+
+    /// Every object in `dir_node` is in the hash-table bucket its name hashes to, with that hash
+    /// stored in its node; returns the names checked.
+    fn assert_htab_consistent<R: Read + Write + Seek + Send>(
+        fs: &mut SfsFilesystem<R>,
+        dir_node: u32,
+    ) -> usize {
+        let htab = fs.dir_hashtable(dir_node).unwrap();
+        let n = fs.htab_entries();
+        let (blk, off) = fs.locate_dir_object(dir_node).unwrap();
+        let buf = fs.read_block(blk).unwrap().to_vec();
+        let firstdir = parse_object(&buf, off).unwrap().0.size_or_firstdirblock;
+        let mut kids = Vec::new();
+        if firstdir != 0 {
+            fs.walk_directory_chain(firstdir, |o| kids.push(o.clone()))
+                .unwrap();
+        }
+        for o in &kids {
+            let hash = sfs_name_hash(&o.name).unwrap();
+            let (leaf, e) = fs.object_node_entry(o.objectnode).unwrap();
+            assert_eq!(
+                rd_u16(fs.read_block(leaf).unwrap(), e + 8),
+                hash,
+                "{}",
+                o.name
+            );
+            let mut cur = rd_u32(fs.read_block(htab).unwrap(), 16 + (hash as usize % n) * 4);
+            let mut found = false;
+            for _ in 0..10_000 {
+                if cur == 0 {
+                    break;
+                }
+                if cur == o.objectnode {
+                    found = true;
+                    break;
+                }
+                let (cl, ce) = fs.object_node_entry(cur).unwrap();
+                cur = rd_u32(fs.read_block(cl).unwrap(), ce + 4);
+            }
+            assert!(found, "{} is not on its hash chain", o.name);
+        }
+        kids.len()
+    }
+
+    /// File content that starts like an SFS block tag is written verbatim, not re-checksummed
+    /// as metadata (AMI-006).
+    #[test]
+    fn file_data_that_looks_like_a_block_tag_is_not_stamped() {
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = create_blank_sfs(8192, "Tag").expect("format");
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = fs.root().unwrap();
+        let mut payload = b"OBJC".to_vec();
+        payload.resize(512, 0);
+        let opts = CreateFileOptions::default();
+        fs.create_file(&root, "tag.bin", &mut &payload[..], 512, &opts)
+            .unwrap();
+        fs.sync_metadata().unwrap();
+        let e = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "tag.bin")
+            .unwrap();
+        assert_eq!(fs.read_file(&e, 512).unwrap(), payload);
+    }
+
+    /// The hash matches values the SFS handler itself stored on a Workbench volume.
+    #[test]
+    fn sfs_name_hash_matches_the_handler() {
+        for (name, want) in [
+            ("Expansion", 6430),
+            ("L", 89),
+            ("IBROWSE.prefs", 30658),
+            ("Passwords", 52823),
+        ] {
+            assert_eq!(sfs_name_hash(name).unwrap(), want, "{name}");
+        }
+    }
+
+    /// Creates, a rename and a delete keep every name on its hash chain, and a new directory
+    /// gets a hash table of its own (AMI-007).
+    #[test]
+    fn edits_keep_the_hash_tables_consistent() {
+        use disk_core::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
+        };
+        let img = create_blank_sfs(32768, "Hash").expect("format");
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        for i in 0..300 {
+            fs.create_file(&root, &format!("File{i}.txt"), &mut &b"x"[..], 1, &opts)
+                .unwrap();
+        }
+        let dir = fs
+            .create_directory(&root, "Sub", &CreateDirectoryOptions::default())
+            .unwrap();
+        fs.create_file(&dir, "Inner", &mut &b"y"[..], 1, &opts)
+            .unwrap();
+        let kids = fs.list_directory(&root).unwrap();
+        let f7 = kids.iter().find(|e| e.name == "File7.txt").unwrap().clone();
+        fs.rename(&root, &f7, "Renamed").unwrap();
+        let f9 = kids.iter().find(|e| e.name == "File9.txt").unwrap().clone();
+        fs.delete_entry(&root, &f9).unwrap();
+        fs.sync_metadata().unwrap();
+        assert_eq!(assert_htab_consistent(&mut fs, ROOTNODE), 300);
+        assert_eq!(assert_htab_consistent(&mut fs, dir.location as u32), 1);
+        let report = fs.fsck().expect("sfs has fsck").unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    /// On a copy of a volume the SFS handler wrote (large fixture, when present), our edits leave
+    /// its hash tables as the handler would: every name on the chain its hash names.
+    #[test]
+    fn edits_on_a_real_sfs_volume_keep_its_hash_tables() {
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../regression-tests/fixtures-large/fs.sfs.workbench-dh0.hd.img"
+        );
+        let Ok(img) = std::fs::read(path) else {
+            eprintln!("skipped: {path} not present");
+            return;
+        };
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "rusty.txt",
+            &mut &b"hello"[..],
+            5,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let fc = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "fontcache")
+            .unwrap();
+        fs.rename(&root, &fc, "fontcache.old").unwrap();
+        fs.sync_metadata().unwrap();
+        assert!(assert_htab_consistent(&mut fs, ROOTNODE) > 20);
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.contains(&"rusty.txt".to_string())
+                && names.contains(&"fontcache.old".to_string())
+        );
     }
 
     #[test]
