@@ -27,8 +27,7 @@
 //! ## Safety gating
 //!
 //! The rebuild only runs when the inode-ownership map can be trusted
-//! completely: v4 only, no btree-format (`di_format == 3`) inodes (whose bmap
-//! btree blocks we can't yet enumerate to mark in use), no double-allocated
+//! completely: none of the features the editor refuses (see `edit_blocker`), no double-allocated
 //! blocks, no out-of-bounds extents, and every inode/inobt read must succeed.
 //! If any of those fail we record a note and write *nothing* — R4/R4b still
 //! run. An AG is rewritten only when its derived free space disagrees with the
@@ -78,29 +77,39 @@ struct AgInfo {
 /// so the rebuild reclaims them. Shared with R3's multi-level inobt rebuild,
 /// which builds an equivalent map (scan-based) to find blocks for the new tree.
 pub(crate) struct InUseMap {
-    used: Vec<bool>,
+    bits: Vec<u64>,
+    len: u64,
 }
 
+/// The largest volume (in blocks) a repair maps: 2^32 blocks is a 512 MiB bitmap (XFS-015).
+const INUSE_MAP_MAX_BLOCKS: u64 = 1 << 32;
+
 impl InUseMap {
-    pub(crate) fn new(dblocks: u64) -> Self {
-        Self {
-            used: vec![false; dblocks as usize],
+    /// A map of `dblocks` blocks, one bit each; `Err` past [`INUSE_MAP_MAX_BLOCKS`].
+    pub(crate) fn new(dblocks: u64) -> Result<Self, String> {
+        if dblocks > INUSE_MAP_MAX_BLOCKS {
+            return Err(format!(
+                "volume of {dblocks} blocks is too large for an in-memory repair map"
+            ));
         }
+        Ok(Self {
+            bits: vec![0; dblocks.div_ceil(64) as usize],
+            len: dblocks,
+        })
     }
     /// Mark `linear` in use. Returns `true` if it was *already* in use — a
     /// cross-link / double allocation that makes the map untrustworthy.
     pub(crate) fn mark(&mut self, linear: u64) -> bool {
-        match self.used.get_mut(linear as usize) {
-            Some(slot) => {
-                let was = *slot;
-                *slot = true;
-                was
-            }
-            None => false,
+        if linear >= self.len {
+            return false;
         }
+        let (word, bit) = ((linear / 64) as usize, 1u64 << (linear % 64));
+        let was = self.bits[word] & bit != 0;
+        self.bits[word] |= bit;
+        was
     }
     pub(crate) fn is_used(&self, linear: u64) -> bool {
-        self.used.get(linear as usize).copied().unwrap_or(true)
+        linear >= self.len || self.bits[(linear / 64) as usize] & (1u64 << (linear % 64)) != 0
     }
 }
 
@@ -240,7 +249,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// map on success or a human-readable reason the rebuild must be skipped.
     fn build_inuse_map(&mut self, sb: &XfsSuperblock, ags: &[AgInfo]) -> Result<InUseMap, String> {
         let agblocks = sb.agblocks as u64;
-        let mut map = InUseMap::new(sb.dblocks);
+        let mut map = InUseMap::new(sb.dblocks)?;
         let blocks_per_chunk =
             ((XFS_INODES_PER_CHUNK as u64) * sb.inodesize as u64).div_ceil(sb.blocksize as u64);
 
@@ -345,6 +354,24 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             .map_err(|e| format!("inode {ino}: {e}"))?;
         if core.mode == 0 {
             return Err(format!("inode {ino} allocated in inobt but zeroed"));
+        }
+        let agblocks = sb.agblocks as u64;
+        let agmask = (1u64 << sb.agblklog) - 1;
+        let attr = self
+            .attr_fork_blocks(&core, &inode_buf)
+            .map_err(|e| format!("inode {ino}: attribute fork: {e}"))?;
+        for (start, count) in attr {
+            for fsb in start..start.saturating_add(count) {
+                let (agno, agbno) = (fsb >> sb.agblklog, fsb & agmask);
+                if agno >= sb.agcount as u64 || agbno >= agblocks {
+                    return Err(format!("inode {ino}: attribute block {fsb} outside volume"));
+                }
+                if map.mark(agno * agblocks + agbno) {
+                    return Err(format!(
+                        "inode {ino}: attribute block {fsb} double-allocated"
+                    ));
+                }
+            }
         }
         match core.format {
             DiFormat::Local | DiFormat::Other(_) => return Ok(()), // owns no blocks
@@ -848,10 +875,20 @@ mod tests {
         }
     }
 
+    /// The in-use map is one bit per block, and refuses a volume too large to map (XFS-015).
+    #[test]
+    fn in_use_map_is_a_bounded_bitset() {
+        let mut map = InUseMap::new(130).unwrap();
+        assert!(!map.mark(129));
+        assert!(map.mark(129), "second mark reports the cross-link");
+        assert!(map.is_used(129) && !map.is_used(128) && map.is_used(130));
+        assert!(InUseMap::new((1 << 32) + 1).is_err());
+    }
+
     #[test]
     fn derive_runs_from_map() {
         // AG 0, 10 blocks: used = {0,3,8,9}; free runs = (1,2),(4,4).
-        let mut map = InUseMap::new(10);
+        let mut map = InUseMap::new(10).unwrap();
         for b in [0, 3, 8, 9] {
             map.mark(b);
         }

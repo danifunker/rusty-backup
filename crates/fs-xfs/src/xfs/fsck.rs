@@ -808,7 +808,15 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             b.files_checked += 1;
         }
 
-        // Only extent / btree formats own separate disk blocks. Local
+        match self.attr_fork_blocks(&core, &inode_buf) {
+            Ok(runs) => {
+                for (start, count) in runs {
+                    self.claim_extent(sb, ino, start, count, map, b);
+                }
+            }
+            Err(e) => b.err("AttrForkDecodeFailed", format!("inode {ino}: {e}")),
+        }
+        // Only extent / btree data forks own separate disk blocks. Local
         // (inline dirs, short symlinks, devices) own none.
         use super::types::DiFormat;
         if !matches!(core.format, DiFormat::Extents | DiFormat::Btree) {

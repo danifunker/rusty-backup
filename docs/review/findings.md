@@ -20,7 +20,9 @@ to another carries the other slice's prefix and is listed under that slice.
 | crates/fs-pc | 27,123 | 2026-11-21, fixed in 0.1.7 | 0 |
 | iris-sgi-crates work (fs-xfs 0.2.0, sgi-disk, rb-fsimporter, provisioning, shells) | ~6,000 changed | 2026-11-21, separate review agent | 15 |
 | iris-sgi-crates follow-up (fork-export, fs-mac-unicode 0.2.0, fs-amiga 0.2.0) | ~2,700 changed | 2026-11-21, separate review agent | 9 |
-| crates/fs-mac | 42,245 | partial (write paths through extents), fixed in 0.1.11 | review not finished |
+| crates/fs-mac | 42,245 | 2026-11-21 (partial, then the remainder by a separate agent) | 20 |
+| crates/fs-xfs | 18,569 | 2026-11-21, separate agent | 20 |
+| crates/fs-amiga | 16,461 | 2026-11-21, separate agent | 16 |
 | crates/fs-squashfs | 6,425 | (seen in passing) | 1 |
 | src/fs | 14,945 | (seen in passing) | 1 |
 | src/partition, src/rbformats, src/restore | 36,000 | (seen in passing) | 2 |
@@ -222,8 +224,90 @@ Probes in a scratch crate; 7 confirmed, 2 plausible.
 | MU-002 | S2 | confirmed | collate `compare_hfsplus_keys` | The comparator decomposes stored units before folding; with the new table a code point older writers stored precomposed (U+0218) sorts elsewhere, so fsck reports KeyOutOfOrder on a volume that was in order. Apple's `FastUnicodeCompare` folds only. | fixed (0c801287) |
 | MU-003 | S4 | confirmed | `case_fold` / `decompose` | Two binary searches per unit on the catalog-compare hot path and no ASCII fast path: 772 ns vs 134 ns per 24-unit compare. | fixed (0c801287) |
 | MU-004 | S4 | confirmed | collate.rs `compare_hfs_keys` | Three-line doc comment. | fixed (0c801287) |
-| FM-001 | S4 | confirmed | fs-mac lib.rs feature table; rb-fsexporter README / CHANGELOG | `fork-export` missing from the lib.rs table (still under `forks`); rb-fsexporter docs still call fs-mac-unicode GPL. | fixed (0c801287) |
+| FX-001 | S4 | confirmed | fs-mac lib.rs feature table; rb-fsexporter README / CHANGELOG | `fork-export` missing from the lib.rs table (still under `forks`); rb-fsexporter docs still call fs-mac-unicode GPL. | fixed (0c801287) |
 | AM-001 | S2 | plausible | fs-amiga sfs.rs node and admin pointers | `blk << shifts` is never checked against `1 << (32 - shifts)`: on a volume over 2^28 blocks a container placed high gets a truncated pointer (predates the rewrite). | fixed (0c801287) |
 | DOC-001 | S4 | confirmed | CLAUDE.md SFS bullet; docs/missing_features_from_regression.md F-014; license_audit.md SFS row | Says object-node tree growth is unimplemented / mirrors the driver's functions; the audit row says "four functions" and names three. | fixed (0c801287) |
 | DOC-002 | S4 | confirmed | crates/dsk-apple and 19 more | Crates already on crates.io were moved to disk-core 0.3 (91ccccee) without a version bump, so the publish workflow skips them and crates.io keeps the disk-core 0.2 builds; fs-mac 0.1.11, fs-pc 0.1.7 and rb-fsexporter 0.1.4 change a public dependency's major version in a patch release. | fixed (0c801287) |
 | DOC-003 | S4 | plausible | fs-mac-unicode manifest / README | Tables derived from UnicodeData.txt: the Unicode licence's notice is linked, not reproduced, and the manifest says only MIT. The use of Apple's TN1150 sample mapping has no recorded terms check. | fixed (0c801287) |
+
+## crates/fs-xfs
+
+Review by a separate agent, 2026-11-21, read-only (no cargo; confirmed by quoted code and traced
+inputs). `dir2_tree.rs` and `dir_hashname` excluded (rewritten clean-room, reviewed above). The
+editor and repair were only ever checked against the crate's own fsck, which accepts v4 inobt
+magic on v5, skips attribute forks and does not cross-check finobt / rmapbt.
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| XFS-001 | S1 | confirmed | edit.rs `try_claim_slot_from_existing_chunks`, `alloc_new_inode_chunk`, `alloc_blocks` | Editor ignores finobt / rmapbt / reflink / inobtcnt and updates none of them: on a ro_compat 0xF volume a create leaves finobt and rmapbt stale. | fixed (XFIX) |
+| XFS-002 | S1 | confirmed | freespace_rebuild.rs `run_freespace_rebuild`, `build_inuse_map` | R2 runs on finobt volumes but never marks finobt blocks in use, so the rebuilt bnobt lists them free and a later allocation overwrites them. | fixed (XFIX) |
+| XFS-003 | S1 | confirmed | inobt_repair.rs `rebuild_single_inobt_leaf`, `rebuild_multilevel_inobt` | R3 on v5 (no rmapbt) writes a v4 IABT block (16-byte header, no CRC) that the kernel rejects. | fixed (XFIX) |
+| XFS-004 | S1 | confirmed | fsck.rs `scan_inode_blocks`; freespace_rebuild.rs `mark_inode_blocks` | Attribute-fork blocks are never claimed: fsck reports UnaccountedBlocks on clean volumes, R2 / R3 free them, delete leaks them. | fixed (XFIX) |
+| XFS-005 | S1 | confirmed | edit.rs `do_delete_entry` | Delete ignores `di_nlink`: removing one name of a hard-linked file frees the inode and blocks the other name still uses. | fixed (XFIX) |
+| XFS-006 | S1 | confirmed | edit.rs `sf_remove_entry`, `rebuild_dir_without` | Names go through `from_utf8_lossy` and are written back: a directory rebuild turns non-UTF-8 names into U+FFFD, and deleting one of two names that are lossily equal removes the wrong entry. | fixed (XFIX) |
+| XFS-007 | S1 | confirmed | edit.rs `current_full_free`, `free_blocks`, slot claim | The allocator trusts bnobt records and `ir_free` unchecked: a record past the AG end sends data writes past `dblocks`; a wrong free mask overwrites a live inode. | fixed (XFIX) |
+| XFS-008 | S1 | confirmed | xfs/mod.rs `open`; src/fs/mod.rs editable XFS openers | No check of `dblocks * blocksize` against the partition length on MBR / GPT volumes: edits and R2 write past the partition end (SD-001 covered sgi-disk only). | fixed (XFIX) |
+| XFS-009 | S1 | confirmed | edit.rs `sf_insert_entry`; dir_repair.rs | Editor and R6 do not check `dir_format`: on a dir1 volume (IRIX 6.2 / 6.4) they write dir2 layout into dir1 forks. | fixed (XFIX) |
+| XFS-010 | S1 | confirmed | edit.rs `sf_insert_entry` | A parent with `i8count > 0` gets a 4-byte inumber appended, so the fork misparses. | fixed (XFIX) |
+| XFS-011 | S1 | plausible | sb.rs; edit.rs; fsck.rs | Sparse inode chunks are not refused: the slot claim can place an inode in a hole. Confirm with `mkfs.xfs -i sparse=1`, fragment, create, `xfs_repair -n`. | fixed (XFIX) |
+| XFS-012 | S1 | plausible | edit.rs, repair.rs | No clean-log check before editing or repairing; recovery would replay over our writes. Confirm: shut down with a pending transaction, edit, mount. | deferred (needs a log-head scan; README says to edit only cleanly unmounted volumes) |
+| XFS-013 | S2 | confirmed | sb.rs `parse` | Superblock geometry unchecked: v5 with 128-byte inodes panics on a slice, large `dirblklog` shift-panics or allocates 2 GiB, `dblocks < (agcount-1)*agblocks` underflows (R2 loops ~2^64); unknown v5 incompat bits accepted. | fixed (XFIX) |
+| XFS-014 | S2 | confirmed | xfs/mod.rs `walk_bmbt`, `collect_bmbt_blocks` | A bmbt leaf whose `rightsib` is itself loops forever and grows a Vec until OOM. | fixed (XFIX) |
+| XFS-015 | S2 | confirmed | freespace_rebuild.rs `InUseMap::new`; inobt_repair.rs | R2 / R3 allocate a `Vec<bool>` of `dblocks` with no cap: 1 GiB for 4 TiB, abort on a hostile `dblocks`. | fixed (XFIX) |
+| XFS-016 | S2 | confirmed | edit.rs `sf_entries_with_ftype`, `gather_dir_entries` | Short-form dir with too large a count or `di_size` past the inode panics on index in create / rename / delete. | fixed (XFIX) |
+| XFS-017 | S2 | confirmed | xfs/mod.rs `read_symlink_target` | v5 remote symlinks include the 56-byte XSLM header in the target, and only the first block is read. | fixed (XFIX) |
+| XFS-018 | S2 | confirmed | inode.rs | BIGTIME timestamps not decoded: mtimes wrong in listings and tar export. | fixed (XFIX) |
+| XFS-019 | S4 | confirmed | repair.rs, edit.rs, freespace_rebuild.rs, inobt_repair.rs, inode_repair.rs, format.rs | Stale docs (mutations "Unsupported", "v4 only", "v5 gate"); public test-only `create_blank_xfs` builds a volume-sized Vec. | fixed (XFIX) |
+| XFS-020 | S4 | confirmed | fsck.rs, inobt_repair.rs, v5_crc.rs, edit.rs | Duplicate btree walkers / `mark_*_blocks` / `stamp_*`; each allocation rebuilds the AG's whole bnobt / cntbt; edit.rs is 4,145 lines with five jobs. | deferred (refactor of edit.rs, own change) |
+
+## crates/fs-amiga
+
+Review by a separate agent, 2026-11-21, read-only; the SFS growth functions rewritten that day
+excluded. No reference C sources opened.
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| AMI-001 | S1 | confirmed | affs_fsck.rs `repair_affs` | AFFS repair rebuilds the bitmap after a broken walk (PFS3 / SFS refuse unless structurally clean): one bad directory checksum frees that subtree's blocks. | open |
+| AMI-002 | S1 | confirmed | affs_fsck.rs `walk_directory_tree`; affs.rs | DOS\4 / DOS\5 dircache not modelled: fsck flags every clean DCFS volume and repair frees the cache blocks; create / delete / rename never update the cache and are not refused. | open |
+| AMI-003 | S1 | confirmed | affs.rs `resize_affs_in_place` | The resize moves the root but leaves the root children's `parent` (0x1F4) pointing at the old root, which is then freed. | open |
+| AMI-004 | S1 | plausible | affs.rs `find_affs_root_block` | The fallback scan accepts the first block that looks like a root (no checksum, no position): an ADF stored on the volume below the real root can be taken for it. | open |
+| AMI-005 | S1 | confirmed | sfs.rs `extent_btree_insert` | Extent length stored as `blocks as u16` with no cap: a file over 65,535 blocks is truncated, its tail leaked. | open |
+| AMI-006 | S1 | confirmed | sfs.rs `is_metadata_block` | Dirty data blocks whose first 4 bytes look like an SFS tag get re-checksummed on read / sync: file content `OBJC...` has bytes 4..8 overwritten. | open |
+| AMI-007 | S1 | confirmed | sfs.rs object-node create / delete / rename | HTAB hash chains never maintained: the SFS handler cannot open new files by name, delete cuts chains, rename leaves entries in the old bucket. | open |
+| AMI-008 | S1 | confirmed | pfs3.rs / sfs.rs `open`; src/fs/mod.rs callers | PFS3 / SFS editors take no partition length: a volume claiming more than its RDB partition gets writes in the next partition. | open |
+| AMI-009 | S1 | plausible | pfs3.rs `do_delete_entry` | Deleting an ST_LINKDIR reads and frees, as a dirblock, the reserved block whose number is the link's parent anode. | open |
+| AMI-010 | S2 | confirmed | affs.rs / pfs3.rs / sfs.rs `create_file` | Sizes of 4 GiB or more stored as `u32` (PFS3 never writes `fsizex`): should be refused. | open |
+| AMI-011 | S2 | confirmed | affs_common.rs `read_bstr` vs affs.rs `write_bstr`; pfs3.rs; sfs.rs | Names read as Latin-1 / lossy UTF-8 but written as UTF-8: AFFS hashes the wrong bytes (NotFound on delete / rename of a non-ASCII name, duplicates on create). | open |
+| AMI-012 | S2 | confirmed | affs.rs, pfs3.rs, sfs.rs, pfs3_clone.rs chain / tree walks | Hash chains, extension chains, anode chains, SFS BNodes and the PFS3 clone walk have no cycle or depth cap: self-links hang or overflow the stack. | open |
+| AMI-013 | S2 | confirmed | pfs3_clone.rs `clone_pfs3_volume`; pfs3.rs `do_create_file` | Clone stages all data in memory and syncs once: peak RAM is the volume's used data. Single-file creates hold the whole file (S3). | open |
+| AMI-014 | S2 | confirmed | affs.rs `CompactAffsReader::new` | Uses `open` not `open_sized`: on an RDB disk the root search fails or the compact size covers the following partitions. | open |
+| AMI-015 | S2 | confirmed | sfs.rs `list_directory`, `create_file` | SFS drops protection, comment and dates on read and ignores them on write; softlinks list as empty files; no volume label. | open |
+| AMI-016 | S4 | confirmed | affs.rs, sfs.rs, pfs3.rs, *_fsck.rs | Duplicates (`sync_metadata` / `flush_metadata`, `fs_type` / `fs_type_label`, `fold`, fsck helpers x3); stale comments; `create_days` read from 0x1A4 (root alteration date). | open |
+
+## crates/fs-mac (remainder)
+
+Review by a separate agent, 2026-11-21, read-only, of what the partial review above left: MFS,
+B-tree handling, fsck / repair, clone / defrag / journal, codecs.
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| MAC-001 | S1 | confirmed | mfs.rs `MfsDirEntry::encode` | Directory names up to 255 bytes parse but are cut to 27 on every directory write-back: any edit renames every file with a longer name. | open |
+| MAC-002 | S1 | confirmed | mfs.rs `MfsMdb::parse`, `alloc_block_offset`, `map_set`, `map_write_back` | MDB geometry unchecked: the map can overlap the directory, allocations can pass the volume end, more than 4094 blocks wrap the 12-bit links, counters overflow. | open |
+| MAC-003 | S1 | confirmed | hfs_fsck/catalog.rs `repair_catalog_consistency`, `fix_thread_record` | When a missing thread does not fit its leaf, repair deletes the directory record (orphaning the subtree) or removes the old thread first and leaves none. | open |
+| MAC-004 | S1 | confirmed | hfs.rs `repair`; hfs_fsck/bitmap.rs | The extents-overflow tree is read with `.ok()`: a read error rebuilds the bitmap without overflow extents and frees fragmented files' later extents. | open |
+| MAC-005 | S2 | confirmed | hfs_fsck/bitmap.rs `repair_extents` | On an overlap the whole range is dropped from the used set, so a later cross-link with the first file survives repair; zeroing extent j keeps j+1. | open |
+| MAC-006 | S1 | plausible | hfs_fsck/btree.rs `rebuild_index_nodes`; hfs.rs `repair` | A failed index rebuild leaves `root_node` on a zeroed node and the catalog is written anyway. | open |
+| MAC-007 | S2 | confirmed | hfs.rs `list_children`, file-extents lookup; hfs_clone.rs `walk_catalog` | Classic HFS leaf-chain walks have no visited set: a self-linked leaf hangs list, read and clone. | open |
+| MAC-008 | S2 | confirmed | hfs.rs, hfs_clone.rs, hfsplus.rs, hfs_common.rs `btree_node_free_space` | `node_size - 2*(i+1)` from on-disk numRecords underflows and panics; HFS+ open accepts node sizes 1-13. | open |
+| MAC-009 | S2 | confirmed | hfs_common.rs `btree_node_bitmap_range` | Header-node record offsets unchecked: panics on small catalogs. | open |
+| MAC-010 | S2 | confirmed | hfs_common.rs `btree_find_insert_leaf`, `btree_insert_full` | `root_node` past the file panics; an index cycle inserts out of order (or into the header node); a zeroed root field orphans every leaf. | open |
+| MAC-011 | S1 | plausible | hfs_common.rs insert budget, `btree_split_leaf_with_insert` | The free-node budget assumes a 2-way split; a 3-way split can run out mid-cascade and the retry inserts twice. | open |
+| MAC-012 | S2 | confirmed | hfsplus_journal.rs `read_transaction`, `replay_journal` | Journal block targets unbounded (outside the checksum): replay can write past the partition; the multiply can overflow. | open |
+| MAC-013 | S2 | confirmed | fork_export.rs; resource_fork.rs `build_appledouble`, `build_macbinary` | Export drops Finder flags (invisible, custom icon, bundle) in BinHex, MacBinary and AppleDouble. | open |
+| MAC-014 | S2 | confirmed | binhex.rs `parse_decoded`; resource_fork.rs `parse_macbinary`; mac_alias.rs | Unchecked `usize` adds of u32 lengths wrap on 32-bit targets and panic. | open |
+| MAC-015 | S2 | plausible | hfs.rs `read_fork_data`; lisa.rs `open` | Allocations sized by on-disk u32 fields before checking the stream length. | open |
+| MAC-016 | S2 | plausible | hfsplus_wrapper_clone.rs `patch_mdb_in_place` | A wrapper shrink keeps the bad-block extent at the old length, past the new volume end. | open |
+| MAC-017 | S3 | confirmed | hfsplus_defrag.rs `emit_progress` | `eprintln!` in library code; thread-local progress sink; no `cancel_check` for whole-volume streams. | open |
+| MAC-018 | S3 | confirmed | mfs.rs `create_blank_mfs`; hfv.rs `build_blank_hfv` | Public builders hold the whole volume in RAM, above the 3 MB floppy exception. | open |
+| MAC-019 | S4 | confirmed | hfsplus.rs, hfsplus_defrag.rs, hfs_fsck | Three copies of `catalog_compare`; near-duplicate hardlink creators and fsck pairs. | open |
+| MAC-020 | S4 | confirmed | mfs.rs, mac_roman.rs, mac_alias.rs, CLAUDE.md | Docs that no longer match (MFS "extract-only", name-length doc, map offset, GPL note, HFV limit 2047 vs 4063 MB); mac_alias shows Mac Roman as `?`. | open |

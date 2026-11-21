@@ -11,10 +11,10 @@
 //! straight field copy, and the fix is provable by re-running the verifier
 //! (and, externally, `xfs_repair -n` via `scripts/xfs-oracle.sh`).
 //!
-//! The editable surface's mutation methods (`create_file`,
-//! `create_directory`, `delete_entry`) are **not** implemented yet — they
-//! belong to the Track B edit work, which needs the §3 write primitives that
-//! repair does not. They return `Unsupported` so the GUI/CLI can gate them.
+//! The editable surface's mutations (create, delete, rename, permissions, owner) live in
+//! `edit.rs`. Every mutation and repair first refuses a volume whose features the editor
+//! does not maintain ([`XfsSuperblock::edit_blocker`]: finobt, rmapbt, reflink, sparse
+//! inodes, bigtime, dir1, ...).
 //!
 //! Behavioural reference: `xfs_repair`, validated against `xfs_repair -n`.
 
@@ -254,6 +254,16 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     }
 }
 
+impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
+    /// Refuse any change to a volume whose features the editor does not maintain.
+    fn ensure_editable(&self) -> Result<(), FilesystemError> {
+        match self.superblock().edit_blocker() {
+            Some(why) => Err(FilesystemError::Unsupported(why)),
+            None => Ok(()),
+        }
+    }
+}
+
 impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
     fn as_filesystem(&self) -> &dyn disk_core::filesystem::Filesystem {
         self
@@ -269,7 +279,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        // v4 short-form parents, single-extent files only.
+        self.ensure_editable()?;
         let mode = ((options.mode.unwrap_or(0o644) & 0o7777) | 0o100000) as u16;
         let uid = options.uid.unwrap_or(0);
         let gid = options.gid.unwrap_or(0);
@@ -292,9 +302,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         name: &str,
         options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        // v4 short-form directories only (block/leaf/node parents and new-chunk
-        // inode allocation are not implemented yet). Force the directory format
-        // bit onto whatever permission bits the caller passed.
+        self.ensure_editable()?;
+        // Force the directory format bit onto whatever permission bits the caller passed.
         let mode = ((options.mode.unwrap_or(0o755) & 0o7777) | 0o040000) as u16;
         let uid = options.uid.unwrap_or(0);
         let gid = options.gid.unwrap_or(0);
@@ -308,8 +317,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
-        // v4 short-form parents; empty short-form directories or single/no-extent
-        // files (bmap-btree children are refused).
+        self.ensure_editable()?;
         self.do_delete_entry(parent.location, &entry.name, entry.location)
     }
 
@@ -319,11 +327,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         entry: &FileEntry,
         new_name: &str,
     ) -> Result<(), FilesystemError> {
+        self.ensure_editable()?;
         // Same-parent, in-place rename (short-form / single-block parents).
         self.do_rename(parent.location, &entry.name, new_name, entry.location)
     }
 
     fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        self.ensure_editable()?;
         // Order matters: R4 (secondary-superblock geometry) → R4b (AGF/AGI
         // summary counters) → R3 (inobt free-mask/freecount repair) → R5
         // (inode-core counters) → R2 (free-space btree rebuild). R3 runs after
@@ -375,6 +385,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
     }
 
     fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        self.ensure_editable()?;
         // di_mode is a big-endian u16 at offset 2 of the dinode core.
         // `write_inode_region` re-stamps the v5 CRC for us.
         let sb = self.superblock().clone();
@@ -388,6 +399,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
     }
 
     fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        self.ensure_editable()?;
         // di_uid / di_gid are big-endian u32s at offsets 8 and 12 — XFS
         // has carried 32-bit ids since v1, so no width check is needed.
         let sb = self.superblock().clone();

@@ -73,6 +73,23 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         Self::open_with_log(reader, partition_offset, |_| {})
     }
 
+    /// [`Self::open`] for a volume in a partition of `partition_len` bytes: refused when the
+    /// superblock declares more, so no edit or repair can write past the partition (XFS-008).
+    pub fn open_within(
+        reader: R,
+        partition_offset: u64,
+        partition_len: u64,
+    ) -> Result<Self, FilesystemError> {
+        let fs = Self::open(reader, partition_offset)?;
+        let declared = fs.sb.dblocks.saturating_mul(u64::from(fs.sb.blocksize));
+        if declared > partition_len {
+            return Err(FilesystemError::Parse(format!(
+                "XFS declares {declared} bytes but its partition holds {partition_len}"
+            )));
+        }
+        Ok(fs)
+    }
+
     pub fn open_with_log<F: FnMut(&str)>(
         mut reader: R,
         partition_offset: u64,
@@ -81,6 +98,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         let mut sector = [0u8; SECTOR as usize];
         read_at_aligned(&mut reader, partition_offset, SECTOR, &mut sector)?;
         let sb = XfsSuperblock::parse(&sector)?;
+        sb.validate_geometry()?;
 
         let dir_format = sb.dir_format();
         let fs_type_name = if sb.is_v5() {
@@ -169,6 +187,53 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         };
         let end = end.min(inode_buf.len());
         &inode_buf[fork_start..end]
+    }
+
+    /// Every fsblock run the attribute fork owns, as `(start, count)`: its extents, plus its
+    /// bmbt nodes when it is btree-format; none when there is no fork or it is local (XFS-004).
+    pub(crate) fn attr_fork_blocks(
+        &mut self,
+        core: &XfsDinodeCore,
+        inode_buf: &[u8],
+    ) -> Result<Vec<(u64, u64)>, FilesystemError> {
+        if core.forkoff == 0 {
+            return Ok(Vec::new());
+        }
+        let start = self.sb.fork_offset() + core.forkoff as usize * 8;
+        let end = (self.sb.inodesize as usize).min(inode_buf.len());
+        if start >= end {
+            return Err(FilesystemError::Parse(format!(
+                "XFS inode {}: attribute fork offset {start} past the inode",
+                core.ino
+            )));
+        }
+        let fork = inode_buf[start..end].to_vec();
+        match DiFormat::from_raw(core.aformat) {
+            DiFormat::Local => Ok(Vec::new()),
+            DiFormat::Extents => Ok(self
+                .decode_inline_extents(&fork, core.anextents as usize)?
+                .iter()
+                .map(|e| (e.startblock, e.blockcount))
+                .collect()),
+            DiFormat::Btree => {
+                let (level, first) = parse_bmbt_root(&fork, fork.len())?;
+                let mut runs: Vec<(u64, u64)> = self
+                    .walk_bmbt(level, first)?
+                    .iter()
+                    .map(|e| (e.startblock, e.blockcount))
+                    .collect();
+                runs.extend(
+                    self.collect_bmbt_blocks(level, first)?
+                        .into_iter()
+                        .map(|b| (b, 1)),
+                );
+                Ok(runs)
+            }
+            DiFormat::Other(v) => Err(FilesystemError::Parse(format!(
+                "XFS inode {}: unknown attribute fork format {v}",
+                core.ino
+            ))),
+        }
     }
 
     /// Decode `di_nextents` inline extent records from a fork buffer, sorted
@@ -278,6 +343,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             expected_level -= 1;
         }
 
+        let mut seen = std::collections::HashSet::from([current]);
         // Leaf level: walk via rightsib, collecting records.
         // numrecs lives at offset 6 in both v4 and v5 long-form btree blocks.
         // Siblings: v4 at 8 / 16, v5 at 8 / 16 too (the order is leftsib,
@@ -301,6 +367,11 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             let rightsib = BigEndian::read_u64(&block[16..24]);
             if rightsib == NULLFSBLOCK {
                 break;
+            }
+            if !seen.insert(rightsib) || seen.len() as u64 > self.sb.dblocks {
+                return Err(FilesystemError::Parse(format!(
+                    "XFS bmap btree leaf chain loops at block {rightsib}"
+                )));
             }
             self.read_fsblock(rightsib, &mut block)?;
             check_bmbt_header(&block, Some(0), self.sb.is_v5())?;
@@ -359,10 +430,16 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             expected_level -= 1;
         }
         // Walk the leaf sibling chain, collecting every leaf block.
+        let mut seen: std::collections::HashSet<u64> = out.iter().copied().collect();
         loop {
             let rightsib = BigEndian::read_u64(&block[16..24]);
             if rightsib == NULLFSBLOCK {
                 break;
+            }
+            if !seen.insert(rightsib) || seen.len() as u64 > self.sb.dblocks {
+                return Err(FilesystemError::Parse(format!(
+                    "XFS bmap btree leaf chain loops at block {rightsib}"
+                )));
             }
             out.push(rightsib);
             self.read_fsblock(rightsib, &mut block)?;
@@ -644,13 +721,28 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             DiFormat::Extents => {
                 let fork = self.data_fork(core, inode_buf);
                 let recs = self.decode_inline_extents(fork, core.nextents as usize)?;
-                let Some(first) = recs.first() else {
-                    return Ok(String::new());
-                };
+                // A target spans every block of every extent (up to 1024 bytes); on v5 each
+                // block starts with a 56-byte XSLM header that is not part of it (XFS-017).
+                let want = (core.size as usize).min(1024);
                 let bs = self.sb.blocksize as usize;
+                let mut target = Vec::with_capacity(want);
                 let mut buf = vec![0u8; bs];
-                self.read_fsblock(first.startblock, &mut buf)?;
-                Ok(symlink::decode_extent_target(&buf, core.size))
+                'outer: for rec in &recs {
+                    for i in 0..rec.blockcount {
+                        if target.len() >= want {
+                            break 'outer;
+                        }
+                        self.read_fsblock(rec.startblock + i, &mut buf)?;
+                        let skip = if self.sb.is_v5() && buf[0..4] == *b"XSLM" {
+                            56
+                        } else {
+                            0
+                        };
+                        let take = (want - target.len()).min(bs - skip);
+                        target.extend_from_slice(&buf[skip..skip + take]);
+                    }
+                }
+                Ok(symlink::decode_extent_target(&target, core.size))
             }
             other => Err(FilesystemError::Unsupported(format!(
                 "XFS symlink di_format {other:?} not supported"
@@ -2441,7 +2533,7 @@ mod tests {
     fn repair_r6_drops_dangling_shortform_entry_on_v5_fixture() {
         use disk_core::filesystem::EditableFilesystem;
 
-        let mut img = load_modern_fixture().to_vec();
+        let mut img = editable_v5_fixture();
 
         // Find the inode number of "hostname" in the v5 root so we know
         // which inode to orphan. The fixture's root is short-form so the
@@ -2520,7 +2612,7 @@ mod tests {
             "v5 R6 didn't drop the entry: {names:?}"
         );
         assert!(
-            names.contains(&"data_1.bin".to_string()),
+            names.contains(&"motd".to_string()),
             "v5 R6 dropped a sibling: {names:?}"
         );
 
@@ -3099,6 +3191,133 @@ mod tests {
     /// (v5/CRC, dir3, blocksize=4096, inodesize=512, 4 AGs).
     fn load_modern_fixture() -> &'static [u8] {
         load_sgi_fixture("xfs_v5_modern_small.img.zst")
+    }
+
+    /// A v5 volume the editor maintains (our formatter: no finobt / rmapbt / reflink), with a
+    /// short-form root holding `hostname` and `motd`.
+    fn editable_v5_fixture() -> Vec<u8> {
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let mut cur = Cursor::new(Vec::new());
+        let len = crate::xfs::format::write_blank_xfs(&mut cur, 0, 32 << 20, "v5ed").unwrap();
+        let mut img = cur.into_inner();
+        img.resize(len as usize, 0);
+        {
+            let mut fs = XfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+            let root = fs.root().unwrap();
+            for (name, body) in [("hostname", &b"irix\n"[..]), ("motd", &b"hi\n"[..])] {
+                let opts = CreateFileOptions::default();
+                fs.create_file(&root, name, &mut &body[..], body.len() as u64, &opts)
+                    .unwrap();
+            }
+            fs.sync_metadata().unwrap();
+        }
+        img
+    }
+
+    /// A superblock whose geometry does not add up is refused at open (XFS-013).
+    #[test]
+    fn inconsistent_superblock_geometry_is_refused_at_open() {
+        let mut img = load_modern_fixture().to_vec();
+        BigEndian::write_u64(&mut img[8..16], 1); // dblocks far below the AGs
+        let err = XfsFilesystem::open(Cursor::new(img), 0)
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("dblocks"), "{err}");
+    }
+
+    /// `open_within` refuses a volume larger than its partition (XFS-008).
+    #[test]
+    fn open_within_refuses_a_volume_larger_than_its_partition() {
+        let img = editable_v5_fixture();
+        let len = img.len() as u64;
+        assert!(XfsFilesystem::open_within(Cursor::new(img.clone()), 0, len).is_ok());
+        assert!(XfsFilesystem::open_within(Cursor::new(img), 0, len - 4096).is_err());
+    }
+
+    /// Deleting one name of a file with two links keeps the inode and drops one link (XFS-005).
+    #[test]
+    fn deleting_one_name_of_a_hard_linked_file_keeps_the_inode() {
+        use disk_core::filesystem::{EditableFilesystem, Filesystem};
+        let mut img = editable_v5_fixture();
+        let (ino, sb) = {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).unwrap();
+            let root = fs.root().unwrap();
+            let e = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "hostname");
+            (e.unwrap().location, fs.sb.clone())
+        };
+        let off = inode_byte_offset(
+            ino,
+            sb.agblocks,
+            sb.agblklog,
+            sb.inopblog,
+            sb.blocksize,
+            sb.inodesize,
+        ) as usize;
+        let isz = sb.inodesize as usize;
+        BigEndian::write_u32(&mut img[off + 16..off + 20], 2);
+        let mut tmp = img[off..off + isz].to_vec();
+        crate::xfs::v5_crc::stamp_inode_v3(&mut tmp, ino, &sb);
+        img[off..off + isz].copy_from_slice(&tmp);
+
+        let mut fs = XfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let e = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "hostname")
+            .unwrap();
+        fs.delete_entry(&root, &e).unwrap();
+        let (core, _) = fs.read_inode_buf(ino).unwrap();
+        assert_ne!(core.mode, 0, "the inode is still allocated");
+        assert_eq!(core.nlink, 1);
+        assert!(fs
+            .list_directory(&root)
+            .unwrap()
+            .iter()
+            .all(|e| e.name != "hostname"));
+    }
+
+    /// BIGTIME inodes keep nanoseconds since 1901 in `di_mtime` (XFS-018).
+    #[test]
+    fn bigtime_mtime_is_decoded_as_unix_seconds() {
+        let mut buf = vec![0u8; 512];
+        BigEndian::write_u16(&mut buf[0..2], types::XFS_DINODE_MAGIC);
+        buf[4] = 3;
+        let unix = 1_700_000_000i64;
+        BigEndian::write_u64(
+            &mut buf[40..48],
+            ((unix + (1i64 << 31)) as u64) * 1_000_000_000,
+        );
+        BigEndian::write_u64(&mut buf[120..128], 1 << 3);
+        assert_eq!(XfsDinodeCore::parse(1, &buf).unwrap().mtime, unix);
+        BigEndian::write_u64(&mut buf[120..128], 0);
+        BigEndian::write_i32(&mut buf[40..44], 1_000);
+        assert_eq!(XfsDinodeCore::parse(1, &buf).unwrap().mtime, 1_000);
+    }
+
+    /// The modern fixture (finobt, rmapbt, reflink, inobtcnt) is read-only: every change is
+    /// refused before anything is written (XFS-001 / 002 / 003).
+    #[test]
+    fn a_volume_with_unmaintained_features_refuses_edits_and_repair() {
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_modern_fixture().to_vec();
+        let mut cursor = Cursor::new(img.clone());
+        let mut fs = XfsFilesystem::open(&mut cursor, 0).unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        let made = fs.create_file(&root, "x", &mut &b"x"[..], 1, &opts);
+        assert!(
+            matches!(made, Err(FilesystemError::Unsupported(_))),
+            "{made:?}"
+        );
+        assert!(matches!(fs.repair(), Err(FilesystemError::Unsupported(_))));
+        drop(fs);
+        assert!(cursor.into_inner() == img, "nothing written");
     }
 
     #[test]
@@ -3785,7 +4004,7 @@ mod tests {
     fn repair_on_clean_v5_fixture_runs_passes_and_stays_clean() {
         use disk_core::filesystem::EditableFilesystem;
 
-        let img = load_modern_fixture().to_vec();
+        let img = editable_v5_fixture();
         let mut cursor = Cursor::new(img);
 
         {
@@ -3829,7 +4048,7 @@ mod tests {
     fn create_file_on_v5_fixture_round_trips_through_fsck() {
         use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
 
-        let img = load_modern_fixture().to_vec();
+        let img = editable_v5_fixture();
         let mut cursor = Cursor::new(img);
 
         let payload: &[u8] = b"hello, v5/CRC XFS world\n";

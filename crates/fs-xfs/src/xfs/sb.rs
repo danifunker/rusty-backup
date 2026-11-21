@@ -24,6 +24,14 @@ const XFS_SB_FEAT_INCOMPAT_ZONED: u32 = 1 << 9;
 /// route through [`XfsSuperblock::meta_uuid`].
 const XFS_SB_FEAT_INCOMPAT_META_UUID: u32 = 1 << 2;
 
+// The other v5 incompat bits by name; any bit outside `KNOWN_INCOMPAT` is refused at parse.
+const XFS_SB_FEAT_INCOMPAT_FTYPE: u32 = 1 << 0;
+const XFS_SB_FEAT_INCOMPAT_SPINODES: u32 = 1 << 1;
+const XFS_SB_FEAT_INCOMPAT_BIGTIME: u32 = 1 << 3;
+const XFS_SB_FEAT_INCOMPAT_EXCHRANGE: u32 = 1 << 6;
+const XFS_SB_FEAT_INCOMPAT_PARENT: u32 = 1 << 7;
+const KNOWN_INCOMPAT: u32 = (1 << 10) - 1;
+
 /// Parsed XFS superblock. Only the fields Step 5 needs to look up the root
 /// inode (and a few cosmetic fields for `fs_type` / `volume_label`).
 #[derive(Debug, Clone)]
@@ -137,11 +145,11 @@ impl XfsSuperblock {
                 | XFS_SB_FEAT_INCOMPAT_NREXT64
                 | XFS_SB_FEAT_INCOMPAT_METADIR
                 | XFS_SB_FEAT_INCOMPAT_ZONED;
-            let bad = features_incompat & REJECT_MASK;
+            let bad = features_incompat & (REJECT_MASK | !KNOWN_INCOMPAT);
             if bad != 0 {
                 return Err(FilesystemError::Unsupported(format!(
                     "XFS v5 incompat features 0x{bad:08X} not supported \
-                     (NEEDSREPAIR/NREXT64/METADIR/ZONED)"
+                     (NEEDSREPAIR/NREXT64/METADIR/ZONED, or unknown)"
                 )));
             }
         }
@@ -209,6 +217,101 @@ impl XfsSuperblock {
         .into_iter()
         .filter(|&ino| ino != 0 && ino != NULLFSINO)
         .collect()
+    }
+
+    /// Reject geometry that the rest of the crate would index, shift or loop on (XFS-013).
+    pub fn validate_geometry(&self) -> Result<(), FilesystemError> {
+        let bad = |what: String| Err(FilesystemError::Parse(format!("XFS superblock: {what}")));
+        if u32::from(self.blocklog) >= 32 || 1u32 << self.blocklog != self.blocksize {
+            return bad(format!(
+                "blocklog {} does not match blocksize {}",
+                self.blocklog, self.blocksize
+            ));
+        }
+        let min_inode = if self.is_v5() { 512 } else { 256 };
+        if !self.inodesize.is_power_of_two()
+            || !(min_inode..=2048).contains(&self.inodesize)
+            || 1u32 << self.inodelog.min(31) != u32::from(self.inodesize)
+        {
+            return bad(format!(
+                "inode size {} / inodelog {}",
+                self.inodesize, self.inodelog
+            ));
+        }
+        if u32::from(self.inopblock) != self.blocksize / u32::from(self.inodesize)
+            || u32::from(self.inopblog) + u32::from(self.inodelog) != u32::from(self.blocklog)
+        {
+            return bad(format!(
+                "inopblock {} / inopblog {}",
+                self.inopblock, self.inopblog
+            ));
+        }
+        if u32::from(self.blocklog) + u32::from(self.dirblklog) > 16 {
+            return bad(format!("directory block log {} too large", self.dirblklog));
+        }
+        if self.agcount == 0
+            || self.agblocks == 0
+            || u32::from(self.agblklog) + u32::from(self.inopblog) > 32
+            || u32::from(self.agblklog) >= 32
+            || u64::from(self.agblocks) > 1u64 << self.agblklog
+        {
+            return bad(format!(
+                "agcount {} agblocks {} agblklog {}",
+                self.agcount, self.agblocks, self.agblklog
+            ));
+        }
+        let full = u64::from(self.agcount - 1) * u64::from(self.agblocks);
+        if self.dblocks <= full || self.dblocks > full + u64::from(self.agblocks) {
+            return bad(format!(
+                "dblocks {} does not fit {} AGs of {}",
+                self.dblocks, self.agcount, self.agblocks
+            ));
+        }
+        Ok(())
+    }
+
+    /// Why the editor and repair must leave this volume alone, if they must: features whose
+    /// structures they do not maintain (finobt, rmapbt, reflink, inobtcnt, sparse inodes, bigtime,
+    /// exchange-range, parent pointers) and dir1 directories.
+    pub fn edit_blocker(&self) -> Option<String> {
+        if !self.is_dir2() {
+            return Some("XFS v1 directories (IRIX 6.2 / 6.4 era) are read-only here".into());
+        }
+        if !self.is_v5() {
+            return None;
+        }
+        let ro = [
+            (super::types::XFS_SB_FEAT_RO_FINOBT, "finobt"),
+            (super::types::XFS_SB_FEAT_RO_RMAPBT, "rmapbt"),
+            (super::types::XFS_SB_FEAT_RO_REFLINK, "reflink"),
+            (super::types::XFS_SB_FEAT_RO_INOBTCNT, "inobtcnt"),
+        ];
+        let inc = [
+            (XFS_SB_FEAT_INCOMPAT_SPINODES, "sparse inodes"),
+            (XFS_SB_FEAT_INCOMPAT_BIGTIME, "bigtime"),
+            (XFS_SB_FEAT_INCOMPAT_EXCHRANGE, "exchange-range"),
+            (XFS_SB_FEAT_INCOMPAT_PARENT, "parent pointers"),
+        ];
+        let on: Vec<&str> = ro
+            .iter()
+            .filter(|(bit, _)| self.features_ro_compat & bit != 0)
+            .chain(
+                inc.iter()
+                    .filter(|(bit, _)| self.features_incompat & bit != 0),
+            )
+            .map(|&(_, name)| name)
+            .collect();
+        (!on.is_empty()).then(|| {
+            format!(
+                "this XFS uses {}, which the editor does not maintain; it is read-only here",
+                on.join(", ")
+            )
+        })
+    }
+
+    /// True iff timestamps are 64-bit nanosecond counts (the BIGTIME feature).
+    pub fn has_bigtime(&self) -> bool {
+        self.is_v5() && self.features_incompat & XFS_SB_FEAT_INCOMPAT_BIGTIME != 0
     }
 
     /// True iff this is a v5 (CRC-enabled, dir3) filesystem.
@@ -368,7 +471,6 @@ impl XfsSuperblock {
         // features2 bit isn't always populated; v5 carries FTYPE in
         // features_incompat instead (XFS_SB_FEAT_INCOMPAT_FTYPE = 0x1).
         const XFS_SB_VERSION2_FTYPE: u32 = 0x0000_0200;
-        const XFS_SB_FEAT_INCOMPAT_FTYPE: u32 = 0x0000_0001;
         if self.is_v5() {
             (self.features_incompat & XFS_SB_FEAT_INCOMPAT_FTYPE) != 0
         } else {

@@ -26,6 +26,8 @@ pub struct XfsDinodeCore {
     pub size: u64,
     pub nblocks: u64,
     pub nextents: u32,
+    /// `di_anextents`: extent count of the attribute fork.
+    pub anextents: u16,
     pub forkoff: u8,
     pub aformat: u8,
     pub flags: u16,
@@ -33,7 +35,21 @@ pub struct XfsDinodeCore {
     /// di_mtime.tv_sec — seconds since 1970. Surfaced so `list_directory`
     /// can populate `FileEntry.modified_unix`, which is what `tar_export`
     /// writes into its headers.
-    pub mtime: i32,
+    pub mtime: i64,
+}
+
+/// `di_mtime` in Unix seconds: a v3 inode with `XFS_DIFLAG2_BIGTIME` (bit 3 of `di_flags2` at
+/// 120) holds nanoseconds since 1901-12-13 as a u64; others hold an i32 of seconds (XFS-018).
+fn decode_mtime(buf: &[u8]) -> i64 {
+    const DIFLAG2_BIGTIME: u64 = 1 << 3;
+    let bigtime = buf[4] == 3
+        && buf.len() >= 128
+        && BigEndian::read_u64(&buf[120..128]) & DIFLAG2_BIGTIME != 0;
+    if bigtime {
+        (BigEndian::read_u64(&buf[40..48]) / 1_000_000_000) as i64 - (1i64 << 31)
+    } else {
+        i64::from(BigEndian::read_i32(&buf[40..44]))
+    }
 }
 
 impl XfsDinodeCore {
@@ -57,19 +73,23 @@ impl XfsDinodeCore {
             mode: BigEndian::read_u16(&buf[2..4]),
             version: buf[4],
             format: DiFormat::from_raw(buf[5]),
-            // bytes 6..8: di_metatype / former di_onlink — unused in v4.
             uid: BigEndian::read_u32(&buf[8..12]),
             gid: BigEndian::read_u32(&buf[12..16]),
-            nlink: BigEndian::read_u32(&buf[16..20]),
+            // v1 inodes keep a 16-bit di_onlink at 6; v2 / v3 the 32-bit di_nlink at 16.
+            nlink: if buf[4] == 1 {
+                u32::from(BigEndian::read_u16(&buf[6..8]))
+            } else {
+                BigEndian::read_u32(&buf[16..20])
+            },
             // bytes 20..32: projid, v2_pad, flushiter — diagnostic only.
             // atime = 32..40, mtime = 40..48, ctime = 48..56 (each = tv_sec i32 + tv_nsec i32);
             // v1/v2 use `i32` seconds → surfaced as `mtime`, dropping nsec.
-            mtime: BigEndian::read_i32(&buf[40..44]),
+            mtime: decode_mtime(buf),
             size: BigEndian::read_u64(&buf[56..64]),
             nblocks: BigEndian::read_u64(&buf[64..72]),
             // bytes 72..76: extsize.
             nextents: BigEndian::read_u32(&buf[76..80]),
-            // bytes 80..82: anextents.
+            anextents: BigEndian::read_u16(&buf[80..82]),
             forkoff: buf[82],
             aformat: buf[83],
             // bytes 84..88: dmevmask; 88..90: dmstate.
