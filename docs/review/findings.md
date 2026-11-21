@@ -345,16 +345,16 @@ Review by a separate agent, 2026-11-21, read-only.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| B8-001 | S1 | confirmed | cbm.rs `read_bam`, `write_bam`, `create_blank` | D64 40-track BAM for tracks 36-40 overlaps the disk name / ID: blank images get a garbage name, real 40-track disks are misread and their names overwritten. | open |
-| B8-002 | S1 | confirmed | cbm.rs `recompute_bam` / `repair` | GEOS VLIR record chains and info blocks are freed by repair; GEOS disks should be refused like REL. | open |
-| B8-003 | S1 | confirmed | trdos.rs `create_file` | New catalogue slot taken from the disk-info count, not the walk: a wrong count overwrites a live entry or hides the new one. | open |
-| B8-004 | S1 | confirmed | oric.rs `create_file_internal` | Length stored as u16: files over 64 KiB read back truncated. | open |
-| B8-005 | S1 | confirmed | os9.rs `build_fd`, `allocate_segments` | Segment sector counts stored as u16 with no split: a 16 MiB+ contiguous file reads back empty. | open |
-| B8-006 | S1 | plausible | atari_dos.rs create / delete | Enhanced-density (VTOC2) disks are edited as if single-VTOC: VTOC2 goes stale. Writes should be refused on ED. | open |
-| B8-007 | S1 | confirmed | qdos.rs `parse_dir_entry`, `delete_entry` | File type read from the wrong offset: subdirectories list as files and deleting one orphans its contents. | open |
+| B8-001 | S1 | confirmed | cbm.rs `read_bam`, `write_bam`, `create_blank` | D64 40-track BAM for tracks 36-40 overlaps the disk name / ID: blank images get a garbage name, real 40-track disks are misread and their names overwritten. | fixed (BFIX) |
+| B8-002 | S1 | confirmed | cbm.rs `recompute_bam` / `repair` | GEOS VLIR record chains and info blocks are freed by repair; GEOS disks should be refused like REL. | fixed (BFIX) |
+| B8-003 | S1 | confirmed | trdos.rs `create_file` | New catalogue slot taken from the disk-info count, not the walk: a wrong count overwrites a live entry or hides the new one. | fixed (BFIX) |
+| B8-004 | S1 | confirmed | oric.rs `create_file_internal` | Length stored as u16: files over 64 KiB read back truncated. | fixed (BFIX) |
+| B8-005 | S1 | confirmed | os9.rs `build_fd`, `allocate_segments` | Segment sector counts stored as u16 with no split: a 16 MiB+ contiguous file reads back empty. | fixed (BFIX) |
+| B8-006 | S1 | plausible | atari_dos.rs create / delete | Enhanced-density (VTOC2) disks are edited as if single-VTOC: VTOC2 goes stale. Writes should be refused on ED. | fixed (BFIX) |
+| B8-007 | S1 | confirmed | qdos.rs `parse_dir_entry`, `delete_entry` | File type read from the wrong offset: subdirectories list as files and deleting one orphans its contents. | fixed (BFIX) |
 | B8-008 | S2 | confirmed | ti99.rs `create_file` | More than 76 cluster runs panics after data was written; `n_data as u16` truncates before the size check. | open |
 | B8-009 | S2 | confirmed | os9.rs `dir_add_entry` | Adding an entry rewrites the parent's FD from scratch, zeroing owner, dates and link count. | open |
-| B8-010 | S2 | confirmed | os9.rs `allocate_segments` | LSN 0 can be allocated when the bitmap bit is clear, overwriting the identification sector. | open |
+| B8-010 | S2 | confirmed | os9.rs `allocate_segments` | LSN 0 can be allocated when the bitmap bit is clear, overwriting the identification sector. | fixed (BFIX) |
 | B8-011 | S2 | confirmed | os9.rs, qdos.rs, lif.rs reads | Allocations sized from on-disk u32 lengths (4 GiB to ~1 TB). | open |
 | B8-012 | S2 | plausible | qdos.rs `FAT_END_LO` | Chains stop at 0xFFF8+ though clusters up to 65,534 are allowed. | open |
 | B8-013 | S2 | confirmed | dragondos.rs `parse_geometry` | Track counts past the bitmap's 3,488 LSNs flip bits in the directory. | open |

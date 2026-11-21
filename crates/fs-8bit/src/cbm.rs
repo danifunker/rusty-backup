@@ -385,6 +385,9 @@ pub struct CbmDirEntry {
     pub size_blocks: u16,
     /// Location of this slot: (dir_track, dir_sector, index 0..8).
     pub slot: (u8, u8, usize),
+    /// A GEOS file: a GEOS type (0x18) or an info block (0x15) on a non-REL entry. Its VLIR
+    /// record chains and info block are not traced by VALIDATE.
+    pub geos: bool,
 }
 
 impl CbmDirEntry {
@@ -408,6 +411,16 @@ pub struct CbmFilesystem<R: Read + Seek + Send> {
     disk_id: String,
     /// Live directory entries (rebuilt after each mutation).
     entries: Vec<CbmDirEntry>,
+}
+
+/// Offset of track `t`'s 4-byte BAM entry in sector 18/0: tracks 1..=35 from 4, tracks 36..=40
+/// of a 40-track disk from 0xC0 (the SpeedDOS layout), clear of the name and ID at 0x90 (B8-001).
+fn d64_bam_entry(t: u8) -> usize {
+    if t <= 35 {
+        4 + (t as usize - 1) * 4
+    } else {
+        0xC0 + (t as usize - 36) * 4
+    }
 }
 
 impl<R: Read + Seek + Send> CbmFilesystem<R> {
@@ -564,6 +577,8 @@ impl<R: Read + Seek + Send> CbmFilesystem<R> {
                     name: decode_petscii_name(&raw_name),
                     size_blocks: u16::from_le_bytes([buf[off + 0x1E], buf[off + 0x1F]]),
                     slot: (track, sector, i),
+                    geos: file_type != CbmFileType::Rel
+                        && (buf[off + 0x18] != 0 || buf[off + 0x15] != 0),
                 };
                 if entry.is_live() {
                     entries.push(entry);
@@ -624,14 +639,13 @@ impl<R: Read + Seek + Send> CbmFilesystem<R> {
         match variant {
             CbmVariant::D64 | CbmVariant::D64_40 | CbmVariant::D71 => {
                 let b18 = self.read_sector(18, 0)?;
-                // Tracks 1..=35 (or 1..=40 for D64_40) at offset 4 + (t-1)*4.
-                let first_block_tracks = if variant == CbmVariant::D71 {
-                    35
-                } else {
-                    tracks
-                };
-                for t in 1..=first_block_tracks {
-                    let o = 4 + (t as usize - 1) * 4;
+                // Tracks 1..=35 at offset 4 + (t-1)*4; a 40-track disk's tracks 36..=40 sit at
+                // 0xC0 (the SpeedDOS layout), past the disk name and ID at 0x90 (B8-001).
+                for t in 1..=tracks.min(40) {
+                    if variant == CbmVariant::D71 && t > 35 {
+                        break;
+                    }
+                    let o = d64_bam_entry(t);
                     free[t as usize - 1] = b18[o];
                     let nb = Bam::bitmap_bytes(variant, t);
                     bits[t as usize - 1][..nb].copy_from_slice(&b18[o + 1..o + 1 + nb]);
@@ -714,8 +728,12 @@ impl<R: Read + Seek + Send> CbmFilesystem<R> {
     /// True when the volume holds a live REL file. REL files carry
     /// side-sector index blocks that this checker does not trace, so BAM
     /// reconciliation is withheld on such volumes (see [`Self::run_fsck`]).
+    /// REL or GEOS files: blocks VALIDATE does not trace (side sectors, VLIR records, info
+    /// blocks), so BAM reconciliation is withheld (B8-002).
     fn has_rel_files(&self) -> bool {
-        self.entries.iter().any(|e| e.file_type == CbmFileType::Rel)
+        self.entries
+            .iter()
+            .any(|e| e.file_type == CbmFileType::Rel || e.geos)
     }
 
     /// Recompute the correct BAM by tracing the directory chain and every
@@ -808,7 +826,7 @@ impl<R: Read + Seek + Send> CbmFilesystem<R> {
                 errors,
                 warnings: vec![FsckIssue {
                     code: "RelFilesPresent".into(),
-                    message: "volume contains REL files; BAM reconciliation skipped \
+                    message: "volume contains REL or GEOS files; BAM reconciliation skipped \
                               (side-sector tracing not implemented)"
                         .into(),
                     repairable: false,
@@ -1053,13 +1071,13 @@ impl<R: Read + Write + Seek + Send> CbmFilesystem<R> {
         match self.variant {
             CbmVariant::D64 | CbmVariant::D64_40 | CbmVariant::D71 => {
                 let mut b18 = self.read_sector(18, 0)?;
-                let first_block_tracks = if self.variant == CbmVariant::D71 {
+                let last = if self.variant == CbmVariant::D71 {
                     35
                 } else {
                     self.variant.tracks()
                 };
-                for t in 1..=first_block_tracks {
-                    let o = 4 + (t as usize - 1) * 4;
+                for t in 1..=last {
+                    let o = d64_bam_entry(t);
                     b18[o] = bam.free[t as usize - 1];
                     let nb = Bam::bitmap_bytes(self.variant, t);
                     b18[o + 1..o + 1 + nb].copy_from_slice(&bam.bits[t as usize - 1][..nb]);
@@ -1510,7 +1528,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CbmFilesystem<R> {
     fn repair(&mut self) -> Result<disk_core::fsck::RepairReport, FilesystemError> {
         if self.has_rel_files() {
             return Err(FilesystemError::Unsupported(
-                "BAM repair is not supported on volumes containing REL files \
+                "BAM repair is not supported on volumes containing REL or GEOS files \
                  (side-sector tracing not implemented)"
                     .into(),
             ));
@@ -1647,7 +1665,7 @@ pub fn create_blank(variant: CbmVariant, name: &str, id: &str) -> Result<Vec<u8>
                 variant.tracks()
             };
             for t in 1..=first_block_tracks {
-                let o = hdr + 4 + (t as usize - 1) * 4;
+                let o = hdr + d64_bam_entry(t);
                 img[o] = bam.free[t as usize - 1];
                 let nb = Bam::bitmap_bytes(variant, t);
                 img[o + 1..o + 1 + nb].copy_from_slice(&bam.bits[t as usize - 1][..nb]);

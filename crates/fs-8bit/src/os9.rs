@@ -799,9 +799,11 @@ impl<R: Read + Write + Seek + Send> Os9Filesystem<R> {
         let need_clusters = sectors.div_ceil(spc);
         let total_clusters = self.cluster_count();
 
-        // Gather free clusters (skip cluster 0 — it covers LSN 0/bitmap/root).
+        // Clusters up to the root directory's FD hold LSN 0, the bitmap and the root: never
+        // hand them out, whatever the bitmap says (B8-010).
+        let first_free = self.ident.root_dir_lsn / spc + 1;
         let mut chosen = Vec::new();
-        for c in 0..total_clusters {
+        for c in first_free..total_clusters {
             if chosen.len() as u64 == need_clusters {
                 break;
             }
@@ -823,7 +825,8 @@ impl<R: Read + Write + Seek + Send> Os9Filesystem<R> {
         for &c in &chosen {
             let lsn = c * spc;
             if let Some(last) = segments.last_mut() {
-                if last.0 + last.1 == lsn {
+                // A segment's sector count is 16 bits in the FD (B8-005).
+                if last.0 + last.1 == lsn && last.1 + spc <= 0xFFFF {
                     last.1 += spc;
                     continue;
                 }

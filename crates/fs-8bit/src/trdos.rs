@@ -548,11 +548,15 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for TrdosFilesystem<R> {
         {
             return Err(FilesystemError::AlreadyExists(name.into()));
         }
-        if self.num_files as usize >= MAX_FILES {
-            return Err(FilesystemError::DiskFull(
-                "TR-DOS catalogue full (128 entries)".into(),
-            ));
-        }
+        // The new slot is the catalogue's first end marker, from the catalogue itself: the
+        // disk-info count can be wrong, and trusting it overwrites or hides an entry (B8-003).
+        let mut cat = vec![0u8; (CATALOG_SECTORS * SECTOR) as usize];
+        self.read_at(0, &mut cat)?;
+        let slot = (0..MAX_FILES)
+            .find(|&i| is_end_of_catalog(&cat, i))
+            .ok_or_else(|| {
+                FilesystemError::DiskFull("TR-DOS catalogue full (128 entries)".into())
+            })?;
         let need = data_len.div_ceil(SECTOR).max(1);
         // The length-in-sectors field is a single byte, so a TR-DOS file tops
         // out at 255 sectors (65280 bytes).
@@ -575,7 +579,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for TrdosFilesystem<R> {
         self.write_at(start * SECTOR, &buf)?;
 
         let entry = TrdosEntry {
-            slot: self.num_files as usize,
+            slot,
             name: name8,
             type_char,
             start_param: 0,
@@ -587,7 +591,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for TrdosFilesystem<R> {
         self.write_entry(&entry)?;
 
         // Advance the high-water mark and free count (append semantics).
-        self.num_files += 1;
+        self.num_files = slot as u16 + 1;
         self.first_free_linear = start + need;
         self.free_sectors =
             (self.geometry.total_sectors() - self.first_free_linear).min(u16::MAX as u64) as u16;
