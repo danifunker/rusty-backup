@@ -8,7 +8,7 @@
 //! | `lisa` | [`lisa`] | Lisa File System, read-only, from DiskCopy 4.2 images with tags |
 //! | `codecs` | [`resource_fork`], [`binhex`] | resource forks, MacBinary / AppleDouble, BinHex 4.0, without HFS |
 //! | `forks` | `codecs` + [`fork_export`] | fork-aware export from a filesystem (implies `hfs`) |
-//! | `collate` | `hfs_common::compare_hfs_keys` / `compare_hfsplus_keys` | catalog name order, from the GPL-2.0-only `fs-mac-unicode`; `hfs` and `hfsplus` turn it on |
+//! | `collate` | `hfs_common::compare_hfs_keys` / `compare_hfsplus_keys` | catalog name order, from `fs-mac-unicode`; `hfs` and `hfsplus` turn it on |
 //!
 //! [`hfs_common`] (B-trees, dates, type/creator codes) and [`mac_roman`] (Mac Roman names) are
 //! always built. Without `collate` (`default-features = false`, with `codecs`) the crate's tree is

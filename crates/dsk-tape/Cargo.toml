@@ -14,7 +14,7 @@ categories = ["filesystem", "emulators"]
 [features]
 default = ["native-zstd", "sun2tape"]
 # Sun QIC tapes: tar sections (plain or compress(1)-ed) and UFS miniroots. The compress(1)
-# codec comes from arc-mac, which is MIT AND LGPL and depends on the GPL fs-mac-unicode.
+# codec comes from arc-mac, which is MIT AND LGPL.
 sun2tape = ["dep:arc-mac", "dep:fs-tar", "dep:fs-unix", "dep:tar"]
 # zstd backend for fs-tar (.tar.zst sections): the C libzstd or the pure-Rust port.
 native-zstd = ["fs-tar?/native-zstd"]

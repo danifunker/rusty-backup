@@ -354,7 +354,7 @@ pub use disk_core::display::decode_ostype;
 // B-tree key comparison
 // ---------------------------------------------------------------------------
 
-/// The catalog-name orderings live in the GPL `fs-mac-unicode` crate (derived tables).
+/// The catalog-name orderings live in the `fs-mac-unicode` crate.
 #[cfg(feature = "collate")]
 pub use fs_mac_unicode::collate::{compare_hfs_keys, compare_hfsplus_keys};
 

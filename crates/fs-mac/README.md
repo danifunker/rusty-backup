@@ -14,6 +14,6 @@ Classic Macintosh filesystems, one Cargo feature each:
 
 Finder info, type / creator codes, dates and resource forks survive every edit. Each filesystem implements the `disk-core` traits. Partition maps (APM) are not included; this crate produces and reads bare volumes. Builds on Rust 1.73 and later. Part of [rusty-backup](https://github.com/danifunker/rusty-backup).
 
-MIT licensed. `hfs` and `hfsplus` (and so the defaults, `mfs` and `forks`) pull in the GPL-2.0-only `fs-mac-unicode` crate for catalog-name ordering, so a binary built with them is covered by the GPL as a whole until those tables are replaced (rusty-backup licence decision D2).
+MIT licensed, with every feature. `hfs` and `hfsplus` pull in `fs-mac-unicode` for catalog-name ordering, which is MIT too since its 0.2.0 (its tables were regenerated from Apple TN1150, Unicode 3.2 and Apple's `RelString`).
 
-To stay free of the GPL-2.0-only crate, depend with `default-features = false` and only `codecs`, `fork-export` and / or `lisa`.
+To leave out the HFS code, depend with `default-features = false` and only `codecs`, `fork-export` and / or `lisa`.

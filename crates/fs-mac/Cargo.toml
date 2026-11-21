@@ -16,8 +16,8 @@ default = ["forks", "hfs", "hfsplus", "lisa", "mfs"]
 # One feature per filesystem; `hfs_common` (B-trees, dates, type/creator codes) is always built.
 hfs = ["collate"]
 hfsplus = ["collate"]
-# The HFS / HFS+ catalog-name orderings from the GPL-2.0-only `fs-mac-unicode` (`hfs_common`'s
-# `compare_hfs_keys` / `compare_hfsplus_keys`). Off, this crate's tree is MIT only.
+# The HFS / HFS+ catalog-name orderings from `fs-mac-unicode` (`hfs_common`'s
+# `compare_hfs_keys` / `compare_hfsplus_keys`).
 collate = ["dep:fs-mac-unicode"]
 mfs = ["hfs"]
 # Lisa Office System; its images come as DiskCopy 4.2 with tags, hence dsk-apple.
@@ -34,8 +34,8 @@ rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac-unicode?/rust173-polyf
 
 [dependencies]
 disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
-# GPL-2.0-only: the HFS / HFS+ name-ordering tables (see that crate's README).
-fs-mac-unicode = { path = "../fs-mac-unicode", version = "0.1", optional = true }
+# The HFS / HFS+ name-ordering tables; MIT since 0.2.0 (see that crate's README).
+fs-mac-unicode = { path = "../fs-mac-unicode", version = "0.2", optional = true }
 dsk-apple = { path = "../dsk-apple", version = "0.1", default-features = false, features = ["dc42"], optional = true }
 anyhow = "1"
 byteorder = "1"

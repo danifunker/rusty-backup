@@ -1,7 +1,9 @@
-//! Catalog-name ordering for HFS (Mac Roman, `HFS_CHARORDER`) and HFS+ (Apple's
+//! Catalog-name ordering for HFS (Mac Roman, Apple's `RelString` ranks) and HFS+ (Apple's
 //! case-fold and decomposition tables in [`crate::hfs_unicode`]).
 
 use std::cmp::Ordering;
+
+use crate::hfs_charorder::HFS_RANK;
 
 /// Normalize an HFS+ catalog name into Apple's `FastUnicodeCompare` form:
 /// canonically decompose each UTF-16 unit (Apple's TN1150 decomposition, NOT
@@ -53,66 +55,14 @@ pub fn compare_hfsplus_keys(
     folded_a.cmp(&folded_b)
 }
 
-/// Mac Roman catalog-name collation order (byte -> sort rank), as used by
-/// classic Mac OS HFS.
-///
-/// Classic HFS compares catalog names with the File Manager's `_RelString`
-/// trap (`CMKeyCmp` in Apple's source: `OS/HFS/CMMAINT.a`), i.e. the system
-/// string comparison — **case-insensitive, diacritical-sensitive**, with a
-/// specific Mac Roman ordering. This is NOT a plain ASCII uppercase: lowercase
-/// folds onto its uppercase *rank*, accented letters sort right after their
-/// base letter (so "Bézier" < "Bind"), and punctuation / quotes / spaces
-/// (incl. high-byte curly quotes 0xD2-0xD5, en/em dashes, and the non-breaking
-/// space 0xCA, which sorts as a space) get their own early ranks rather than
-/// landing after 'Z' by raw byte value.
-///
-/// The table is the well-known `hfs_charorder` reproduction (hfsutils
-/// `libhfs/data.c`); the Linux kernel's `caseorder` (`fs/hfs/string.c`) is a
-/// second, independent copy — they use different absolute values but induce an
-/// identical ordering, and this table reproduces real Apple-formatted volumes
-/// fsck-clean (verified against a MacPack boot disk). The previous table only
-/// folded ASCII and left high bytes raw, which mis-sorted any name with an
-/// accent or curly quote.
-static HFS_CHARORDER: [u8; 256] = [
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-    0x20, 0x22, 0x23, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
-    0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
-    0x47, 0x48, 0x58, 0x5a, 0x5e, 0x60, 0x67, 0x69, 0x6b, 0x6d, 0x73, 0x75, 0x77, 0x79, 0x7b, 0x7f,
-    0x8d, 0x8f, 0x91, 0x93, 0x96, 0x98, 0x9f, 0xa1, 0xa3, 0xa5, 0xa8, 0xaa, 0xab, 0xac, 0xad, 0xae,
-    0x54, 0x48, 0x58, 0x5a, 0x5e, 0x60, 0x67, 0x69, 0x6b, 0x6d, 0x73, 0x75, 0x77, 0x79, 0x7b, 0x7f,
-    0x8d, 0x8f, 0x91, 0x93, 0x96, 0x98, 0x9f, 0xa1, 0xa3, 0xa5, 0xa8, 0xaf, 0xb0, 0xb1, 0xb2, 0xb3,
-    0x4c, 0x50, 0x5c, 0x62, 0x7d, 0x81, 0x9a, 0x55, 0x4a, 0x56, 0x4c, 0x4e, 0x50, 0x5c, 0x62, 0x64,
-    0x65, 0x66, 0x6f, 0x70, 0x71, 0x72, 0x7d, 0x89, 0x8a, 0x8b, 0x81, 0x83, 0x9c, 0x9d, 0x9e, 0x9a,
-    0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0x95, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0, 0x52, 0x85,
-    0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0x57, 0x8c, 0xcc, 0x52, 0x85,
-    0xcd, 0xce, 0xcf, 0xd0, 0xd1, 0xd2, 0xd3, 0x26, 0x27, 0xd4, 0x20, 0x4a, 0x4e, 0x83, 0x87, 0x87,
-    0xd5, 0xd6, 0x24, 0x25, 0x2d, 0x2e, 0xd7, 0xd8, 0xa7, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf,
-    0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef,
-    0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
-];
-
-/// Compare two HFS (classic) catalog keys the way the Mac OS File Manager does.
-///
-/// Keys are: parent_cnid (u32) + name (Mac Roman bytes). Parent IDs compare
-/// numerically; names compare through [`HFS_CHARORDER`] byte-by-byte, with the
-/// shorter name sorting first on a common prefix (matching hfsutils
-/// `d_relstring` / the Linux kernel `hfs_strcmp`).
+/// Compare two classic HFS catalog keys as the Mac OS File Manager does: parent IDs
+/// numerically, then names rank by rank ([`HFS_RANK`], Apple's `RelString` order), the
+/// shorter name first on a common prefix.
 pub fn compare_hfs_keys(parent_a: u32, name_a: &[u8], parent_b: u32, name_b: &[u8]) -> Ordering {
-    match parent_a.cmp(&parent_b) {
-        Ordering::Equal => {}
-        other => return other,
-    }
-    let len = name_a.len().min(name_b.len());
-    for i in 0..len {
-        let a = HFS_CHARORDER[name_a[i] as usize];
-        let b = HFS_CHARORDER[name_b[i] as usize];
-        match a.cmp(&b) {
-            Ordering::Equal => {}
-            other => return other,
-        }
-    }
-    name_a.len().cmp(&name_b.len())
+    let rank = |&b: &u8| HFS_RANK[b as usize];
+    parent_a
+        .cmp(&parent_b)
+        .then_with(|| name_a.iter().map(rank).cmp(name_b.iter().map(rank)))
 }
 
 #[cfg(test)]
@@ -264,6 +214,24 @@ mod tests {
             compare_hfsplus_keys(2, &nul_prefixed, 2, &plain, true),
             Ordering::Less
         );
+    }
+
+    /// Answers Apple's `RelString` gives (Mac Roman bytes): case-blind, accent-aware.
+    #[test]
+    fn test_compare_hfs_keys_follows_relstring() {
+        let cmp = |a: &[u8], b: &[u8]| compare_hfs_keys(2, a, 2, b);
+        assert_eq!(cmp(b"a", b"A"), Ordering::Equal);
+        assert_eq!(cmp(b"\x83", b"\x8E"), Ordering::Equal, "E-acute == e-acute");
+        assert_eq!(cmp(b"e", b"\x8E"), Ordering::Less, "e < e-acute");
+        assert_eq!(cmp(b"B\x8Ezier", b"Bind"), Ordering::Less, "e-acute < i");
+        assert_eq!(
+            cmp(b"\xCA", b" "),
+            Ordering::Equal,
+            "non-breaking space == space"
+        );
+        assert_eq!(cmp(b"Z", b"_"), Ordering::Less);
+        assert_eq!(cmp(b"ab", b"abc"), Ordering::Less);
+        assert_eq!(compare_hfs_keys(1, b"z", 2, b"a"), Ordering::Less);
     }
 
     #[test]

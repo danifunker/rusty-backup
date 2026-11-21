@@ -23,8 +23,8 @@ minix = []
 reiserfs = []
 ufs = []
 vxfs = []
-# Old BeOS fs (pre-DR9). Not in `default`: it needs fs-mac for the Mac type/creator table, and
-# fs-mac brings in the GPL-2.0-only fs-mac-unicode, so enabling it makes the build GPL as a whole.
+# Old BeOS fs (pre-DR9). Not in `default`: it needs fs-mac (no features) for the Mac
+# type/creator table.
 ofs = ["dep:fs-mac"]
 # Only for a Rust 1.73 toolchain; see disk-core.
 rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac?/rust173-polyfill"]

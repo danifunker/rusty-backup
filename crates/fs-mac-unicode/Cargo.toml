@@ -1,11 +1,11 @@
 [package]
 name = "fs-mac-unicode"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.73"
-license = "GPL-2.0-only"
+license = "MIT"
 authors = ["Dani Sarfati <dani@funkervogt.com>"]
-description = "HFS and HFS+ catalog-name ordering: Apple's Unicode case-fold and decomposition tables and the Mac Roman sort order"
+description = "HFS and HFS+ catalog-name ordering: Apple's HFS+ case folding and Unicode 3.2 decomposition, and the Mac Roman RelString order"
 repository = "https://github.com/danifunker/rusty-backup"
 readme = "README.md"
 keywords = ["hfs", "hfsplus", "unicode", "apple", "filesystem"]
