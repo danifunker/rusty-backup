@@ -152,7 +152,7 @@ impl Mbr {
         let disk_signature = ds_cursor.read_u32::<LittleEndian>().unwrap();
 
         // Parse 4 partition entries starting at offset 446
-        let mut entries: [MbrPartitionEntry; 4] = std::array::from_fn(|i| {
+        let entries: [MbrPartitionEntry; 4] = std::array::from_fn(|i| {
             let offset = PARTITION_TABLE_OFFSET + i * PARTITION_ENTRY_SIZE;
             let entry_data: [u8; PARTITION_ENTRY_SIZE] = data
                 [offset..offset + PARTITION_ENTRY_SIZE]
@@ -160,9 +160,6 @@ impl Mbr {
                 .unwrap();
             MbrPartitionEntry::parse(&entry_data)
         });
-
-        // Sort non-empty entries to the front (preserving order)
-        let _ = &mut entries; // entries already in table order
 
         Ok(Self {
             disk_signature,
@@ -249,10 +246,13 @@ pub fn parse_ebr_chain(
             .unwrap();
         let entry1 = MbrPartitionEntry::parse(&entry1_data);
 
-        // Entry 0's start_lba is relative to current EBR position
+        // Entry 0's start_lba is relative to current EBR position; one past 2 TiB ends the chain.
         if !entry0.is_empty() {
             let mut logical = entry0;
-            logical.start_lba += current_ebr_lba;
+            let Some(start) = logical.start_lba.checked_add(current_ebr_lba) else {
+                break;
+            };
+            logical.start_lba = start;
             logical_partitions.push(logical);
         }
 
@@ -260,7 +260,10 @@ pub fn parse_ebr_chain(
         if entry1.is_empty() {
             break;
         }
-        current_ebr_lba = extended_start_lba + entry1.start_lba;
+        let Some(next) = extended_start_lba.checked_add(entry1.start_lba) else {
+            break;
+        };
+        current_ebr_lba = next;
     }
 
     Ok(logical_partitions)
@@ -313,7 +316,21 @@ pub fn clear_orphan_entries_overlapping(
 ///   - Bytes 1-3, 5-7: CHS start/end (if `heads > 0`)
 ///
 /// Used by: VHD export (size changes only), restore (size + alignment changes).
-pub fn patch_mbr_entries(mbr: &mut [u8; 512], overrides: &[PartitionSizeOverride]) {
+pub fn patch_mbr_entries(
+    mbr: &mut [u8; 512],
+    overrides: &[PartitionSizeOverride],
+) -> Result<(), PartitionError> {
+    // All or nothing: a refused override must not leave the earlier ones half-written.
+    let mut work = *mbr;
+    patch_entries_into(&mut work, overrides)?;
+    *mbr = work;
+    Ok(())
+}
+
+fn patch_entries_into(
+    mbr: &mut [u8; 512],
+    overrides: &[PartitionSizeOverride],
+) -> Result<(), PartitionError> {
     for ps in overrides {
         // Primary partitions are entries 0-3 in the MBR
         if ps.index > 3 {
@@ -337,13 +354,26 @@ pub fn patch_mbr_entries(mbr: &mut [u8; 512], overrides: &[PartitionSizeOverride
             continue; // Safety check: don't patch if start LBA doesn't match
         }
 
-        let effective_start = ps.effective_start_lba();
-        let new_sectors = (ps.export_size / 512) as u32;
+        // An MBR entry is two u32 sector counts; refuse rather than wrap past 2 TiB.
+        let effective_start = u32::try_from(ps.effective_start_lba()).map_err(|_| {
+            PartitionError::InvalidMbr(format!(
+                "partition {} would start at sector {}, past what an MBR can address",
+                ps.index + 1,
+                ps.effective_start_lba()
+            ))
+        })?;
+        let new_sectors = u32::try_from(ps.export_size / 512).map_err(|_| {
+            PartitionError::InvalidMbr(format!(
+                "partition {} would be {} bytes, more than an MBR entry can hold (2 TiB)",
+                ps.index + 1,
+                ps.export_size
+            ))
+        })?;
 
         // Patch start_lba if changed
         if ps.new_start_lba.is_some() {
             mbr[entry_offset + 8..entry_offset + 12]
-                .copy_from_slice(&(effective_start as u32).to_le_bytes());
+                .copy_from_slice(&effective_start.to_le_bytes());
         }
 
         // Patch total_sectors
@@ -355,19 +385,20 @@ pub fn patch_mbr_entries(mbr: &mut [u8; 512], overrides: &[PartitionSizeOverride
             let s = ps.sectors_per_track as u32;
 
             // CHS start
-            let (sc, sh, ss) = lba_to_chs(effective_start as u32, h, s);
+            let (sc, sh, ss) = lba_to_chs(effective_start, h, s);
             mbr[entry_offset + 1] = sh as u8;
             mbr[entry_offset + 2] = ((sc >> 2) & 0xC0) as u8 | (ss & 0x3F) as u8;
             mbr[entry_offset + 3] = sc as u8;
 
             // CHS end
-            let end_lba = (effective_start as u32).saturating_add(new_sectors.saturating_sub(1));
+            let end_lba = effective_start.saturating_add(new_sectors.saturating_sub(1));
             let (ec, eh, es) = lba_to_chs(end_lba, h, s);
             mbr[entry_offset + 5] = eh as u8;
             mbr[entry_offset + 6] = ((ec >> 2) & 0xC0) as u8 | (es & 0x3F) as u8;
             mbr[entry_offset + 7] = ec as u8;
         }
     }
+    Ok(())
 }
 
 /// Convert an LBA address to CHS values using the given geometry.
@@ -417,7 +448,13 @@ pub struct LogicalPartitionInfo {
 pub fn build_ebr_chain(
     extended_start_lba: u32,
     logical_partitions: &[LogicalPartitionInfo],
-) -> Vec<(u64, [u8; 512])> {
+) -> Result<Vec<(u64, [u8; 512])>, PartitionError> {
+    let bad = |what: &str, i: usize| {
+        PartitionError::InvalidMbr(format!(
+            "logical partition {} {what}, so its EBR cannot be placed",
+            i + 5
+        ))
+    };
     let mut result = Vec::with_capacity(logical_partitions.len());
 
     for (i, lp) in logical_partitions.iter().enumerate() {
@@ -428,26 +465,39 @@ pub fn build_ebr_chain(
         let ebr_lba = if i == 0 {
             extended_start_lba
         } else {
-            lp.start_lba - 1
+            lp.start_lba
+                .checked_sub(1)
+                .ok_or_else(|| bad("starts at sector 0", i))?
         };
 
         // Entry 0: the logical partition (start relative to this EBR)
         let e0_off = PARTITION_TABLE_OFFSET;
         ebr[e0_off + 4] = lp.partition_type;
-        let rel_start: u32 = lp.start_lba - ebr_lba;
+        let rel_start = lp
+            .start_lba
+            .checked_sub(ebr_lba)
+            .ok_or_else(|| bad("starts before the extended partition", i))?;
         ebr[e0_off + 8..e0_off + 12].copy_from_slice(&rel_start.to_le_bytes());
         ebr[e0_off + 12..e0_off + 16].copy_from_slice(&lp.total_sectors.to_le_bytes());
 
         // Entry 1: link to next EBR (relative to extended container start)
         if i + 1 < logical_partitions.len() {
             let next_lp = &logical_partitions[i + 1];
-            let next_ebr_lba = next_lp.start_lba - 1;
+            let next_ebr_lba = next_lp
+                .start_lba
+                .checked_sub(1)
+                .ok_or_else(|| bad("starts at sector 0", i + 1))?;
             let e1_off = PARTITION_TABLE_OFFSET + PARTITION_ENTRY_SIZE;
             ebr[e1_off + 4] = 0x05; // extended type for the link
-            let next_rel = next_ebr_lba - extended_start_lba;
+            let next_rel = next_ebr_lba
+                .checked_sub(extended_start_lba)
+                .ok_or_else(|| bad("starts before the extended partition", i + 1))?;
             ebr[e1_off + 8..e1_off + 12].copy_from_slice(&next_rel.to_le_bytes());
             // Size of next EBR region = 1 (EBR sector) + next partition sectors
-            let next_region_size = 1 + next_lp.total_sectors;
+            let next_region_size = next_lp
+                .total_sectors
+                .checked_add(1)
+                .ok_or_else(|| bad("is too large", i + 1))?;
             ebr[e1_off + 12..e1_off + 16].copy_from_slice(&next_region_size.to_le_bytes());
         }
         // Entry 1 is all zeros for the last partition (already zero-initialized)
@@ -459,7 +509,7 @@ pub fn build_ebr_chain(
         result.push((ebr_lba as u64 * 512, ebr));
     }
 
-    result
+    Ok(result)
 }
 
 /// Standard generic MBR bootstrap (84 bytes), occupying the boot-code area
@@ -861,7 +911,8 @@ mod tests {
                 total_sectors: 2000,
                 partition_type: 0x06,
             }],
-        );
+        )
+        .unwrap();
 
         assert_eq!(chain.len(), 1);
         let (offset, ebr) = &chain[0];
@@ -912,7 +963,7 @@ mod tests {
             },
         ];
 
-        let chain = build_ebr_chain(extended_start, &logicals);
+        let chain = build_ebr_chain(extended_start, &logicals).unwrap();
         assert_eq!(chain.len(), 3);
 
         // First EBR at extended container start (LBA 1000)
@@ -950,7 +1001,7 @@ mod tests {
             },
         ];
 
-        let chain = build_ebr_chain(extended_start, &logicals);
+        let chain = build_ebr_chain(extended_start, &logicals).unwrap();
 
         // Write to disk buffer
         let disk_size = (8194 + 2048 + 1) as usize * 512;
@@ -1022,5 +1073,54 @@ mod tests {
         // Sanity: the bootstrap ends with the chainload far-jump to 0000:7C00
         // (ljmp $0,$0x7c00 = EA 00 7C 00 00).
         assert_eq!(&MBR_BOOT_CODE[79..84], &[0xEA, 0x00, 0x7C, 0x00, 0x00]);
+    }
+
+    fn entry(start: u32, sectors: u32, kind: u8) -> [u8; 16] {
+        let mut e = [0u8; 16];
+        e[4] = kind;
+        e[8..12].copy_from_slice(&start.to_le_bytes());
+        e[12..16].copy_from_slice(&sectors.to_le_bytes());
+        e
+    }
+
+    /// PT-005: an EBR whose offsets overflow u32 ends the chain instead of panicking or wrapping.
+    #[test]
+    fn an_overflowing_ebr_chain_stops_cleanly() {
+        let mut disk = vec![0u8; 4 * 512];
+        let ebr = &mut disk[512..1024];
+        ebr[446..462].copy_from_slice(&entry(u32::MAX, 10, 0x06));
+        ebr[462..478].copy_from_slice(&entry(u32::MAX, 10, 0x05));
+        ebr[510] = 0x55;
+        ebr[511] = 0xAA;
+        let got = parse_ebr_chain(&mut Cursor::new(disk), 1).unwrap();
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// PT-001: a partition past 2 TiB is refused, never written with a wrapped sector count.
+    #[test]
+    fn patching_past_two_tib_is_refused() {
+        let mut mbr = build_minimal_mbr(1, &[(0x0C, 2048, 1000, false)], 255, 63);
+        let before = mbr;
+        let big = PartitionSizeOverride::size_only(0, 2048, 1000 * 512, 3 << 40);
+        assert!(patch_mbr_entries(&mut mbr, &[big]).is_err());
+        assert_eq!(mbr, before, "a refused patch leaves the table alone");
+        let ok = PartitionSizeOverride::size_only(0, 2048, 1000 * 512, 1 << 40);
+        patch_mbr_entries(&mut mbr, &[ok]).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(mbr[458..462].try_into().unwrap()),
+            1 << 31
+        );
+    }
+
+    /// An EBR that cannot be placed is an error, not a wrapped sector number.
+    #[test]
+    fn an_impossible_ebr_chain_is_an_error() {
+        let lp = |start_lba| LogicalPartitionInfo {
+            start_lba,
+            total_sectors: 10,
+            partition_type: 0x06,
+        };
+        assert!(build_ebr_chain(1000, &[lp(1002), lp(0)]).is_err());
+        assert!(build_ebr_chain(1000, &[lp(900)]).is_err());
     }
 }

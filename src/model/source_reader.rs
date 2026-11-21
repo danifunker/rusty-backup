@@ -724,8 +724,8 @@ fn try_open_cbk_lazy(path: &Path) -> Result<Option<CbkLazyReader>> {
     ) else {
         return Ok(None);
     };
-    part_tables::mbr::patch_mbr_entries(&mut mbr, &overrides);
-    let ebr = crate::restore::build_restore_ebr_chain(&metadata, &overrides, Some(&mbr));
+    part_tables::mbr::patch_mbr_entries(&mut mbr, &overrides).context("patching the MBR")?;
+    let ebr = crate::restore::build_restore_ebr_chain(&metadata, &overrides, Some(&mbr))?;
 
     let mut regions: Vec<CbkRegion> = Vec::new();
 

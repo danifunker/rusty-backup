@@ -34,6 +34,9 @@ pub enum RustyBackupError {
     #[error("Invalid AHDI: {0}")]
     InvalidAhdi(String),
 
+    #[error("Invalid X68k partition table: {0}")]
+    InvalidX68k(String),
+
     #[error("Device is currently mounted: {0}")]
     DeviceMounted(String),
 
@@ -64,6 +67,7 @@ impl From<part_tables::PartitionError> for RustyBackupError {
             P::InvalidSgi(m) => Self::InvalidSgi(m),
             P::InvalidRdb(m) => Self::InvalidRdb(m),
             P::InvalidAhdi(m) => Self::InvalidAhdi(m),
+            P::InvalidX68k(m) => Self::InvalidX68k(m),
         }
     }
 }

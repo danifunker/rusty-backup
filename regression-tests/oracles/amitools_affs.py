@@ -41,11 +41,16 @@ def main() -> int:
         work = Path(tmp) / "volume.hdf"
         shutil.copyfile(src, work)
         work.chmod(0o644)
-        proc = subprocess.run(
-            ["xdftool", str(work), "list"],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            proc = subprocess.run(
+                ["xdftool", str(work), "list"],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            # No xdftool on PATH says nothing about the volume.
+            print("unavailable: xdftool not found on PATH", file=sys.stderr)
+            return 77
         sys.stdout.write(proc.stdout)
         sys.stderr.write(proc.stderr)
         # xdftool that cannot even start (amitools missing for this python) says nothing about the volume.

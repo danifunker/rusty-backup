@@ -574,7 +574,7 @@ fn apply_gpt_edits(
 
     // Write backup GPT
     let backup = patched.build_backup_gpt(disk_sectors);
-    let backup_offset = (disk_sectors - 33) * 512;
+    let backup_offset = disk_sectors * 512 - backup.len() as u64;
     file.seek(SeekFrom::Start(backup_offset))?;
     file.write_all(&backup)?;
 

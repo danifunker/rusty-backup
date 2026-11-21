@@ -16,8 +16,11 @@ to another carries the other slice's prefix and is listed under that slice.
 | Slice | Lines | Reviewed | Open findings |
 |---|---:|---|---:|
 | crates/disk-core | 4,943 | 2026-11-21, fixed in 0.3.0 | 1 (DC-006, per driver) |
+| crates/part-tables | 10,220 | 2026-11-21, fixed in 0.2.0 | 0 |
 | crates/fs-squashfs | 6,425 | (seen in passing) | 1 |
 | src/fs | 14,945 | (seen in passing) | 1 |
+| src/partition, src/rbformats, src/restore | 36,000 | (seen in passing) | 2 |
+| src/model/convert | — | (seen in passing) | 1 |
 
 ## Mechanical checks
 
@@ -66,10 +69,44 @@ crate's review. DC-012 also stops `stream_pipe` hiding the source's typed error,
 while a consumer that fails first still reports its own error rather than the
 broken pipe it caused.
 
+**Regression (batch level, 2026-11-21, `84935173`):** preflight green (release tests,
+MiSTer feature set, Rust 1.73 vintage build, doc parity, harness tests), layer check
+green. 821 cases: 500 pass, 167 fail, 154 skip. None of the failures comes from this
+change: 164 are AppKit / Cocoa GUI flows, which cannot drive a desktop session on an
+unattended run (the shell is killed waiting for its window); 3 are CV-001 below,
+failing on main since the Convert redesign. One oracle verdict failed because
+`amitools_affs.py` crashed when `xdftool` is missing instead of reporting itself
+unavailable; fixed in the harness.
+
 Checked and fine: `stream_pipe` (no deadlock on early stop or panic; producer
 errors never become a silent short read), `raw_name` round trip, `name_legalize`
 (host names can't escape the folder: `/` and `..` are refused and repaired),
 `bits` arithmetic, the DOS / exFAT / NTFS / Mac / ADFS / OS-9 converters.
+
+## crates/part-tables
+
+Read line by line: `mbr`, `gpt`, `apm`, the RDB restore plan, the X68k patch,
+`lvm/{aix,hpux,linux}`, `size_override`. Scanned with the mechanical greps (narrowing
+casts, unchecked indexing, disk-sized allocations): `atari`, `next`, `sgi`,
+`sgi_dklabel`, `sun`, `solaris_x86`, `bsd`, `lif`; nothing found there that needed a
+fix. Fixed in **part-tables 0.2.0** (breaking: `patch_mbr_entries`, `build_ebr_chain`,
+`Apm::patch_for_restore` and `patch_x68k_entries` return `Result`; new
+`PartitionError::InvalidX68k`).
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| PT-001 | S1 | confirmed | [mbr.rs:319](../../crates/part-tables/src/mbr.rs#L319) | `patch_mbr_entries` wrote `(export_size / 512) as u32`: a "fill remaining" restore of an MBR backup onto a card past 2 TiB wrote a wrapped sector count, so the table described a tiny partition under a large filesystem. Now refused with an error, all-or-nothing, and every restore / VHD / CHD caller propagates it. | fixed (part-tables 0.2.0) |
+| PT-002 | S1 | confirmed | [gpt.rs](../../crates/part-tables/src/gpt.rs) | `build_primary_gpt` / `build_backup_gpt` cut the entry array to 16 KiB but computed its CRC over the whole array and kept the header's entry count, so a GPT with more than 128 entries of 128 bytes was rebuilt with a CRC mismatch. The array region is now sized from the array (`array_sectors`), first / last usable LBAs follow it, and callers place the backup by its length instead of `target - 33`. | fixed (part-tables 0.2.0) |
+| PT-003 | S2 | confirmed | [gpt.rs](../../crates/part-tables/src/gpt.rs) | `partition_entry_size` from disk sized a `Vec` directly (up to 4 GiB). Now 128..=4096 and a power of two, as the spec allows. | fixed (part-tables 0.2.0) |
+| PT-004 | S2 | confirmed | [gpt.rs](../../crates/part-tables/src/gpt.rs) | Neither the header CRC nor the entry-array CRC was checked, and the backup GPT was never consulted. A primary that fails either CRC now gives way to a backup that passes both; with no good backup the primary is still read, as before. | fixed (part-tables 0.2.0) |
+| PT-005 | S2 | confirmed | [mbr.rs](../../crates/part-tables/src/mbr.rs) | `parse_ebr_chain` added untrusted u32 LBAs unchecked: a crafted EBR panicked in debug builds and wrapped in release. Now ends the chain. | fixed (part-tables 0.2.0) |
+| PT-006 | S2 | confirmed | [apm.rs](../../crates/part-tables/src/apm.rs) | A DDR with block size 0 made restore divide by zero (`src/rbformats/mod.rs`, `src/restore/mod.rs`) and showed every partition at 0. The parser reads it as 512, and the restore path that loads `apm.json` from older backups does the same. | fixed (part-tables 0.2.0) |
+| PT-007 | S2 | confirmed | [lvm/aix.rs](../../crates/part-tables/src/lvm/aix.rs) | The AIX VGDA length from disk sized a buffer with no cap (up to 2 TiB). Capped at 65,536 sectors; HP-UX and Linux LVM already capped theirs. | fixed (part-tables 0.2.0) |
+| PT-008 | S2 | confirmed | [gpt.rs](../../crates/part-tables/src/gpt.rs) | `GptPartitionEntry::size_bytes` underflowed on last < first; `patch_for_restore` underflowed for a size under one sector; `build_*_gpt` underflowed for tiny disks. | fixed (part-tables 0.2.0) |
+| PT-009 | S3 | confirmed | [apm.rs](../../crates/part-tables/src/apm.rs), [rdb.rs](../../crates/part-tables/src/rdb.rs) | Restore patches narrowed with `as u32` (APM block count and start, RDB low cylinder, high cylinder, disk cylinders). Now checked, with errors. | fixed (part-tables 0.2.0) |
+| PT-010 | S2 | plausible | [x68k.rs:334](../../crates/part-tables/src/x68k.rs#L334) | Moving an X68k partition overwrote the start word's high byte, which holds the active / flags bits, with zero, and a start past 24 bits wrapped silently. The flags byte is now kept and a too-large start is refused. The app's own `restore_patch::patch_x68k` already kept it (see PR-001). | fixed (part-tables 0.2.0) |
+| PT-011 | S1 | confirmed | [mbr.rs](../../crates/part-tables/src/mbr.rs) | `build_ebr_chain` subtracted LBAs unchecked; an impossible layout wrote EBRs at wrapped positions. Now an error; `restore::build_restore_ebr_chain` returns `Result<Option<_>>` so a restore stops instead of dropping the logical partitions. | fixed (part-tables 0.2.0) |
+| PT-012 | S4 | confirmed | [mbr.rs](../../crates/part-tables/src/mbr.rs) | Dead code in `Mbr::parse` (`let _ = &mut entries`). Removed. The crate's private `Cursor` / `be16` / `le32` helpers move onto `disk_core::bytes` when each module is next touched (DC-011). | fixed (part-tables 0.2.0) |
 
 ## crates/fs-squashfs
 
@@ -82,3 +119,16 @@ errors never become a silent short read), `raw_name` round trip, `name_legalize`
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
 | FS-001 | S2 | plausible | [export_selection.rs:434](../../src/fs/export_selection.rs#L434) | Zip export builds member paths from raw entry names via `archive_name()`, which rejects only an exact `.` / `..`. Classic HFS and MFS allow `/` in a name, so `a/b` becomes a nested member and `../../x` a traversal member (`zip` does not refuse `..`; the `tar` crate does, so tar export fails instead). Folder export is safe (`sanitize_filename`). Confirm by `put`-ting a file named `../x` onto an HFS image and zipping it. | open |
+
+## src/partition, src/rbformats, src/restore
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| PR-001 | S4 | confirmed | [restore_patch.rs:579](../../src/partition/restore_patch.rs#L579) | Two X68k table patchers: `restore_patch::patch_x68k` (slot matching, repack, keeps flags) and `part_tables::x68k::patch_x68k_entries` (used by `src/rbformats/mod.rs`). The crate one lost the flags byte until PT-010. One should go. | open |
+| PR-002 | S4 | confirmed | [vhd.rs:246](../../src/rbformats/vhd.rs#L246) | `rebuild_vhd_ebr_chain` re-implements `restore::build_restore_ebr_chain` ("same algorithm", says its own comment), with its own silent fallback when the chain can't be rebuilt. | open |
+
+## src/model/convert
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| CV-001 | S3 | confirmed | [classify.rs:81](../../src/model/convert/classify.rs#L81) | A 2 MB FAT image classifies as a floppy, and `--format qcow2` / `vmdk-sparse` / `chd` (hard-disk formats) are then ignored without a word: the output is raw. `subcmd.convert.{qcow2,vmdk-sparse,chd}-reopens` fail on main since the Convert redesign (`da41d419`). Either warn when `--format` doesn't apply to a kind, or let a hard-disk format pull a floppy-sized image along. | open |
