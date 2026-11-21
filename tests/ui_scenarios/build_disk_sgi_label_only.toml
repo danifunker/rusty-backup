@@ -1,0 +1,84 @@
+# The SGI preset's Format choice: "Volume header only" writes the SGI label and partition table
+# and leaves the EFS root unformatted; "Volume header and EFS" formats the root as well.
+name = "Build Disk: SGI volume header only"
+vm = "build_disk"
+
+[[step]]
+action = "SetKind"
+arg = "easy"
+
+[[step]]
+action = "Next"
+
+[[step]]
+action = "OutputImage"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Disk" }
+
+[[step]]
+action = "System"
+arg = 9
+expect = { sgi_label_only = false, summary = "~EFS label" }
+
+[[step]]
+action = "SgiFormat"
+arg = "label-only"
+expect = { sgi_label_only = true, summary = "~SGI volume header only; the EFS root is left unformatted" }
+
+[[step]]
+action = "SetSize"
+arg = "64M"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Review", summary = "~SGI volume header only" }
+
+[[step]]
+action = "Next"
+settle = true
+expect = { step = "Build", result = "ok", sgi_header = true, root_efs = false }
+
+# The same disk with the EFS root formatted: the root opens as EFS.
+[[step]]
+action = "BuildAnother"
+expect = { step = "Kind" }
+
+[[step]]
+action = "SetKind"
+arg = "easy"
+
+[[step]]
+action = "Next"
+
+[[step]]
+action = "OutputImage"
+
+[[step]]
+action = "Next"
+expect = { step = "Disk" }
+
+[[step]]
+action = "System"
+arg = 9
+
+[[step]]
+action = "SgiFormat"
+arg = "efs"
+expect = { sgi_label_only = false, summary = "~EFS label" }
+
+[[step]]
+action = "SetSize"
+arg = "64M"
+
+[[step]]
+action = "Next"
+expect = { step = "Review" }
+
+[[step]]
+action = "Next"
+settle = true
+expect = { step = "Build", result = "ok", sgi_header = true, root_efs = true }

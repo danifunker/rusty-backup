@@ -464,6 +464,17 @@ impl BuildDiskTab {
                                 egui::TextEdit::singleline(&mut p.sgi_label).desired_width(80.0),
                             );
                         });
+                        ui.push_id(ids::SGI_FORMAT, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Format:");
+                                ui.radio_value(
+                                    &mut p.sgi_label_only,
+                                    false,
+                                    "Volume header and EFS",
+                                );
+                                ui.radio_value(&mut p.sgi_label_only, true, "Volume header only");
+                            });
+                        });
                     }
                     // An easy target asks only for a size.
                     _ => {}

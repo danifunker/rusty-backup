@@ -18,6 +18,7 @@ use crate::form::{
 use crate::widgets::set_text;
 
 const CONTROLLERS: [&str; 2] = ["SASI (256-byte sectors)", "SCSI (1024-byte sectors)"];
+const SGI_FORMATS: [&str; 2] = ["Volume header and EFS", "Volume header only"];
 
 /// What the step shows.
 pub struct DiskShown {
@@ -72,6 +73,7 @@ struct PresetRows {
     system: adw::ActionRow,
     clear: gtk::Button,
     label: adw::EntryRow,
+    sgi_format: adw::ComboRow,
 }
 
 impl PresetRows {
@@ -135,6 +137,12 @@ impl PresetRows {
         let apply = edit(Rc::new(move |p| p.sgi_label = picked.text().to_string()));
         label.connect_changed(move |_| apply());
         root.add(&label);
+
+        let sgi_format = combo("Format", ids::SGI_FORMAT, &SGI_FORMATS);
+        let picked = sgi_format.clone();
+        let apply = edit(Rc::new(move |p| p.sgi_label_only = picked.selected() == 1));
+        sgi_format.connect_selected_notify(move |_| apply());
+        root.add(&sgi_format);
         PresetRows {
             root,
             held,
@@ -144,6 +152,7 @@ impl PresetRows {
             system,
             clear,
             label,
+            sgi_format,
         }
     }
 
@@ -155,6 +164,7 @@ impl PresetRows {
         self.partitions.set_visible(x68k);
         self.system.set_visible(x68k);
         self.label.set_visible(!x68k);
+        self.sgi_format.set_visible(p.kind == PresetKind::SgiEfs);
         set_combo(&self.controller, u32::from(p.x68k_scsi));
         set_spin(&self.partitions, p.x68k_partitions as f64);
         let disk = p.x68k_system_disk.as_ref().map(|d| d.display().to_string());
@@ -164,6 +174,7 @@ impl PresetRows {
         );
         self.clear.set_visible(disk.is_some());
         set_entry(&self.label, &p.sgi_label);
+        set_combo(&self.sgi_format, u32::from(p.sgi_label_only));
         *self.held.borrow_mut() = Some(p);
     }
 }

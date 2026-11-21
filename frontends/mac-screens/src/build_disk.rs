@@ -31,6 +31,7 @@ use super::sync::SyncGuard;
 
 const OUTPUTS: [&str; 2] = ["Image file", "Physical disk"];
 const CONTROLLERS: [&str; 2] = ["SASI (256-byte sectors)", "SCSI (1024-byte sectors)"];
+const SGI_FORMATS: [&str; 2] = ["Volume header and EFS", "Volume header only"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum K {
@@ -76,6 +77,8 @@ pub enum K {
     SystemClear,
     SgiCaption,
     SgiLabel,
+    SgiFormatCaption,
+    SgiFormat,
     CdLayoutCaption,
     CdLayout,
     CdNameCaption,
@@ -234,6 +237,8 @@ impl BuildScreen {
             f.button(K::SystemClear, "Clear", ids::SYSTEM_DISK_CLEAR);
             f.label(K::SgiCaption, "EFS label:");
             f.field(K::SgiLabel, ids::SGI_LABEL, "EFS label", false);
+            f.label(K::SgiFormatCaption, "Format:");
+            f.popup(K::SgiFormat, &strings(&SGI_FORMATS), ids::SGI_FORMAT);
             let layouts: Vec<&str> = CdLayout::ALL.iter().map(|l| l.label()).collect();
             f.label(K::CdLayoutCaption, &format!("{}:", labels::CD_LAYOUT));
             f.popup(K::CdLayout, &strings(&layouts), ids::CD_LAYOUT);
@@ -534,6 +539,9 @@ impl BuildScreen {
         f.show(K::SgiCaption, sgi);
         f.show(K::SgiLabel, sgi);
         f.set_text(K::SgiLabel, &p.sgi_label);
+        f.show(K::SgiFormatCaption, sgi);
+        f.show(K::SgiFormat, sgi);
+        f.select(K::SgiFormat, usize::from(p.sgi_label_only));
 
         let c = ctrl.cd();
         for k in [
@@ -697,6 +705,10 @@ impl BuildScreen {
         }
         if shown(K::SgiLabel) {
             col.push(pair(K::SgiCaption, fixed(K::SgiLabel, 120)));
+            col.push(pair(
+                K::SgiFormatCaption,
+                pop(K::SgiFormat, Size::Fixed(220)),
+            ));
         }
         if shown(K::CdLayout) {
             col.push(pair(K::CdLayoutCaption, pop(K::CdLayout, Size::Fixed(360))));
@@ -843,6 +855,10 @@ impl BuildScreen {
             K::X68kScsi => {
                 let scsi = f.picked(k)? == 1;
                 self.preset_edit(|p| p.x68k_scsi = scsi)
+            }
+            K::SgiFormat => {
+                let only = f.picked(k)? == 1;
+                self.preset_edit(|p| p.sgi_label_only = only)
             }
             K::CdLayout => {
                 let layout = *CdLayout::ALL.get(f.picked(k)?)?;
