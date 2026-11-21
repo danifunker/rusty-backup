@@ -112,7 +112,7 @@ pub fn create_or_replace(
     } = policy;
     let fold_case = efs.case_insensitive_lookup();
     let siblings = efs.list_directory(parent)?;
-    let existing = disk_core::entry::select_child(&siblings, fold_case, name).cloned();
+    let existing = disk_core::filesystem::find_child(fold_case, &siblings, name).cloned();
 
     let Some(existing) = existing else {
         let created = efs.create_file(parent, name, data, data_len, opts)?;

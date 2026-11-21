@@ -331,6 +331,8 @@ pub struct PreservedMeta {
     /// Classic-Mac OSType / creator, kept raw so a non-ASCII code survives.
     pub os_type: Option<[u8; 4]>,
     pub os_creator: Option<[u8; 4]>,
+    /// Finder flags (`hasBundle`, custom icon, invisible): lose them and an app shows a generic icon.
+    pub finder_flags: Option<u16>,
     /// ProDOS auxiliary type (a file's load address, say).
     pub aux_type: Option<u16>,
     /// FAT attribute bits: read-only, hidden, system, archive.
@@ -352,6 +354,7 @@ impl PreservedMeta {
             && self.gid.is_none()
             && self.os_type.is_none()
             && self.os_creator.is_none()
+            && self.finder_flags.is_none()
             && self.aux_type.is_none()
             && self.dos_attributes.is_none()
             && self.amiga_protection.is_none()
@@ -373,6 +376,9 @@ impl PreservedMeta {
         }
         if let (Some(t), Some(c)) = (self.os_type, self.os_creator) {
             parts.push(format!("type/creator {}/{}", ascii4(&t), ascii4(&c)));
+        }
+        if let Some(f) = self.finder_flags {
+            parts.push(format!("Finder flags 0x{f:04x}"));
         }
         if let Some(a) = self.dos_attributes {
             parts.push(format!("DOS attrs 0x{a:02x}"));
@@ -415,6 +421,9 @@ impl PreservedMeta {
         }
         if opts.creator_code.is_none() && opts.os_creator.is_none() {
             opts.os_creator = self.os_creator;
+        }
+        if opts.finder_flags.is_none() {
+            opts.finder_flags = self.finder_flags;
         }
         if opts.aux_type.is_none() {
             opts.aux_type = self.aux_type;
@@ -485,6 +494,7 @@ pub fn preserved_meta(
         gid: entry.gid,
         os_type: entry.type_code,
         os_creator: entry.creator_code,
+        finder_flags: entry.finder_flags,
         aux_type: entry.aux_type,
         dos_attributes: entry.dos_attributes,
         amiga_protection: entry.amiga_protection,
@@ -725,5 +735,62 @@ mod tests {
         assert!(text.contains("gid 42 (from replaced file)"), "{text}");
         // ASCII only -- the GUI font has no glyph coverage beyond it.
         assert!(text.is_ascii(), "log text must stay ASCII: {text}");
+    }
+
+    /// DC-001: replacing an application's data fork must keep its `hasBundle` bit.
+    #[test]
+    fn a_replace_keeps_the_finder_flags() {
+        let mut app = FileEntry::new_file("App".into(), "/App".into(), 1, 1);
+        app.finder_flags = Some(0x2000);
+        let mut fs = NoXattrs;
+        let kept = preserved_meta(&mut fs, Some(&app));
+        assert!(!kept.is_empty());
+        let mut opts = crate::filesystem::CreateFileOptions::default();
+        kept.apply_to_options(&mut opts);
+        assert_eq!(opts.finder_flags, Some(0x2000));
+        assert!(kept.summary().contains("Finder flags 0x2000"));
+        let mut explicit = crate::filesystem::CreateFileOptions {
+            finder_flags: Some(0x0400),
+            ..Default::default()
+        };
+        kept.apply_to_options(&mut explicit);
+        assert_eq!(
+            explicit.finder_flags,
+            Some(0x0400),
+            "a caller's own flags win"
+        );
+    }
+
+    struct NoXattrs;
+
+    impl crate::filesystem::Filesystem for NoXattrs {
+        fn root(&mut self) -> Result<FileEntry, crate::filesystem::FilesystemError> {
+            Ok(FileEntry::root())
+        }
+        fn list_directory(
+            &mut self,
+            _: &FileEntry,
+        ) -> Result<Vec<FileEntry>, crate::filesystem::FilesystemError> {
+            Ok(Vec::new())
+        }
+        fn read_file(
+            &mut self,
+            _: &FileEntry,
+            _: usize,
+        ) -> Result<Vec<u8>, crate::filesystem::FilesystemError> {
+            Ok(Vec::new())
+        }
+        fn volume_label(&self) -> Option<&str> {
+            None
+        }
+        fn fs_type(&self) -> &str {
+            "HFS"
+        }
+        fn total_size(&self) -> u64 {
+            0
+        }
+        fn used_size(&self) -> u64 {
+            0
+        }
     }
 }

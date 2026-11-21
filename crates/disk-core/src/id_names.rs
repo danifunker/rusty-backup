@@ -112,9 +112,7 @@ fn read_file_at_path(fs: &mut dyn Filesystem, components: &[&str]) -> Option<Vec
         let children = fs.list_directory(&current).ok()?;
         let next = children.into_iter().find(|e| &e.name == comp)?;
         if is_last {
-            // `/etc/passwd` is commonly a symlink on some distros; the FS
-            // read_file follows or returns the target, but for our purposes a
-            // plain regular file is what we expect.
+            // A symlinked `/etc/passwd` is not followed: names fall back to numbers, which is harmless.
             if next.entry_type != EntryType::File {
                 return None;
             }
@@ -160,7 +158,7 @@ mod tests {
         // Known user, unknown group.
         assert_eq!(m.format_owner(0, 99), "root:99 (0:99)");
         // Unknown user, known group.
-        assert_eq!(m.format_owner(0, 0), "root:wheel (0:0)");
+        assert_eq!(m.format_owner(99, 0), "99:wheel (99:0)");
         m.users.remove(&0);
         assert_eq!(m.format_owner(0, 0), "0:wheel (0:0)");
         m.groups.remove(&0);

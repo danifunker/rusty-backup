@@ -858,14 +858,9 @@ fn find_child(
     parent: &FileEntry,
     name: &str,
 ) -> Result<Option<FileEntry>> {
-    let fold_case = dst.case_insensitive_lookup();
-    let children = dst
-        .list_directory(parent)
-        .map_err(|e| anyhow!("list_directory {}: {e}", parent.path))?;
-    Ok(select_child(&children, fold_case, name).cloned())
+    disk_core::filesystem::lookup_child(dst.as_filesystem_mut(), parent, name)
+        .map_err(|e| anyhow!("list_directory {}: {e}", parent.path))
 }
-
-use disk_core::entry::select_child;
 
 fn list_children(src: &mut dyn Filesystem, dir: &FileEntry) -> Result<Vec<FileEntry>> {
     src.list_directory(dir)
@@ -879,7 +874,7 @@ mod tests {
     /// A FAT driver refuses `readme.txt` next to `README.TXT`, so a lookup that
     /// only matched exactly told `--force` there was nothing to replace.
     #[test]
-    fn select_child_follows_the_filesystem_case_rules() {
+    fn find_child_follows_the_filesystem_case_rules() {
         let children = vec![
             FileEntry::new_file("README.TXT".to_string(), "/README.TXT".to_string(), 0, 3),
             FileEntry::new_file("notes".to_string(), "/notes".to_string(), 0, 4),
@@ -889,16 +884,17 @@ mod tests {
         assert!(!disk_core::filesystem::folds_case("HFSX"));
         assert!(!disk_core::filesystem::folds_case("ext4"));
         assert_eq!(
-            select_child(&children, true, "readme.txt").map(|e| e.name.as_str()),
+            disk_core::filesystem::find_child(true, &children, "readme.txt")
+                .map(|e| e.name.as_str()),
             Some("README.TXT")
         );
         assert_eq!(
-            select_child(&children, true, "Notes").map(|e| e.name.as_str()),
+            disk_core::filesystem::find_child(true, &children, "Notes").map(|e| e.name.as_str()),
             Some("notes")
         );
-        assert!(select_child(&children, false, "readme.txt").is_none());
+        assert!(disk_core::filesystem::find_child(false, &children, "readme.txt").is_none());
         assert_eq!(
-            select_child(&children, false, "notes").map(|e| e.name.as_str()),
+            disk_core::filesystem::find_child(false, &children, "notes").map(|e| e.name.as_str()),
             Some("notes")
         );
     }

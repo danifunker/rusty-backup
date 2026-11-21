@@ -69,6 +69,10 @@ impl Read for ChanReader {
     }
 }
 
+fn is_broken_pipe(e: &FilesystemError) -> bool {
+    matches!(e, FilesystemError::Io(io) if io.kind() == io::ErrorKind::BrokenPipe)
+}
+
 /// Run `consume` over a reader that streams `entry`'s bytes out of `source`.
 pub fn with_file_reader<S, T>(
     source: &mut S,
@@ -105,10 +109,12 @@ where
         let produced = producer
             .join()
             .map_err(|_| FilesystemError::Io(crate::io_other("source reader panicked")))?;
+        // When both failed, the side that failed first is the cause; a broken pipe means the consumer did.
         match (out, produced) {
             (Ok(v), Ok(_)) => Ok(v),
-            (Err(e), _) => Err(e),
-            (Ok(_), Err(e)) => Err(e),
+            (Err(e), Err(p)) if is_broken_pipe(&p) => Err(e),
+            (_, Err(p)) => Err(p),
+            (Err(e), Ok(_)) => Err(e),
         }
     })
 }
@@ -174,6 +180,56 @@ mod tests {
         })
         .unwrap();
         assert_eq!(got, body);
+    }
+
+    /// The consumer's own failure (a full target, say) is reported, not the broken pipe it caused.
+    #[test]
+    fn a_failing_consumer_reports_its_own_error() {
+        let mut fs = OneFile(vec![7u8; CHUNK * DEPTH * 4]);
+        let entry = fs.entry();
+        let got: Result<(), _> = with_file_reader(&mut fs, &entry, |_| {
+            Err(FilesystemError::DiskFull("target".into()))
+        });
+        assert!(matches!(got, Err(FilesystemError::DiskFull(_))), "{got:?}");
+    }
+
+    /// A failing source reports its own typed error, not the string the consumer saw.
+    #[test]
+    fn a_failing_source_reports_its_typed_error() {
+        let mut fs = Failing;
+        let entry = FileEntry::new_file("x".into(), "/x".into(), 1, 1);
+        let got = with_file_reader(&mut fs, &entry, |r| {
+            let mut v = Vec::new();
+            r.read_to_end(&mut v)?;
+            Ok(v)
+        });
+        assert!(matches!(got, Err(FilesystemError::NotFound(_))), "{got:?}");
+    }
+
+    struct Failing;
+
+    impl Filesystem for Failing {
+        fn root(&mut self) -> Result<FileEntry, FilesystemError> {
+            Ok(FileEntry::root())
+        }
+        fn list_directory(&mut self, _: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
+            Ok(Vec::new())
+        }
+        fn read_file(&mut self, _: &FileEntry, _: usize) -> Result<Vec<u8>, FilesystemError> {
+            Err(FilesystemError::NotFound("/x".into()))
+        }
+        fn volume_label(&self) -> Option<&str> {
+            None
+        }
+        fn fs_type(&self) -> &str {
+            "test"
+        }
+        fn total_size(&self) -> u64 {
+            0
+        }
+        fn used_size(&self) -> u64 {
+            0
+        }
     }
 
     #[test]

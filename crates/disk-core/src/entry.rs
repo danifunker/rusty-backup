@@ -130,75 +130,12 @@ pub enum EntryType {
 }
 
 impl FileEntry {
-    pub fn root() -> Self {
-        Self {
-            name: "/".into(),
-            path: "/".into(),
-            entry_type: EntryType::Directory,
-            size: 0,
-            location: 0,
-            modified: None,
-            modified_unix: None,
-            type_code: None,
-            creator_code: None,
-            finder_flags: None,
-            prodos_file_type: None,
-            symlink_target: None,
-            special_type: None,
-            mode: None,
-            uid: None,
-            gid: None,
-            resource_fork_size: None,
-            aux_type: None,
-            link_target_cnid: None,
-            amiga_protection: None,
-            amiga_comment: None,
-            amiga_date: None,
-            dos_attributes: None,
-            mac_dates: None,
-            owner_label: None,
-            native_attrs: None,
-            qnx2_attrs: None,
-        }
-    }
-
-    pub fn new_directory(name: String, path: String, location: u64) -> Self {
+    /// An entry with every optional field empty; the constructors fill in what they know.
+    fn bare(name: String, path: String, entry_type: EntryType, size: u64, location: u64) -> Self {
         Self {
             name,
             path,
-            entry_type: EntryType::Directory,
-            size: 0,
-            location,
-            modified: None,
-            modified_unix: None,
-            type_code: None,
-            creator_code: None,
-            finder_flags: None,
-            prodos_file_type: None,
-            symlink_target: None,
-            special_type: None,
-            mode: None,
-            uid: None,
-            gid: None,
-            resource_fork_size: None,
-            aux_type: None,
-            link_target_cnid: None,
-            amiga_protection: None,
-            amiga_comment: None,
-            amiga_date: None,
-            dos_attributes: None,
-            mac_dates: None,
-            owner_label: None,
-            native_attrs: None,
-            qnx2_attrs: None,
-        }
-    }
-
-    pub fn new_file(name: String, path: String, size: u64, location: u64) -> Self {
-        Self {
-            name,
-            path,
-            entry_type: EntryType::File,
+            entry_type,
             size,
             location,
             modified: None,
@@ -224,6 +161,18 @@ impl FileEntry {
             native_attrs: None,
             qnx2_attrs: None,
         }
+    }
+
+    pub fn root() -> Self {
+        Self::bare("/".into(), "/".into(), EntryType::Directory, 0, 0)
+    }
+
+    pub fn new_directory(name: String, path: String, location: u64) -> Self {
+        Self::bare(name, path, EntryType::Directory, 0, location)
+    }
+
+    pub fn new_file(name: String, path: String, size: u64, location: u64) -> Self {
+        Self::bare(name, path, EntryType::File, size, location)
     }
 
     pub fn new_symlink(
@@ -234,33 +183,8 @@ impl FileEntry {
         target: String,
     ) -> Self {
         Self {
-            name,
-            path,
-            entry_type: EntryType::Symlink,
-            size,
-            location,
-            modified: None,
-            modified_unix: None,
-            type_code: None,
-            creator_code: None,
-            finder_flags: None,
-            prodos_file_type: None,
             symlink_target: Some(target),
-            special_type: None,
-            mode: None,
-            uid: None,
-            gid: None,
-            resource_fork_size: None,
-            aux_type: None,
-            link_target_cnid: None,
-            amiga_protection: None,
-            amiga_comment: None,
-            amiga_date: None,
-            dos_attributes: None,
-            mac_dates: None,
-            owner_label: None,
-            native_attrs: None,
-            qnx2_attrs: None,
+            ..Self::bare(name, path, EntryType::Symlink, size, location)
         }
     }
 
@@ -271,33 +195,8 @@ impl FileEntry {
         special_type_str: String,
     ) -> Self {
         Self {
-            name,
-            path,
-            entry_type: EntryType::Special,
-            size: 0,
-            location,
-            modified: None,
-            modified_unix: None,
-            type_code: None,
-            creator_code: None,
-            finder_flags: None,
-            prodos_file_type: None,
-            symlink_target: None,
             special_type: Some(special_type_str),
-            mode: None,
-            uid: None,
-            gid: None,
-            resource_fork_size: None,
-            aux_type: None,
-            link_target_cnid: None,
-            amiga_protection: None,
-            amiga_comment: None,
-            amiga_date: None,
-            dos_attributes: None,
-            mac_dates: None,
-            owner_label: None,
-            native_attrs: None,
-            qnx2_attrs: None,
+            ..Self::bare(name, path, EntryType::Special, 0, location)
         }
     }
 
@@ -424,20 +323,6 @@ pub fn relative_dir(entry: &FileEntry, base: &str) -> String {
     let dir = parent_dir(&entry.path);
     let rel = dir.strip_prefix(base).unwrap_or(dir);
     rel.trim_matches('/').to_string()
-}
-
-/// The child called `name`, matched the way the filesystem itself would
-/// (`fold_case` is its `case_insensitive_lookup`); an exact match wins first.
-pub fn select_child<'a>(
-    children: &'a [FileEntry],
-    fold_case: bool,
-    name: &str,
-) -> Option<&'a FileEntry> {
-    children.iter().find(|c| c.name == name).or_else(|| {
-        fold_case
-            .then(|| children.iter().find(|c| c.name.eq_ignore_ascii_case(name)))
-            .flatten()
-    })
 }
 
 #[cfg(test)]

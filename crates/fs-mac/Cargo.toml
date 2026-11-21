@@ -31,7 +31,7 @@ forks = ["codecs", "hfs"]
 rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac-unicode?/rust173-polyfill", "dsk-apple?/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.2", features = ["fs"] }
+disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
 # GPL-2.0-only: the HFS / HFS+ name-ordering tables (see that crate's README).
 fs-mac-unicode = { path = "../fs-mac-unicode", version = "0.1", optional = true }
 dsk-apple = { path = "../dsk-apple", version = "0.1", default-features = false, features = ["dc42"], optional = true }

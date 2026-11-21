@@ -5022,7 +5022,7 @@ mod tests {
     #[test]
     fn classic_hfs_stamps_are_local_time_and_round_trip_to_utc() {
         use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-        use disk_core::times::{local_utc_offset_secs, unix_to_mac_epoch, UnixTimes};
+        use disk_core::times::{unix_to_mac_epoch, utc_offset_at, UnixTimes};
         const T: u64 = 1_700_000_000; // 2023-11-14 22:13:20 UTC
         let mut img = create_blank_hfs(4 * 1024 * 1024, 4096, "Zone").unwrap();
         let mut fs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
@@ -5042,7 +5042,7 @@ mod tests {
             .unwrap();
         assert_eq!(entry.modified_unix, Some(T), "UTC must round-trip");
         let raw = entry.mac_dates.expect("raw Mac dates").1;
-        let expected = (T as i64 + local_utc_offset_secs()) as u64;
+        let expected = (T as i64 + utc_offset_at(T)) as u64;
         assert_eq!(
             raw,
             unix_to_mac_epoch(expected),

@@ -157,6 +157,10 @@ pub fn resolve_or_now(supplied: Option<UnixTimes>) -> UnixTimes {
 /// `format_unix_timestamp` in unix_common::inode uses); safe for any u64
 /// value we can actually store on disk. Deliberately not exported — the
 /// format-specific encoders below are the public API.
+pub(crate) fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    ymd_hms(secs)
+}
+
 fn ymd_hms(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     let sec_of_day = secs % 86400;
     let hour = (sec_of_day / 3600) as u32;
@@ -196,6 +200,11 @@ fn secs_from_ymd_hms(year: i64, month: u32, day: u32, hour: u32, minute: u32, se
 /// True when a Gregorian year is a leap year.
 fn is_leap(year: i64) -> bool {
     (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0)
+}
+
+/// `day` moved into range after a year clamp, so 29 February never lands in a common year.
+fn clamped_day(year: i64, month: u32, day: u32) -> u32 {
+    day.min(days_in_month(year, month))
 }
 
 /// Days in month for a given Gregorian year.
@@ -306,7 +315,7 @@ pub const EXFAT_UTC_OFFSET_VALID: u8 = 0x80;
 /// Unix seconds to an exFAT (timestamp, UtcOffset) pair: local time tagged with the host offset.
 /// A host offset exFAT cannot express (not whole quarter hours) is written as UTC, offset 0.
 pub fn unix_to_exfat_local(secs: u64) -> (u32, u8) {
-    let offset = local_utc_offset_secs();
+    let offset = utc_offset_at(secs);
     let quarters = offset / 900;
     if offset % 900 != 0 || !(-64..=63).contains(&quarters) {
         return (unix_to_exfat_timestamp(secs), EXFAT_UTC_OFFSET_VALID);
@@ -373,22 +382,42 @@ pub fn filetime_to_unix(ft: u64) -> Option<u64> {
 /// HFS/HFS+ modules (MFS uses the same epoch and lives elsewhere).
 const MAC_EPOCH_DELTA: u64 = 2_082_844_800;
 
-/// Seconds this host's local time is ahead of UTC, for the filesystems that store
-/// wall-clock time with no zone (HFS, MFS, FAT, Human68k, ProDOS). The current offset, not the date's.
+/// Seconds this host's local time is ahead of UTC right now. Converting a stored date wants
+/// [`utc_offset_at`] instead, which knows whether daylight saving applied on that date.
 pub fn local_utc_offset_secs() -> i64 {
     chrono::Local::now().offset().local_minus_utc() as i64
 }
 
+/// Seconds this host's local time was ahead of UTC at the moment `secs` (Unix, UTC).
+pub fn utc_offset_at(secs: u64) -> i64 {
+    use chrono::TimeZone;
+    i64::try_from(secs)
+        .ok()
+        .and_then(|s| chrono::Local.timestamp_opt(s, 0).single())
+        .map(|d| d.offset().local_minus_utc() as i64)
+        .unwrap_or_else(local_utc_offset_secs)
+}
+
+/// The offset in force at a zone-less wall-clock time; the earlier one when the clock fell back.
+fn offset_at_local(local: u64) -> i64 {
+    use chrono::TimeZone;
+    i64::try_from(local)
+        .ok()
+        .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+        .and_then(|d| chrono::Local.from_local_datetime(&d.naive_utc()).earliest())
+        .map(|d| d.offset().local_minus_utc() as i64)
+        // A time skipped by the spring-forward jump: the offset just before it.
+        .unwrap_or_else(|| utc_offset_at(local))
+}
+
 /// Unix seconds (UTC) to the same moment on this host's wall clock, as zone-less seconds.
 fn utc_to_local(secs: u64) -> u64 {
-    (secs as i64).saturating_add(local_utc_offset_secs()).max(0) as u64
+    (secs as i64).saturating_add(utc_offset_at(secs)).max(0) as u64
 }
 
 /// Zone-less wall-clock seconds on this host back to Unix seconds (UTC).
 fn local_to_utc(local: u64) -> u64 {
-    (local as i64)
-        .saturating_sub(local_utc_offset_secs())
-        .max(0) as u64
+    (local as i64).saturating_sub(offset_at_local(local)).max(0) as u64
 }
 
 /// Unix seconds to a classic-Mac local-time stamp: the wall clock the Mac shows.
@@ -446,6 +475,7 @@ pub fn unix_to_prodos_datetime(secs: u64) -> (u16, u16) {
     if year > 2039 {
         year = 2039;
     }
+    let day = clamped_day(year, month, day);
     let year_bits = if year >= 2000 {
         (year - 2000) as u16
     } else {
@@ -514,6 +544,7 @@ pub fn prodos_local_now() -> (u16, u16) {
 pub fn unix_to_ucsd_date(secs: u64) -> u16 {
     let (year, month, day, _h, _m, _s) = ymd_hms(secs);
     let year = year.clamp(1900, 1999);
+    let day = clamped_day(year, month, day);
     let year_bits = (year - 1900) as u16;
     (day as u16 & 0x1F) | ((month as u16 & 0x0F) << 5) | ((year_bits & 0x7F) << 9)
 }
@@ -580,15 +611,15 @@ pub fn adfs_time_to_unix(load: u32, exec: u32) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// OS-9 — FD.DAT (5-byte last-modified Y-M-D-H-M) + FD.DCR (3-byte
-// creation Y-M-D). Each byte is a plain binary component; year is
-// offset from 1900.
+// HP LIF — 6-byte BCD YYMMDDhhmmss
 // ---------------------------------------------------------------------------
 
 /// Encode Unix seconds as HP LIF's 6-byte BCD `YYMMDDhhmmss`; years outside 1970-2069 clamp.
 pub fn unix_to_lif_bcd(secs: u64) -> [u8; 6] {
     let (year, month, day, hour, minute, second) = ymd_hms(secs);
-    let yy = (year.clamp(1970, 2069) % 100) as u32;
+    let year = year.clamp(1970, 2069);
+    let day = clamped_day(year, month, day);
+    let yy = (year % 100) as u32;
     let bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
     [
         bcd(yy),
@@ -600,13 +631,18 @@ pub fn unix_to_lif_bcd(secs: u64) -> [u8; 6] {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// OS-9 — FD.DAT (5-byte last-modified Y-M-D-H-M) + FD.DCR (3-byte
+// creation Y-M-D). Each byte is a plain binary component; year is
+// offset from 1900.
+// ---------------------------------------------------------------------------
+
 /// Encode Unix seconds as OS-9 FD.DAT (5 bytes: year-1900, month, day,
-/// hour, minute). OS-9's year is a single unsigned byte — 1900..2155
-/// representable. Pre-1900 clamps to 1900-01-01; post-2155 clamps to
-/// 2155-12-31.
+/// hour, minute). OS-9's year is a single unsigned byte, so years past 2155 clamp.
 pub fn unix_to_os9_dat(secs: u64) -> [u8; 5] {
     let (year, month, day, hour, minute, _s) = ymd_hms(secs);
     let year = year.clamp(1900, 2155);
+    let day = clamped_day(year, month, day);
     [
         (year - 1900) as u8,
         month as u8,
@@ -676,7 +712,7 @@ const QDOS_EPOCH_OFFSET_SECS: u64 = 283_996_800;
 /// Pre-1961 clamps to 0 (1961-01-01); post-2097-02-06 truncates by u32
 /// wraparound. No QDOS tool guards against either.
 pub fn unix_to_qdos_date(secs: u64) -> u32 {
-    (secs.saturating_add(QDOS_EPOCH_OFFSET_SECS)) as u32
+    u32::try_from(secs.saturating_add(QDOS_EPOCH_OFFSET_SECS)).unwrap_or(u32::MAX)
 }
 
 /// Decode a QDOS timestamp to Unix seconds. Returns `None` for zero (the
@@ -845,7 +881,7 @@ mod tests {
     /// R-077: FAT words hold the host's wall clock, i.e. UTC shifted by the host offset.
     #[test]
     fn dos_local_stores_the_host_wall_clock() {
-        let local = (T_2020 as i64 + local_utc_offset_secs()) as u64;
+        let local = (T_2020 as i64 + utc_offset_at(T_2020)) as u64;
         assert_eq!(unix_to_dos_local(T_2020), unix_to_dos_datetime(local));
         let (d, t) = unix_to_dos_local(T_2020);
         assert_eq!(dos_local_to_unix(d, t), Some(T_2020));
@@ -855,7 +891,7 @@ mod tests {
     #[test]
     fn prodos_local_stores_the_host_wall_clock() {
         let t = T_2020 - T_2020 % 60;
-        let local = (t as i64 + local_utc_offset_secs()) as u64;
+        let local = (t as i64 + utc_offset_at(t)) as u64;
         assert_eq!(unix_to_prodos_local(t), unix_to_prodos_datetime(local));
         let (d, tm) = unix_to_prodos_local(t);
         assert_eq!(prodos_local_to_unix(d, tm), Some(t));
@@ -875,7 +911,7 @@ mod tests {
         let (ts, off) = unix_to_exfat_local(T_2020);
         assert_ne!(off & EXFAT_UTC_OFFSET_VALID, 0);
         assert_eq!(exfat_local_to_unix(ts, off), Some(T_2020));
-        let host = local_utc_offset_secs();
+        let host = utc_offset_at(T_2020);
         if host % 900 == 0 {
             let local = (T_2020 as i64 + host) as u64;
             assert_eq!(ts, unix_to_exfat_timestamp(local));
@@ -895,7 +931,53 @@ mod tests {
             Some(T_2020)
         );
         // No valid offset: the host's wall clock.
-        let host = (T_2020 as i64 - local_utc_offset_secs()) as u64;
+        let host = (T_2020 as i64 - utc_offset_at(T_2020)) as u64;
         assert_eq!(exfat_local_to_unix(base, 0), Some(host));
+    }
+
+    /// DC-003: a clamped year keeps month and day, but never an impossible 29 February.
+    #[test]
+    fn clamped_years_never_write_an_impossible_day() {
+        let leap_day = |y: i64| secs_from_ymd_hms(y, 2, 29, 12, 0, 0);
+        let (d, t) = unix_to_prodos_datetime(leap_day(2040));
+        assert!(prodos_datetime_to_unix(d, t).is_some(), "ProDOS 2040-02-29");
+        assert!(
+            ucsd_date_to_unix(unix_to_ucsd_date(leap_day(2028))).is_some(),
+            "UCSD 2028-02-29"
+        );
+        let (year, month, day, ..) =
+            ymd_hms(ucsd_date_to_unix(unix_to_ucsd_date(leap_day(2028))).unwrap());
+        assert_eq!((year, month, day), (1999, 2, 28));
+        assert_eq!(
+            unix_to_lif_bcd(leap_day(2072))[1..3],
+            [0x02, 0x28],
+            "LIF 2072-02-29"
+        );
+        // An ordinary date in a clamped year keeps its month and day.
+        assert_eq!(
+            unix_to_ucsd_date(secs_from_ymd_hms(2026, 5, 10, 0, 0, 0)) & 0x1FF,
+            (5 << 5) | 10
+        );
+    }
+
+    /// DC-004: QDOS saturates at its last second instead of wrapping into the 1960s.
+    #[test]
+    fn qdos_dates_saturate() {
+        let far = secs_from_ymd_hms(2100, 1, 1, 0, 0, 0);
+        assert_eq!(unix_to_qdos_date(far), u32::MAX);
+        assert!(qdos_date_to_unix(unix_to_qdos_date(far)).is_some());
+    }
+
+    /// DC-007: a summer date and a winter date each convert with their own offset.
+    #[test]
+    fn local_dates_use_the_offset_of_their_own_day() {
+        let summer = secs_from_ymd_hms(2023, 7, 1, 12, 0, 0);
+        let winter = secs_from_ymd_hms(2023, 1, 1, 12, 0, 0);
+        for t in [summer, winter] {
+            assert_eq!(utc_to_local(t), (t as i64 + utc_offset_at(t)) as u64);
+            let (d, tm) = unix_to_dos_local(t);
+            assert_eq!(dos_local_to_unix(d, tm), Some(t), "round trip at {t}");
+            assert_eq!(mac_local_to_unix(unix_to_mac_local(t)), Some(t));
+        }
     }
 }

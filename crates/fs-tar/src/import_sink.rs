@@ -572,9 +572,6 @@ pub fn find_child(
     parent: &FileEntry,
     name: &str,
 ) -> Result<Option<FileEntry>> {
-    let fold_case = efs.case_insensitive_lookup();
-    let children = efs
-        .list_directory(parent)
-        .map_err(|e| anyhow!("list_directory {}: {e}", parent.path))?;
-    Ok(disk_core::entry::select_child(&children, fold_case, name).cloned())
+    disk_core::filesystem::lookup_child(efs.as_filesystem_mut(), parent, name)
+        .map_err(|e| anyhow!("list_directory {}: {e}", parent.path))
 }

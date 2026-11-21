@@ -16,7 +16,7 @@ categories = ["filesystem", "emulators"]
 rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.2", features = ["fs"] }
+disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
 # The fork writers (AppleDouble, MacBinary, BinHex); fs-mac pulls in the GPL-2.0-only fs-mac-unicode.
 fs-mac = { path = "../fs-mac", version = "0.1.1", default-features = false, features = ["forks"] }
 anyhow = "1"

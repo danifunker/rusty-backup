@@ -86,33 +86,14 @@ pub fn unix_entry_from_inode(
     };
 
     FileEntry {
-        name: name.to_string(),
-        path: path.to_string(),
         entry_type,
-        size: display_size,
-        location: inode_num,
         modified,
         modified_unix,
-        type_code: None,
-        creator_code: None,
-        symlink_target: None,
         special_type,
         mode: Some(mode),
         uid: Some(uid),
         gid: Some(gid),
-        resource_fork_size: None,
-        aux_type: None,
-        link_target_cnid: None,
-        amiga_protection: None,
-        amiga_comment: None,
-        amiga_date: None,
-        dos_attributes: None,
-        finder_flags: None,
-        prodos_file_type: None,
-        mac_dates: None,
-        owner_label: None,
-        native_attrs: None,
-        qnx2_attrs: None,
+        ..FileEntry::new_file(name.to_string(), path.to_string(), display_size, inode_num)
     }
 }
 
@@ -166,29 +147,7 @@ pub fn format_unix_timestamp(epoch: i64) -> String {
     if epoch < 0 {
         return "1970-01-01 00:00:00".to_string();
     }
-    let secs = epoch as u64;
-
-    let sec_of_day = secs % 86400;
-    let hour = sec_of_day / 3600;
-    let minute = (sec_of_day % 3600) / 60;
-    let second = sec_of_day % 60;
-
-    // Calculate date from day count since 1970-01-01
-    let mut days = (secs / 86400) as i64;
-
-    // Algorithm adapted from Howard Hinnant's civil_from_days
-    // http://howardhinnant.github.io/date_algorithms.html
-    days += 719468; // shift epoch from 1970-01-01 to 0000-03-01
-    let era = if days >= 0 { days } else { days - 146096 } / 146097;
-    let doe = (days - era * 146097) as u32; // day of era [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
-    let mp = (5 * doy + 2) / 153; // month prime [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
-    let year = if m <= 2 { y + 1 } else { y };
-
+    let (year, m, d, hour, minute, second) = crate::times::civil_from_unix(epoch as u64);
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         year, m, d, hour, minute, second
