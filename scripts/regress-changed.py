@@ -354,7 +354,13 @@ def run_all(cmds, keep_going):
     for label, argv in cmds:
         print("\n=== %s\n    %s" % (label, " ".join(argv)), flush=True)
         t = time.time()
-        code = subprocess.run(argv, cwd=REPO).returncode
+        # Shell scripts go through bash: not every one in scripts/ carries the execute bit.
+        run_argv = ["bash"] + argv if argv[0].endswith(".sh") else argv
+        try:
+            code = subprocess.run(run_argv, cwd=REPO).returncode
+        except OSError as e:
+            print("    could not start: %s" % e)
+            code = 127
         results.append((label, code, time.time() - t))
         if code != 0 and not keep_going:
             break

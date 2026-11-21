@@ -77,6 +77,12 @@ class MapTests(unittest.TestCase):
         self.assertIn("fs-xfs", crate_cmds[0])
 
 
+    def test_every_build_manifest_is_mapped(self):
+        for lock in ("rb-cli-ppc/Cargo.lock", "rb-cli-sol9/Cargo.lock", "rb-cli-vintage/Cargo.lock"):
+            reasons = [why for _, why in plan_for(lock).wide]
+            self.assertEqual(reasons, ["change-map marks it wide"], lock)
+
+
 class LintTests(unittest.TestCase):
     def test_flags_post_173_apis(self):
         hits = rc.lint_post_173([("src/x.rs", "let e = io::Error::other(msg);"),

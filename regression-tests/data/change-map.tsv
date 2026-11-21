@@ -75,6 +75,9 @@ scripts/*	skip
 tests/fixtures/*	skip
 tests/ui_scenarios/*	test:ui_scenarios
 rb-cli-vintage/*	wide
+rb-cli-ppc/*	wide
+rb-cli-sol9/*	wide
+rb-cli-mini/*	wide
 
 # ---- front-ends --------------------------------------------------------------
 frontends/gtk4/*	front:gtk4 check:boundaries
