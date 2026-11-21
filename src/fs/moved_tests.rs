@@ -18,7 +18,8 @@ mod exfat_clone {
         );
     }
 
-    /// A grow its FAT caps is rebuilt at the full size, files and the partition offset kept.
+    /// A grow its FAT caps is rebuilt at the full size over junk (a used card), files and the
+    /// partition offset kept, and the volume checks clean.
     #[test]
     fn a_capped_exfat_grow_is_rebuilt_at_the_full_size() {
         use disk_core::filesystem::{EditableFilesystem, Filesystem};
@@ -27,7 +28,9 @@ mod exfat_clone {
         const MIB: u64 = 1024 * 1024;
         let (offset, target) = (MIB, 64 * MIB);
         let mut disk = tempfile::tempfile().unwrap();
-        disk.set_len(offset + target).unwrap();
+        for _ in 0..(offset + target) / MIB {
+            disk.write_all(&vec![0xEEu8; MIB as usize]).unwrap();
+        }
         let mut vol = Cursor::new(Vec::new());
         let template = ExfatFormatTemplate {
             bytes_per_sector: 512,
@@ -53,6 +56,8 @@ mod exfat_clone {
 
         let mut fs = ExfatFilesystem::open(disk.try_clone().unwrap(), offset).unwrap();
         assert!(fs.total_size() > 60 * MIB, "volume is {}", fs.total_size());
+        let check = fs_pc::exfat_fsck::fsck_exfat(&mut fs).unwrap();
+        assert!(check.errors.is_empty(), "{:?}", check.errors);
         let root = fs.root().unwrap();
         let iso = fs
             .list_directory(&root)

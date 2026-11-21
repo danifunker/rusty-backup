@@ -1407,7 +1407,7 @@ fn run_single_file_chd_restore_as_is(
     let container_path = config.backup_folder.join(container_name);
     if !container_path.exists() {
         bail!(
-            "single-file-CHD backup is missing its container: {}",
+            "the backup's disk image is missing: {}",
             container_path.display()
         );
     }
@@ -1416,7 +1416,7 @@ fn run_single_file_chd_restore_as_is(
         &progress,
         LogLevel::Info,
         format!(
-            "Single-file-CHD restore (as-is): {} -> {}",
+            "Restoring the disk image as-is: {} -> {}",
             container_path.display(),
             config.target_path.display(),
         ),
@@ -1430,7 +1430,7 @@ fn run_single_file_chd_restore_as_is(
 
     if logical_size > config.target_size {
         bail!(
-            "target ({} bytes) is smaller than the CHD's logical size ({} bytes). \
+            "target ({} bytes) is smaller than the disk image ({} bytes). \
              Pick a non-Original size for one or more partitions in the size mode \
              column (Minimum / MinPlus20 / Custom) so the restore can re-pack the \
              disk into the smaller target.",
@@ -1503,7 +1503,7 @@ fn run_single_file_chd_restore_as_is(
         let want = (remaining as usize).min(buf.len());
         reader
             .read_exact(&mut buf[..want])
-            .with_context(|| format!("failed to read CHD logical bytes at offset {written}"))?;
+            .with_context(|| format!("failed to read the disk image at offset {written}"))?;
         target
             .write_all(&buf[..want])
             .with_context(|| format!("failed to write to target at offset {written}"))?;
@@ -1604,7 +1604,7 @@ fn run_single_file_chd_restore_resize(
     let container_path = config.backup_folder.join(container_name);
     if !container_path.exists() {
         bail!(
-            "single-file-CHD backup is missing its container: {}",
+            "the backup's disk image is missing: {}",
             container_path.display()
         );
     }
@@ -1613,7 +1613,7 @@ fn run_single_file_chd_restore_resize(
         &progress,
         LogLevel::Info,
         format!(
-            "Single-file-CHD restore (re-resize): {} -> {}",
+            "Restoring the disk image with resized partitions: {} -> {}",
             container_path.display(),
             config.target_path.display(),
         ),
@@ -1722,10 +1722,10 @@ fn run_single_file_chd_restore_resize(
         let mut head = vec![0u8; head_len as usize];
         image
             .seek(SeekFrom::Start(0))
-            .context("seek CHD to its head region")?;
+            .context("seek the disk image to its head region")?;
         image
             .read_exact(&mut head)
-            .context("read the head region from the CHD")?;
+            .context("read the head region from the disk image")?;
         let mut local_log = |m: &str| log(&progress, LogLevel::Info, m);
         let patched = crate::partition::restore_patch::patch_head_for_restore(
             &metadata.partition_table_type,
@@ -1838,10 +1838,10 @@ fn run_single_file_chd_restore_resize(
         let mut mbr = [0u8; 512];
         image
             .seek(SeekFrom::Start(0))
-            .context("failed to seek CHD to sector 0")?;
+            .context("failed to seek the disk image to sector 0")?;
         image
             .read_exact(&mut mbr)
-            .context("failed to read MBR from CHD")?;
+            .context("failed to read the MBR from the disk image")?;
         patch_mbr_entries(&mut mbr, &overrides);
         for index in part_tables::mbr::clear_orphan_entries_overlapping(&mut mbr, &overrides) {
             log(
@@ -1943,13 +1943,23 @@ fn run_single_file_chd_restore_resize(
     // Pre-flight: a 1 MiB chunk size for the partition copy loop, sized
     // per CONTRIBUTING.md's I/O guidance.
     const CHUNK: usize = 1024 * 1024;
-    let total_logical_bytes: u64 = overrides
-        .iter()
-        .map(|o| o.effective_start_lba() * 512 + o.export_size)
-        .max()
-        .unwrap_or(config.target_size)
-        .min(config.target_size);
-    set_progress_bytes(&progress, 0, total_logical_bytes);
+    // The bytes the copy loop below writes: each body, plus the zeroed space a grow needs.
+    let mut total_logical_bytes: u64 = 0;
+    for pm in &metadata.partitions {
+        let Some(ov) = overrides.iter().find(|o| o.index == pm.index) else {
+            continue;
+        };
+        let to_copy = pm.imaged_size_bytes.min(ov.export_size);
+        let pad = ov.export_size - to_copy;
+        let pad = if pad > 0 && !crate::fs::grow_reads_new_space(&mut image, pm.start_lba * 512) {
+            pad.min(CHUNK as u64)
+        } else {
+            pad
+        };
+        total_logical_bytes += to_copy + pad;
+    }
+    set_progress_bytes(&progress, 0, total_logical_bytes.max(1));
+    set_operation(&progress, "Copying partitions...");
 
     // Helper: resolve the *target* LBA for a partition, using the
     // EBR-recalculated positions for logical partitions when present.
@@ -2000,7 +2010,7 @@ fn run_single_file_chd_restore_resize(
             &progress,
             LogLevel::Info,
             format!(
-                "Partition {}: copying {} bytes from CHD offset {} to target offset {}",
+                "Partition {}: copying {} bytes from image offset {} to target offset {}",
                 pm.index, to_copy, chd_offset, new_offset
             ),
         );
@@ -2010,7 +2020,7 @@ fn run_single_file_chd_restore_resize(
             .with_context(|| format!("seek target to partition-{} offset", pm.index))?;
         image
             .seek(SeekFrom::Start(chd_offset))
-            .with_context(|| format!("seek CHD to partition-{} source", pm.index))?;
+            .with_context(|| format!("seek the disk image to partition-{}", pm.index))?;
 
         let mut remaining = to_copy;
         while remaining > 0 {
@@ -2020,7 +2030,7 @@ fn run_single_file_chd_restore_resize(
             let want = (remaining as usize).min(buf.len());
             image
                 .read_exact(&mut buf[..want])
-                .with_context(|| format!("read partition-{} body from CHD", pm.index))?;
+                .with_context(|| format!("read partition-{} from the disk image", pm.index))?;
             target
                 .write_all(&buf[..want])
                 .with_context(|| format!("write partition-{} body to target", pm.index))?;
@@ -2029,21 +2039,34 @@ fn run_single_file_chd_restore_resize(
             set_progress_bytes(&progress, bytes_progressed, total_logical_bytes);
         }
 
-        // Grow case: zero-fill the gap between the copied source bytes
-        // and the new partition end so resize_filesystem_for can land
-        // its alt-VH / boot tail bytes in clean space. Sparse seek is
-        // not enough here because resize_*_in_place reads back, which
-        // returns whatever junk was on the device.
+        // Grow case: zero the space past the copied bytes, which some resizers read back (device
+        // junk would not do). FAT and exFAT never read it, so they only get their last MiB.
         if to_copy < export_size {
-            let pad = export_size - to_copy;
+            let mut pad = export_size - to_copy;
+            if !crate::fs::grow_reads_new_space(&mut image, chd_offset) {
+                let tail = pad.min(CHUNK as u64);
+                target
+                    .seek(SeekFrom::Start(new_offset + export_size - tail))
+                    .with_context(|| format!("seek to partition-{} tail", pm.index))?;
+                pad = tail;
+            } else {
+                set_operation(
+                    &progress,
+                    format!("Zeroing partition {}'s new space...", pm.index),
+                );
+            }
             let zeros = vec![0u8; CHUNK];
-            let mut left = pad;
-            while left > 0 {
-                let want = (left as usize).min(zeros.len());
+            while pad > 0 {
+                if is_cancelled(&progress) {
+                    bail!("restore cancelled");
+                }
+                let want = (pad as usize).min(zeros.len());
                 target
                     .write_all(&zeros[..want])
                     .with_context(|| format!("zero-pad partition-{} grow region", pm.index))?;
-                left -= want as u64;
+                pad -= want as u64;
+                bytes_progressed += want as u64;
+                set_progress_bytes(&progress, bytes_progressed, total_logical_bytes);
             }
         }
     }

@@ -138,9 +138,11 @@ pub fn resize_filesystem_for(
     let new_sectors_u32 = (new_size_bytes / 512) as u32;
     let new_sectors_u64 = new_size_bytes / 512;
     // FAT says it declined only through its bool, so a shrink it refused is caught here.
-    if !fat::resize_fat_in_place(file, partition_offset, new_sectors_u32, log_cb)?
-        && detect_filesystem_type(file, partition_offset) == "fat"
-    {
+    let fat_resized = fat::resize_fat_in_place(file, partition_offset, new_sectors_u32, log_cb)?;
+    if fat_resized {
+        recount_fat32_free(file, partition_offset, log_cb)?;
+    }
+    if !fat_resized && detect_filesystem_type(file, partition_offset) == "fat" {
         let declared = fat_declared_bytes(file, partition_offset)?;
         if declared > new_size_bytes {
             anyhow::bail!(
@@ -170,6 +172,81 @@ pub fn resize_filesystem_for(
     qdos::resize_qdos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     prodos::resize_prodos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     Ok(())
+}
+
+/// A resized FAT32's FSInfo still counts the old free clusters; count them again from the FAT.
+fn recount_fat32_free(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    file.seek(SeekFrom::Start(partition_offset))?;
+    let mut bpb = [0u8; 512];
+    file.read_exact(&mut bpb)?;
+    let bps = u64::from(u16::from_le_bytes([bpb[11], bpb[12]]));
+    let fat32 = bpb[22] == 0 && bpb[23] == 0 && bpb[17] == 0 && bpb[18] == 0;
+    if !fat32 || bps < 512 {
+        return Ok(());
+    }
+    let le32 = |at: usize| {
+        u64::from(u32::from_le_bytes([
+            bpb[at],
+            bpb[at + 1],
+            bpb[at + 2],
+            bpb[at + 3],
+        ]))
+    };
+    let (reserved, fats) = (
+        u64::from(u16::from_le_bytes([bpb[14], bpb[15]])),
+        u64::from(bpb[16]),
+    );
+    let (total, spf, spc) = (le32(32), le32(36), u64::from(bpb[13].max(1)));
+    let clusters = total.saturating_sub(reserved + fats * spf) / spc;
+    let mut free: u64 = 0;
+    file.seek(SeekFrom::Start(partition_offset + reserved * bps))?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut entry: u64 = 0;
+    let entries = (clusters + 2).min(spf * bps / 4);
+    while entry < entries {
+        let n = ((entries - entry) * 4).min(buf.len() as u64) as usize;
+        file.read_exact(&mut buf[..n])?;
+        for e in buf[..n].chunks_exact(4) {
+            if entry >= 2 && u32::from_le_bytes([e[0], e[1], e[2], e[3]]) & 0x0FFF_FFFF == 0 {
+                free += 1;
+            }
+            entry += 1;
+        }
+    }
+    let info = u64::from(u16::from_le_bytes([bpb[48], bpb[49]]));
+    let backup = u64::from(u16::from_le_bytes([bpb[50], bpb[51]]));
+    let mut sectors = vec![info];
+    if backup != 0 && backup != 0xFFFF {
+        sectors.push(backup + info);
+    }
+    for sector in sectors.into_iter().filter(|&s| s != 0 && s != 0xFFFF) {
+        let at = partition_offset + sector * bps;
+        let mut fsinfo = [0u8; 512];
+        file.seek(SeekFrom::Start(at))?;
+        file.read_exact(&mut fsinfo)?;
+        if fsinfo[0..4] != *b"RRaA" || fsinfo[484..488] != *b"rrAa" {
+            continue;
+        }
+        fsinfo[488..492].copy_from_slice(&(free as u32).to_le_bytes());
+        fsinfo[492..496].copy_from_slice(&[0xFF; 4]);
+        file.seek(SeekFrom::Start(at))?;
+        file.write_all(&fsinfo)?;
+    }
+    log_cb(&format!("FAT32: FSInfo free count set to {free} clusters"));
+    Ok(())
+}
+
+/// A grow of this filesystem reads the new space, so it must be zeroed first. FAT and exFAT
+/// only write there (their free clusters' contents never matter), so a card needs no zero-fill.
+pub(crate) fn grow_reads_new_space<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> bool {
+    !matches!(
+        detect_filesystem_type(reader, partition_offset),
+        "fat" | "exfat"
+    )
 }
 
 /// An exFAT whose FAT capped an in-place grow, rebuilt at `new_size_bytes` by cloning its files.
@@ -214,19 +291,105 @@ pub fn grow_exfat_past_its_fat(
     );
     let mut fs = exfat::ExfatFilesystem::open(src, 0)
         .map_err(|e| anyhow::anyhow!("exFAT: reopening the copy: {e}"))?;
-    file.seek(SeekFrom::Start(partition_offset))?;
+    // Built in a sparse temp, then only its metadata and used clusters go to the target.
+    let mut built = tempfile::tempfile()?;
+    exfat::create_blank_exfat(&mut built, &fs.format_template(), target)
+        .map_err(|e| anyhow::anyhow!("exFAT: formatting the new volume: {e}"))?;
+    let mut handle = built.try_clone()?;
+    let mut rebuilt = exfat::ExfatFilesystem::open(built, 0)
+        .map_err(|e| anyhow::anyhow!("exFAT: opening the new volume: {e}"))?;
     let mut log = |m: &str| log_cb(m);
-    let report =
-        fs_pc::exfat_clone::stream_defragmented_exfat(&mut fs, target, file, &mut log, &mut |_| {})
-            .map_err(|e| anyhow::anyhow!("exFAT: rebuilding the volume: {e}"))?;
+    let report = fs_pc::exfat_clone::clone_exfat_volume(&mut fs, &mut rebuilt, &mut log)
+        .map_err(|e| anyhow::anyhow!("exFAT: copying the files: {e}"))?;
+    drop(rebuilt);
+    let written = write_used_exfat(&mut handle, file, partition_offset)?;
     exfat::patch_exfat_hidden_sectors(file, partition_offset, hidden, log_cb)?;
     log_cb(&format!(
-        "exFAT: rebuilt at {} with {} file(s) and {} folder(s)",
+        "exFAT: rebuilt at {} with {} file(s) and {} folder(s), writing {}",
         disk_core::display::format_size(target),
         report.files_copied,
         report.dirs_copied,
+        disk_core::display::format_size(written),
     ));
     Ok(())
+}
+
+/// Copy a built exFAT from `src` onto `dst` at `base`: all of it before the cluster heap, then
+/// only the clusters its bitmap marks used, since a free cluster's bytes never matter.
+fn write_used_exfat(
+    src: &mut std::fs::File,
+    dst: &mut (impl Write + Seek),
+    base: u64,
+) -> anyhow::Result<u64> {
+    let le32 = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    let mut vbr = [0u8; 512];
+    src.seek(SeekFrom::Start(0))?;
+    src.read_exact(&mut vbr)?;
+    let sector = 1u64 << vbr[0x6C];
+    let cluster = sector << vbr[0x6D];
+    let fat_at = u64::from(le32(&vbr, 0x50)) * sector;
+    let heap = u64::from(le32(&vbr, 0x58)) * sector;
+    let count = u64::from(le32(&vbr, 0x5C));
+    let at = |c: u32| heap + (u64::from(c) - 2) * cluster;
+    let mut dir = vec![0u8; cluster as usize];
+    src.seek(SeekFrom::Start(at(le32(&vbr, 0x60))))?;
+    src.read_exact(&mut dir)?;
+    let (first, len) = dir
+        .chunks(32)
+        .find(|e| e[0] == 0x81)
+        .map(|e| {
+            (
+                le32(e, 20),
+                u64::from_le_bytes(e[24..32].try_into().unwrap_or([0; 8])),
+            )
+        })
+        .ok_or_else(|| anyhow::anyhow!("exFAT: the new volume has no allocation bitmap"))?;
+    anyhow::ensure!(
+        len * 8 >= count,
+        "exFAT: the allocation bitmap is too short"
+    );
+    let mut bitmap = vec![0u8; len as usize];
+    let (mut c, mut got) = (first, 0usize);
+    while got < bitmap.len() {
+        anyhow::ensure!(
+            c >= 2 && u64::from(c) < count + 2,
+            "exFAT: bad bitmap chain"
+        );
+        let n = (bitmap.len() - got).min(cluster as usize);
+        src.seek(SeekFrom::Start(at(c)))?;
+        src.read_exact(&mut bitmap[got..got + n])?;
+        got += n;
+        let mut next = [0u8; 4];
+        src.seek(SeekFrom::Start(fat_at + u64::from(c) * 4))?;
+        src.read_exact(&mut next)?;
+        c = match u32::from_le_bytes(next) {
+            0 => c + 1,
+            n => n,
+        };
+    }
+    let mut copy = |from: u64, len: u64| -> anyhow::Result<u64> {
+        src.seek(SeekFrom::Start(from))?;
+        dst.seek(SeekFrom::Start(base + from))?;
+        let copied = std::io::copy(&mut Read::take(&mut *src, len), &mut *dst)?;
+        anyhow::ensure!(copied == len, "exFAT: short read writing the volume");
+        Ok(len)
+    };
+    let mut written = copy(0, heap)?;
+    let used = |i: u64| bitmap[(i / 8) as usize] & (1 << (i % 8)) != 0;
+    let mut i = 0;
+    while i < count {
+        if !used(i) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < count && used(i) {
+            i += 1;
+        }
+        written += copy(at(start as u32 + 2), (i - start) * cluster)?;
+    }
+    dst.flush()?;
+    Ok(written)
 }
 
 /// The size a FAT boot sector says its volume is.
