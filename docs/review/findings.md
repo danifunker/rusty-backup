@@ -369,14 +369,14 @@ drivers are merged.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| UNX-001 | S1 | confirmed | ext.rs, ufs.rs, efs.rs, efs_v1.rs `delete_entry` | No `nlink` check: deleting one hard-link name frees the inode and blocks the other still uses. | fixed (UFIX) |
-| UNX-002 | S1 | confirmed | ext.rs `delete_entry`, `inode_data_blocks` | `i_block` read as pointers for fast symlinks / devices / inline data: frees random blocks or panics. | fixed (UFIX) |
-| UNX-003 | S1 | confirmed | ext.rs `add_dir_entry`, `try_insert_dir_entry` | htree (dir_index) directories not handled: the first insert overwrites `dx_root_info`; leaf inserts ignore hash order. | fixed (UFIX) |
-| UNX-004 | S1 | confirmed | ext.rs `open`, `build_relocation_map` | No incompat / ro_compat gate: meta_bg, RECOVER (unreplayed journal), bigalloc, inline_data all edited wrongly. | fixed (UFIX) |
+| UNX-001 | S1 | confirmed | ext.rs, ufs.rs, efs.rs, efs_v1.rs `delete_entry` | No `nlink` check: deleting one hard-link name frees the inode and blocks the other still uses. | fixed (72c94099) |
+| UNX-002 | S1 | confirmed | ext.rs `delete_entry`, `inode_data_blocks` | `i_block` read as pointers for fast symlinks / devices / inline data: frees random blocks or panics. | fixed (72c94099) |
+| UNX-003 | S1 | confirmed | ext.rs `add_dir_entry`, `try_insert_dir_entry` | htree (dir_index) directories not handled: the first insert overwrites `dx_root_info`; leaf inserts ignore hash order. | fixed (72c94099) |
+| UNX-004 | S1 | confirmed | ext.rs `open`, `build_relocation_map` | No incompat / ro_compat gate: meta_bg, RECOVER (unreplayed journal), bigalloc, inline_data all edited wrongly. | fixed (72c94099) |
 | UNX-005 | S1 | confirmed | ufs.rs, jfs.rs, efs.rs directory / inode writes | On-disk pointers never checked against the volume size: edits can write into the next partition. | open |
 | UNX-006 | S1 | confirmed | ufs.rs `free_inode_blocks`, `free_frag_run` | Freeing trusts pointers: panics past the CG, frees CG headers / inode tables, frees cross-linked blocks. | open |
-| UNX-007 | S1 | confirmed | efs.rs directory code, efs_fsck.rs, efs_resize.rs | Indirect-extent directories (numextents > 12) treated as direct: insert overwrites an index block, listing shows empty, repair double-links. | fixed (UFIX) |
-| UNX-008 | S1 | confirmed | efs_v1.rs `allocate_inode`, `dir_insert` | Dirents hold a u16 inum but inodes above 65,535 are handed out: the entry points at the wrong inode. | fixed (UFIX) |
+| UNX-007 | S1 | confirmed | efs.rs directory code, efs_fsck.rs, efs_resize.rs | Indirect-extent directories (numextents > 12) treated as direct: insert overwrites an index block, listing shows empty, repair double-links. | fixed (72c94099) |
+| UNX-008 | S1 | confirmed | efs_v1.rs `allocate_inode`, `dir_insert` | Dirents hold a u16 inum but inodes above 65,535 are handed out: the entry points at the wrong inode. | fixed (72c94099) |
 | UNX-009 | S1 | confirmed | bfs_fsck.rs `check_inode`, `repair_bfs` | Double-indirect and indirect map blocks never claimed: repair frees them. | open |
 | UNX-010 | S1 | confirmed | ofs_fsck.rs `claim_file`; ofs_write.rs `owned_runs` | Only the first allocation list counted: repair frees chained lists, delete leaks them. | open |
 | UNX-011 | S1 | confirmed | bfs_write.rs `BTree::split_and_promote` | Internal split promotes the wrong key: some keys become unreachable. | open |
@@ -389,13 +389,13 @@ drivers are merged.
 | UNX-018 | S2 | confirmed | ufs.rs, efs.rs, efs_v1.rs orphan adoption | Children of an orphaned directory adopted twice; UFS `..` and lost+found nlink stale; efs `continue` in the wrong loop. | open |
 | UNX-019 | S2 | confirmed | ext.rs, btrfs.rs, jfs.rs, reiserfs.rs tree walks | No depth cap / level check: self-pointing nodes overflow the stack or loop. | open |
 | UNX-020 | S2 | confirmed | ext, ufs, jfs, jfs1, btrfs, bfs, vxfs | Allocations sized from on-disk fields (symlink size 1<<40 aborts a listing). | open |
-| UNX-021 | S2 | confirmed | efs.rs `open`, `inode_byte_offset` | `cgisize` / `cgfsize` / `ncg` not validated: divide by zero on listing. | fixed (UFIX) |
-| UNX-022 | S2 | confirmed | ext.rs `try_insert_dir_entry` | `rec_len - actual_len` underflows (panic / wrapped rec_len written). | fixed (UFIX) |
-| UNX-023 | S2 | confirmed | ext.rs `delete_entry` | Deleting an ext2/3 file over 12 blocks leaks its indirect blocks. | fixed (UFIX) |
-| UNX-024 | S2 | confirmed | ext.rs `free_blocks_list` | No range / state check: underflow, panic, double-free counted. | fixed (UFIX) |
-| UNX-025 | S2 | confirmed | ext.rs `open` | Shift before range check, underflow, descriptor Vec sized from disk (up to 128 GiB). | fixed (UFIX) |
-| UNX-026 | S2 | confirmed | ext.rs `add_block_to_extent_inode` | `eh_entries` / `eh_max` trusted: indexes past `i_block`. | fixed (UFIX) |
-| UNX-027 | S2 | confirmed | ext.rs `rename` | File type recomputed as dir / regular: symlinks, devices, fifos get the wrong type. | fixed (UFIX) |
+| UNX-021 | S2 | confirmed | efs.rs `open`, `inode_byte_offset` | `cgisize` / `cgfsize` / `ncg` not validated: divide by zero on listing. | fixed (72c94099) |
+| UNX-022 | S2 | confirmed | ext.rs `try_insert_dir_entry` | `rec_len - actual_len` underflows (panic / wrapped rec_len written). | fixed (72c94099) |
+| UNX-023 | S2 | confirmed | ext.rs `delete_entry` | Deleting an ext2/3 file over 12 blocks leaks its indirect blocks. | fixed (72c94099) |
+| UNX-024 | S2 | confirmed | ext.rs `free_blocks_list` | No range / state check: underflow, panic, double-free counted. | fixed (72c94099) |
+| UNX-025 | S2 | confirmed | ext.rs `open` | Shift before range check, underflow, descriptor Vec sized from disk (up to 128 GiB). | fixed (72c94099) |
+| UNX-026 | S2 | confirmed | ext.rs `add_block_to_extent_inode` | `eh_entries` / `eh_max` trusted: indexes past `i_block`. | fixed (72c94099) |
+| UNX-027 | S2 | confirmed | ext.rs `rename` | File type recomputed as dir / regular: symlinks, devices, fifos get the wrong type. | fixed (72c94099) |
 | UNX-028 | S2 | plausible | ext_fsck.rs; ext.rs | INODE_UNINIT / `itable_unused` ignored: false errors and repairs on lazy-init volumes. | open |
 | UNX-029 | S2 | plausible | ext.rs `grow_ext_add_groups` | Grow ignores reserved GDT blocks and the resize inode. | open |
 | UNX-030 | S2 | plausible | ext.rs; ext_fsck.rs | Block-bitmap checksum covers the whole block, not blocks_per_group / 8. | open |
