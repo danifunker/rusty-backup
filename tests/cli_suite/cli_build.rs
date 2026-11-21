@@ -739,3 +739,70 @@ fn a_card_image_restores_with_its_last_partition_grown() {
     fsck_clean(&format!("{g}@2"));
     assert!(run(&["ls", &format!("{g}@2"), "/"]).contains("readme.txt"));
 }
+
+/// A pagefile at the end of a volume pins its minimum; `--drop-swap-files` deletes it from a copy.
+#[test]
+fn drop_swap_files_lets_a_card_image_shrink_past_its_pagefile() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = dir.path().join("c");
+    std::fs::create_dir_all(&files).unwrap();
+    std::fs::write(files.join("DATA.TXT"), b"keep me").unwrap();
+    std::fs::write(files.join("PAGEFILE.SYS"), vec![0x77u8; 96 * 1024 * 1024]).unwrap();
+    let card = dir.path().join("xp.img");
+    let c = card.to_str().unwrap();
+    let folder = format!("1={}", files.display());
+    run(&[
+        "build",
+        c,
+        "--size",
+        "160M",
+        "--table",
+        "mbr",
+        "--partition",
+        "rest:0c",
+        "--format",
+        "1=fat32:XP",
+        "--folder",
+        &folder,
+    ]);
+    let before = std::fs::read(&card).unwrap();
+    let small = dir.path().join("small.img");
+    let s = small.to_str().unwrap();
+    let (ok, text) = run_raw(&[
+        "restore",
+        c,
+        s,
+        "--target-size",
+        "67108864",
+        "--size",
+        "minimum",
+    ]);
+    assert!(
+        !ok,
+        "a 64 MiB target cannot hold the pagefile's extent:\n{text}"
+    );
+    assert!(text.contains("--drop-swap-files"), "{text}");
+
+    let out = run(&[
+        "restore",
+        c,
+        s,
+        "--target-size",
+        "67108864",
+        "--size",
+        "minimum",
+        "--drop-swap-files",
+    ]);
+    assert!(out.contains("dropped PAGEFILE.SYS"), "{out}");
+    assert_eq!(
+        std::fs::read(&card).unwrap(),
+        before,
+        "the source image is never written"
+    );
+    fsck_clean(&format!("{s}@1"));
+    let ls = run(&["ls", &format!("{s}@1"), "/"]);
+    assert!(
+        ls.contains("DATA.TXT") && !ls.contains("PAGEFILE.SYS"),
+        "{ls}"
+    );
+}

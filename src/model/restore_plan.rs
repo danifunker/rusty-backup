@@ -125,6 +125,8 @@ pub struct LoadedBackup {
     pub guard: Option<tempfile::TempDir>,
     /// The disk had a Mac driver and this backup did not keep it.
     pub mac_driver_missing: bool,
+    /// Windows swap files in a disk image read as a backup, which a restore may drop.
+    pub swap_files: Vec<crate::model::image_backup::SwapFile>,
 }
 
 impl LoadedBackup {
@@ -214,6 +216,7 @@ fn load_native(folder: &Path, metadata_path: &Path) -> Result<LoadedBackup, Stri
         loaded_line,
         guard: None,
         mac_driver_missing,
+        swap_files: crate::model::image_backup::swap_files(folder),
     })
 }
 
@@ -385,6 +388,7 @@ fn load_clonezilla(folder: &Path, cz_folder: &Path) -> Result<LoadedBackup, Stri
         loaded_line,
         guard: None,
         mac_driver_missing: false,
+        swap_files: Vec::new(),
     })
 }
 

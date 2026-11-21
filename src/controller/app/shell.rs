@@ -434,6 +434,8 @@ impl AppController {
 
     /// Sync a tab with the shared folder: it opened a new backup, or (only when empty) adopts it.
     pub fn share_backup(&mut self, loaded: Option<PathBuf>, tab_empty: bool) -> ShareStep {
+        // A disk image Restore reads as a backup of itself is not a folder Inspect can load.
+        let loaded = loaded.filter(|p| !crate::model::image_backup::is_image_file(p));
         if let Some(new) = loaded {
             if self.shell.shared_backup.as_ref() != Some(&new) {
                 self.shell.shared_backup = Some(new.clone());

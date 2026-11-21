@@ -77,10 +77,16 @@ pub struct RestoreArgs {
     /// Leave out the bundled Mac driver a backup that lost its own would otherwise get.
     #[arg(long = "no-mac-driver")]
     pub no_mac_driver: bool,
+
+    /// With a disk image source: delete Windows' swap and hibernation files (PAGEFILE.SYS,
+    /// HIBERFIL.SYS, WIN386.SWP, ...) first, from a temporary copy, so `--size minimum` can shrink
+    /// past them. Windows recreates them at boot; the image file itself is not changed.
+    #[arg(long = "drop-swap-files")]
+    pub drop_swap_files: bool,
 }
 
 /// Turn a `.cbk` or a disk image into a backup folder in a temp dir the caller keeps alive.
-fn prepare_source(backup_dir: &mut PathBuf) -> Result<Option<tempfile::TempDir>> {
+fn prepare_source(backup_dir: &mut PathBuf, drop_swap: bool) -> Result<Option<tempfile::TempDir>> {
     if !backup_dir.is_file() {
         return Ok(None);
     }
@@ -100,6 +106,18 @@ fn prepare_source(backup_dir: &mut PathBuf) -> Result<Option<tempfile::TempDir>>
             "rb-cli restore: reading {} as a backup of itself",
             backup_dir.display()
         ));
+        let swap = crate::model::image_backup::swap_files(tmp.path());
+        if drop_swap && !swap.is_empty() {
+            crate::model::image_backup::drop_swap_files(tmp.path(), &mut |m| log_stderr(m))
+                .context("dropping the swap files")?;
+        } else if !swap.is_empty() {
+            let names: Vec<&str> = swap.iter().map(|s| s.name.as_str()).collect();
+            log_stderr(format!(
+                "rb-cli restore: {} would be rebuilt by Windows at boot; --drop-swap-files deletes \
+                 them first so --size minimum can shrink past them",
+                names.join(", ")
+            ));
+        }
     } else {
         return Ok(None);
     }
@@ -109,7 +127,7 @@ fn prepare_source(backup_dir: &mut PathBuf) -> Result<Option<tempfile::TempDir>>
 
 pub fn run(args: RestoreArgs) -> Result<()> {
     let mut args = args;
-    let _source_guard = prepare_source(&mut args.backup_dir)?;
+    let _source_guard = prepare_source(&mut args.backup_dir, args.drop_swap_files)?;
     // Remote target (`rb://host[:port]/path`): restore over the block tier. The
     // local device-safety preflight below is for local device paths only; a
     // remote device is gated on the daemon side, so dispatch before it.
