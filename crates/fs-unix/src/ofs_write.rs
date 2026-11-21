@@ -302,10 +302,8 @@ impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
             return Ok(runs);
         }
         let mut runs = self.file_extents(attrs)?;
-        if !attrs.is_contiguous() && attrs.first_alloc_list != 0 {
-            // The extent-list sector itself is allocated too.
-            runs.push((attrs.first_alloc_list as u64, 1));
-        }
+        // Every extent-list sector of the chain is allocated too, not only the first (UNX-010).
+        runs.extend(self.alloc_list_sectors(attrs)?.into_iter().map(|s| (s, 1)));
         Ok(runs)
     }
 

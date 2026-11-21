@@ -1645,7 +1645,18 @@ impl<R: Read + Write + Seek + Send> JfsFilesystem<R> {
                 "jfs: fileset inode {fino}: inoext[{local_extent}] not allocated"
             )));
         }
-        Ok(pxd.address * self.bsize + in_extent * DISIZE)
+        // The extent address comes from disk: the inode must lie inside the aggregate (UNX-005).
+        let byte = pxd
+            .address
+            .checked_mul(self.bsize)
+            .and_then(|b| b.checked_add(in_extent * DISIZE))
+            .filter(|&b| b + DISIZE <= self.total_byte_extent)
+            .ok_or_else(|| {
+                FilesystemError::InvalidData(format!(
+                    "jfs: fileset inode {fino} lies past the aggregate"
+                ))
+            })?;
+        Ok(byte)
     }
 
     /// Re-write fileset inode `fino`'s 512-byte dinode from `raw`. Callers

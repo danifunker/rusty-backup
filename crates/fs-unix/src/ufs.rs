@@ -2685,6 +2685,12 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 )));
             }
             let take = (bytes.len() - written).min(bs);
+            if frag.saturating_add((take as u64).div_ceil(self.fsize)) > self.total_frags {
+                // An on-disk pointer past the volume: refuse rather than write beyond it (UNX-005).
+                return Err(FilesystemError::InvalidData(format!(
+                    "ufs write_dir_bytes: directory block at fragment {frag} is past the volume"
+                )));
+            }
             // Whole-block writes round up to bsize; the last partial
             // write only updates `take` bytes (preserves anything past
             // the file's logical end).

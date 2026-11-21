@@ -338,7 +338,7 @@ pub fn grow_efs<R: Read + Write + Seek>(
             let cg_start = sb.firstcg + cg * sb.cgfsize;
             let zero_sector = [0u8; EFS_BLOCKSIZE_USIZE];
             for i in 0..sb.cgisize as u32 {
-                fs.write_block(cg_start + i, &zero_sector)?;
+                fs.write_block_resizing(cg_start + i, &zero_sector)?;
             }
             // Reservation may have been deferred for blocks past the
             // pre-relocation bitmap end. Catch up here now that the
@@ -777,7 +777,7 @@ fn rewrite_directory_inum_refs<R: Read + Write + Seek>(
                             "aggressive shrink: re-serializing dirblock {bn} grew past 512 bytes"
                         ))
                     })?;
-                    fs.write_block(bn, &new_block)?;
+                    fs.write_block_resizing(bn, &new_block)?;
                     dirblocks_rewritten += 1;
                 }
             }

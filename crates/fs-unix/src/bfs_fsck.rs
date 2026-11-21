@@ -414,9 +414,16 @@ impl<R: Read + Seek + Send> BfsFilesystem<R> {
             }
         }
         if inode.data.double_indirect.len > 0 {
-            survey.warnings.push(warning(
+            let start = inode.data.double_indirect.to_block(self.sb.ag_shift);
+            for b in start..start + inode.data.double_indirect.len as u64 {
+                survey.claimed.insert(b);
+            }
+            // The indirect blocks it lists are not claimed here, so the bitmap must not be
+            // rebuilt from this survey: an error that blocks repair, not a warning (UNX-009).
+            survey.errors.push(error(
                 "DoubleIndirectStream",
-                format!("{path}: uses a double-indirect stream, which is not fully validated"),
+                format!("{path}: uses a double-indirect stream, whose block map is not walked"),
+                false,
             ));
         }
     }

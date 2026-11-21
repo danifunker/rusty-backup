@@ -373,12 +373,12 @@ drivers are merged.
 | UNX-002 | S1 | confirmed | ext.rs `delete_entry`, `inode_data_blocks` | `i_block` read as pointers for fast symlinks / devices / inline data: frees random blocks or panics. | fixed (72c94099) |
 | UNX-003 | S1 | confirmed | ext.rs `add_dir_entry`, `try_insert_dir_entry` | htree (dir_index) directories not handled: the first insert overwrites `dx_root_info`; leaf inserts ignore hash order. | fixed (72c94099) |
 | UNX-004 | S1 | confirmed | ext.rs `open`, `build_relocation_map` | No incompat / ro_compat gate: meta_bg, RECOVER (unreplayed journal), bigalloc, inline_data all edited wrongly. | fixed (72c94099) |
-| UNX-005 | S1 | confirmed | ufs.rs, jfs.rs, efs.rs directory / inode writes | On-disk pointers never checked against the volume size: edits can write into the next partition. | open |
+| UNX-005 | S1 | confirmed | ufs.rs, jfs.rs, efs.rs directory / inode writes | On-disk pointers never checked against the volume size: edits can write into the next partition. | fixed (U3FIX) |
 | UNX-006 | S1 | confirmed | ufs.rs `free_inode_blocks`, `free_frag_run` | Freeing trusts pointers: panics past the CG, frees CG headers / inode tables, frees cross-linked blocks. | partly fixed (f55f13c6): runs past the CG and double frees refused; the metadata-area check is left out (the CG layout of our own test volumes does not match the reviewer's model) |
 | UNX-007 | S1 | confirmed | efs.rs directory code, efs_fsck.rs, efs_resize.rs | Indirect-extent directories (numextents > 12) treated as direct: insert overwrites an index block, listing shows empty, repair double-links. | fixed (72c94099) |
 | UNX-008 | S1 | confirmed | efs_v1.rs `allocate_inode`, `dir_insert` | Dirents hold a u16 inum but inodes above 65,535 are handed out: the entry points at the wrong inode. | fixed (72c94099) |
-| UNX-009 | S1 | confirmed | bfs_fsck.rs `check_inode`, `repair_bfs` | Double-indirect and indirect map blocks never claimed: repair frees them. | open |
-| UNX-010 | S1 | confirmed | ofs_fsck.rs `claim_file`; ofs_write.rs `owned_runs` | Only the first allocation list counted: repair frees chained lists, delete leaks them. | open |
+| UNX-009 | S1 | confirmed | bfs_fsck.rs `check_inode`, `repair_bfs` | Double-indirect and indirect map blocks never claimed: repair frees them. | fixed (U3FIX) |
+| UNX-010 | S1 | confirmed | ofs_fsck.rs `claim_file`; ofs_write.rs `owned_runs` | Only the first allocation list counted: repair frees chained lists, delete leaks them. | fixed (U3FIX) |
 | UNX-011 | S1 | confirmed | bfs_write.rs `BTree::split_and_promote` | Internal split promotes the wrong key: some keys become unreachable. | fixed (f55f13c6) |
 | UNX-012 | S1 | confirmed | bfs_write.rs `write_blank_bfs_into` | 65,537..65,539-block volumes put the root tree past the volume end. | fixed (f55f13c6) |
 | UNX-013 | S1 | confirmed | minix.rs `write_blank_minix_into` | `firstdatazone` / `zmap_blocks` stored as u16 unchecked: large V3 volumes overlap data and inodes. | fixed (f55f13c6) |

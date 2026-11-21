@@ -1007,6 +1007,24 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         bn: u32,
         buf: &[u8; EFS_BLOCKSIZE as usize],
     ) -> Result<(), FilesystemError> {
+        // Edits go through here: an on-disk pointer past the volume is refused, not written
+        // into whatever follows the partition (UNX-005). Resize, which grows the volume
+        // before it records the new size, uses `write_block_resizing`.
+        if bn >= self.sb.fs_size {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS write to block {bn} is past the {}-block volume",
+                self.sb.fs_size
+            )));
+        }
+        self.write_block_resizing(bn, buf)
+    }
+
+    /// [`Self::write_block`] without the volume-end check, for the resize paths only.
+    pub(crate) fn write_block_resizing(
+        &mut self,
+        bn: u32,
+        buf: &[u8; EFS_BLOCKSIZE as usize],
+    ) -> Result<(), FilesystemError> {
         self.reader.seek(SeekFrom::Start(
             self.partition_offset + bn as u64 * EFS_BLOCKSIZE,
         ))?;

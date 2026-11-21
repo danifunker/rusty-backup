@@ -205,18 +205,29 @@ impl<R: Read + Seek + Send> OfsFilesystem<R> {
 
     fn claim_file(&mut self, attrs: &crate::ofs::OfsAttrs, path: &str, survey: &mut Survey) {
         let total = self.toc.total_sectors as u64;
-        if !attrs.is_contiguous() && attrs.first_alloc_list != 0 {
-            // The extent-list sector is allocated in its own right.
-            let list = attrs.first_alloc_list as u64;
-            if list >= total {
+        // Every extent-list sector of the chain is allocated in its own right (UNX-010).
+        match self.alloc_list_sectors(attrs) {
+            Ok(lists) => {
+                for list in lists {
+                    if list >= total {
+                        survey.errors.push(issue(
+                            "ExtentListPastEnd",
+                            format!("{path}: extent list at sector {list} is past the volume"),
+                            false,
+                        ));
+                        return;
+                    }
+                    survey.claimed.insert(list);
+                }
+            }
+            Err(err) => {
                 survey.errors.push(issue(
-                    "ExtentListPastEnd",
-                    format!("{path}: extent list at sector {list} is past the volume"),
+                    "UnreadableExtents",
+                    format!("{path}: extent list chain could not be read ({err})"),
                     false,
                 ));
                 return;
             }
-            survey.claimed.insert(list);
         }
         let extents = match self.file_extents(attrs) {
             Ok(e) => e,
