@@ -35,6 +35,8 @@
 <dd>Write zeros to unused filesystem space</dd>
 <dt><code>--no-mac-driver</code></dt>
 <dd>Leave out the bundled Mac driver a backup that lost its own would otherwise get</dd>
+<dt><code>--drop-swap-files</code></dt>
+<dd>With a disk image source: delete Windows' swap and hibernation files (PAGEFILE.SYS, HIBERFIL.SYS, WIN386.SWP, ...) first, from a temporary copy, so `--size minimum` can shrink past them. Windows recreates them at boot; the image file itself is not changed</dd>
 </dl>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

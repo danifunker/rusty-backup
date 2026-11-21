@@ -20,8 +20,8 @@ use rusty_backup::controller::app::{
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::restore::{
-    hints, ids, purpose, CaveatLevel, HostRequest, JobRegistry, RestoreAction, RestoreController,
-    RestoreMode, RestoreServices, TargetSlot, MODES,
+    hints, ids, labels, purpose, CaveatLevel, HostRequest, JobRegistry, RestoreAction,
+    RestoreController, RestoreMode, RestoreServices, TargetSlot, MODES,
 };
 use rusty_backup::controller::{Controller, Effect};
 
@@ -86,6 +86,9 @@ pub struct RestoreScreen {
     sizes: Sizes,
     caveats_group: adw::PreferencesGroup,
     mac_driver: adw::SwitchRow,
+    /// The disk image's swap files, with "Drop Swap Files..." as the row's suffix.
+    swap: adw::ActionRow,
+    drop_swap: gtk::Button,
     caveats: Notes,
     target_line: gtk::Label,
     outcome: Notes,
@@ -105,6 +108,8 @@ struct Shown {
     new_disk: NewDiskShown,
     sizes: SizesShown,
     mac_driver: Option<bool>,
+    swap_line: Option<String>,
+    dropping_swap: bool,
     caveats: Vec<(Tone, String)>,
     write_target: Option<String>,
     running: bool,
@@ -156,7 +161,14 @@ impl RestoreScreen {
                 s(RestoreAction::SetInstallMacDriver(r.is_active()))
             });
             let caveats = Notes::new();
+            let drop_swap = button(labels::DROP_SWAP, ids::DROP_SWAP);
+            drop_swap.set_valign(gtk::Align::Center);
+            let s = send.clone();
+            drop_swap.connect_clicked(move |_| s(RestoreAction::DropSwapFiles));
+            let swap = adw::ActionRow::builder().title("Swap files").build();
+            swap.add_suffix(&drop_swap);
             caveats_group.add(&mac_driver);
+            caveats_group.add(&swap);
             caveats_group.add(caveats.root());
 
             let form = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -238,6 +250,8 @@ impl RestoreScreen {
                 sizes,
                 caveats_group,
                 mac_driver,
+                swap,
+                drop_swap,
                 caveats,
                 target_line,
                 outcome,
@@ -426,6 +440,10 @@ impl RestoreScreen {
             new_disk: NewDiskShown::read(&ctrl),
             sizes: SizesShown::read(&ctrl),
             mac_driver: ctrl.mac_driver_missing().then(|| ctrl.install_mac_driver()),
+            swap_line: ctrl
+                .swap_files_line()
+                .filter(|_| ctrl.mode() == RestoreMode::FullDisk),
+            dropping_swap: ctrl.dropping_swap().is_some(),
             caveats,
             write_target: ctrl.write_target(),
             running: ctrl.is_running(),
@@ -475,8 +493,11 @@ impl RestoreScreen {
 
         self.mac_driver.set_visible(s.mac_driver.is_some());
         set_switch(&self.mac_driver, s.mac_driver.unwrap_or(false));
+        self.swap.set_visible(s.swap_line.is_some());
+        self.swap.set_subtitle(s.swap_line.as_deref().unwrap_or(""));
+        self.drop_swap.set_sensitive(!s.dropping_swap);
         self.caveats_group
-            .set_visible(s.mac_driver.is_some() || !s.caveats.is_empty());
+            .set_visible(s.mac_driver.is_some() || s.swap_line.is_some() || !s.caveats.is_empty());
         self.caveats.show(s.caveats);
 
         let shown = s.write_target.map(|t| format!("Writes to: {t}"));

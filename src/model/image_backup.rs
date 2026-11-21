@@ -9,6 +9,11 @@
 //! The "Minimum" each partition offers is its filesystem's last used byte: the data stays where it
 //! is, so a shrink may only trim the free tail. MBR (primary partitions), GPT and APM disks are
 //! offered; the label schemes and MBR logical partitions are refused, and write as-is instead.
+//!
+//! Windows' swap and hibernation files ([`SWAP_FILE_NAMES`]) are rebuilt at boot, and one at the
+//! end of a volume pins its minimum there. [`virtualize`] lists any in a partition's root in
+//! `swap-files.json`; [`drop_swap_files`] deletes them, once the user agrees, from the folder's own
+//! copy of the disk (a flat image is copied in first, so the user's file is never written).
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -21,6 +26,28 @@ use crate::partition::{detect_alignment, PartitionTable};
 
 /// The container file a virtual backup keeps beside its metadata when the image needed decoding.
 pub const DECODED_NAME: &str = "disk.img";
+
+/// The sidecar listing the swap files found in the image's partitions.
+pub const SWAP_FILES_NAME: &str = "swap-files.json";
+
+/// Root-level files Windows rebuilds at boot: NT's pagefile and hibernation file, the Windows 8+
+/// swapfile, Windows 9x's and Windows 3.x's swap files.
+pub const SWAP_FILE_NAMES: &[&str] = &[
+    "PAGEFILE.SYS",
+    "HIBERFIL.SYS",
+    "SWAPFILE.SYS",
+    "WIN386.SWP",
+    "386SPART.PAR",
+];
+
+/// A swap file in one of the image's partitions.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SwapFile {
+    /// The partition's `index` in the metadata.
+    pub partition: usize,
+    pub name: String,
+    pub size: u64,
+}
 
 /// True for a file (not a folder, not a `.cbk`) that [`virtualize`] may take.
 pub fn is_image_file(path: &Path) -> bool {
@@ -59,6 +86,20 @@ pub fn virtualize(image: &Path, folder: &Path, log: &mut dyn FnMut(String)) -> R
         );
     }
     let alignment = detect_alignment(&table);
+    let swap: Vec<SwapFile> = parts
+        .iter()
+        .filter(|p| !p.is_extended_container)
+        .flat_map(|p| find_swap_files(&file, p))
+        .collect();
+    for s in &swap {
+        log(format!(
+            "Partition {}: {} ({} bytes) is rebuilt at boot",
+            s.partition, s.name, s.size
+        ));
+    }
+    if !swap.is_empty() {
+        sidecar(folder, SWAP_FILES_NAME, &swap)?;
+    }
     let partitions = parts
         .iter()
         .filter(|p| !p.is_extended_container)
@@ -137,6 +178,139 @@ pub fn virtualize(image: &Path, folder: &Path, log: &mut dyn FnMut(String)) -> R
     };
     sidecar(folder, "metadata.json", &metadata)?;
     Ok(container)
+}
+
+/// The swap files in `p`'s root directory; none when it does not open.
+fn find_swap_files(file: &File, p: &crate::partition::PartitionInfo) -> Vec<SwapFile> {
+    let Ok(clone) = file.try_clone() else {
+        return Vec::new();
+    };
+    let Ok(mut fs) = crate::fs::open_filesystem(
+        BufReader::new(clone),
+        p.start_lba * 512,
+        p.partition_type_byte,
+        p.partition_type_string.as_deref(),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(root) = fs.root() else {
+        return Vec::new();
+    };
+    fs.list_directory(&root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| {
+            e.is_file()
+                && SWAP_FILE_NAMES
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&e.name))
+        })
+        .map(|e| SwapFile {
+            partition: p.index,
+            name: e.name,
+            size: e.size,
+        })
+        .collect()
+}
+
+/// The swap files [`virtualize`] found in the image at `folder`; none for any other backup.
+pub fn swap_files(folder: &Path) -> Vec<SwapFile> {
+    std::fs::read(folder.join(SWAP_FILES_NAME))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Delete the swap files from the folder's copy of the disk and recompute each partition's
+/// minimum. A flat image referenced in place is copied into the folder first.
+pub fn drop_swap_files(folder: &Path, log: &mut dyn FnMut(String)) -> Result<()> {
+    let swap = swap_files(folder);
+    if swap.is_empty() {
+        return Ok(());
+    }
+    let meta_path = folder.join("metadata.json");
+    let mut metadata: BackupMetadata = serde_json::from_slice(
+        &std::fs::read(&meta_path).with_context(|| format!("reading {}", meta_path.display()))?,
+    )
+    .context("parsing metadata.json")?;
+    let container = folder.join(metadata.container.as_deref().unwrap_or(DECODED_NAME));
+    let own = folder.join(DECODED_NAME);
+    if container != own {
+        log(format!(
+            "Copying {} to a temporary file so its swap files can be dropped",
+            container.display()
+        ));
+        std::fs::copy(&container, &own)
+            .with_context(|| format!("copying {}", container.display()))?;
+        metadata.container = Some(own.display().to_string());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&own)
+        .with_context(|| format!("opening {}", own.display()))?;
+    for pm in metadata.partitions.iter_mut() {
+        let names: Vec<&SwapFile> = swap.iter().filter(|s| s.partition == pm.index).collect();
+        if names.is_empty() {
+            continue;
+        }
+        let offset = pm.start_lba * 512;
+        let ctx = crate::fs::EditContext {
+            partition_len: Some(pm.original_size_bytes),
+            ..Default::default()
+        };
+        let mut efs = crate::fs::open_editable_filesystem_with(
+            file.try_clone()?,
+            offset,
+            ctx,
+            pm.partition_type_byte,
+            pm.partition_type_string.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("partition {}: opening it to edit: {e}", pm.index))?;
+        let root = efs
+            .as_filesystem_mut()
+            .root()
+            .map_err(|e| anyhow::anyhow!("partition {}: reading its root: {e}", pm.index))?;
+        let entries = efs
+            .as_filesystem_mut()
+            .list_directory(&root)
+            .map_err(|e| anyhow::anyhow!("partition {}: listing its root: {e}", pm.index))?;
+        for s in names {
+            let Some(entry) = entries
+                .iter()
+                .find(|e| e.name.eq_ignore_ascii_case(&s.name))
+            else {
+                continue;
+            };
+            efs.delete_entry(&root, entry)
+                .map_err(|e| anyhow::anyhow!("partition {}: deleting {}: {e}", pm.index, s.name))?;
+            log(format!(
+                "Partition {}: dropped {} ({} bytes)",
+                pm.index, s.name, s.size
+            ));
+        }
+        efs.sync_metadata()
+            .map_err(|e| anyhow::anyhow!("partition {}: saving the deletion: {e}", pm.index))?;
+        drop(efs);
+        pm.minimum_size_bytes = crate::fs::effective_partition_size_reported(
+            BufReader::new(file.try_clone()?),
+            offset,
+            pm.partition_type_byte,
+            pm.partition_type_string.as_deref(),
+        )
+        .ok()
+        .map(|m| m.min(pm.original_size_bytes));
+        log(format!(
+            "Partition {}: minimum now {}",
+            pm.index,
+            pm.minimum_size_bytes
+                .map_or("unknown".to_string(), |m| format!("{m} bytes"))
+        ));
+    }
+    file.sync_all().context("syncing the copy")?;
+    sidecar(folder, "metadata.json", &metadata)?;
+    std::fs::remove_file(folder.join(SWAP_FILES_NAME)).context("clearing the swap-file list")?;
+    Ok(())
 }
 
 fn sidecar<T: serde::Serialize>(folder: &Path, name: &str, value: &T) -> Result<()> {
@@ -242,6 +416,25 @@ pub(crate) mod tests {
         target
     }
 
+    /// Restore an already-virtualized `folder` as-is onto a file of `size` bytes.
+    fn restore_folder(folder: &Path, size: u64) -> PathBuf {
+        use crate::restore::{RestoreAlignment, RestoreConfig, RestoreProgress};
+        let target = folder.parent().unwrap().join("from-folder.img");
+        let cfg = RestoreConfig {
+            backup_folder: folder.to_path_buf(),
+            target_path: target.clone(),
+            target_is_device: false,
+            target_size: size,
+            alignment: RestoreAlignment::Original,
+            partition_sizes: vec![],
+            write_zeros_to_unused: false,
+            install_mac_driver: true,
+        };
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(RestoreProgress::new()));
+        crate::restore::run_restore(cfg, progress).expect("restore");
+        target
+    }
+
     /// The partition's size and HELLO.TXT read back from a restored disk.
     fn read_back(disk: &Path) -> (u64, Vec<u8>) {
         let mut f = File::open(disk).unwrap();
@@ -297,6 +490,64 @@ pub(crate) mod tests {
         std::fs::write(&xz, packed).unwrap();
         let (size, hello) = read_back(&restore(&xz, 48 * MIB, RestoreSizeChoice::FillRemaining));
         assert!(size > 40 * MIB, "grew to {size}");
+        assert_eq!(hello, vec![0x42u8; 20_000]);
+    }
+
+    /// [`fat_disk`] with a 20 MiB PAGEFILE.SYS after HELLO.TXT, pinning the minimum past it.
+    pub(crate) fn fat_disk_with_pagefile(dir: &Path) -> PathBuf {
+        let image = fat_disk(dir);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image)
+            .unwrap();
+        let mut efs = crate::fs::open_editable_filesystem(f, 1024 * 1024, 0x06, None).unwrap();
+        let root = efs.as_filesystem_mut().root().unwrap();
+        let swap = vec![0x77u8; 20 * 1024 * 1024];
+        let (len, opts) = (swap.len() as u64, Default::default());
+        efs.create_file(
+            &root,
+            "PAGEFILE.SYS",
+            &mut std::io::Cursor::new(&swap),
+            len,
+            &opts,
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+        image
+    }
+
+    #[test]
+    fn a_pagefile_is_listed_and_dropping_it_lowers_the_minimum_on_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = fat_disk_with_pagefile(dir.path());
+        let before = std::fs::read(&image).unwrap();
+        let folder = dir.path().join("virtual");
+        virtualize(&image, &folder, &mut |_| {}).unwrap();
+        let listed = swap_files(&folder);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].name.to_ascii_uppercase(), "PAGEFILE.SYS");
+        let min = |folder: &Path| -> u64 {
+            let m: BackupMetadata =
+                serde_json::from_slice(&std::fs::read(folder.join("metadata.json")).unwrap())
+                    .unwrap();
+            m.partitions[0].minimum_size_bytes.unwrap()
+        };
+        let pinned = min(&folder);
+        assert!(pinned > 20 * 1024 * 1024, "{pinned}");
+
+        drop_swap_files(&folder, &mut |_| {}).unwrap();
+        let freed = min(&folder);
+        // Down to this FAT16's floor (about 16 MiB), the size its cluster count needs.
+        assert!(freed < pinned - 3 * 1024 * 1024, "{freed} vs {pinned}");
+        assert!(swap_files(&folder).is_empty());
+        assert_eq!(
+            std::fs::read(&image).unwrap(),
+            before,
+            "the user's image is never written"
+        );
+        let (size, hello) = read_back(&restore_folder(&folder, 32 * 1024 * 1024));
+        assert!(size > 0);
         assert_eq!(hello, vec![0x42u8; 20_000]);
     }
 

@@ -755,3 +755,44 @@ fn a_disk_image_opens_as_a_resizable_backup_from_both_entry_points() {
     assert_eq!(ctl.mode(), RestoreMode::FullDisk);
     assert!(ctl.has_native_backup());
 }
+
+#[test]
+fn an_images_pagefile_is_offered_then_dropped_after_a_yes() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = crate::model::image_backup::tests::fat_disk_with_pagefile(dir.path());
+    let mut ctl = controller();
+    open(&mut ctl, img);
+    assert_eq!(ctl.swap_files().len(), 1);
+    assert!(ctl
+        .swap_files_line()
+        .unwrap()
+        .contains("rebuilt by Windows at boot"));
+    let pinned = ctl.size_rows()[0].minimum_size;
+
+    let fx = ctl.apply(RestoreAction::DropSwapFiles);
+    assert!(
+        matches!(fx.as_slice(), [Effect::Confirm(c)] if c.purpose == purpose::DROP_SWAP
+            && c.message.contains("your file is not changed")),
+        "{fx:?}"
+    );
+    ctl.apply(RestoreAction::Confirmed {
+        purpose: purpose::DROP_SWAP,
+        yes: false,
+    });
+    ctl.wait_idle();
+    assert_eq!(ctl.swap_files().len(), 1, "a no leaves it");
+
+    ctl.apply(RestoreAction::DropSwapFiles);
+    ctl.apply(RestoreAction::Confirmed {
+        purpose: purpose::DROP_SWAP,
+        yes: true,
+    });
+    ctl.wait_idle();
+    assert!(ctl.swap_files().is_empty());
+    assert!(ctl.swap_files_line().is_none());
+    assert!(
+        ctl.size_rows()[0].minimum_size < pinned,
+        "{:?}",
+        ctl.size_rows()[0]
+    );
+}

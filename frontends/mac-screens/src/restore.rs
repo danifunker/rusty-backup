@@ -171,6 +171,9 @@ enum K {
     RowSize(usize),
     Notes,
     MacDriver,
+    /// The disk image's swap files, and "Drop Swap Files..." beside them.
+    SwapLine,
+    DropSwap,
     Caveats,
     TargetLine,
     Outcome,
@@ -355,6 +358,8 @@ impl RestoreScreen {
             }
             form.wrap(K::Notes, "");
             form.check(K::MacDriver, hints::MAC_DRIVER, ids::MAC_DRIVER);
+            form.wrap(K::SwapLine, "");
+            form.button(K::DropSwap, labels::DROP_SWAP, ids::DROP_SWAP);
             form.wrap(K::Caveats, "");
             form.label(K::TargetLine, "");
             form.label(K::Outcome, "");
@@ -813,6 +818,10 @@ impl RestoreScreen {
         let mac = ctrl.mac_driver_missing().then(|| ctrl.install_mac_driver());
         f.show(K::MacDriver, mac.is_some() && !writing);
         f.set_check(K::MacDriver, mac.unwrap_or(false));
+        let swap = ctrl.swap_files_line().filter(|_| full);
+        self.line(K::SwapLine, swap.as_deref(), None);
+        f.show(K::DropSwap, swap.is_some());
+        f.enable(K::DropSwap, ctrl.dropping_swap().is_none());
         let caveats = if slot.is_some() {
             ctrl.size_caveats()
         } else {
@@ -1048,6 +1057,7 @@ impl RestoreScreen {
             K::Align,
             K::Custom,
             K::MacDriver,
+            K::DropSwap,
         ];
         for (i, _) in self.rows.borrow().iter() {
             v.push(K::RowMode(*i));
@@ -1204,6 +1214,10 @@ impl RestoreScreen {
         }
         col.push(lines(K::Notes));
         col.push(Node::row(vec![stretch(K::MacDriver)]));
+        col.push(Node::row(vec![
+            stretch(K::SwapLine),
+            Node::button(K::DropSwap, 150),
+        ]));
         col.push(lines(K::Caveats));
         col.push(Node::Space(Size::Stretch(1)));
         col.push(stretch(K::TargetLine));
@@ -1353,6 +1367,7 @@ impl RestoreScreen {
                 }
             }
             K::MacDriver => Some(RestoreAction::SetInstallMacDriver(f.checked(k))),
+            K::DropSwap => Some(RestoreAction::DropSwapFiles),
             // Start only asks; the controller's own question begins the write.
             K::Start => self.may_start().then_some(RestoreAction::Start),
             K::Cancel => Some(RestoreAction::Cancel),
