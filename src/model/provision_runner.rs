@@ -181,8 +181,8 @@ pub enum Preset {
         /// A Human68k system floppy cloned into partition 1.
         system_disk: Option<PathBuf>,
     },
-    /// SGI IRIX: a volume header and an EFS root.
-    SgiEfs { label: String },
+    /// SGI IRIX: a volume header and an EFS root; `label_only` writes the header alone.
+    SgiEfs { label: String, label_only: bool },
 }
 
 impl Preset {
@@ -231,15 +231,21 @@ fn run_preset(
                 disk_core::display::format_size(s.partition_bytes),
             ));
         }
-        Preset::SgiEfs { label } => {
+        Preset::SgiEfs { label, label_only } => {
             use crate::partition::sgi_hdd_builder::{write_sgi_efs_hdd, SgiHddOptions};
-            let opts = SgiHddOptions::new(size, label.as_str());
+            let mut opts = SgiHddOptions::new(size, label.as_str());
+            opts.format_root = !*label_only;
             let mut file = std::fs::File::create(out)
                 .with_context(|| format!("creating {}", out.display()))?;
             let layout = write_sgi_efs_hdd(&mut file, &opts)?;
             file.set_len(layout.disk_bytes)?;
             log(&format!(
-                "Wrote an SGI volume header and an EFS root ({} cylinders)",
+                "Wrote an SGI volume header{} ({} cylinders)",
+                if *label_only {
+                    " only; the EFS root is unformatted"
+                } else {
+                    " and an EFS root"
+                },
                 layout.cylinders
             ));
         }

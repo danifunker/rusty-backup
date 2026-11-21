@@ -244,6 +244,10 @@ pub struct BuildArgs {
     #[arg(long)]
     pub system_disk: Option<PathBuf>,
 
+    /// `--preset sgi-efs`: write the SGI volume header and partition table only, no EFS.
+    #[arg(long = "sgi-label-only")]
+    pub sgi_label_only: bool,
+
     /// With no `--table`: the volume label (a volume's, or a `--preset`'s).
     #[arg(long)]
     pub label: Option<String>,
@@ -409,6 +413,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         view.x68k_scsi = args.scsi;
         view.x68k_partitions = args.x68k_partitions;
         view.x68k_system_disk = args.system_disk.clone();
+        view.sgi_label_only = args.sgi_label_only;
         if let Some(label) = &args.label {
             view.sgi_label = label.clone();
             view.label = Some(label.clone());

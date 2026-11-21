@@ -464,6 +464,7 @@ Usage: build [OPTIONS] <TARGET>
 - `--scsi` — `--preset x68k`: write the SCSI form (1024-byte sectors) rather than SASI
 - `--x68k-partitions` — `--preset x68k`: how many Human68k partitions, 1 to 8
 - `--system-disk` — `--preset x68k`: a Human68k system floppy cloned into partition 1
+- `--sgi-label-only` — `--preset sgi-efs`: write the SGI volume header and partition table only, no EFS
 - `--label` — With no `--table`: the volume label (a volume's, or a `--preset`'s)
 - `--geometry` — With no `--table`: the fixed geometry of a floppy format, e.g. `d71` for a 1571 disk (`cbm`), `80` tracks (`dfs`, `rsdos`), `80ds` (`dragondos`). The default is the format's first
 - `--ntfs-version` — The on-disk version of every NTFS volume or partition this builds: `1.2` (alias `nt4`) for Windows NT 3.5 / 3.51 / 4.0, `3.1` (alias `xp`, the default)
