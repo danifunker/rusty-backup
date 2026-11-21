@@ -5678,6 +5678,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-fsimporter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bzip2 0.6.1",
+ "disk-core",
+ "flate2",
+ "fs-mac",
+ "fs-pc",
+ "fs-tar",
+ "tar",
+ "tempfile",
+]
+
+[[package]]
 name = "read-fonts"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6085,6 +6100,7 @@ dependencies = [
  "qnx2fs",
  "ratatui",
  "rb-fsexporter",
+ "rb-fsimporter",
  "reqwest",
  "rfd",
  "rodio",

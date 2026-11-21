@@ -15,6 +15,7 @@
 //! - [`filesystem`]: `Filesystem` (read) and `EditableFilesystem` (write),
 //!   `FilesystemError`, create/repair options.
 //! - [`attrs`]: resolve the attributes a copied or imported entry should get.
+//! - [`caps`]: what a filesystem can store (forks, modes, DOS / Amiga metadata), by `fs_type`.
 //! - [`entry`]: `FileEntry`, `EntryType` and directory display ordering.
 //! - [`id_names`]: uid / gid names from an image's own `/etc/passwd` and `/etc/group`.
 //! - [`fsck`]: integrity-check results shared by every checker.
@@ -40,6 +41,8 @@ pub mod sgi;
 
 #[cfg(feature = "fs")]
 pub mod attrs;
+#[cfg(feature = "fs")]
+pub mod caps;
 #[cfg(feature = "fs")]
 pub mod entry;
 #[cfg(feature = "fs")]
