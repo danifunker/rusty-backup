@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "arc-mac"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1797,7 +1797,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "dsk-apple"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-clonezilla"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1825,7 +1825,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-dmg"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "aes 0.9.3",
  "anyhow",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-floppy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1854,14 +1854,14 @@ dependencies = [
 
 [[package]]
 name = "dsk-flux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "disk-core",
 ]
 
 [[package]]
 name = "dsk-ghost"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "disk-core",
@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-imz"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes 0.9.3",
  "anyhow",
@@ -1889,7 +1889,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-tape"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "arc-mac",
  "disk-core",
@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-vm"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "disk-core",
@@ -2449,7 +2449,7 @@ dependencies = [
 
 [[package]]
 name = "fs-8bit"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2459,7 +2459,7 @@ dependencies = [
 
 [[package]]
 name = "fs-adfs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "disk-core",
@@ -2477,7 +2477,7 @@ dependencies = [
 
 [[package]]
 name = "fs-apfs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes 0.9.3",
  "disk-core",
@@ -2486,7 +2486,7 @@ dependencies = [
 
 [[package]]
 name = "fs-apple2"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2497,21 +2497,21 @@ dependencies = [
 
 [[package]]
 name = "fs-cpm"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "disk-core",
 ]
 
 [[package]]
 name = "fs-hpfs"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "disk-core",
 ]
 
 [[package]]
 name = "fs-mac"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2533,7 +2533,7 @@ version = "0.2.0"
 
 [[package]]
 name = "fs-pc"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2545,14 +2545,14 @@ dependencies = [
 
 [[package]]
 name = "fs-qnx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "disk-core",
 ]
 
 [[package]]
 name = "fs-squashfs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "disk-core",
  "flate2",
@@ -2598,7 +2598,7 @@ dependencies = [
 
 [[package]]
 name = "fs-xerox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "disk-core",
  "flate2",
@@ -5273,7 +5273,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qnx2fs"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "disk-core",
@@ -5669,7 +5669,7 @@ dependencies = [
 
 [[package]]
 name = "rb-fsexporter"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "disk-core",

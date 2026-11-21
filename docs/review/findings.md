@@ -19,6 +19,7 @@ to another carries the other slice's prefix and is listed under that slice.
 | crates/part-tables | 10,220 | 2026-11-21, fixed in 0.2.0 | 0 |
 | crates/fs-pc | 27,123 | 2026-11-21, fixed in 0.1.7 | 0 |
 | iris-sgi-crates work (fs-xfs 0.2.0, sgi-disk, rb-fsimporter, provisioning, shells) | ~6,000 changed | 2026-11-21, separate review agent | 15 |
+| iris-sgi-crates follow-up (fork-export, fs-mac-unicode 0.2.0, fs-amiga 0.2.0) | ~2,700 changed | 2026-11-21, separate review agent | 9 |
 | crates/fs-mac | 42,245 | partial (write paths through extents), fixed in 0.1.11 | review not finished |
 | crates/fs-squashfs | 6,425 | (seen in passing) | 1 |
 | src/fs | 14,945 | (seen in passing) | 1 |
@@ -208,3 +209,21 @@ clone / defrag / journal modules. A regression run for 0.1.11 is still owed.
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
 | CV-001 | S3 | confirmed | [classify.rs:81](../../src/model/convert/classify.rs#L81) | A 2 MB FAT image classifies as a floppy, and `--format qcow2` / `vmdk-sparse` / `chd` (hard-disk formats) are then ignored without a word: the output is raw. `subcmd.convert.{qcow2,vmdk-sparse,chd}-reopens` fail on main since the Convert redesign (`da41d419`). Either warn when `--format` doesn't apply to a kind, or let a hard-disk format pull a floppy-sized image along. The produce step's `fmt.vhd-fixed`, `fmt.vhd-dynamic`, `fmt.qcow2`, `fmt.vmdk-sparse`, `fmt.chd` and `optical.chdcd` artifacts are missing for the same reason. | open |
+
+## iris-sgi-crates follow-up review (2026-11-21)
+
+Review of `699dcf75..a580e817` by a separate agent against this rubric, under the same clean-room
+limits as the rewrite (no kernel / hfsutils / SFS / pfs3aio source, no old `hfs_unicode.rs` body).
+Probes in a scratch crate; 7 confirmed, 2 plausible.
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| MU-001 | S2 | confirmed | fs-mac-unicode `decompose_str` vs collate `fold_hfsplus_name_for_compare`; fs-mac `find_catalog_record` | Lookup keys are now canonically reordered but the compare fold is not, so a name stored with marks out of canonical order (as fs-mac 0.1.10 wrote) no longer matches its own listed name: delete returns NotFound, and a create with the same name makes a second child. | fixed (FIXCOMMIT) |
+| MU-002 | S2 | confirmed | collate `compare_hfsplus_keys` | The comparator decomposes stored units before folding; with the new table a code point older writers stored precomposed (U+0218) sorts elsewhere, so fsck reports KeyOutOfOrder on a volume that was in order. Apple's `FastUnicodeCompare` folds only. | fixed (FIXCOMMIT) |
+| MU-003 | S4 | confirmed | `case_fold` / `decompose` | Two binary searches per unit on the catalog-compare hot path and no ASCII fast path: 772 ns vs 134 ns per 24-unit compare. | fixed (FIXCOMMIT) |
+| MU-004 | S4 | confirmed | collate.rs `compare_hfs_keys` | Three-line doc comment. | fixed (FIXCOMMIT) |
+| FM-001 | S4 | confirmed | fs-mac lib.rs feature table; rb-fsexporter README / CHANGELOG | `fork-export` missing from the lib.rs table (still under `forks`); rb-fsexporter docs still call fs-mac-unicode GPL. | fixed (FIXCOMMIT) |
+| AM-001 | S2 | plausible | fs-amiga sfs.rs node and admin pointers | `blk << shifts` is never checked against `1 << (32 - shifts)`: on a volume over 2^28 blocks a container placed high gets a truncated pointer (predates the rewrite). | fixed (FIXCOMMIT) |
+| DOC-001 | S4 | confirmed | CLAUDE.md SFS bullet; docs/missing_features_from_regression.md F-014; license_audit.md SFS row | Says object-node tree growth is unimplemented / mirrors the driver's functions; the audit row says "four functions" and names three. | fixed (FIXCOMMIT) |
+| DOC-002 | S4 | confirmed | crates/dsk-apple and 19 more | Crates already on crates.io were moved to disk-core 0.3 (91ccccee) without a version bump, so the publish workflow skips them and crates.io keeps the disk-core 0.2 builds; fs-mac 0.1.11, fs-pc 0.1.7 and rb-fsexporter 0.1.4 change a public dependency's major version in a patch release. | fixed (FIXCOMMIT) |
+| DOC-003 | S4 | plausible | fs-mac-unicode manifest / README | Tables derived from UnicodeData.txt: the Unicode licence's notice is linked, not reproduced, and the manifest says only MIT. The use of Apple's TN1150 sample mapping has no recorded terms check. | fixed (FIXCOMMIT) |

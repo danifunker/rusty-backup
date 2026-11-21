@@ -36,7 +36,7 @@ byteorder = "1"
 crc32c = "0.6"
 log = "0.4"
 # Only for the `ofs` feature (early BeOS used Mac-style type / creator codes).
-fs-mac = { path = "../fs-mac", version = "0.1", default-features = false, optional = true }
+fs-mac = { path = "../fs-mac", version = "0.2", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

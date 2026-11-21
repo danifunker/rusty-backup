@@ -1391,6 +1391,18 @@ struct NodeGeometry {
     leaf_slots: u32,
 }
 
+impl NodeGeometry {
+    /// The index pointer to block `blk`, refused when the block is too high to encode.
+    fn pointer_to(&self, blk: u32) -> Result<u32, FilesystemError> {
+        if u64::from(blk) >= 1u64 << (32 - self.shifts) {
+            return Err(FilesystemError::DiskFull(format!(
+                "SFS: node container block {blk} is beyond what an index pointer can hold"
+            )));
+        }
+        Ok(blk << self.shifts)
+    }
+}
+
 /// `(nodecount, isleaf, nodesize)` from a BTreeContainer header.
 fn node_header(buf: &[u8]) -> (usize, bool, usize) {
     (rd_u16(buf, 12) as usize, buf[14] != 0, buf[15] as usize)
@@ -1844,6 +1856,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
                 span / g.fanout
             };
             let child = self.alloc_admin_block()?;
+            let pointer = g.pointer_to(child)?;
             let mut nb = vec![0u8; self.root.blocksize as usize];
             write_u32(&mut nb, 0, NODECONTAINER_ID);
             write_u32(&mut nb, 8, child);
@@ -1852,7 +1865,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
             self.dirty.insert(child, nb);
             self.ensure_dirty(parent)?;
             let pb = self.dirty.get_mut(&parent).unwrap();
-            write_u32(pb, NDC_ENTRIES_OFF + slot * 4, child << g.shifts);
+            write_u32(pb, NDC_ENTRIES_OFF + slot * 4, pointer);
             if child_span == 1 {
                 return Ok((child, 0, first));
             }
@@ -1913,13 +1926,14 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         }
         .ok_or_else(|| FilesystemError::DiskFull("SFS: the object-node tree cannot grow".into()))?;
         let blk = self.alloc_admin_block()?;
+        let pointer = g.pointer_to(blk)?;
         write_u32(&mut moved, 8, blk);
         self.dirty.insert(blk, moved);
         self.ensure_dirty(root)?;
         let top = self.dirty.get_mut(&root).unwrap();
         top[NDC_ENTRIES_OFF..].fill(0);
         write_u32(top, 16, whole);
-        write_u32(top, NDC_ENTRIES_OFF, (blk << g.shifts) | 1);
+        write_u32(top, NDC_ENTRIES_OFF, pointer | 1);
         Ok(())
     }
 
@@ -4246,6 +4260,30 @@ mod tests {
             "a freed node is reused"
         );
         assert_full_bits_exact(&mut fs, top);
+    }
+
+    /// A node container too high for an index pointer is refused, not truncated (AM-001).
+    #[test]
+    fn node_pointers_refuse_blocks_they_cannot_encode() {
+        let g = NodeGeometry {
+            shifts: 4,
+            fanout: 123,
+            leaf_slots: 49,
+        };
+        assert_eq!(
+            g.pointer_to((1 << 28) - 1).unwrap(),
+            ((1u32 << 28) - 1) << 4
+        );
+        assert!(matches!(
+            g.pointer_to(1 << 28),
+            Err(FilesystemError::DiskFull(_))
+        ));
+        let wide = NodeGeometry {
+            shifts: 0,
+            fanout: 1,
+            leaf_slots: 1,
+        };
+        assert_eq!(wide.pointer_to(u32::MAX).unwrap(), u32::MAX);
     }
 
     #[test]

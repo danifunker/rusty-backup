@@ -5,34 +5,8 @@ use std::cmp::Ordering;
 
 use crate::hfs_charorder::HFS_RANK;
 
-/// Normalize an HFS+ catalog name into Apple's `FastUnicodeCompare` form:
-/// canonically decompose each UTF-16 unit (Apple's TN1150 decomposition, NOT
-/// Rust NFD — the two differ in the ranges Apple excludes), then case-fold each
-/// resulting unit through Apple's table, dropping units that fold to 0
-/// (Apple's "ignored" set: zero-width / format / variation selectors). NUL
-/// folds to 0xFFFF, so a leading-NUL name like the `HFS+ Private Data`
-/// directory sorts *last*. Comparing the folded `u16` sequences lexicographically
-/// reproduces a real Mac OS volume's ordering exactly (see [`crate::hfs_unicode`]).
-fn fold_hfsplus_name_for_compare(name: &[u16]) -> Vec<u16> {
-    let mut out = Vec::with_capacity(name.len());
-    let mut buf = [0u16; 3];
-    for &unit in name {
-        for &d in crate::hfs_unicode::decompose(unit, &mut buf) {
-            let folded = crate::hfs_unicode::case_fold(d);
-            if folded != 0 {
-                out.push(folded);
-            }
-        }
-    }
-    out
-}
-
-/// Compare two HFS+ catalog keys (case-insensitive by default).
-///
-/// Keys are: parent_cnid (u32) + name (UTF-16BE units).
-/// Comparison: parent CNID first (numeric), then name.
-/// Case-insensitive: drop Apple-ignored code points, NFD decompose, then
-/// compare uppercased chars.
+/// Compare two HFS+ catalog keys: parent CNID, then the names as Apple's `FastUnicodeCompare`
+/// does (fold each unit, skip ignorables); names must already be decomposed (`decompose_str`).
 pub fn compare_hfsplus_keys(
     parent_a: u32,
     name_a: &[u16],
@@ -50,14 +24,16 @@ pub fn compare_hfsplus_keys(
         // compare, no folding, no ignore set.)
         return name_a.cmp(name_b);
     }
-    let folded_a = fold_hfsplus_name_for_compare(name_a);
-    let folded_b = fold_hfsplus_name_for_compare(name_b);
-    folded_a.cmp(&folded_b)
+    let fold = |u: &u16| crate::hfs_unicode::case_fold(*u);
+    name_a
+        .iter()
+        .map(fold)
+        .filter(|&f| f != 0)
+        .cmp(name_b.iter().map(fold).filter(|&f| f != 0))
 }
 
-/// Compare two classic HFS catalog keys as the Mac OS File Manager does: parent IDs
-/// numerically, then names rank by rank ([`HFS_RANK`], Apple's `RelString` order), the
-/// shorter name first on a common prefix.
+/// Classic HFS keys as the File Manager orders them: parent ID, then names rank by rank
+/// ([`HFS_RANK`], Apple's `RelString`), the shorter first on a common prefix.
 pub fn compare_hfs_keys(parent_a: u32, name_a: &[u8], parent_b: u32, name_b: &[u8]) -> Ordering {
     let rank = |&b: &u8| HFS_RANK[b as usize];
     parent_a
@@ -156,12 +132,23 @@ mod tests {
 
     #[test]
     fn test_compare_hfsplus_keys_nfd() {
-        // é (U+00E9, precomposed) vs e + combining acute (U+0065 U+0301).
-        // Apple's decomposition folds the precomposed form to the decomposed
-        // one, so the two keys must compare equal.
-        let a: Vec<u16> = "é".encode_utf16().collect();
+        // Keys are decomposed before they are compared, as on disk; the compare itself only folds.
+        let a = crate::hfs_unicode::decompose_str("\u{E9}");
         let b: Vec<u16> = vec![0x0065, 0x0301];
         assert_eq!(compare_hfsplus_keys(2, &a, 2, &b, false), Ordering::Equal);
+        let raw: Vec<u16> = vec![0x00E9];
+        assert_ne!(compare_hfsplus_keys(2, &raw, 2, &b, false), Ordering::Equal);
+    }
+
+    /// Units an older writer stored precomposed (U+0218) sort by their own value, as
+    /// `FastUnicodeCompare` sorts them, not by a decomposition (MU-002).
+    #[test]
+    fn test_compare_hfsplus_keys_does_not_decompose_stored_units() {
+        let stored = [0x0218u16, b'a' as u16];
+        assert_eq!(
+            compare_hfsplus_keys(2, &stored, 2, &[b't' as u16], false),
+            Ordering::Greater
+        );
     }
 
     #[test]

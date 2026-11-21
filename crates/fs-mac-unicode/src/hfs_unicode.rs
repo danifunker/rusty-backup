@@ -22,6 +22,14 @@ const T_COUNT: u16 = 28;
 
 /// The HFS+ case-insensitive fold of `c`: 0 when HFS+ ignores it in comparisons.
 pub fn case_fold(c: u16) -> u16 {
+    if c < 0x80 {
+        // ASCII, the common case: only NUL and A-Z are in the table.
+        return match c {
+            0 => 0xFFFF,
+            0x41..=0x5A => c + 0x20,
+            _ => c,
+        };
+    }
     match FOLD.binary_search_by_key(&c, |&(code, _)| code) {
         Ok(i) => FOLD[i].1,
         Err(_) => c,
@@ -41,7 +49,12 @@ pub fn decompose(uc: u16, buf: &mut [u16; 3]) -> &[u16] {
         buf[2] = JAMO_T + t;
         return &buf[..3];
     }
-    match DECOMP.binary_search_by_key(&uc, |&(code, _, _)| code) {
+    let found = if uc < DECOMP[0].0 {
+        Err(0) // nothing below U+00C0 decomposes
+    } else {
+        DECOMP.binary_search_by_key(&uc, |&(code, _, _)| code)
+    };
+    match found {
         Ok(i) => {
             let (_, start, len) = DECOMP[i];
             &DECOMP_POOL[start as usize..start as usize + len as usize]
@@ -97,6 +110,17 @@ mod tests {
 
     fn dec(c: u16) -> Vec<String> {
         hex(decompose(c, &mut [0; 3]))
+    }
+
+    #[test]
+    fn ascii_fast_paths_agree_with_the_tables() {
+        for c in 0..0x80u16 {
+            let table = FOLD
+                .binary_search_by_key(&c, |&(code, _)| code)
+                .map_or(c, |i| FOLD[i].1);
+            assert_eq!(case_fold(c), table, "U+{c:04X}");
+        }
+        assert_eq!(DECOMP[0].0, 0x00C0);
     }
 
     #[test]

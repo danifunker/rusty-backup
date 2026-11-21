@@ -701,16 +701,14 @@ thousand.
 
 ## F-014 — an SFS volume takes about 43 files {#f-014}
 
-**SHIPPED 2026-09-06.** The object-node tree grows the way SFS's own
-`createnode` grows it: a fresh container under the first unused pointer,
-and when there is none a new level (`addnewnodelevel`: the root's contents
-move to a new block and the root becomes an index over it, so the root
-block number never changes). The "container full" bits in the parents'
-pointers, which SFS trusts when it creates a node, are set when a
-container fills and cleared when a node is freed, rippling upward. Admin
-space grows too (`allocadminspace`): a fresh 32-block region from the
-bitmap, entered in a container with an unused slot or opened with its own
-container linked at the end of the chain. A unit test puts 600 files on a
+**SHIPPED 2026-09-06; rewritten from the on-disk rules 2026-11-21 (fs-amiga 0.2.0).** The
+object-node tree grows by hanging containers under the deepest unused pointer until there is a
+new leaf, and when no pointer is free it adds a level (the root's contents move to a new block
+and the root becomes an index over it, so the root block number never changes). The "container
+full" bits in the parents' pointers, which SFS trusts when it creates a node, are recomputed up
+the path on every allocation and free. Admin space grows too: a fresh 32-block region from the
+bitmap, entered in a container with an unused slot or opened with its own container linked at
+the end of the chain. A unit test puts 600 files on a
 blank volume (tree at two levels, four new admin regions), lists, empties
 and fscks it. Found by `churn.sfs`: the 43rd file fails with `SFS: every object-node leaf
 is full, and growing the node tree is not implemented`. Known since the SFS

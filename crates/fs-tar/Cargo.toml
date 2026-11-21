@@ -39,13 +39,13 @@ chrono = { version = "0.4", optional = true }
 tempfile = "3"
 zstd = { version = ">=0.13, <0.15", optional = true }
 libzstd-bitexact-rs = { version = "0.157", optional = true }
-fs-mac = { path = "../fs-mac", version = "0.1.11", default-features = false, features = ["codecs"], optional = true }
+fs-mac = { path = "../fs-mac", version = "0.2", default-features = false, features = ["codecs"], optional = true }
 zip = { version = ">=2.4.2, <10", default-features = false, optional = true }
 
 [dev-dependencies]
 # Inflating ZIP members in the `mem_archive` tests.
 zip = { version = ">=2.4.2, <10", default-features = false, features = ["deflate"] }
 # The tests round-trip through real FAT, ext, UFS and HFS volumes.
-fs-mac = { path = "../fs-mac", version = "0.1", default-features = false, features = ["hfs", "forks"] }
-fs-pc = { path = "../fs-pc", version = "0.1", default-features = false, features = ["fat"] }
+fs-mac = { path = "../fs-mac", version = "0.2", default-features = false, features = ["hfs", "forks"] }
+fs-pc = { path = "../fs-pc", version = "0.2", default-features = false, features = ["fat"] }
 fs-unix = { path = "../fs-unix", version = "0.3", default-features = false, features = ["ext", "ufs"] }

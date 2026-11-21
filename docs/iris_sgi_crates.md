@@ -19,7 +19,7 @@ BSD-3-Clause, Zlib, bzip2-1.0.6, Unicode-3.0; no GPL or LGPL).
 | Open for editing | `sgi-disk` | 0.1.0 | `xfs` for XFS | `open_partition_editable<'a, R: Read + Write + Seek + Send + 'a>(R, index) -> Result<Box<dyn EditableFilesystem + 'a>>`; `open_kind_editable(kind, R, offset, len)` |
 | Copy a host folder in | `rb-fsimporter` | 0.1.0 | default (`native-zstd`) or `pure-zstd` | `import_dir_with(&mut dyn EditableFilesystem, dest: &FileEntry, root: &Path, &DirImportOptions, expander: Option<&dyn Expander>, host: &dyn Host) -> Result<ImportStats>`; `Host { cancelled(&self) -> bool, progress(&self, &ImportStats) }`; cancel returns `Cancelled`. Simple form: `import_dir(.., progress: &dyn Fn(&ImportStats))` |
 | Preflight / measure | `rb-fsimporter` | 0.1.0 | | `preflight_dir_with`, `measure_dir_for(root, &DirImportOptions) -> Result<(files, dirs, bytes)>` |
-| Copy files out | `rb-fsexporter` | 0.1.4 | | `extract(&mut dyn Filesystem, &FileEntry, dest: &Path, &Options, &mut dyn Host) -> Result<Summary>`; `Options::new(ResourceForkMode)`; `Host::cancelled` / `wrote` for progress |
+| Copy files out | `rb-fsexporter` | 0.2.0 | | `extract(&mut dyn Filesystem, &FileEntry, dest: &Path, &Options, &mut dyn Host) -> Result<Summary>`; `Options::new(ResourceForkMode)`; `Host::cancelled` / `wrote` for progress |
 | Export a tar | `fs-tar` | 0.2.0 | | `export_tar<W: Write>(&mut dyn Filesystem, root: &FileEntry, prefix, W, TarCompression, &TarExportOptions, progress) -> Result<TarExportStats>` |
 | Check | `disk-core` 0.3.0 trait, via `sgi-disk` | | | `Filesystem::fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>>` (EFS and XFS return `Some`) |
 
@@ -40,22 +40,21 @@ Lower layers, if iris wants them directly: `part-tables` 0.2.0 (feature `sgi`), 
 
 ## Publishing
 
-None of these are on crates.io yet. Pushing to `main` with these `Cargo.toml` versions
-publishes them all (`.github/workflows/publish-crates.yml`). To publish by hand, in this
-dependency order:
+32 crates have versions that are not on crates.io yet, and pushing to `main` with them
+publishes them all (`.github/workflows/publish-crates.yml`, which orders them by dependency).
+Iris needs nine of them: disk-core, part-tables, fs-unix, fs-xfs, sgi-disk, rb-fsimporter,
+rb-fsexporter, fs-tar and fs-mac. Twenty others were moved to disk-core 0.3 earlier on this
+branch without a version bump, so they get one now: 0.x.y to 0.(x+1).0, because disk-core's
+types are part of their API. fs-mac, fs-pc and rb-fsexporter go to 0.2.0 for the same reason.
 
-1. `disk-core` 0.3.0
-2. `fs-mac-unicode` 0.2.0
-3. `fs-mac` 0.1.11
-4. `fs-amiga` 0.2.0
-5. `fs-pc` 0.1.7
-6. `part-tables` 0.2.0
-7. `fs-xfs` 0.2.0
-8. `fs-unix` 0.3.0
-9. `fs-tar` 0.2.0
-10. `rb-fsexporter` 0.1.4
-11. `rb-fsimporter` 0.1.0
-12. `sgi-disk` 0.1.0
+By hand, in dependency order:
 
-`fs-amiga` and `fs-mac-unicode` are not used by iris; they are in this batch because they were
-relicensed MIT on the same branch.
+disk-core 0.3.0, dsk-apple 0.2.0, dsk-clonezilla 0.2.0, dsk-floppy 0.2.0, dsk-flux 0.2.0,
+dsk-imz 0.2.0, dsk-vm 0.2.0, fs-8bit 0.2.0, fs-adfs 0.2.0, fs-amiga 0.2.0, fs-apfs 0.2.0,
+fs-apple2 0.2.0, fs-cpm 0.2.0, fs-hpfs 0.2.0, fs-mac-unicode 0.2.0, fs-mac 0.2.0,
+arc-mac 0.3.0, dsk-dmg 0.2.0, fs-pc 0.2.0, dsk-ghost 0.2.0, fs-qnx 0.2.0, fs-squashfs 0.2.0,
+fs-unix 0.3.0, fs-tar 0.2.0, dsk-tape 0.2.0, fs-xerox 0.2.0, fs-xfs 0.2.0, part-tables 0.2.0,
+qnx2fs 0.4.0, rb-fsexporter 0.2.0, rb-fsimporter 0.1.0, sgi-disk 0.1.0.
+
+`scripts/unpublished-crates.py` lists them; `cargo publish --dry-run -p A -p B ...` with that
+list checks the whole set first, and `cargo publish -p A -p B ...` publishes it in order.

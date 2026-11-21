@@ -27,11 +27,11 @@ rust173-polyfill = ["disk-core/rust173-polyfill", "fs-tar/rust173-polyfill", "fs
 anyhow = "1"
 disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
 fs-tar = { path = "../fs-tar", version = "0.2", default-features = false, features = ["zip"] }
-fs-mac = { path = "../fs-mac", version = "0.1.11", default-features = false, features = ["codecs"], optional = true }
+fs-mac = { path = "../fs-mac", version = "0.2", default-features = false, features = ["codecs"], optional = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
-fs-pc = { path = "../fs-pc", version = "0.1", default-features = false, features = ["fat"] }
+fs-pc = { path = "../fs-pc", version = "0.2", default-features = false, features = ["fat"] }
 tempfile = "3"
 tar = "0.4"
 bzip2 = ">=0.5.2, <0.7"

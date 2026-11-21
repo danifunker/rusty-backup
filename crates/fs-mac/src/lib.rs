@@ -7,12 +7,12 @@
 //! | `hfsplus` | [`hfsplus`], [`hfsplus_fsck`], [`hfsplus_journal`], [`hfsplus_clone`], [`hfsplus_defrag`], [`hfsplus_wrapper_clone`] | HFS+ / HFSX: read, edit, create, check, journal replay, defragmenting clone (flat or HFS-wrapped) |
 //! | `lisa` | [`lisa`] | Lisa File System, read-only, from DiskCopy 4.2 images with tags |
 //! | `codecs` | [`resource_fork`], [`binhex`] | resource forks, MacBinary / AppleDouble, BinHex 4.0, without HFS |
-//! | `forks` | `codecs` + [`fork_export`] | fork-aware export from a filesystem (implies `hfs`) |
+//! | `fork-export` | `codecs` + [`fork_export`] | fork-aware export from any `disk-core` filesystem, without HFS |
+//! | `forks` | `fork-export` + `hfs` | as before 0.2.0 |
 //! | `collate` | `hfs_common::compare_hfs_keys` / `compare_hfsplus_keys` | catalog name order, from `fs-mac-unicode`; `hfs` and `hfsplus` turn it on |
 //!
 //! [`hfs_common`] (B-trees, dates, type/creator codes) and [`mac_roman`] (Mac Roman names) are
-//! always built. Without `collate` (`default-features = false`, with `codecs`) the crate's tree is
-//! MIT only. All fields are big-endian.
+//! always built. Every feature is MIT (`fs-mac-unicode` too, since 0.2.0). All fields are big-endian.
 
 // `is_multiple_of` & co. come from disk-core's rust173 polyfill on 1.73; the real floor check is a 1.73 build.
 #![allow(clippy::incompatible_msrv)]

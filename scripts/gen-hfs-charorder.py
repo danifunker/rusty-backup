@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Generate crates/fs-mac-unicode/src/hfs_charorder.rs, the classic HFS name order.
 
-Usage (macOS only): gen-hfs-charorder.py > crates/fs-mac-unicode/src/hfs_charorder.rs
+Usage (macOS only): gen-hfs-charorder.py \
+    | rustfmt --edition 2021 --emit stdout > crates/fs-mac-unicode/src/hfs_charorder.rs
 
 Classic HFS compares catalog names with the system's RelString (case-insensitive,
 diacritic-sensitive). This builds scripts/hfs-relstring-pairs.c against CoreServices,

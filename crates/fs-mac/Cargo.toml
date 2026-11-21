@@ -1,6 +1,6 @@
 [package]
 name = "fs-mac"
-version = "0.1.11"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -36,7 +36,7 @@ rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac-unicode?/rust173-polyf
 disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
 # The HFS / HFS+ name-ordering tables; MIT since 0.2.0 (see that crate's README).
 fs-mac-unicode = { path = "../fs-mac-unicode", version = "0.2", optional = true }
-dsk-apple = { path = "../dsk-apple", version = "0.1", default-features = false, features = ["dc42"], optional = true }
+dsk-apple = { path = "../dsk-apple", version = "0.2", default-features = false, features = ["dc42"], optional = true }
 anyhow = "1"
 byteorder = "1"
 chrono = "0.4"
