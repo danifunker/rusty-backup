@@ -195,6 +195,9 @@ pub struct ExtFilesystem<R> {
     /// every metadata write to keep the volume checksum-consistent.
     #[allow(dead_code)] // consumed by the checksum-aware editor in Phase D
     metadata_csum: bool,
+    /// Why edits are refused on this volume, if they are (features the editor does not
+    /// maintain; UNX-004).
+    edit_blocker: Option<String>,
     /// crc32c seed derived from the volume UUID (`ext_csum::csum_seed`).
     #[allow(dead_code)] // consumed by the checksum-aware editor in Phase D
     csum_seed: u32,
@@ -230,7 +233,12 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         let metadata_csum = feature_ro_compat & 0x0400 != 0;
         let csum_seed = crate::ext_csum::volume_seed(&sb);
 
-        let block_size = 1024u64 << log_block_size;
+        // Range-check the log before shifting by it (UNX-025).
+        let block_size = if log_block_size <= 6 {
+            1024u64 << log_block_size
+        } else {
+            0
+        };
         if !(1024..=65536).contains(&block_size) {
             return Err(FilesystemError::Parse(format!(
                 "ext: invalid block size {block_size}"
@@ -287,8 +295,21 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         if blocks_per_group == 0 {
             return Err(FilesystemError::Parse("ext: blocks_per_group is 0".into()));
         }
-        let group_count =
-            (total_blocks - first_data_block as u64).div_ceil(blocks_per_group as u64) as u32;
+        if total_blocks <= first_data_block as u64 {
+            return Err(FilesystemError::Parse(format!(
+                "ext: {total_blocks} blocks, first data block {first_data_block}"
+            )));
+        }
+        let groups = (total_blocks - first_data_block as u64).div_ceil(blocks_per_group as u64);
+        // The descriptor table is read whole, so its size must be plausible for the volume.
+        if groups > u64::from(u32::MAX)
+            || groups.saturating_mul(u64::from(desc_size)) > total_blocks.saturating_mul(block_size)
+        {
+            return Err(FilesystemError::Parse(format!(
+                "ext: implausible group count {groups}"
+            )));
+        }
+        let group_count = groups as u32;
 
         if inodes_count == 0 || inodes_per_group == 0 {
             return Err(FilesystemError::Parse(
@@ -370,6 +391,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         }
 
         Ok(Self {
+            edit_blocker: ext_edit_blocker(feature_incompat, feature_ro_compat),
             blocks_per_group: blocks_per_group as u64,
             sparse_super: feature_ro_compat & 0x0001 != 0,
             reserved_gdt_blocks: u16::from_le_bytes([sb[0xCE], sb[0xCF]]) as u64,
@@ -1748,6 +1770,11 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
             if blk == 0 {
                 continue; // sparse blocks
             }
+            if blk < self.first_data_block as u64 || blk >= self.total_blocks {
+                return Err(FilesystemError::InvalidData(format!(
+                    "block {blk} is outside the volume; check it first"
+                )));
+            }
             let group = ((blk - self.first_data_block as u64) / blocks_per_group) as u32;
             by_group.entry(group).or_default().push(blk);
         }
@@ -1758,6 +1785,11 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
 
             for &blk in blk_list {
                 let bit = blk - group_start;
+                // Count a block free only once, and only if it was in use (UNX-024).
+                let byte = (bit / 8) as usize;
+                if byte >= bitmap.len() || bitmap[byte] & (1 << (bit % 8)) == 0 {
+                    continue;
+                }
                 bitmap_clear_bit(&mut bitmap, bit);
                 self.group_descriptors[*group as usize].free_blocks += 1;
                 self.free_blocks += 1;
@@ -1898,6 +1930,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         file_type: u8,
     ) -> Result<(), FilesystemError> {
         let parent = self.read_inode(parent_inode)?;
+        refuse_hashed_dir(parent.flags)?;
         let data_blocks = self.inode_data_blocks(&parent)?;
         let new_entry_len = dir_entry_actual_len(name.len());
 
@@ -1985,7 +2018,8 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
                 dir_entry_actual_len(name_len)
             };
 
-            let slack = rec_len - actual_len;
+            // A record shorter than its own name is corrupt: no slack in it (UNX-022).
+            let slack = rec_len.saturating_sub(actual_len);
             if slack >= new_entry_len {
                 if inode == 0 {
                     // Reuse this deleted entry slot
@@ -2031,6 +2065,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
     /// Remove a directory entry by name from the parent directory.
     fn remove_dir_entry(&mut self, parent_inode: u32, name: &str) -> Result<(), FilesystemError> {
         let parent = self.read_inode(parent_inode)?;
+        refuse_hashed_dir(parent.flags)?;
         let data_blocks = self.inode_data_blocks(&parent)?;
 
         for &block_num in &data_blocks {
@@ -2178,6 +2213,13 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         if header.depth == 0 {
             // Leaf level — try to extend existing extent or add new one
             let max_entries = u16::from_le_bytes([inode.block[4], inode.block[5]]);
+            // 60 bytes of i_block hold the header and at most 4 extents (UNX-026).
+            if header.entries > 4 || max_entries > 4 {
+                return Err(FilesystemError::InvalidData(format!(
+                    "inode {inode_num}: in-inode extent header claims {} / {max_entries} entries",
+                    header.entries
+                )));
+            }
 
             // Check if we can extend the last extent
             if header.entries > 0 {
@@ -2348,35 +2390,6 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         self.reader.seek(SeekFrom::Start(offset))?;
         self.reader.write_all(&sectors.to_le_bytes())?;
         self.reseal_inode_csum(inode_num)
-    }
-
-    /// The index blocks of an inode's extent tree (none at depth 0).
-    fn extent_index_blocks(&mut self, inode: &InodeData) -> Result<Vec<u64>, FilesystemError> {
-        let mut out = Vec::new();
-        if inode.flags & EXT4_EXTENTS_FL == 0 || !is_extent_header(&inode.block) {
-            return Ok(out);
-        }
-        let header = parse_extent_header(&inode.block)?;
-        if header.depth == 0 {
-            return Ok(out);
-        }
-        let mut pending: Vec<u64> = parse_extent_indices(&inode.block, header.entries)
-            .into_iter()
-            .map(|i| i.child_block)
-            .collect();
-        while let Some(b) = pending.pop() {
-            out.push(b);
-            let data = self.read_block(b)?;
-            let h = parse_extent_header(&data)?;
-            if h.depth > 0 {
-                pending.extend(
-                    parse_extent_indices(&data, h.entries)
-                        .into_iter()
-                        .map(|i| i.child_block),
-                );
-            }
-        }
-        Ok(out)
     }
 
     /// Patch just the i_block field (60 bytes at offset 0x28) in an on-disk inode.
@@ -2574,6 +2587,54 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
 
 // ---- EditableFilesystem implementation ----
 
+/// A hashed (htree) directory keeps an index the editor does not maintain: refuse to change
+/// it rather than overwrite `dx_root` or put names out of hash order (UNX-003).
+fn refuse_hashed_dir(flags: u32) -> Result<(), FilesystemError> {
+    const EXT2_INDEX_FL: u32 = 0x1000;
+    if flags & EXT2_INDEX_FL != 0 {
+        return Err(FilesystemError::Unsupported(
+            "this ext directory is hashed (dir_index), which the editor does not maintain".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Features whose layouts the editor does not maintain (UNX-004): META_BG moves group
+/// descriptors, RECOVER means an unreplayed journal, INLINE_DATA keeps file data in the inode,
+/// BIGALLOC counts clusters, and any incompat bit we do not know about.
+fn ext_edit_blocker(incompat: u32, ro_compat: u32) -> Option<String> {
+    const RECOVER: u32 = 0x0004;
+    const META_BG: u32 = 0x0010;
+    const INLINE_DATA: u32 = 0x8000;
+    const BIGALLOC: u32 = 0x0200;
+    // FILETYPE, JOURNAL_DEV-less journal, EXTENTS, 64BIT, MMP, FLEX_BG, CSUM_SEED, LARGEDIR.
+    const KNOWN: u32 =
+        0x0002 | 0x0004 | 0x0010 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x2000 | 0x4000 | 0x8000;
+    let why = if incompat & RECOVER != 0 {
+        "its journal needs recovery (mount it once, or run e2fsck)"
+    } else if incompat & META_BG != 0 {
+        "it uses meta_bg"
+    } else if incompat & INLINE_DATA != 0 {
+        "it uses inline_data"
+    } else if ro_compat & BIGALLOC != 0 {
+        "it uses bigalloc"
+    } else if incompat & !KNOWN != 0 {
+        "it has incompat features this editor does not know"
+    } else {
+        return None;
+    };
+    Some(format!("this ext volume is read-only here: {why}"))
+}
+
+impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
+    fn ensure_editable(&self) -> Result<(), FilesystemError> {
+        match &self.edit_blocker {
+            Some(why) => Err(FilesystemError::Unsupported(why.clone())),
+            None => Ok(()),
+        }
+    }
+}
+
 impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
     fn as_filesystem(&self) -> &dyn disk_core::filesystem::Filesystem {
         self
@@ -2582,6 +2643,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         self
     }
     fn repair(&mut self) -> Result<disk_core::fsck::RepairReport, FilesystemError> {
+        self.ensure_editable()?;
         crate::ext_fsck::repair_ext(self)
     }
 
@@ -2593,6 +2655,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        self.ensure_editable()?;
         validate_ext_name(name)?;
 
         let parent_inode = parent.location as u32;
@@ -2675,6 +2738,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         name: &str,
         options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        self.ensure_editable()?;
         validate_ext_name(name)?;
 
         let parent_inode = parent.location as u32;
@@ -2761,6 +2825,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
+        self.ensure_editable()?;
         if entry.is_directory() {
             let children = self.list_directory(entry)?;
             if !children.is_empty() {
@@ -2773,16 +2838,21 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
 
         let parent_inode = parent.location as u32;
         let entry_inode = entry.location as u32;
+        let victim = self.fsck_read_inode(entry_inode)?;
+        if !entry.is_directory() && victim.links_count > 1 {
+            // Another name still links the inode: drop this name and one link only (UNX-001).
+            self.remove_dir_entry(parent_inode, &entry.name)?;
+            self.update_inode_links(entry_inode, -1)?;
+            return Ok(());
+        }
+
+        // Every block the inode owns: data plus indirect / extent-index blocks, and none for
+        // fast symlinks, devices or inline data, whose i_block is not pointers (UNX-002 / 023).
+        let owned = self.fsck_owned_blocks(&victim)?;
 
         // Remove directory entry from parent
         self.remove_dir_entry(parent_inode, &entry.name)?;
-
-        // Free data blocks, and the extent tree's own index blocks with them.
-        let victim = self.read_inode(entry_inode)?;
-        let data_blocks = self.inode_data_blocks(&victim)?;
-        let mut non_zero: Vec<u64> = data_blocks.into_iter().filter(|&b| b != 0).collect();
-        non_zero.extend(self.extent_index_blocks(&victim)?);
-        self.free_blocks_list(&non_zero)?;
+        self.free_blocks_list(&owned)?;
 
         // If directory, decrement parent's link count and the group's dir count.
         if entry.is_directory() {
@@ -2803,6 +2873,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         entry: &FileEntry,
         new_name: &str,
     ) -> Result<(), FilesystemError> {
+        self.ensure_editable()?;
         if new_name == entry.name {
             return Ok(());
         }
@@ -2819,10 +2890,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
 
         // The name lives only in the dirent; the inode keeps its number
         // and data. Match the file_type create uses for this kind.
-        let file_type = if entry.is_directory() {
-            FT_DIR
-        } else {
-            FT_REG_FILE
+        // From the inode's mode, so a symlink, device or fifo keeps its type (UNX-027).
+        let mode = self.read_inode(entry.location as u32)?.mode;
+        let file_type = match mode & 0xF000 {
+            0x4000 => FT_DIR,
+            0xA000 => FT_SYMLINK,
+            0x2000 => FT_CHRDEV,
+            0x6000 => FT_BLKDEV,
+            0x1000 => FT_FIFO,
+            0xC000 => FT_SOCK,
+            _ => FT_REG_FILE,
         };
 
         // Add the new dirent first (pointing at the same inode), then
@@ -2835,6 +2912,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
     }
 
     fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        self.ensure_editable()?;
         let inode_num = entry.location as u32;
         let inode = self.read_inode(inode_num)?;
 
@@ -2856,6 +2934,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
     }
 
     fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        self.ensure_editable()?;
         let inode_num = entry.location as u32;
 
         // ext splits each id into a low half in the classic 128-byte

@@ -1143,7 +1143,8 @@ impl<R: Read + Write + Seek> EfsV1Filesystem<R> {
 
     /// Lowest free inode (`di_mode == 0`). Inums 0 and 1 are reserved.
     pub(crate) fn allocate_inode(&mut self) -> Result<u32, FilesystemError> {
-        let total = self.sb.total_inodes();
+        // Directory entries hold a 16-bit inode number: no inode past 65535 can be named (UNX-008).
+        let total = self.sb.total_inodes().min(0x1_0000);
         for inum in 2..total {
             if self.read_inode(inum)?.is_free() {
                 return Ok(inum);
@@ -1684,10 +1685,16 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem
         }
         self.write_inode(&parent_ino)?;
 
-        self.free_inode_extents(&ino, &mut bm)?;
-        self.write_inode(&EfsV1Inode::empty(inum))?;
-
-        self.sb.tinode = self.sb.tinode.saturating_add(1);
+        if !ino.is_dir() && ino.nlink > 1 {
+            // Another name still links the inode: keep it, one link fewer (UNX-001).
+            let mut kept = ino;
+            kept.nlink -= 1;
+            self.write_inode(&kept)?;
+        } else {
+            self.free_inode_extents(&ino, &mut bm)?;
+            self.write_inode(&EfsV1Inode::empty(inum))?;
+            self.sb.tinode = self.sb.tinode.saturating_add(1);
+        }
         self.refresh_tfree(&bm);
         self.write_bitmap(&bm)?;
         self.sync_superblock()?;

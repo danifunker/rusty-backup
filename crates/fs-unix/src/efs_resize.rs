@@ -746,8 +746,7 @@ fn rewrite_directory_inum_refs<R: Read + Write + Seek>(
         if !ino.is_dir() {
             continue;
         }
-        for i in 0..(ino.numextents as usize).min(EFS_DIRECTEXTENTS_MAX) {
-            let ext = ino.extents[i];
+        for ext in fs.dir_extents(ino)? {
             if ext.length == 0 {
                 continue;
             }

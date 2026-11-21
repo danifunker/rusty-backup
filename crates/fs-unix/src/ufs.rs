@@ -3227,6 +3227,13 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
             )));
         }
 
+        if !is_dir && target.nlink > 1 {
+            // Another name still links the inode: keep it, one link fewer (UNX-001).
+            let mut kept = target;
+            kept.nlink -= 1;
+            self.write_inode(entry_inum, &kept)?;
+            return Ok(());
+        }
         // Free the inode's data blocks, then the inode itself.
         self.free_inode_blocks(&target)?;
         self.free_inode(entry_inum)?;
