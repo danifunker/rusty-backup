@@ -1,0 +1,29 @@
+[package]
+name = "sgi-disk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Build SGI/IRIX disk images (volume header + EFS, XFS or label only) and open their partitions as disk-core filesystems"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["sgi", "irix", "efs", "xfs", "disk-image"]
+categories = ["filesystem", "emulators"]
+
+[features]
+default = ["xfs"]
+# XFS root partitions: build (write_blank_xfs) and open. Off: EFS and label-only only.
+xfs = ["dep:fs-xfs"]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill", "part-tables/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs?/rust173-polyfill"]
+
+[dependencies]
+anyhow = "1"
+disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
+part-tables = { path = "../part-tables", version = "0.2", default-features = false, features = ["sgi"] }
+fs-unix = { path = "../fs-unix", version = "0.2", default-features = false, features = ["efs"] }
+fs-xfs = { path = "../fs-xfs", version = "0.2", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

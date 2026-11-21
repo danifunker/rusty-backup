@@ -19,15 +19,17 @@ use std::path::PathBuf;
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
 use crate::partition::sgi_hdd_builder::{
-    write_sgi_efs_hdd, SgiHddOptions, SgiMedia, DEFAULT_HEADS, DEFAULT_SECTORS_PER_TRACK,
+    write_sgi_efs_hdd, SgiHddOptions, SgiMedia, SgiPartitionLayout, SgiRootFs, DEFAULT_HEADS,
+    DEFAULT_SECTORS_PER_TRACK,
 };
 use fs_unix::efs::resolve_bytes_per_inode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SgiFs {
-    /// IRIX EFS root partition (IRIX 5.3–6.5). The only root filesystem
-    /// supported today; XFS is a future addition.
+    /// IRIX EFS root partition (IRIX 5.3–6.5).
     Efs,
+    /// XFS root partition (type 10). Written as v5 / CRC XFS, which IRIX itself cannot mount.
+    Xfs,
 }
 
 #[derive(Debug, Args)]
@@ -95,9 +97,17 @@ pub struct NewSgiHddArgs {
     #[arg(long, default_value = "rusty")]
     pub name: String,
 
-    /// Root filesystem to format. Only `efs` is supported today.
+    /// Root filesystem: it sets the root partition's type and, unless `--label-only`, is formatted.
     #[arg(long, value_enum, default_value = "efs")]
     pub fs: SgiFs,
+
+    /// Write the SGI volume header and partition table only; leave the partitions unformatted.
+    #[arg(long = "label-only", conflicts_with = "from_dir")]
+    pub label_only: bool,
+
+    /// Lay the disk out as an IRIX system disk: swap of this size in slot 1, the root after it.
+    #[arg(long)]
+    pub swap: Option<String>,
 
     /// Heads (tracks per cylinder). Must match the geometry the target drive
     /// reports over SCSI: IRIX `fx` rejects the volume header if its geometry
@@ -126,9 +136,16 @@ pub struct NewSgiHddArgs {
 }
 
 pub fn run(args: NewSgiHddArgs) -> Result<()> {
-    match args.fs {
-        SgiFs::Efs => { /* the only supported root filesystem today */ }
-    }
+    let root_fs = match args.fs {
+        SgiFs::Efs => SgiRootFs::Efs,
+        SgiFs::Xfs => SgiRootFs::Xfs,
+    };
+    let layout_kind = match &args.swap {
+        None => SgiPartitionLayout::DataOnly,
+        Some(s) => SgiPartitionLayout::RootSwap {
+            swap_bytes: parse_size(s).context("parsing --swap")?,
+        },
+    };
 
     let size_bytes = if args.size.eq_ignore_ascii_case("auto") {
         let Some(dir) = &args.from_dir else {
@@ -161,6 +178,9 @@ pub fn run(args: NewSgiHddArgs) -> Result<()> {
         // most of the disk; this is the count the user cares about).
         bytes_per_inode: resolve_bytes_per_inode(size_bytes, args.inodes, args.bytes_per_inode),
         media: SgiMedia::HardDisk,
+        root_fs,
+        layout: layout_kind,
+        format_root: !args.label_only,
     };
     // Stream directly to the output file: the volume header + EFS metadata are
     // written and the rest stays sparse, so even multi-GB disks never
@@ -172,11 +192,20 @@ pub fn run(args: NewSgiHddArgs) -> Result<()> {
     file.set_len(layout.disk_bytes)
         .with_context(|| format!("sizing {}", args.image.display()))?;
 
+    let fs_name = match root_fs {
+        SgiRootFs::Efs => "EFS",
+        SgiRootFs::Xfs => "XFS",
+    };
     log_stderr(format!(
-        "wrote {} ({} bytes, {} MiB) - SGI volume header + EFS root",
+        "wrote {} ({} bytes, {} MiB) - SGI volume header + {}",
         args.image.display(),
         layout.disk_bytes,
         layout.disk_bytes / (1024 * 1024),
+        if args.label_only {
+            format!("an unformatted {fs_name} root (label only)")
+        } else {
+            format!("{fs_name} root")
+        },
     ));
     log_stderr(format!(
         "  geometry: {} cyls x {} heads x {} secs/trk x 512 ({} sectors, {}-sector cylinders)",
@@ -190,19 +219,27 @@ pub fn run(args: NewSgiHddArgs) -> Result<()> {
         "  slot 8 VOLHDR: sectors 0..{}   slot 10 VOLUME: sectors 0..{} (whole disk)",
         layout.volhdr_sectors, layout.disk_sectors,
     ));
+    if layout.swap_sectors > 0 {
+        log_stderr(format!(
+            "  slot 1 swap: sectors {}..{} ({} MiB)",
+            layout.swap_first_sector,
+            layout.swap_first_sector + layout.swap_sectors,
+            (layout.swap_sectors * 512) / (1024 * 1024),
+        ));
+    }
     log_stderr(format!(
-        "  slot 0 EFS root: sectors {}..{} ({} sectors, {} MiB)",
-        layout.efs_first_sector,
-        layout.efs_first_sector + layout.efs_sectors,
-        layout.efs_sectors,
-        (layout.efs_sectors * 512) / (1024 * 1024),
+        "  slot 0 {fs_name} root: sectors {}..{} ({} sectors, {} MiB)",
+        layout.root_first_sector,
+        layout.root_first_sector + layout.root_sectors,
+        layout.root_sectors,
+        (layout.root_sectors * 512) / (1024 * 1024),
     ));
     if let Some(dir) = &args.from_dir {
         // Drop the write handle before reopening through the normal
         // partition-resolution path.
         drop(file);
         populate(&args, dir)?;
-    } else {
+    } else if !args.label_only {
         log_stderr(format!(
             "  populate it with: rb-cli import {} <dir>   (or put ...@1 host/file /file)",
             args.image.display(),

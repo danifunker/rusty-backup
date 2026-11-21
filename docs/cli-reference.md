@@ -1333,7 +1333,9 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too
 - `--exclude-appledouble` — Leave macOS `._*` sidecars out entirely: neither copied as files nor taken as a file's resource fork. For a folder that only has them because it came off a modern Mac
 - `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
-- `--fs` — Root filesystem to format. Only `efs` is supported today
+- `--fs` — Root filesystem: it sets the root partition's type and, unless `--label-only`, is formatted
+- `--label-only` — Write the SGI volume header and partition table only; leave the partitions unformatted
+- `--swap` — Lay the disk out as an IRIX system disk: swap of this size in slot 1, the root after it
 - `--heads` — Heads (tracks per cylinder). Must match the geometry the target drive reports over SCSI: IRIX `fx` rejects the volume header if its geometry disagrees with the drive, which stops the disk from mounting. The IRIS emulator and typical SGI SCSI HDDs report 16 heads; change this only for a drive you know reports otherwise
 - `--sectors` — Sectors per track (512-byte sectors). Like `--heads`, must match the drive's reported geometry or IRIX `fx` rejects the label. Default 63 (the IRIS emulator's value; 16 × 63 = 1008-sector cylinders)
 - `--inodes` — Approximate total inode count for the EFS root. The formatter scales the cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`. When neither is given the density is ~1 inode/4 KiB

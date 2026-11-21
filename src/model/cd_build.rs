@@ -240,7 +240,7 @@ pub fn write_blank(path: &Path, req: &CdRequest, size: u64) -> Result<CdWritten>
             file.set_len(l.disk_bytes)?;
             CdWritten {
                 disk_bytes: l.disk_bytes,
-                fs_offset: l.efs_first_sector * 512,
+                fs_offset: l.root_first_sector * 512,
                 lines: vec![
                     format!(
                         "SGI volume header + EFS CD-ROM, {} cyls x {} heads x {} secs/trk",
@@ -249,7 +249,7 @@ pub fn write_blank(path: &Path, req: &CdRequest, size: u64) -> Result<CdWritten>
                     format!(
                         "slot 7 EFS (type SYSV): {} MiB; on IRIX: mount -t efs -o ro \
                          /dev/dsk/dks0d<N>s7 /CDROM",
-                        mib(l.efs_sectors * 512)
+                        mib(l.root_sectors * 512)
                     ),
                 ],
             }

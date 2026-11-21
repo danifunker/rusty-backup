@@ -6093,6 +6093,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "sgi-disk",
  "sha1 0.11.0",
  "sha2 0.11.1",
  "shell-words",
@@ -6301,6 +6302,18 @@ checksum = "909764a65f86829ccdb5eea9ab355843aa02c019a7bfd47465092953565caa05"
 dependencies = [
  "noyalib",
  "serde",
+]
+
+[[package]]
+name = "sgi-disk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "fs-unix",
+ "fs-xfs",
+ "part-tables",
+ "tempfile",
 ]
 
 [[package]]
