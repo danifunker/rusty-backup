@@ -1,70 +1,90 @@
-//! Incremental inserts and removes for leaf and node-form dir2 directories,
-//! after `xfs_dir2_leaf.c`, `xfs_dir2_node.c` and `xfs_da_btree.c`.
+//! In-place inserts and removes for leaf-form and node-form directories.
 //!
-//! A directory's blocks live in three address spaces of the inode's file:
-//! data blocks from offset 0, the hash index from `XFS_DIR2_LEAF_OFFSET`
-//! (the root block sits there: a leaf1 in leaf form, a leafN or a da node in
-//! node form), and freeindex blocks from `XFS_DIR2_FREE_OFFSET`. An
-//! operation runs against a [`Dir2Store`] through [`Dir2Op`], which caches
-//! every block it touches and hands the store one transaction to apply, so
-//! nothing reaches the disk until the whole change is known.
+//! Written from SGI's *XFS Algorithms & Data Structures* (CC-BY-SA): ch.
+//! Directories (secs. Block Directories, Leaf Directories, Node Directories,
+//! B+tree Directories) for the block formats, and ch. Variable Length Record
+//! B+trees (secs. Block Headers, Internal Nodes) for the hash tree.
 //!
-//! Insert: descend the da btree by hash to the leaf; refuse a duplicate;
-//! take room from the first data block whose `bests` entry admits the entry
-//! (appending a data block, and a freeindex block when its table is full,
-//! when none does); place the entry from that block's `bestfree[0]`; add
-//! `(hash, dataptr)` to the leaf, reusing a stale slot when there is one.
-//! A full leafN splits in two, the new sibling is keyed into the parent, a
-//! full parent splits the same way, and a full root is first copied down a
-//! level so the split has a parent (`xfs_da3_root_split`). A full leaf1 is
-//! left to the rebuild in `edit.rs`, which converts to node form.
+//! A directory's file has three address spaces: data blocks from offset 0,
+//! the hash index from the leaf offset (32 GiB; its first block is the root:
+//! a leaf1 block in leaf form, a leafN or a da node in node form) and
+//! freeindex blocks from the free offset (64 GiB). A [`Dir2Op`] reads blocks
+//! through a [`Dir2Store`], keeps every block it changes in memory, and hands
+//! the store one [`Dir2Txn`] on commit, so nothing reaches the disk until the
+//! whole change is known. The store stamps v5 CRC headers (blkno, owner, uuid,
+//! crc) itself; this module only lays out the payload.
 //!
-//! Remove: find the entry, return its bytes to the data block's free space
-//! (coalescing neighbours, `xfs_dir2_data_make_free`), mark the leaf slot
-//! stale, free a data block that emptied and drop its `bests` entry, remove
-//! a leaf with no live entries from its parent, and collapse a root left
-//! with one child (`xfs_da3_root_join`). Half-empty siblings are not merged.
-//! The caller is told when a smaller form would fit so it can rebuild.
+//! Insert: hash the name, descend the tree (a node's entry covers every hash
+//! up to its `hashval`), refuse a duplicate, pick the first data block whose
+//! best free length fits the entry (else fill a hole or append a block, and a
+//! freeindex block when the last one is full), carve the entry out of that
+//! block's largest unused record, and put `(hash, address)` into the leaf,
+//! taking the place of a stale entry when the leaf has one. A full leafN is
+//! split in half; the new right sibling is linked after it and keyed into the
+//! parent, which splits the same way when full. A full root is first copied
+//! into a new block so the split has a parent (the root block never moves).
+//! A full leaf1 returns [`Outcome::Fallback`] and `edit.rs` rebuilds the
+//! directory into node form.
 //!
-//! Block-level rules that `xfs_repair` checks and this module keeps:
-//! `bestfree` is the three largest unused records, longest first, ties in
-//! offset order (a full rescan after every change, as `xfs_dir2_data_freescan`
-//! would); every unused record carries its offset as a trailing tag; a leaf's
-//! hashes are sorted with stale entries keeping theirs and `stale` counting
-//! them; a node entry's hash is its child's last hash; siblings at every
-//! level are linked by dablk; a freeindex block's `nused` counts its
-//! non-null bests and `nvalid` reaches the last data block it covers.
+//! Remove: find the entry, turn its bytes into an unused record merged with
+//! unused neighbours, zero the leaf entry's address (stale; it keeps its
+//! hash), free a data block left empty and null its best, unlink and free a
+//! leaf whose entries are all stale (and a node left empty), and copy a root
+//! with one child back up. Half-empty siblings are not merged. `shrink` tells
+//! the caller when the next smaller form would hold what is left.
+//!
+//! Rules held for `xfs_repair`: `bestfree` lists the three longest unused
+//! records, longest first, ties by offset, rescanned after every change; each
+//! unused record ends with its own offset as a tag; leaf hashes stay sorted
+//! and `stale` counts zero addresses; a node entry's hash is its child's last
+//! hash; blocks at each level are chained through `forw` (next block) and
+//! `back` (previous block); a freeindex block's `nused` counts its non-null
+//! bests and `nvalid` ends at the last data block it covers.
+//!
+//! Two points where the document's prose does not match the disk: it
+//! describes `forw` as the previous block and `back` as the next (its own
+//! `xfs_db` dumps show `forw` as the next), and it places a freeindex
+//! block's `bests` at the end of the block (its dump shows them right after
+//! the header). This module follows the dumps, as the crate's readers do.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use byteorder::{BigEndian, ByteOrder};
-
-use super::{
-    blocks_per_dir_block, build_da_node_block, build_free_block, build_leaf_data_block,
-    build_leafn_block, dir2_da_hdr_len, dir2_data_entsize, dir2_data_hdr_len, dir2_free_hdr_len,
-    dir2_free_offset_fb, dir2_leaf_offset_fb, dir_hashname, NULLDATAOFF, XFS_DA3_NODE_MAGIC,
-    XFS_DA_NODE_MAGIC, XFS_DIR2_LEAF1_MAGIC, XFS_DIR2_LEAFN_MAGIC, XFS_DIR3_LEAF1_MAGIC,
-    XFS_DIR3_LEAFN_MAGIC,
-};
 use disk_core::filesystem::FilesystemError;
 
-/// A stale leaf entry's address (`XFS_DIR2_NULL_DATAPTR`): 0, which no
-/// entry can have since the data header occupies it.
-const NULL_DATAPTR: u32 = 0;
+#[cfg(test)]
+use super::build_leafn_block;
+use super::{
+    blocks_per_dir_block, build_free_block, build_leaf_data_block, dir2_da_hdr_len,
+    dir2_data_entsize, dir2_data_hdr_len, dir2_free_hdr_len, dir2_free_offset_fb,
+    dir2_leaf_offset_fb, dir_hashname, NULLDATAOFF, XFS_DA3_NODE_MAGIC, XFS_DA_NODE_MAGIC,
+    XFS_DIR2_LEAF1_MAGIC, XFS_DIR2_LEAFN_MAGIC, XFS_DIR3_LEAF1_MAGIC, XFS_DIR3_LEAFN_MAGIC,
+};
+use crate::xfs::dir2::{XFS_DIR2_DATA_MAGIC, XFS_DIR3_DATA_MAGIC};
 
-/// The directory geometry every block computation needs.
+/// Address of a stale leaf entry (doc ch. Directories, sec. Leaf Directories).
+const NULL_DATAPTR: u32 = 0;
+/// `freetag` opening an unused data record (sec. Block Directories).
+const DATA_FREE_TAG: u16 = 0xFFFF;
+/// Deepest hash tree accepted while descending; guards against loops on a corrupt tree.
+const MAX_TREE_DEPTH: usize = 16;
+
+/// Directory geometry (doc ch. Directories, intro and sec. Leaf Directories).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Geo {
     pub dirblksize: usize,
     pub is_v5: bool,
     pub has_ftype: bool,
-    /// fsblocks per dir block; dablk numbers advance by this much.
+    /// Filesystem blocks per directory block.
     pub bpd: u64,
+    /// First fsblock of the leaf (hash index) address space.
     pub leaf_off: u64,
+    /// First fsblock of the freeindex address space.
     pub free_off: u64,
 }
 
 impl Geo {
+    /// Geometry of a volume's directories, from its superblock.
     pub fn of(sb: &crate::xfs::sb::XfsSuperblock) -> Geo {
         Geo {
             dirblksize: sb.dirblksize() as usize,
@@ -76,7 +96,7 @@ impl Geo {
         }
     }
 
-    /// A geometry for in-memory tests: any dir block size, v5 headers, ftype on.
+    /// A v5, ftype geometry with one fsblock per `dirblksize` directory block.
     #[cfg(test)]
     pub fn synthetic(dirblksize: usize) -> Geo {
         Geo {
@@ -84,503 +104,75 @@ impl Geo {
             is_v5: true,
             has_ftype: true,
             bpd: 1,
-            leaf_off: 1 << 20,
-            free_off: 2 << 20,
+            leaf_off: dir2_leaf_offset_fb(dirblksize as u32),
+            free_off: dir2_free_offset_fb(dirblksize as u32),
         }
+    }
+
+    /// True for a block of the hash index (leaf1, leafN or da node).
+    pub fn is_leaf_space(&self, dablk: u64) -> bool {
+        dablk >= self.leaf_off && dablk < self.free_off
     }
 
     fn data_hdr(&self) -> usize {
         dir2_data_hdr_len(self.is_v5)
     }
+
     fn da_hdr(&self) -> usize {
         dir2_da_hdr_len(self.is_v5)
     }
+
     fn free_hdr(&self) -> usize {
         dir2_free_hdr_len(self.is_v5)
     }
-    /// Offset of `count` in a leaf or node header (`stale`/`level` follow it).
-    fn count_off(&self) -> usize {
-        if self.is_v5 {
-            56
-        } else {
-            12
-        }
-    }
-    /// Offset of `bestfree[0]` in a data header, and of `firstdb` in a free one.
-    fn fields_off(&self) -> usize {
-        if self.is_v5 {
-            48
-        } else {
-            4
-        }
-    }
-    fn da_max_ents(&self) -> usize {
-        (self.dirblksize - self.da_hdr()) / 8
-    }
-    fn free_max_bests(&self) -> usize {
-        (self.dirblksize - self.free_hdr()) / 2
-    }
+
+    /// Leaf address of byte `off` in data block `db`: data-space offset / 8.
     fn dataptr(&self, db: u64, off: usize) -> u32 {
         ((db * self.dirblksize as u64 + off as u64) / 8) as u32
     }
-    fn dataptr_db(&self, ptr: u32) -> u64 {
-        (u64::from(ptr) * 8) / self.dirblksize as u64
+
+    /// `(data block, byte offset in it)` of a leaf address.
+    fn split_dataptr(&self, addr: u32) -> (u64, usize) {
+        let byte = u64::from(addr) * 8;
+        let dbs = self.dirblksize as u64;
+        (byte / dbs, (byte % dbs) as usize)
     }
-    fn dataptr_off(&self, ptr: u32) -> usize {
-        ((u64::from(ptr) * 8) % self.dirblksize as u64) as usize
-    }
+
     fn data_dablk(&self, db: u64) -> u64 {
         db * self.bpd
     }
+
+    /// File offset of freeindex block `fdb` (sec. Node Directories).
     fn free_dablk(&self, fdb: u64) -> u64 {
         self.free_off + fdb * self.bpd
     }
-    pub fn is_leaf_space(&self, dablk: u64) -> bool {
-        dablk >= self.leaf_off && dablk < self.free_off
+
+    /// Bests one freeindex block holds; block `fdb` covers data blocks from `fdb * this`.
+    fn free_max_bests(&self) -> usize {
+        (self.dirblksize - self.free_hdr()) / 2
     }
-}
 
-// ---------- data blocks ----------
+    /// Entries a leafN or da node block holds.
+    fn da_max_ents(&self) -> usize {
+        (self.dirblksize - self.da_hdr()) / 8
+    }
 
-/// Every record of a data block as `(offset, length, unused)`.
-fn data_records(geo: &Geo, block: &[u8]) -> Result<Vec<(usize, usize, bool)>, FilesystemError> {
-    let mut out = Vec::new();
-    let mut pos = geo.data_hdr();
-    let end = block.len();
-    while pos + 8 <= end {
-        let (len, unused) = if BigEndian::read_u16(&block[pos..pos + 2]) == 0xFFFF {
-            (BigEndian::read_u16(&block[pos + 2..pos + 4]) as usize, true)
+    /// Bytes a data block offers entries when empty.
+    fn data_body(&self) -> usize {
+        self.dirblksize - self.data_hdr()
+    }
+
+    fn node_magic(&self) -> u16 {
+        if self.is_v5 {
+            XFS_DA3_NODE_MAGIC
         } else {
-            (
-                dir2_data_entsize(block[pos + 8] as usize, geo.has_ftype),
-                false,
-            )
-        };
-        if len < 8 || pos + len > end {
-            return Err(FilesystemError::Parse(format!(
-                "directory data record at byte {pos} has length {len}"
-            )));
-        }
-        out.push((pos, len, unused));
-        pos += len;
-    }
-    if pos != end {
-        return Err(FilesystemError::Parse(format!(
-            "directory data records end at byte {pos} of {end}"
-        )));
-    }
-    Ok(out)
-}
-
-/// Write an unused record over `[off, off + len)`: free tag, length, tail tag.
-fn data_write_unused(block: &mut [u8], off: usize, len: usize) {
-    BigEndian::write_u16(&mut block[off..off + 2], 0xFFFF);
-    BigEndian::write_u16(&mut block[off + 2..off + 4], len as u16);
-    BigEndian::write_u16(&mut block[off + len - 2..off + len], off as u16);
-}
-
-/// Recompute `bestfree`: the three longest unused records, ties by offset.
-fn data_freescan(geo: &Geo, block: &mut [u8]) -> Result<(), FilesystemError> {
-    let mut frees: Vec<(usize, usize)> = data_records(geo, block)?
-        .into_iter()
-        .filter(|r| r.2)
-        .map(|r| (r.0, r.1))
-        .collect();
-    frees.sort_by_key(|f| std::cmp::Reverse(f.1));
-    let bf = geo.fields_off();
-    for i in 0..3 {
-        let (off, len) = frees.get(i).copied().unwrap_or((0, 0));
-        BigEndian::write_u16(&mut block[bf + i * 4..bf + i * 4 + 2], off as u16);
-        BigEndian::write_u16(&mut block[bf + i * 4 + 2..bf + i * 4 + 4], len as u16);
-    }
-    Ok(())
-}
-
-fn data_best(geo: &Geo, block: &[u8]) -> u16 {
-    let bf = geo.fields_off();
-    BigEndian::read_u16(&block[bf + 2..bf + 4])
-}
-
-/// Carve `need` bytes off the front of `bestfree[0]` (as `xfs_dir2_data_use_free`
-/// does for an add); the caller writes the entry there and rescans.
-fn data_take(geo: &Geo, block: &mut [u8], need: usize) -> Option<usize> {
-    let bf = geo.fields_off();
-    let off = BigEndian::read_u16(&block[bf..bf + 2]) as usize;
-    let len = BigEndian::read_u16(&block[bf + 2..bf + 4]) as usize;
-    if len < need || off == 0 {
-        return None;
-    }
-    if len > need {
-        data_write_unused(block, off + need, len - need);
-    }
-    Some(off)
-}
-
-fn data_put_entry(geo: &Geo, block: &mut [u8], off: usize, ino: u64, name: &[u8], ft: u8) {
-    let ent = dir2_data_entsize(name.len(), geo.has_ftype);
-    block[off..off + ent].fill(0);
-    BigEndian::write_u64(&mut block[off..off + 8], ino);
-    block[off + 8] = name.len() as u8;
-    block[off + 9..off + 9 + name.len()].copy_from_slice(name);
-    if geo.has_ftype {
-        block[off + 9 + name.len()] = ft;
-    }
-    BigEndian::write_u16(&mut block[off + ent - 2..off + ent], off as u16);
-}
-
-/// `(ino, name, ftype, entsize)` of the entry at `off`.
-fn data_get_entry(
-    geo: &Geo,
-    block: &[u8],
-    off: usize,
-) -> Result<(u64, Vec<u8>, u8, usize), FilesystemError> {
-    if off + 9 > block.len() || BigEndian::read_u16(&block[off..off + 2]) == 0xFFFF {
-        return Err(FilesystemError::Parse(format!(
-            "directory leaf points at byte {off}, which holds no entry"
-        )));
-    }
-    let namelen = block[off + 8] as usize;
-    let ent = dir2_data_entsize(namelen, geo.has_ftype);
-    if off + ent > block.len() {
-        return Err(FilesystemError::Parse(format!(
-            "directory entry at byte {off} runs past the block"
-        )));
-    }
-    let name = block[off + 9..off + 9 + namelen].to_vec();
-    let ft = if geo.has_ftype {
-        block[off + 9 + namelen]
-    } else {
-        0
-    };
-    Ok((BigEndian::read_u64(&block[off..off + 8]), name, ft, ent))
-}
-
-/// Return `[off, off + len)` to free space, coalescing with unused
-/// neighbours; true when the whole block is free afterwards.
-fn data_make_free(
-    geo: &Geo,
-    block: &mut [u8],
-    off: usize,
-    len: usize,
-) -> Result<bool, FilesystemError> {
-    let recs = data_records(geo, block)?;
-    let mut start = off;
-    let mut end = off + len;
-    for &(o, l, unused) in &recs {
-        if unused && o + l == off {
-            start = o;
-        }
-        if unused && o == off + len {
-            end = o + l;
+            XFS_DA_NODE_MAGIC
         }
     }
-    block[start..end].fill(0);
-    data_write_unused(block, start, end - start);
-    data_freescan(geo, block)?;
-    Ok(end - start == block.len() - geo.data_hdr())
 }
 
-// ---------- leaf and node blocks ----------
-
-/// The shared prefix of leaf1, leafN and da node blocks.
-#[derive(Clone, Copy, Debug)]
-struct DaHdr {
-    forw: u32,
-    back: u32,
-    magic: u16,
-    count: u16,
-    /// `stale` in a leaf, `level` in a node.
-    aux: u16,
-}
-
-fn da_read_hdr(geo: &Geo, block: &[u8]) -> DaHdr {
-    let c = geo.count_off();
-    DaHdr {
-        forw: BigEndian::read_u32(&block[0..4]),
-        back: BigEndian::read_u32(&block[4..8]),
-        magic: BigEndian::read_u16(&block[8..10]),
-        count: BigEndian::read_u16(&block[c..c + 2]),
-        aux: BigEndian::read_u16(&block[c + 2..c + 4]),
-    }
-}
-
-fn da_write_hdr(geo: &Geo, block: &mut [u8], h: &DaHdr) {
-    let c = geo.count_off();
-    BigEndian::write_u32(&mut block[0..4], h.forw);
-    BigEndian::write_u32(&mut block[4..8], h.back);
-    BigEndian::write_u16(&mut block[8..10], h.magic);
-    BigEndian::write_u16(&mut block[c..c + 2], h.count);
-    BigEndian::write_u16(&mut block[c + 2..c + 4], h.aux);
-}
-
-/// Entry `i` of a leaf `(hash, dataptr)` or node `(hash, before)`.
-fn da_ent(geo: &Geo, block: &[u8], i: usize) -> (u32, u32) {
-    let off = geo.da_hdr() + i * 8;
-    (
-        BigEndian::read_u32(&block[off..off + 4]),
-        BigEndian::read_u32(&block[off + 4..off + 8]),
-    )
-}
-
-fn da_put_ent(geo: &Geo, block: &mut [u8], i: usize, hash: u32, v: u32) {
-    let off = geo.da_hdr() + i * 8;
-    BigEndian::write_u32(&mut block[off..off + 4], hash);
-    BigEndian::write_u32(&mut block[off + 4..off + 8], v);
-}
-
-fn da_ents(geo: &Geo, block: &[u8]) -> Vec<(u32, u32)> {
-    let n = da_read_hdr(geo, block).count as usize;
-    (0..n).map(|i| da_ent(geo, block, i)).collect()
-}
-
-/// Replace every entry, zeroing the slots past the new count.
-fn da_set_ents(geo: &Geo, block: &mut [u8], ents: &[(u32, u32)], keep_end: usize) {
-    let hdr = geo.da_hdr();
-    block[hdr..keep_end].fill(0);
-    for (i, &(h, v)) in ents.iter().enumerate() {
-        da_put_ent(geo, block, i, h, v);
-    }
-    let mut h = da_read_hdr(geo, block);
-    h.count = ents.len() as u16;
-    da_write_hdr(geo, block, &h);
-}
-
-fn is_node_magic(m: u16) -> bool {
-    m == XFS_DA_NODE_MAGIC || m == XFS_DA3_NODE_MAGIC
-}
-fn is_leaf1_magic(m: u16) -> bool {
-    m == XFS_DIR2_LEAF1_MAGIC || m == XFS_DIR3_LEAF1_MAGIC
-}
-fn is_leafn_magic(m: u16) -> bool {
-    m == XFS_DIR2_LEAFN_MAGIC || m == XFS_DIR3_LEAFN_MAGIC
-}
-
-/// First entry whose hash is at least `hash`, or `count`.
-fn da_lower_bound(geo: &Geo, block: &[u8], hash: u32) -> usize {
-    let n = da_read_hdr(geo, block).count as usize;
-    let (mut lo, mut hi) = (0usize, n);
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if da_ent(geo, block, mid).0 < hash {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
-}
-
-fn da_last_hash(geo: &Geo, block: &[u8]) -> u32 {
-    let n = da_read_hdr(geo, block).count as usize;
-    if n == 0 {
-        0
-    } else {
-        da_ent(geo, block, n - 1).0
-    }
-}
-
-// leaf1 tail: bests[bestcount] then the u32 bestcount.
-fn leaf1_bestcount(block: &[u8]) -> usize {
-    let n = block.len();
-    BigEndian::read_u32(&block[n - 4..n]) as usize
-}
-fn leaf1_bests_off(block: &[u8]) -> usize {
-    block.len() - 4 - 2 * leaf1_bestcount(block)
-}
-fn leaf1_best(block: &[u8], db: usize) -> u16 {
-    let o = leaf1_bests_off(block) + db * 2;
-    BigEndian::read_u16(&block[o..o + 2])
-}
-fn leaf1_put_best(block: &mut [u8], db: usize, v: u16) {
-    let o = leaf1_bests_off(block) + db * 2;
-    BigEndian::write_u16(&mut block[o..o + 2], v);
-}
-
-/// Resize the bests table, moving it; new slots read `NULLDATAOFF`.
-fn leaf1_set_bestcount(block: &mut [u8], n: usize) {
-    let old: Vec<u16> = (0..leaf1_bestcount(block))
-        .map(|i| leaf1_best(block, i))
-        .collect();
-    let len = block.len();
-    let old_off = leaf1_bests_off(block);
-    let new_off = len - 4 - 2 * n;
-    block[old_off.min(new_off)..len - 4].fill(0);
-    BigEndian::write_u32(&mut block[len - 4..len], n as u32);
-    for i in 0..n {
-        let v = old.get(i).copied().unwrap_or(NULLDATAOFF);
-        BigEndian::write_u16(&mut block[new_off + i * 2..new_off + i * 2 + 2], v);
-    }
-}
-
-/// Entry slots a leaf can hold: up to the bests table for leaf1.
-fn leaf_capacity(geo: &Geo, block: &[u8]) -> usize {
-    let end = if is_leaf1_magic(da_read_hdr(geo, block).magic) {
-        leaf1_bests_off(block)
-    } else {
-        block.len()
-    };
-    end.saturating_sub(geo.da_hdr()) / 8
-}
-
-/// Add `(hash, addr)` keeping hash order, reusing the nearest stale slot as
-/// `xfs_dir2_leafn_add` does; false when the leaf has no room.
-fn leaf_insert(geo: &Geo, block: &mut [u8], hash: u32, addr: u32) -> bool {
-    let mut h = da_read_hdr(geo, block);
-    let count = h.count as usize;
-    let idx = da_lower_bound(geo, block, hash);
-    if h.aux > 0 {
-        let lowstale = (0..idx)
-            .rev()
-            .find(|&i| da_ent(geo, block, i).1 == NULL_DATAPTR);
-        let highstale = (idx..count).find(|&i| da_ent(geo, block, i).1 == NULL_DATAPTR);
-        let use_low = match (lowstale, highstale) {
-            (Some(l), Some(hi)) => idx - l <= hi - idx,
-            (Some(_), None) => true,
-            _ => false,
-        };
-        if use_low {
-            let l = lowstale.unwrap_or(0);
-            for i in l..idx - 1 {
-                let (eh, ev) = da_ent(geo, block, i + 1);
-                da_put_ent(geo, block, i, eh, ev);
-            }
-            da_put_ent(geo, block, idx - 1, hash, addr);
-        } else {
-            let hi = highstale.unwrap_or(idx);
-            for i in (idx + 1..=hi).rev() {
-                let (eh, ev) = da_ent(geo, block, i - 1);
-                da_put_ent(geo, block, i, eh, ev);
-            }
-            da_put_ent(geo, block, idx, hash, addr);
-        }
-        h.aux -= 1;
-        da_write_hdr(geo, block, &h);
-        return true;
-    }
-    if count >= leaf_capacity(geo, block) {
-        return false;
-    }
-    for i in (idx + 1..=count).rev() {
-        let (eh, ev) = da_ent(geo, block, i - 1);
-        da_put_ent(geo, block, i, eh, ev);
-    }
-    da_put_ent(geo, block, idx, hash, addr);
-    h.count += 1;
-    da_write_hdr(geo, block, &h);
-    true
-}
-
-fn leaf_mark_stale(geo: &Geo, block: &mut [u8], idx: usize) {
-    let (hash, _) = da_ent(geo, block, idx);
-    da_put_ent(geo, block, idx, hash, NULL_DATAPTR);
-    let mut h = da_read_hdr(geo, block);
-    h.aux += 1;
-    da_write_hdr(geo, block, &h);
-}
-
-/// Drop the stale entries (`xfs_dir3_leaf_compact`).
-fn leaf_compact(geo: &Geo, block: &mut [u8]) {
-    let live: Vec<(u32, u32)> = da_ents(geo, block)
-        .into_iter()
-        .filter(|e| e.1 != NULL_DATAPTR)
-        .collect();
-    let end = geo.da_hdr() + leaf_capacity(geo, block) * 8;
-    da_set_ents(geo, block, &live, end);
-    let mut h = da_read_hdr(geo, block);
-    h.aux = 0;
-    da_write_hdr(geo, block, &h);
-}
-
-fn leaf_live(geo: &Geo, block: &[u8]) -> usize {
-    let h = da_read_hdr(geo, block);
-    (h.count - h.aux) as usize
-}
-
-/// Node entry leading to `hash`: the first whose key is at least it, else the last.
-fn node_child_for(geo: &Geo, block: &[u8], hash: u32) -> usize {
-    let n = da_read_hdr(geo, block).count as usize;
-    da_lower_bound(geo, block, hash).min(n.saturating_sub(1))
-}
-
-fn node_find_child(geo: &Geo, block: &[u8], before: u64) -> Option<usize> {
-    da_ents(geo, block)
-        .iter()
-        .position(|&(_, b)| u64::from(b) == before)
-}
-
-fn node_insert(geo: &Geo, block: &mut [u8], idx: usize, hash: u32, before: u32) -> bool {
-    let mut h = da_read_hdr(geo, block);
-    let count = h.count as usize;
-    if count >= geo.da_max_ents() {
-        return false;
-    }
-    for i in (idx + 1..=count).rev() {
-        let (eh, ev) = da_ent(geo, block, i - 1);
-        da_put_ent(geo, block, i, eh, ev);
-    }
-    da_put_ent(geo, block, idx, hash, before);
-    h.count += 1;
-    da_write_hdr(geo, block, &h);
-    true
-}
-
-fn node_remove(geo: &Geo, block: &mut [u8], idx: usize) {
-    let mut ents = da_ents(geo, block);
-    ents.remove(idx);
-    let end = geo.da_hdr() + geo.da_max_ents() * 8;
-    da_set_ents(geo, block, &ents, end);
-}
-
-// ---------- freeindex blocks ----------
-
-fn free_read_hdr(geo: &Geo, block: &[u8]) -> (u32, u32, u32) {
-    let f = geo.fields_off();
-    (
-        BigEndian::read_u32(&block[f..f + 4]),
-        BigEndian::read_u32(&block[f + 4..f + 8]),
-        BigEndian::read_u32(&block[f + 8..f + 12]),
-    )
-}
-
-fn free_write_hdr(geo: &Geo, block: &mut [u8], firstdb: u32, nvalid: u32, nused: u32) {
-    let f = geo.fields_off();
-    BigEndian::write_u32(&mut block[f..f + 4], firstdb);
-    BigEndian::write_u32(&mut block[f + 4..f + 8], nvalid);
-    BigEndian::write_u32(&mut block[f + 8..f + 12], nused);
-}
-
-fn free_best(geo: &Geo, block: &[u8], i: usize) -> u16 {
-    let o = geo.free_hdr() + i * 2;
-    BigEndian::read_u16(&block[o..o + 2])
-}
-
-/// Set best `i`, keeping `nvalid` and `nused` in step.
-fn free_put_best(geo: &Geo, block: &mut [u8], i: usize, v: u16) {
-    let (firstdb, nvalid, nused) = free_read_hdr(geo, block);
-    let old = if i < nvalid as usize {
-        free_best(geo, block, i)
-    } else {
-        NULLDATAOFF
-    };
-    for j in nvalid as usize..i {
-        let o = geo.free_hdr() + j * 2;
-        BigEndian::write_u16(&mut block[o..o + 2], NULLDATAOFF);
-    }
-    let o = geo.free_hdr() + i * 2;
-    BigEndian::write_u16(&mut block[o..o + 2], v);
-    let mut nvalid = nvalid.max(i as u32 + 1);
-    while nvalid > 0 && free_best(geo, block, nvalid as usize - 1) == NULLDATAOFF {
-        nvalid -= 1;
-    }
-    let nused = nused + u32::from(old == NULLDATAOFF && v != NULLDATAOFF)
-        - u32::from(old != NULLDATAOFF && v == NULLDATAOFF);
-    free_write_hdr(geo, block, firstdb, nvalid, nused);
-}
-
-// ---------- the store and the operation ----------
-
-/// One directory change: blocks to rewrite (created ones included), the
-/// dablks to map, the dablks to unmap, and the new `di_size`.
+/// One directory change: blocks to write (created ones included), dablks to
+/// map fresh, dablks to unmap and free, and the new `di_size`.
 pub(super) struct Dir2Txn {
     pub dirty: BTreeMap<u64, Vec<u8>>,
     pub created: BTreeSet<u64>,
@@ -588,28 +180,373 @@ pub(super) struct Dir2Txn {
     pub size: u64,
 }
 
-/// What a [`Dir2Op`] runs against: block reads by dablk, the map, and the
-/// commit of one transaction.
+/// Where a directory's blocks live; `apply` stamps v5 headers and writes,
+/// returning `Ok(false)` when it backed out without touching anything.
 pub(super) trait Dir2Store {
     fn geo(&self) -> Geo;
     fn read_block(&mut self, dablk: u64) -> Result<Option<Vec<u8>>, FilesystemError>;
     fn is_mapped(&self, dablk: u64) -> bool;
     fn size(&self) -> u64;
-    /// Apply the change; `Ok(false)` when it was backed out untouched
-    /// because the inode cannot hold the resulting extent list.
     fn apply(&mut self, txn: Dir2Txn) -> Result<bool, FilesystemError>;
 }
 
-/// How an operation ended.
+/// Result of an insert or remove that did not fail.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Outcome {
-    /// Applied (after `commit`). For a remove, `shrink` says a smaller
-    /// directory form would now fit, so the caller may rebuild.
+    /// Staged; `shrink` when a smaller directory form would now fit.
     Done { shrink: bool },
-    /// Nothing changed; the caller must rebuild the directory instead.
+    /// Not done here (a full leaf1); the caller rebuilds the directory.
     Fallback,
 }
 
+fn corrupt(msg: impl Into<String>) -> FilesystemError {
+    FilesystemError::Parse(format!("directory: {}", msg.into()))
+}
+
+// ---- data blocks (doc ch. Directories, secs. Block and Leaf Directories) ----
+
+fn bestfree_off(geo: &Geo) -> usize {
+    if geo.is_v5 {
+        48
+    } else {
+        4
+    }
+}
+
+/// Every record of a data block as `(offset, length, unused)`, in offset order.
+fn data_records(geo: &Geo, blk: &[u8]) -> Result<Vec<(usize, usize, bool)>, FilesystemError> {
+    let mut out = Vec::new();
+    let mut pos = geo.data_hdr();
+    while pos < blk.len() {
+        if pos + 8 > blk.len() {
+            return Err(corrupt(format!("record at {pos} runs past the block")));
+        }
+        let unused = BigEndian::read_u16(&blk[pos..pos + 2]) == DATA_FREE_TAG;
+        let len = if unused {
+            BigEndian::read_u16(&blk[pos + 2..pos + 4]) as usize
+        } else {
+            dir2_data_entsize(blk[pos + 8] as usize, geo.has_ftype)
+        };
+        if len < 8 || len % 8 != 0 || pos + len > blk.len() {
+            return Err(corrupt(format!("record at {pos} has bad length {len}")));
+        }
+        out.push((pos, len, unused));
+        pos += len;
+    }
+    Ok(out)
+}
+
+/// The entry at `off`: `(inumber, name, ftype, record length)`.
+fn data_get_entry(
+    geo: &Geo,
+    blk: &[u8],
+    off: usize,
+) -> Result<(u64, Vec<u8>, u8, usize), FilesystemError> {
+    if off < geo.data_hdr()
+        || off + 8 > blk.len()
+        || BigEndian::read_u16(&blk[off..off + 2]) == DATA_FREE_TAG
+    {
+        return Err(corrupt(format!("no entry at data offset {off}")));
+    }
+    let namelen = blk[off + 8] as usize;
+    let len = dir2_data_entsize(namelen, geo.has_ftype);
+    if off + len > blk.len() {
+        return Err(corrupt(format!("entry at {off} runs past the block")));
+    }
+    let ino = BigEndian::read_u64(&blk[off..off + 8]);
+    let name = blk[off + 9..off + 9 + namelen].to_vec();
+    let ft = if geo.has_ftype {
+        blk[off + 9 + namelen]
+    } else {
+        0
+    };
+    Ok((ino, name, ft, len))
+}
+
+/// Rewrite `bestfree[]` from the records: the three longest unused, longest first, ties by offset.
+fn data_freescan(geo: &Geo, blk: &mut [u8]) -> Result<(), FilesystemError> {
+    let mut free: Vec<(usize, usize)> = data_records(geo, blk)?
+        .into_iter()
+        .filter(|r| r.2)
+        .map(|r| (r.0, r.1))
+        .collect();
+    free.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let bf = bestfree_off(geo);
+    for i in 0..3 {
+        let (off, len) = free.get(i).copied().unwrap_or((0, 0));
+        BigEndian::write_u16(&mut blk[bf + i * 4..bf + i * 4 + 2], off as u16);
+        BigEndian::write_u16(&mut blk[bf + i * 4 + 2..bf + i * 4 + 4], len as u16);
+    }
+    Ok(())
+}
+
+/// `bestfree[0].length`, the value the leaf1 / freeindex `bests` mirror.
+fn data_best(geo: &Geo, blk: &[u8]) -> u16 {
+    let bf = bestfree_off(geo);
+    BigEndian::read_u16(&blk[bf + 2..bf + 4])
+}
+
+/// Write an unused record over `[off, off + len)`: freetag, length, then the offset tag at its end.
+fn write_unused(blk: &mut [u8], off: usize, len: usize) {
+    blk[off..off + len].fill(0);
+    BigEndian::write_u16(&mut blk[off..off + 2], DATA_FREE_TAG);
+    BigEndian::write_u16(&mut blk[off + 2..off + 4], len as u16);
+    BigEndian::write_u16(&mut blk[off + len - 2..off + len], off as u16);
+}
+
+/// Place an entry in the block's longest unused record; `None` when it does not fit.
+fn data_place(
+    geo: &Geo,
+    blk: &mut [u8],
+    name: &[u8],
+    ino: u64,
+    ft: u8,
+) -> Result<Option<usize>, FilesystemError> {
+    let need = dir2_data_entsize(name.len(), geo.has_ftype);
+    let mut best: Option<(usize, usize)> = None;
+    for (off, len, unused) in data_records(geo, blk)? {
+        if unused && best.map_or(true, |b| len > b.1) {
+            best = Some((off, len));
+        }
+    }
+    let Some((off, len)) = best.filter(|b| b.1 >= need) else {
+        return Ok(None);
+    };
+    blk[off..off + need].fill(0);
+    BigEndian::write_u64(&mut blk[off..off + 8], ino);
+    blk[off + 8] = name.len() as u8;
+    blk[off + 9..off + 9 + name.len()].copy_from_slice(name);
+    if geo.has_ftype {
+        blk[off + 9 + name.len()] = ft;
+    }
+    BigEndian::write_u16(&mut blk[off + need - 2..off + need], off as u16);
+    if len > need {
+        write_unused(blk, off + need, len - need);
+    }
+    data_freescan(geo, blk)?;
+    Ok(Some(off))
+}
+
+/// Free the entry at `off`, merging the unused records on either side of it.
+fn data_make_free(geo: &Geo, blk: &mut [u8], off: usize) -> Result<(), FilesystemError> {
+    let recs = data_records(geo, blk)?;
+    let Some(i) = recs.iter().position(|r| r.0 == off && !r.2) else {
+        return Err(corrupt(format!("no entry at data offset {off}")));
+    };
+    let mut start = off;
+    let mut end = off + recs[i].1;
+    if i > 0 && recs[i - 1].2 {
+        start = recs[i - 1].0;
+    }
+    if let Some(next) = recs.get(i + 1).filter(|r| r.2) {
+        end = next.0 + next.1;
+    }
+    write_unused(blk, start, end - start);
+    data_freescan(geo, blk)
+}
+
+/// Bytes the block's live entries occupy.
+fn data_used(geo: &Geo, blk: &[u8]) -> Result<usize, FilesystemError> {
+    Ok(data_records(geo, blk)?
+        .iter()
+        .filter(|r| !r.2)
+        .map(|r| r.1)
+        .sum())
+}
+
+// ---- hash tree blocks (ch. Variable Length Record B+trees; ch. Directories) ----
+
+/// The header shared by leaf1, leafN and da node blocks; `aux` is `stale` in
+/// a leaf and `level` in a node.
+#[derive(Clone, Copy, Debug)]
+struct DaHdr {
+    forw: u32,
+    back: u32,
+    magic: u16,
+    count: u16,
+    aux: u16,
+}
+
+fn da_count_off(geo: &Geo) -> usize {
+    if geo.is_v5 {
+        56
+    } else {
+        12
+    }
+}
+
+fn da_read_hdr(geo: &Geo, blk: &[u8]) -> DaHdr {
+    let c = da_count_off(geo);
+    DaHdr {
+        forw: BigEndian::read_u32(&blk[0..4]),
+        back: BigEndian::read_u32(&blk[4..8]),
+        magic: BigEndian::read_u16(&blk[8..10]),
+        count: BigEndian::read_u16(&blk[c..c + 2]),
+        aux: BigEndian::read_u16(&blk[c + 2..c + 4]),
+    }
+}
+
+fn set_forw(blk: &mut [u8], forw: u32) {
+    BigEndian::write_u32(&mut blk[0..4], forw);
+}
+
+fn set_back(blk: &mut [u8], back: u32) {
+    BigEndian::write_u32(&mut blk[4..8], back);
+}
+
+fn is_node_magic(m: u16) -> bool {
+    m == XFS_DA_NODE_MAGIC || m == XFS_DA3_NODE_MAGIC
+}
+
+fn is_leaf1_magic(m: u16) -> bool {
+    m == XFS_DIR2_LEAF1_MAGIC || m == XFS_DIR3_LEAF1_MAGIC
+}
+
+fn is_leafn_magic(m: u16) -> bool {
+    m == XFS_DIR2_LEAFN_MAGIC || m == XFS_DIR3_LEAFN_MAGIC
+}
+
+/// Whether `m` is a hash tree magic of this volume's version.
+fn tree_magic_ok(geo: &Geo, m: u16) -> bool {
+    if geo.is_v5 {
+        matches!(
+            m,
+            XFS_DIR3_LEAF1_MAGIC | XFS_DIR3_LEAFN_MAGIC | XFS_DA3_NODE_MAGIC
+        )
+    } else {
+        matches!(
+            m,
+            XFS_DIR2_LEAF1_MAGIC | XFS_DIR2_LEAFN_MAGIC | XFS_DA_NODE_MAGIC
+        )
+    }
+}
+
+/// A leaf1 block's `bestcount` (the u32 tail at the end of the block).
+fn leaf1_bestcount(blk: &[u8]) -> usize {
+    BigEndian::read_u32(&blk[blk.len() - 4..]) as usize
+}
+
+/// Entries the block can hold: leaf1 shares its room with the bests table.
+fn leaf_capacity(geo: &Geo, blk: &[u8]) -> usize {
+    if is_leaf1_magic(da_read_hdr(geo, blk).magic) {
+        let tail = 4 + 2 * leaf1_bestcount(blk);
+        blk.len().saturating_sub(geo.da_hdr() + tail) / 8
+    } else {
+        geo.da_max_ents()
+    }
+}
+
+/// `(hashval, address)` of a leaf or `(hashval, before)` of a node.
+fn da_ents(geo: &Geo, blk: &[u8]) -> Vec<(u32, u32)> {
+    let hdr = geo.da_hdr();
+    let n = (da_read_hdr(geo, blk).count as usize).min((blk.len() - hdr) / 8);
+    (0..n)
+        .map(|i| {
+            let o = hdr + i * 8;
+            (
+                BigEndian::read_u32(&blk[o..o + 4]),
+                BigEndian::read_u32(&blk[o + 4..o + 8]),
+            )
+        })
+        .collect()
+}
+
+/// Store `ents` and `count`, zeroing the rest up to `end`; a leaf's `stale` is recounted.
+fn da_set_ents(geo: &Geo, blk: &mut [u8], ents: &[(u32, u32)], end: usize) {
+    let hdr = geo.da_hdr();
+    blk[hdr..end].fill(0);
+    for (i, (h, a)) in ents.iter().enumerate() {
+        let o = hdr + i * 8;
+        BigEndian::write_u32(&mut blk[o..o + 4], *h);
+        BigEndian::write_u32(&mut blk[o + 4..o + 8], *a);
+    }
+    let c = da_count_off(geo);
+    BigEndian::write_u16(&mut blk[c..c + 2], ents.len() as u16);
+    if !is_node_magic(BigEndian::read_u16(&blk[8..10])) {
+        let stale = ents.iter().filter(|e| e.1 == NULL_DATAPTR).count();
+        BigEndian::write_u16(&mut blk[c + 2..c + 4], stale as u16);
+    }
+}
+
+/// Hash of the block's last entry: the key its parent holds for it.
+fn da_last_hash(geo: &Geo, blk: &[u8]) -> u32 {
+    da_ents(geo, blk).last().map_or(0, |e| e.0)
+}
+
+/// An empty leafN / node block with `magic` and, for a node, `level`.
+fn new_da_block(geo: &Geo, magic: u16, level: u16) -> Vec<u8> {
+    let mut blk = vec![0u8; geo.dirblksize];
+    BigEndian::write_u16(&mut blk[8..10], magic);
+    if is_node_magic(magic) {
+        let c = da_count_off(geo);
+        BigEndian::write_u16(&mut blk[c + 2..c + 4], level);
+    }
+    blk
+}
+
+/// A leaf1 block's `bests` table, one per data block (sec. Leaf Directories).
+fn leaf1_bests(blk: &[u8]) -> Vec<u16> {
+    let n = leaf1_bestcount(blk);
+    let start = blk.len() - 4 - 2 * n;
+    (0..n)
+        .map(|i| BigEndian::read_u16(&blk[start + i * 2..start + i * 2 + 2]))
+        .collect()
+}
+
+/// Lay out a leaf1 block: entries after the header, `bests` then `bestcount` at the end.
+fn leaf1_write(geo: &Geo, blk: &mut [u8], ents: &[(u32, u32)], bests: &[u16]) {
+    let len = blk.len();
+    let start = len - 4 - 2 * bests.len();
+    da_set_ents(geo, blk, ents, start);
+    for (i, b) in bests.iter().enumerate() {
+        BigEndian::write_u16(&mut blk[start + i * 2..start + i * 2 + 2], *b);
+    }
+    BigEndian::write_u32(&mut blk[len - 4..], bests.len() as u32);
+}
+
+// ---- freeindex blocks (ch. Directories, sec. Node Directories) ----
+
+fn free_fields_off(geo: &Geo) -> usize {
+    if geo.is_v5 {
+        48
+    } else {
+        4
+    }
+}
+
+/// `(firstdb, nvalid, nused)`.
+fn free_read_hdr(geo: &Geo, blk: &[u8]) -> (u32, u32, u32) {
+    let f = free_fields_off(geo);
+    (
+        BigEndian::read_u32(&blk[f..f + 4]),
+        BigEndian::read_u32(&blk[f + 4..f + 8]),
+        BigEndian::read_u32(&blk[f + 8..f + 12]),
+    )
+}
+
+fn free_write_hdr(geo: &Geo, blk: &mut [u8], firstdb: u32, nvalid: u32, nused: u32) {
+    let f = free_fields_off(geo);
+    BigEndian::write_u32(&mut blk[f..f + 4], firstdb);
+    BigEndian::write_u32(&mut blk[f + 4..f + 8], nvalid);
+    BigEndian::write_u32(&mut blk[f + 8..f + 12], nused);
+}
+
+fn free_best(geo: &Geo, blk: &[u8], i: usize) -> u16 {
+    let o = geo.free_hdr() + i * 2;
+    BigEndian::read_u16(&blk[o..o + 2])
+}
+
+fn free_set_best(geo: &Geo, blk: &mut [u8], i: usize, v: u16) {
+    let o = geo.free_hdr() + i * 2;
+    BigEndian::write_u16(&mut blk[o..o + 2], v);
+}
+
+// ---- the operation ----
+
+/// A path from the root: `(dablk, entry index)` per level, the leaf last.
+type Chain = Vec<(u64, usize)>;
+
+/// One insert or remove against a [`Dir2Store`], staged until [`Dir2Op::commit`].
 pub(super) struct Dir2Op<'a, S: Dir2Store> {
     store: &'a mut S,
     geo: Geo,
@@ -635,67 +572,98 @@ impl<'a, S: Dir2Store> Dir2Op<'a, S> {
         }
     }
 
-    fn block(&mut self, dablk: u64) -> Result<Vec<u8>, FilesystemError> {
-        if self.freed.contains(&dablk) {
-            return Err(FilesystemError::Parse(format!(
-                "directory block {dablk} used after being freed"
+    /// True when `name` is in the directory.
+    pub fn contains(&mut self, name: &[u8]) -> Result<bool, FilesystemError> {
+        Ok(self.find(name)?.is_some())
+    }
+
+    /// Stage adding `name -> ino` (with `ft` when the volume stores ftype).
+    pub fn insert(&mut self, name: &[u8], ino: u64, ft: u8) -> Result<Outcome, FilesystemError> {
+        if name.is_empty() || name.len() > 255 {
+            return Err(FilesystemError::InvalidData(format!(
+                "directory entry name of {} bytes",
+                name.len()
             )));
         }
-        if let Some(b) = self.cache.get(&dablk) {
-            return Ok(b.clone());
-        }
-        let b = self.store.read_block(dablk)?.ok_or_else(|| {
-            FilesystemError::Parse(format!("directory block {dablk} is not mapped"))
-        })?;
-        self.cache.insert(dablk, b.clone());
-        Ok(b)
-    }
-
-    fn put(&mut self, dablk: u64, block: Vec<u8>) {
-        self.cache.insert(dablk, block);
-        self.dirty.insert(dablk);
-    }
-
-    fn create(&mut self, dablk: u64, block: Vec<u8>) {
-        self.freed.remove(&dablk);
-        self.created.insert(dablk);
-        self.put(dablk, block);
-    }
-
-    fn free(&mut self, dablk: u64) {
-        self.cache.remove(&dablk);
-        self.dirty.remove(&dablk);
-        if !self.created.remove(&dablk) {
-            self.freed.insert(dablk);
-        }
-    }
-
-    fn is_mapped(&self, dablk: u64) -> bool {
-        !self.freed.contains(&dablk)
-            && (self.cache.contains_key(&dablk) || self.store.is_mapped(dablk))
-    }
-
-    /// First unmapped dir block at or after `lo` (below `hi`).
-    fn first_hole(&self, lo: u64, hi: u64) -> Result<u64, FilesystemError> {
-        let mut d = lo;
-        while d < hi && self.is_mapped(d) {
-            d += self.geo.bpd;
-        }
-        if d >= hi {
-            return Err(FilesystemError::DiskFull(
-                "directory address space exhausted".into(),
+        if self.find(name)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(
+                String::from_utf8_lossy(name).into_owned(),
             ));
         }
-        Ok(d)
+        let root = self.get(self.geo.leaf_off)?;
+        if is_leaf1_magic(da_read_hdr(&self.geo, &root).magic) {
+            self.insert_leaf1(root, name, ino, ft)
+        } else {
+            self.insert_node(name, ino, ft)
+        }
     }
 
-    /// Hand the change to the store; false when it was backed out.
+    /// Stage removing `name`; `NotFound` when it is not there.
+    pub fn remove(&mut self, name: &[u8]) -> Result<Outcome, FilesystemError> {
+        let geo = self.geo;
+        let Some(mut chain) = self.find(name)? else {
+            return Err(FilesystemError::NotFound(
+                String::from_utf8_lossy(name).into_owned(),
+            ));
+        };
+        let (leaf_d, slot) = *chain.last().expect("chain has a leaf");
+        let mut leaf = self.get(leaf_d)?;
+        let mut ents = da_ents(&geo, &leaf);
+        let (db, off) = geo.split_dataptr(ents[slot].1);
+        let dd = geo.data_dablk(db);
+        let mut data = self.get_data(dd)?;
+        data_make_free(&geo, &mut data, off)?;
+        let best = data_best(&geo, &data);
+        let emptied = db != 0 && best as usize == geo.data_body();
+        if emptied {
+            self.free(dd);
+        } else {
+            self.put(dd, data);
+        }
+        ents[slot].1 = NULL_DATAPTR;
+        let new_best = if emptied { NULLDATAOFF } else { best };
+
+        if is_leaf1_magic(da_read_hdr(&geo, &leaf).magic) {
+            let mut bests = leaf1_bests(&leaf);
+            let Some(b) = bests.get_mut(db as usize) else {
+                return Err(corrupt(format!("data block {db} has no leaf1 best")));
+            };
+            *b = new_best;
+            while bests.last() == Some(&NULLDATAOFF) {
+                bests.pop();
+            }
+            leaf1_write(&geo, &mut leaf, &ents, &bests);
+            self.put(leaf_d, leaf);
+            if emptied {
+                self.trim_size();
+            }
+            let shrink = self.leaf1_fits_block(&ents, &bests)?;
+            return Ok(Outcome::Done { shrink });
+        }
+
+        da_set_ents(&geo, &mut leaf, &ents, geo.dirblksize);
+        self.put(leaf_d, leaf);
+        self.set_free_best(db, new_best)?;
+        if emptied {
+            self.trim_size();
+        }
+        if ents.iter().all(|e| e.1 == NULL_DATAPTR) && self.can_unhook(&chain)? {
+            let k = chain.len() - 1;
+            self.unhook(&mut chain, k)?;
+        }
+        self.collapse_root()?;
+        let shrink = self.node_fits_leaf1()?;
+        Ok(Outcome::Done { shrink })
+    }
+
+    /// Hand the staged change to the store; `Ok(false)` when it backed out.
     pub fn commit(self) -> Result<bool, FilesystemError> {
+        if self.dirty.is_empty() && self.freed.is_empty() {
+            return Ok(true);
+        }
         let mut dirty = BTreeMap::new();
         for d in &self.dirty {
-            if let Some(b) = self.cache.get(d) {
-                dirty.insert(*d, b.clone());
-            }
+            dirty.insert(*d, self.cache[d].clone());
         }
         self.store.apply(Dir2Txn {
             dirty,
@@ -705,592 +673,581 @@ impl<'a, S: Dir2Store> Dir2Op<'a, S> {
         })
     }
 
-    fn magic(&mut self, dablk: u64) -> Result<u16, FilesystemError> {
-        let b = self.block(dablk)?;
-        Ok(BigEndian::read_u16(&b[8..10]))
+    // ---- block cache ----
+
+    fn mapped(&self, d: u64) -> bool {
+        self.created.contains(&d) || (self.store.is_mapped(d) && !self.freed.contains(&d))
     }
 
-    fn last_hash(&mut self, dablk: u64) -> Result<u32, FilesystemError> {
-        let b = self.block(dablk)?;
-        Ok(da_last_hash(&self.geo, &b))
+    /// The current content of block `d`, read through the store once.
+    fn get(&mut self, d: u64) -> Result<Vec<u8>, FilesystemError> {
+        if let Some(b) = self.cache.get(&d) {
+            return Ok(b.clone());
+        }
+        if self.freed.contains(&d) {
+            return Err(corrupt(format!("block {d} used after it was freed")));
+        }
+        let Some(b) = self.store.read_block(d)? else {
+            return Err(corrupt(format!("block {d} is not mapped")));
+        };
+        if b.len() != self.geo.dirblksize {
+            return Err(corrupt(format!("block {d} read as {} bytes", b.len())));
+        }
+        self.cache.insert(d, b.clone());
+        Ok(b)
     }
 
-    /// Descend from the root to the leaf that would hold `hash`: the node
-    /// dablks passed (root first) and the leaf.
-    fn lookup_path(&mut self, hash: u32) -> Result<(Vec<u64>, u64), FilesystemError> {
-        let mut path = Vec::new();
-        let mut dablk = self.geo.leaf_off;
-        loop {
-            let b = self.block(dablk)?;
-            let h = da_read_hdr(&self.geo, &b);
-            if is_node_magic(h.magic) {
-                if h.count == 0 || path.len() > 8 {
-                    return Err(FilesystemError::Parse(
-                        "directory da btree node is empty or too deep".into(),
-                    ));
-                }
-                path.push(dablk);
-                let i = node_child_for(&self.geo, &b, hash);
-                dablk = u64::from(da_ent(&self.geo, &b, i).1);
-            } else if is_leaf1_magic(h.magic) || is_leafn_magic(h.magic) {
-                return Ok((path, dablk));
-            } else {
-                return Err(FilesystemError::Parse(format!(
-                    "directory block {dablk} has magic {:#06x}, not a leaf or node",
-                    h.magic
-                )));
-            }
+    /// A data block, checked for this volume's data magic.
+    fn get_data(&mut self, d: u64) -> Result<Vec<u8>, FilesystemError> {
+        let b = self.get(d)?;
+        let want = if self.geo.is_v5 {
+            XFS_DIR3_DATA_MAGIC
+        } else {
+            XFS_DIR2_DATA_MAGIC
+        };
+        if BigEndian::read_u32(&b[0..4]) != want {
+            return Err(corrupt(format!("data block {d} has a bad magic")));
+        }
+        Ok(b)
+    }
+
+    /// A hash tree block, checked for a tree magic of this volume's version.
+    fn get_tree(&mut self, d: u64) -> Result<Vec<u8>, FilesystemError> {
+        let b = self.get(d)?;
+        if !tree_magic_ok(&self.geo, da_read_hdr(&self.geo, &b).magic) {
+            return Err(corrupt(format!("hash tree block {d} has a bad magic")));
+        }
+        Ok(b)
+    }
+
+    fn put(&mut self, d: u64, b: Vec<u8>) {
+        self.cache.insert(d, b);
+        self.dirty.insert(d);
+    }
+
+    /// Map block `d` with content `b` (re-using it when freed earlier in this op).
+    fn create(&mut self, d: u64, b: Vec<u8>) {
+        if !self.freed.remove(&d) {
+            self.created.insert(d);
+        }
+        self.put(d, b);
+    }
+
+    fn free(&mut self, d: u64) {
+        self.cache.remove(&d);
+        self.dirty.remove(&d);
+        if !self.created.remove(&d) {
+            self.freed.insert(d);
         }
     }
 
-    /// The leaf, slot and dataptr of `name`, searching from `leaf` across
-    /// siblings that continue the same hash.
-    fn find_entry(
-        &mut self,
-        leaf: u64,
-        hash: u32,
-        name: &[u8],
-    ) -> Result<Option<(u64, usize, u32)>, FilesystemError> {
+    // ---- lookup ----
+
+    /// Root-to-leaf path for `hash`: in a node, the first entry whose hash is
+    /// not below it (else the last); in the leaf, the first such slot.
+    fn descend(&mut self, hash: u32) -> Result<Chain, FilesystemError> {
         let geo = self.geo;
-        let mut dablk = leaf;
+        let mut chain = Chain::new();
+        let mut d = geo.leaf_off;
+        let mut level: Option<u16> = None;
         loop {
-            let b = self.block(dablk)?;
-            let h = da_read_hdr(&geo, &b);
-            let mut i = da_lower_bound(&geo, &b, hash);
-            while i < h.count as usize {
-                let (eh, addr) = da_ent(&geo, &b, i);
-                if eh != hash {
-                    return Ok(None);
+            if chain.len() >= MAX_TREE_DEPTH || !geo.is_leaf_space(d) {
+                return Err(corrupt(format!("hash tree walk reached block {d}")));
+            }
+            let blk = self.get_tree(d)?;
+            let h = da_read_hdr(&geo, &blk);
+            let ents = da_ents(&geo, &blk);
+            if !is_node_magic(h.magic) {
+                let misplaced = !chain.is_empty() && !is_leafn_magic(h.magic);
+                if misplaced || level.is_some_and(|l| l != 1) {
+                    return Err(corrupt(format!(
+                        "block {d} is not a leaf where one belongs"
+                    )));
                 }
-                if addr != NULL_DATAPTR {
-                    let data = self.block(geo.data_dablk(geo.dataptr_db(addr)))?;
-                    let (_, n, _, _) = data_get_entry(&geo, &data, geo.dataptr_off(addr))?;
-                    if n == name {
-                        return Ok(Some((dablk, i, addr)));
+                chain.push((d, ents.partition_point(|e| e.0 < hash)));
+                return Ok(chain);
+            }
+            if ents.is_empty() || level.is_some_and(|l| h.aux.checked_add(1) != Some(l)) {
+                return Err(corrupt(format!("node {d} is empty or out of level")));
+            }
+            let i = ents
+                .iter()
+                .position(|e| e.0 >= hash)
+                .unwrap_or(ents.len() - 1);
+            chain.push((d, i));
+            level = Some(h.aux);
+            d = u64::from(ents[i].1);
+        }
+    }
+
+    /// Move `chain` to the next leaf in hash order; false after the last.
+    fn advance(&mut self, chain: &mut Chain) -> Result<bool, FilesystemError> {
+        let geo = self.geo;
+        for k in (0..chain.len().saturating_sub(1)).rev() {
+            let ents = da_ents(&geo, &self.get_tree(chain[k].0)?);
+            if chain[k].1 + 1 >= ents.len() {
+                continue;
+            }
+            chain[k].1 += 1;
+            let mut child = u64::from(ents[chain[k].1].1);
+            for j in k + 1..chain.len() {
+                chain[j] = (child, 0);
+                if j + 1 < chain.len() {
+                    let below = da_ents(&geo, &self.get_tree(child)?);
+                    let Some(first) = below.first() else {
+                        return Err(corrupt(format!("node {child} is empty")));
+                    };
+                    child = u64::from(first.1);
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Path to the leaf slot naming `name`, following equal hashes across leaves.
+    fn find(&mut self, name: &[u8]) -> Result<Option<Chain>, FilesystemError> {
+        let geo = self.geo;
+        let hash = dir_hashname(name);
+        let mut chain = self.descend(hash)?;
+        loop {
+            let (leaf, start) = *chain.last().expect("chain has a leaf");
+            let ents = da_ents(&geo, &self.get_tree(leaf)?);
+            let mut i = start;
+            while i < ents.len() && ents[i].0 == hash {
+                if ents[i].1 != NULL_DATAPTR {
+                    let (db, off) = geo.split_dataptr(ents[i].1);
+                    let data = self.get_data(geo.data_dablk(db))?;
+                    if data_get_entry(&geo, &data, off)?.1 == name {
+                        chain.last_mut().expect("leaf").1 = i;
+                        return Ok(Some(chain));
                     }
                 }
                 i += 1;
             }
-            if h.forw == 0 {
+            if i < ents.len() || !self.advance(&mut chain)? {
                 return Ok(None);
             }
-            dablk = u64::from(h.forw);
         }
     }
 
-    /// Whether `name` is present (a cheap duplicate check for preflight).
-    pub fn contains(&mut self, name: &[u8]) -> Result<bool, FilesystemError> {
-        let hash = dir_hashname(name);
-        let (_, leaf) = self.lookup_path(hash)?;
-        Ok(self.find_entry(leaf, hash, name)?.is_some())
-    }
+    // ---- insert ----
 
-    /// Insert `name -> ino`; `Fallback` when a leaf1 index is full.
-    pub fn insert(&mut self, name: &[u8], ino: u64, ft: u8) -> Result<Outcome, FilesystemError> {
+    /// Leaf form: room in the leaf1 for one more entry (and a best when a data block is added), or Fallback.
+    fn insert_leaf1(
+        &mut self,
+        mut leaf: Vec<u8>,
+        name: &[u8],
+        ino: u64,
+        ft: u8,
+    ) -> Result<Outcome, FilesystemError> {
         let geo = self.geo;
-        let hash = dir_hashname(name);
         let need = dir2_data_entsize(name.len(), geo.has_ftype);
-        let is_leaf1 = is_leaf1_magic(self.magic(geo.leaf_off)?);
-        let (path, leaf) = self.lookup_path(hash)?;
-        if self.find_entry(leaf, hash, name)?.is_some() {
-            return Err(FilesystemError::AlreadyExists(
-                String::from_utf8_lossy(name).into_owned(),
-            ));
-        }
-        let Some(db) = self.pick_data_block(is_leaf1, need, ino)? else {
-            return Ok(Outcome::Fallback);
+        let mut ents = da_ents(&geo, &leaf);
+        let mut bests = leaf1_bests(&leaf);
+        let fits = bests
+            .iter()
+            .position(|&b| b != NULLDATAOFF && b as usize >= need);
+        let (db, fresh) = match fits {
+            Some(i) => (i, false),
+            None => {
+                let hole = (0..bests.len())
+                    .find(|&i| bests[i] == NULLDATAOFF && !self.mapped(geo.data_dablk(i as u64)));
+                (hole.unwrap_or(bests.len()), true)
+            }
         };
-        let mut data = self.block(geo.data_dablk(db))?;
-        let Some(off) = data_take(&geo, &mut data, need) else {
-            return Err(FilesystemError::Parse(format!(
-                "directory data block {db} promised {need} bytes it does not have"
-            )));
+        let nbests = bests.len().max(db + 1);
+        let room = geo.dirblksize.saturating_sub(geo.da_hdr() + 4 + 2 * nbests) / 8;
+        let stale = ents.iter().filter(|e| e.1 == NULL_DATAPTR).count();
+        let after = if stale > 0 {
+            ents.len()
+        } else {
+            ents.len() + 1
         };
-        data_put_entry(&geo, &mut data, off, ino, name, ft);
-        data_freescan(&geo, &mut data)?;
-        let best = data_best(&geo, &data);
-        self.put(geo.data_dablk(db), data);
-        self.set_best(is_leaf1, db, best)?;
-        self.size = self.size.max((db + 1) * geo.dirblksize as u64);
-        let addr = geo.dataptr(db, off);
-        let mut lb = self.block(leaf)?;
-        if leaf_insert(&geo, &mut lb, hash, addr) {
-            self.put(leaf, lb);
-            self.fix_key(&path, leaf)?;
-            return Ok(Outcome::Done { shrink: false });
+        if after > room {
+            if ents.len() - stale + 1 > room {
+                return Ok(Outcome::Fallback);
+            }
+            ents.retain(|e| e.1 != NULL_DATAPTR);
         }
-        if is_leaf1 {
-            return Ok(Outcome::Fallback);
+        let (addr, best) = self.place_in_data(db as u64, fresh, name, ino, ft)?;
+        if db == bests.len() {
+            bests.push(best);
+        } else {
+            bests[db] = best;
         }
-        self.split_leaf_insert(path, leaf, hash, addr)?;
+        add_leaf_entry(&mut ents, dir_hashname(name), addr);
+        leaf1_write(&geo, &mut leaf, &ents, &bests);
+        self.put(geo.leaf_off, leaf);
         Ok(Outcome::Done { shrink: false })
     }
 
-    /// The data block for a `need`-byte entry, created (with a freeindex
-    /// block) when none has room; `None` when leaf1's bests table cannot grow.
-    fn pick_data_block(
+    /// Node form: data block from the freeindex, then the leaf, splitting upward as needed.
+    fn insert_node(&mut self, name: &[u8], ino: u64, ft: u8) -> Result<Outcome, FilesystemError> {
+        let geo = self.geo;
+        let need = dir2_data_entsize(name.len(), geo.has_ftype);
+        let (db, fresh) = self.pick_data_block(need)?;
+        let (addr, best) = self.place_in_data(db, fresh, name, ino, ft)?;
+        self.set_free_best(db, best)?;
+        let hash = dir_hashname(name);
+        let mut chain = self.descend(hash)?;
+        let k = chain.len() - 1;
+        let mut ents = da_ents(&geo, &self.get_tree(chain[k].0)?);
+        add_leaf_entry(&mut ents, hash, addr);
+        self.put_ents(&mut chain, k, ents)?;
+        Ok(Outcome::Done { shrink: false })
+    }
+
+    /// Write the entry into data block `db` (made when `fresh`): its address and new best.
+    fn place_in_data(
         &mut self,
-        is_leaf1: bool,
-        need: usize,
-        self_ino: u64,
-    ) -> Result<Option<u64>, FilesystemError> {
+        db: u64,
+        fresh: bool,
+        name: &[u8],
+        ino: u64,
+        ft: u8,
+    ) -> Result<(u32, u16), FilesystemError> {
         let geo = self.geo;
-        let db = if is_leaf1 {
-            let root = self.block(geo.leaf_off)?;
-            let n = leaf1_bestcount(&root);
-            let bests: Vec<u16> = (0..n).map(|i| leaf1_best(&root, i)).collect();
-            match bests
-                .iter()
-                .position(|&b| b != NULLDATAOFF && usize::from(b) >= need)
-            {
-                Some(i) => return Ok(Some(i as u64)),
-                None => {
-                    let db = bests.iter().position(|&b| b == NULLDATAOFF).unwrap_or(n);
-                    if db == n {
-                        let mut root = root;
-                        leaf1_set_bestcount(&mut root, n + 1);
-                        if da_read_hdr(&geo, &root).count as usize > leaf_capacity(&geo, &root) {
-                            return Ok(None);
-                        }
-                        self.put(geo.leaf_off, root);
-                    }
-                    db as u64
-                }
-            }
-        } else {
-            let mut fdb = 0u64;
-            let mut found = None;
-            while self.is_mapped(geo.free_dablk(fdb)) {
-                let fb = self.block(geo.free_dablk(fdb))?;
-                let (firstdb, nvalid, _) = free_read_hdr(&geo, &fb);
-                for i in 0..nvalid as usize {
-                    let b = free_best(&geo, &fb, i);
-                    if b != NULLDATAOFF && usize::from(b) >= need {
-                        found = Some(u64::from(firstdb) + i as u64);
-                        break;
-                    }
-                }
-                if found.is_some() {
-                    break;
-                }
-                fdb += 1;
-            }
-            match found {
-                Some(db) => return Ok(Some(db)),
-                None => {
-                    let dablk = self.first_hole(0, geo.leaf_off)?;
-                    let db = dablk / geo.bpd;
-                    let fdb = db / geo.free_max_bests() as u64;
-                    if !self.is_mapped(geo.free_dablk(fdb)) {
-                        let mut fb = build_free_block(&[], geo.dirblksize, geo.is_v5)?;
-                        free_write_hdr(
-                            &geo,
-                            &mut fb,
-                            (fdb * geo.free_max_bests() as u64) as u32,
-                            0,
-                            0,
-                        );
-                        self.create(geo.free_dablk(fdb), fb);
-                    }
-                    db
-                }
-            }
-        };
-        let built = build_leaf_data_block(
-            &[],
-            self_ino,
-            0,
-            db,
-            geo.dirblksize,
-            geo.has_ftype,
-            false,
-            geo.is_v5,
-        )?;
-        self.create(geo.data_dablk(db), built.bytes);
-        Ok(Some(db))
-    }
-
-    /// Record data block `db`'s largest free length in the leaf1 tail or
-    /// its freeindex block.
-    fn set_best(&mut self, is_leaf1: bool, db: u64, best: u16) -> Result<(), FilesystemError> {
-        let geo = self.geo;
-        if is_leaf1 {
-            let mut root = self.block(geo.leaf_off)?;
-            leaf1_put_best(&mut root, db as usize, best);
-            self.put(geo.leaf_off, root);
-        } else {
-            let fdb = db / geo.free_max_bests() as u64;
-            let mut fb = self.block(geo.free_dablk(fdb))?;
-            free_put_best(
-                &geo,
-                &mut fb,
-                (db % geo.free_max_bests() as u64) as usize,
-                best,
-            );
-            self.put(geo.free_dablk(fdb), fb);
-        }
-        Ok(())
-    }
-
-    /// Re-key `child` in its ancestors after its last hash changed.
-    fn fix_key(&mut self, path: &[u64], child: u64) -> Result<(), FilesystemError> {
-        let geo = self.geo;
-        let mut child = child;
-        for &parent in path.iter().rev() {
-            let last = self.last_hash(child)?;
-            let mut p = self.block(parent)?;
-            let Some(idx) = node_find_child(&geo, &p, child) else {
-                return Err(FilesystemError::Parse(format!(
-                    "directory node {parent} does not point at block {child}"
-                )));
-            };
-            let count = da_read_hdr(&geo, &p).count as usize;
-            if da_ent(&geo, &p, idx).0 == last {
-                break;
-            }
-            da_put_ent(&geo, &mut p, idx, last, child as u32);
-            self.put(parent, p);
-            if idx + 1 != count {
-                break;
-            }
-            child = parent;
-        }
-        Ok(())
-    }
-
-    /// Move the root's contents to a fresh block and make the root a node
-    /// one level up with that single child (`xfs_da3_root_split`).
-    fn push_down_root(&mut self) -> Result<u64, FilesystemError> {
-        let geo = self.geo;
-        let root = self.block(geo.leaf_off)?;
-        let h = da_read_hdr(&geo, &root);
-        let level = if is_node_magic(h.magic) { h.aux } else { 0 };
-        let child = self.first_hole(geo.leaf_off + geo.bpd, geo.free_off)?;
-        let last = da_last_hash(&geo, &root);
-        self.create(child, root);
-        let mut newroot = build_da_node_block(&[(last, child as u32)], geo.dirblksize, geo.is_v5);
-        let mut nh = da_read_hdr(&geo, &newroot);
-        nh.aux = level + 1;
-        da_write_hdr(&geo, &mut newroot, &nh);
-        self.put(geo.leaf_off, newroot);
-        Ok(child)
-    }
-
-    /// Split the full leafN `leaf` (ancestors in `path`) and add `(hash, addr)`.
-    fn split_leaf_insert(
-        &mut self,
-        mut path: Vec<u64>,
-        mut leaf: u64,
-        hash: u32,
-        addr: u32,
-    ) -> Result<(), FilesystemError> {
-        let geo = self.geo;
-        if path.is_empty() {
-            leaf = self.push_down_root()?;
-            path.push(geo.leaf_off);
-        }
-        let mut old = self.block(leaf)?;
-        leaf_compact(&geo, &mut old);
-        let ents = da_ents(&geo, &old);
-        if ents.len() < geo.da_max_ents() {
-            // Compaction made room after all.
-            leaf_insert(&geo, &mut old, hash, addr);
-            self.put(leaf, old);
-            return self.fix_key(&path, leaf);
-        }
-        let new_dablk = self.first_hole(geo.leaf_off + geo.bpd, geo.free_off)?;
-        let mid = ents.len() / 2;
-        let old_h = da_read_hdr(&geo, &old);
-        let mut new = build_leafn_block(
-            &ents[mid..],
-            old_h.forw,
-            leaf as u32,
-            geo.dirblksize,
-            geo.is_v5,
-        );
-        let end = geo.da_hdr() + geo.da_max_ents() * 8;
-        da_set_ents(&geo, &mut old, &ents[..mid], end);
-        let mut oh = da_read_hdr(&geo, &old);
-        oh.forw = new_dablk as u32;
-        da_write_hdr(&geo, &mut old, &oh);
-        if old_h.forw != 0 {
-            let mut next = self.block(u64::from(old_h.forw))?;
-            let mut nh = da_read_hdr(&geo, &next);
-            nh.back = new_dablk as u32;
-            da_write_hdr(&geo, &mut next, &nh);
-            self.put(u64::from(old_h.forw), next);
-        }
-        if hash < ents[mid].0 {
-            leaf_insert(&geo, &mut old, hash, addr);
-        } else {
-            leaf_insert(&geo, &mut new, hash, addr);
-        }
-        self.put(leaf, old);
-        self.create(new_dablk, new);
-        self.insert_into_parent(&path, leaf, new_dablk)
-    }
-
-    /// Key `new_child` into the parent of `child` (splitting upward as needed).
-    fn insert_into_parent(
-        &mut self,
-        path: &[u64],
-        child: u64,
-        new_child: u64,
-    ) -> Result<(), FilesystemError> {
-        let geo = self.geo;
-        let Some((&parent, above)) = path.split_last() else {
-            return Err(FilesystemError::Parse(
-                "directory split reached above the root".into(),
+        let dd = geo.data_dablk(db);
+        if dd >= geo.leaf_off {
+            return Err(FilesystemError::DiskFull(
+                "directory data space is full".into(),
             ));
+        }
+        let mut data = if fresh {
+            build_leaf_data_block(
+                &[],
+                0,
+                0,
+                db,
+                geo.dirblksize,
+                geo.has_ftype,
+                false,
+                geo.is_v5,
+            )?
+            .bytes
+        } else {
+            self.get_data(dd)?
         };
-        let child_last = self.last_hash(child)?;
-        let new_last = self.last_hash(new_child)?;
-        let mut p = self.block(parent)?;
-        let Some(idx) = node_find_child(&geo, &p, child) else {
-            return Err(FilesystemError::Parse(format!(
-                "directory node {parent} does not point at block {child}"
+        let Some(off) = data_place(&geo, &mut data, name, ino, ft)? else {
+            return Err(corrupt(format!(
+                "data block {db} lacks the room its best claims"
             )));
         };
-        da_put_ent(&geo, &mut p, idx, child_last, child as u32);
-        if node_insert(&geo, &mut p, idx + 1, new_last, new_child as u32) {
-            self.put(parent, p);
-            return self.fix_key(above, parent);
+        let best = data_best(&geo, &data);
+        if fresh {
+            self.create(dd, data);
+        } else {
+            self.put(dd, data);
         }
-        self.put(parent, p);
-        if above.is_empty() {
-            let copy = self.push_down_root()?;
-            return self.split_node_insert(&[geo.leaf_off], copy, idx + 1, new_last, new_child);
-        }
-        self.split_node_insert(above, parent, idx + 1, new_last, new_child)
+        self.size = self.size.max((db + 1) * geo.dirblksize as u64);
+        Ok((geo.dataptr(db, off), best))
     }
 
-    /// Split the full node `node` and add `(hash, before)` at slot `at`.
-    fn split_node_insert(
+    /// Data blocks the directory spans: from `di_size`, extended over any mapped block past it.
+    fn data_top(&self) -> u64 {
+        let mut n = self.size / self.geo.dirblksize as u64;
+        while self.geo.data_dablk(n) < self.geo.leaf_off && self.mapped(self.geo.data_dablk(n)) {
+            n += 1;
+        }
+        n
+    }
+
+    /// After freeing data blocks, end `di_size` at the last one still mapped.
+    fn trim_size(&mut self) {
+        let mut n = self.data_top();
+        while n > 0 && !self.mapped(self.geo.data_dablk(n - 1)) {
+            n -= 1;
+        }
+        self.size = n * self.geo.dirblksize as u64;
+    }
+
+    /// Node form: the first data block whose best admits `need`, else a hole, else a new last block.
+    fn pick_data_block(&mut self, need: usize) -> Result<(u64, bool), FilesystemError> {
+        let geo = self.geo;
+        let top = self.data_top();
+        let max = geo.free_max_bests() as u64;
+        let mut hole = None;
+        for fdb in 0..top.div_ceil(max).max(1) {
+            let d = geo.free_dablk(fdb);
+            if !self.mapped(d) {
+                continue;
+            }
+            let fb = self.get(d)?;
+            let (firstdb, nvalid, _) = free_read_hdr(&geo, &fb);
+            for i in 0..(nvalid as usize).min(geo.free_max_bests()) {
+                let b = free_best(&geo, &fb, i);
+                let db = u64::from(firstdb) + i as u64;
+                if b == NULLDATAOFF {
+                    if hole.is_none() && !self.mapped(geo.data_dablk(db)) {
+                        hole = Some(db);
+                    }
+                } else if b as usize >= need {
+                    return Ok((db, false));
+                }
+            }
+        }
+        Ok((hole.unwrap_or(top), true))
+    }
+
+    /// Record data block `db`'s best in its freeindex block (made when missing),
+    /// keeping `nused` and `nvalid`; an emptied block past the first is freed.
+    fn set_free_best(&mut self, db: u64, best: u16) -> Result<(), FilesystemError> {
+        let geo = self.geo;
+        let max = geo.free_max_bests() as u64;
+        let (fdb, i) = (db / max, (db % max) as usize);
+        let d = geo.free_dablk(fdb);
+        let (mut fb, existed) = if self.mapped(d) {
+            (self.get(d)?, true)
+        } else {
+            let mut b = build_free_block(&[], geo.dirblksize, geo.is_v5)?;
+            free_write_hdr(&geo, &mut b, (fdb * max) as u32, 0, 0);
+            (b, false)
+        };
+        let (firstdb, mut nvalid, mut nused) = free_read_hdr(&geo, &fb);
+        if u64::from(firstdb) != fdb * max {
+            return Err(corrupt(format!(
+                "freeindex block {fdb} has firstdb {firstdb}"
+            )));
+        }
+        while (nvalid as usize) <= i {
+            free_set_best(&geo, &mut fb, nvalid as usize, NULLDATAOFF);
+            nvalid += 1;
+        }
+        let prev = free_best(&geo, &fb, i);
+        if prev == NULLDATAOFF && best != NULLDATAOFF {
+            nused += 1;
+        } else if prev != NULLDATAOFF && best == NULLDATAOFF {
+            nused = nused.saturating_sub(1);
+        }
+        free_set_best(&geo, &mut fb, i, best);
+        while nvalid > 0 && free_best(&geo, &fb, nvalid as usize - 1) == NULLDATAOFF {
+            nvalid -= 1;
+            free_set_best(&geo, &mut fb, nvalid as usize, 0);
+        }
+        free_write_hdr(&geo, &mut fb, firstdb, nvalid, nused);
+        if nvalid == 0 && fdb > 0 {
+            if existed {
+                self.free(d);
+            }
+        } else if existed {
+            self.put(d, fb);
+        } else {
+            self.create(d, fb);
+        }
+        Ok(())
+    }
+
+    /// Lowest unmapped block of the hash index past the root.
+    fn alloc_tree_dablk(&self) -> Result<u64, FilesystemError> {
+        let mut d = self.geo.leaf_off + self.geo.bpd;
+        while self.mapped(d) {
+            d += self.geo.bpd;
+        }
+        if d >= self.geo.free_off || d > u64::from(u32::MAX) {
+            return Err(FilesystemError::DiskFull(
+                "directory hash index space is full".into(),
+            ));
+        }
+        Ok(d)
+    }
+
+    /// Store `ents` in `chain[k]`, splitting it (and its parents) when they
+    /// overflow, then bring the keys above it up to date.
+    fn put_ents(
         &mut self,
-        above: &[u64],
-        node: u64,
-        at: usize,
-        hash: u32,
-        before: u64,
+        chain: &mut Chain,
+        k: usize,
+        ents: Vec<(u32, u32)>,
     ) -> Result<(), FilesystemError> {
         let geo = self.geo;
-        let mut old = self.block(node)?;
-        let ents = da_ents(&geo, &old);
-        let oh = da_read_hdr(&geo, &old);
-        let mid = ents.len() / 2;
-        let new_dablk = self.first_hole(geo.leaf_off + geo.bpd, geo.free_off)?;
-        let mut new = build_da_node_block(&ents[mid..], geo.dirblksize, geo.is_v5);
-        let mut nh = da_read_hdr(&geo, &new);
-        nh.aux = oh.aux;
-        nh.forw = oh.forw;
-        nh.back = node as u32;
-        da_write_hdr(&geo, &mut new, &nh);
-        let end = geo.da_hdr() + geo.da_max_ents() * 8;
-        da_set_ents(&geo, &mut old, &ents[..mid], end);
-        let mut oh2 = da_read_hdr(&geo, &old);
-        oh2.forw = new_dablk as u32;
-        da_write_hdr(&geo, &mut old, &oh2);
-        if oh.forw != 0 {
-            let mut next = self.block(u64::from(oh.forw))?;
-            let mut h = da_read_hdr(&geo, &next);
-            h.back = new_dablk as u32;
-            da_write_hdr(&geo, &mut next, &h);
-            self.put(u64::from(oh.forw), next);
-        }
-        if at <= mid {
-            node_insert(&geo, &mut old, at, hash, before as u32);
-        } else {
-            node_insert(&geo, &mut new, at - mid, hash, before as u32);
-        }
-        self.put(node, old);
-        self.create(new_dablk, new);
-        self.insert_into_parent(above, node, new_dablk)
-    }
-
-    /// Remove `name`; `NotFound` when absent.
-    pub fn remove(&mut self, name: &[u8]) -> Result<Outcome, FilesystemError> {
-        let geo = self.geo;
-        let hash = dir_hashname(name);
-        let is_leaf1 = is_leaf1_magic(self.magic(geo.leaf_off)?);
-        let (_, leaf0) = self.lookup_path(hash)?;
-        let Some((leaf, idx, addr)) = self.find_entry(leaf0, hash, name)? else {
-            return Err(FilesystemError::NotFound(
-                String::from_utf8_lossy(name).into_owned(),
-            ));
-        };
-        let db = geo.dataptr_db(addr);
-        let off = geo.dataptr_off(addr);
-        let mut data = self.block(geo.data_dablk(db))?;
-        let (_, _, _, ent) = data_get_entry(&geo, &data, off)?;
-        let empty = data_make_free(&geo, &mut data, off, ent)?;
-        let best = data_best(&geo, &data);
-        let mut lb = self.block(leaf)?;
-        leaf_mark_stale(&geo, &mut lb, idx);
-        self.put(leaf, lb);
-        if empty && db != 0 {
-            self.free(geo.data_dablk(db));
-            self.set_best(is_leaf1, db, NULLDATAOFF)?;
-            if is_leaf1 {
-                let mut root = self.block(geo.leaf_off)?;
-                let mut n = leaf1_bestcount(&root);
-                while n > 0 && leaf1_best(&root, n - 1) == NULLDATAOFF {
-                    n -= 1;
-                }
-                leaf1_set_bestcount(&mut root, n);
-                self.put(geo.leaf_off, root);
+        let d = chain[k].0;
+        let mut blk = self.get_tree(d)?;
+        let h = da_read_hdr(&geo, &blk);
+        if ents.len() <= leaf_capacity(&geo, &blk) {
+            if is_leaf1_magic(h.magic) {
+                let bests = leaf1_bests(&blk);
+                leaf1_write(&geo, &mut blk, &ents, &bests);
             } else {
-                let fdb = db / geo.free_max_bests() as u64;
-                let fb = self.block(geo.free_dablk(fdb))?;
-                if free_read_hdr(&geo, &fb).2 == 0 {
-                    self.free(geo.free_dablk(fdb));
-                }
+                da_set_ents(&geo, &mut blk, &ents, geo.dirblksize);
             }
-            // di_size reaches the last mapped data block (holes may remain).
-            let old_blocks = self.size / geo.dirblksize as u64;
-            let last = (0..old_blocks)
-                .rev()
-                .find(|&i| self.is_mapped(geo.data_dablk(i)))
-                .map_or(0, |i| i + 1);
-            self.size = last * geo.dirblksize as u64;
-        } else {
-            self.put(geo.data_dablk(db), data);
-            self.set_best(is_leaf1, db, best)?;
+            self.put(d, blk);
+            return self.fix_keys(chain, k);
         }
-        if is_leaf1 {
-            let root = self.block(geo.leaf_off)?;
-            let live_blocks = (0..leaf1_bestcount(&root))
-                .filter(|&i| leaf1_best(&root, i) != NULLDATAOFF)
-                .count();
-            return Ok(Outcome::Done {
-                shrink: live_blocks <= 1,
-            });
+        if is_leaf1_magic(h.magic) {
+            return Err(corrupt("leaf1 block overflowed"));
         }
-        let lb = self.block(leaf)?;
-        if leaf_live(&geo, &lb) == 0 && leaf != geo.leaf_off {
-            self.remove_leaf(leaf)?;
+        if k == 0 {
+            // Root full: move its content to a new child so the split has a parent.
+            let child = self.alloc_tree_dablk()?;
+            let level = if is_node_magic(h.magic) { h.aux + 1 } else { 1 };
+            let mut root = new_da_block(&geo, geo.node_magic(), level);
+            da_set_ents(
+                &geo,
+                &mut root,
+                &[(da_last_hash(&geo, &blk), child as u32)],
+                geo.dirblksize,
+            );
+            self.create(child, blk);
+            self.put(d, root);
+            let slot = chain[0].1;
+            chain[0].1 = 0;
+            chain.insert(1, (child, slot));
+            return self.put_ents(chain, 1, ents);
         }
-        // A lone leafN root whose live entries and bests fit a leaf1 block
-        // can go back to leaf form (`xfs_dir2_node_to_leaf`).
-        let root = self.block(geo.leaf_off)?;
-        let shrink = is_leafn_magic(da_read_hdr(&geo, &root).magic) && {
-            let mut nvalid = 0usize;
-            let mut fdb = 0u64;
-            while self.is_mapped(geo.free_dablk(fdb)) {
-                let fb = self.block(geo.free_dablk(fdb))?;
-                let (firstdb, nv, _) = free_read_hdr(&geo, &fb);
-                nvalid = nvalid.max((firstdb + nv) as usize);
-                fdb += 1;
-            }
-            geo.da_hdr() + leaf_live(&geo, &root) * 8 + nvalid * 2 + 4 <= geo.dirblksize
-        };
-        Ok(Outcome::Done { shrink })
+        let mid = ents.len() / 2;
+        let (left, right) = ents.split_at(mid);
+        let sib = self.alloc_tree_dablk()?;
+        let level = if is_node_magic(h.magic) { h.aux } else { 0 };
+        let mut nb = new_da_block(&geo, h.magic, level);
+        da_set_ents(&geo, &mut nb, right, geo.dirblksize);
+        set_forw(&mut nb, h.forw);
+        set_back(&mut nb, d as u32);
+        da_set_ents(&geo, &mut blk, left, geo.dirblksize);
+        set_forw(&mut blk, sib as u32);
+        self.put(d, blk);
+        self.create(sib, nb);
+        if h.forw != 0 {
+            let mut next = self.get_tree(u64::from(h.forw))?;
+            set_back(&mut next, sib as u32);
+            self.put(u64::from(h.forw), next);
+        }
+        let (p, pi) = chain[k - 1];
+        let mut pents = da_ents(&geo, &self.get_tree(p)?);
+        pents[pi].0 = left.last().expect("left half").0;
+        pents.insert(pi + 1, (right.last().expect("right half").0, sib as u32));
+        chain.truncate(k);
+        self.put_ents(chain, k - 1, pents)
     }
 
-    /// Unlink and free a leaf with no live entries, then thin its ancestors.
-    fn remove_leaf(&mut self, leaf: u64) -> Result<(), FilesystemError> {
+    /// Re-key each parent from `chain[k]` up while its child's last hash changed.
+    fn fix_keys(&mut self, chain: &Chain, k: usize) -> Result<(), FilesystemError> {
         let geo = self.geo;
-        let lb = self.block(leaf)?;
-        let path = self.path_to(leaf, da_last_hash(&geo, &lb))?;
-        let Some(path) = path else {
-            return Ok(()); // ambiguous hashes: leave the empty leaf in place
-        };
-        self.unlink_and_free(leaf)?;
-        self.remove_from_parent(&path, leaf)
-    }
-
-    /// The ancestors of `dablk`, found by descending with `hash`; `None`
-    /// when the descent lands elsewhere.
-    fn path_to(&mut self, dablk: u64, hash: u32) -> Result<Option<Vec<u64>>, FilesystemError> {
-        let (path, leaf) = self.lookup_path(hash)?;
-        if leaf == dablk {
-            return Ok(Some(path));
-        }
-        // Equal hashes may continue in the next siblings.
-        let geo = self.geo;
-        let mut cur = leaf;
-        for _ in 0..8 {
-            let b = self.block(cur)?;
-            let h = da_read_hdr(&geo, &b);
-            if h.forw == 0 {
+        for j in (1..=k).rev() {
+            let last = da_last_hash(&geo, &self.get_tree(chain[j].0)?);
+            let (p, pi) = chain[j - 1];
+            let mut pblk = self.get_tree(p)?;
+            let o = geo.da_hdr() + pi * 8;
+            if BigEndian::read_u32(&pblk[o..o + 4]) == last {
                 break;
             }
-            cur = u64::from(h.forw);
-            if cur == dablk {
-                let cb = self.block(cur)?;
-                let last = da_last_hash(&geo, &cb);
-                let (p2, l2) = self.lookup_path(last)?;
-                if l2 == dablk {
-                    return Ok(Some(p2));
-                }
-                break;
-            }
+            BigEndian::write_u32(&mut pblk[o..o + 4], last);
+            self.put(p, pblk);
         }
-        Ok(None)
+        Ok(())
     }
 
-    fn unlink_and_free(&mut self, dablk: u64) -> Result<(), FilesystemError> {
+    // ---- remove ----
+
+    /// A dead leaf may go unless that would leave the root without children.
+    fn can_unhook(&mut self, chain: &Chain) -> Result<bool, FilesystemError> {
+        for k in (0..chain.len().saturating_sub(1)).rev() {
+            let geo = self.geo;
+            if da_read_hdr(&geo, &self.get_tree(chain[k].0)?).count > 1 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Unlink `chain[k]` from its siblings, free it, and drop its parent entry
+    /// (the parent too, when that leaves it empty).
+    fn unhook(&mut self, chain: &mut Chain, k: usize) -> Result<(), FilesystemError> {
         let geo = self.geo;
-        let b = self.block(dablk)?;
-        let h = da_read_hdr(&geo, &b);
+        let d = chain[k].0;
+        let h = da_read_hdr(&geo, &self.get_tree(d)?);
         if h.back != 0 {
-            let mut prev = self.block(u64::from(h.back))?;
-            let mut ph = da_read_hdr(&geo, &prev);
-            ph.forw = h.forw;
-            da_write_hdr(&geo, &mut prev, &ph);
+            let mut prev = self.get_tree(u64::from(h.back))?;
+            set_forw(&mut prev, h.forw);
             self.put(u64::from(h.back), prev);
         }
         if h.forw != 0 {
-            let mut next = self.block(u64::from(h.forw))?;
-            let mut nh = da_read_hdr(&geo, &next);
-            nh.back = h.back;
-            da_write_hdr(&geo, &mut next, &nh);
+            let mut next = self.get_tree(u64::from(h.forw))?;
+            set_back(&mut next, h.back);
             self.put(u64::from(h.forw), next);
         }
-        self.free(dablk);
-        Ok(())
+        self.free(d);
+        let (p, pi) = chain[k - 1];
+        let mut pblk = self.get_tree(p)?;
+        let mut pents = da_ents(&geo, &pblk);
+        pents.remove(pi);
+        chain.truncate(k);
+        if pents.is_empty() && k > 1 {
+            return self.unhook(chain, k - 1);
+        }
+        da_set_ents(&geo, &mut pblk, &pents, geo.dirblksize);
+        self.put(p, pblk);
+        let last = chain.len() - 1;
+        chain[last].1 = pi.min(pents.len().saturating_sub(1));
+        self.fix_keys(chain, last)
     }
 
-    /// Drop `child` from the last node of `path`; an emptied node goes the
-    /// same way, and a root left with one child absorbs it.
-    fn remove_from_parent(&mut self, path: &[u64], child: u64) -> Result<(), FilesystemError> {
+    /// While the root is a node with one child, copy that child into the root.
+    fn collapse_root(&mut self) -> Result<(), FilesystemError> {
         let geo = self.geo;
-        let Some((&parent, above)) = path.split_last() else {
-            return Ok(());
-        };
-        let mut p = self.block(parent)?;
-        let Some(idx) = node_find_child(&geo, &p, child) else {
-            return Err(FilesystemError::Parse(format!(
-                "directory node {parent} does not point at block {child}"
-            )));
-        };
-        node_remove(&geo, &mut p, idx);
-        let count = da_read_hdr(&geo, &p).count as usize;
-        self.put(parent, p);
-        if count == 0 && parent != geo.leaf_off {
-            self.unlink_and_free(parent)?;
-            return self.remove_from_parent(above, parent);
-        }
-        if parent == geo.leaf_off {
-            // Root join: an only child's contents become the root, again
-            // while that child is itself a one-child node.
-            loop {
-                let r = self.block(geo.leaf_off)?;
-                let rh = da_read_hdr(&geo, &r);
-                if !is_node_magic(rh.magic) || rh.count != 1 {
-                    return Ok(());
-                }
-                let only = u64::from(da_ent(&geo, &r, 0).1);
-                let mut c = self.block(only)?;
-                let mut ch = da_read_hdr(&geo, &c);
-                ch.forw = 0;
-                ch.back = 0;
-                da_write_hdr(&geo, &mut c, &ch);
-                self.free(only);
-                self.put(geo.leaf_off, c);
+        loop {
+            let root = self.get_tree(geo.leaf_off)?;
+            let h = da_read_hdr(&geo, &root);
+            if !is_node_magic(h.magic) || h.count != 1 {
+                return Ok(());
             }
+            let child = u64::from(da_ents(&geo, &root)[0].1);
+            let mut cb = self.get_tree(child)?;
+            set_forw(&mut cb, 0);
+            set_back(&mut cb, 0);
+            self.free(child);
+            self.put(geo.leaf_off, cb);
         }
-        self.fix_key(above, parent)
     }
+
+    // ---- shrink checks ----
+
+    /// Leaf form: one data block left and its entries plus leaf fit a block-form directory.
+    fn leaf1_fits_block(
+        &mut self,
+        ents: &[(u32, u32)],
+        bests: &[u16],
+    ) -> Result<bool, FilesystemError> {
+        if bests.iter().filter(|&&b| b != NULLDATAOFF).count() != 1 {
+            return Ok(false);
+        }
+        let geo = self.geo;
+        let used = data_used(&geo, &self.get_data(0)?)?;
+        let live = ents.iter().filter(|e| e.1 != NULL_DATAPTR).count();
+        Ok(geo.data_hdr() + used + live * 8 + 8 <= geo.dirblksize)
+    }
+
+    /// Node form: a lone leafN whose live entries and bests fit one leaf1 block.
+    fn node_fits_leaf1(&mut self) -> Result<bool, FilesystemError> {
+        let geo = self.geo;
+        let root = self.get_tree(geo.leaf_off)?;
+        let h = da_read_hdr(&geo, &root);
+        if !is_leafn_magic(h.magic) || self.data_top() > geo.free_max_bests() as u64 {
+            return Ok(false);
+        }
+        let live = h.count.saturating_sub(h.aux) as usize;
+        if !self.mapped(geo.free_dablk(0)) {
+            return Ok(false);
+        }
+        let (_, _, nused) = free_read_hdr(&geo, &self.get(geo.free_dablk(0))?);
+        Ok(geo.da_hdr() + live * 8 + nused as usize * 2 + 4 <= geo.dirblksize)
+    }
+}
+
+/// Add `(hash, addr)` in hash order, taking the place of the stale entry nearest it when there is one.
+fn add_leaf_entry(ents: &mut Vec<(u32, u32)>, hash: u32, addr: u32) {
+    let pos = ents.partition_point(|e| e.0 <= hash);
+    let stale = ents
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.1 == NULL_DATAPTR)
+        .min_by_key(|(i, _)| i.abs_diff(pos))
+        .map(|(i, _)| i);
+    if let Some(s) = stale {
+        ents.remove(s);
+    }
+    let pos = ents.partition_point(|e| e.0 <= hash);
+    ents.insert(pos, (hash, addr));
 }
 
 #[cfg(test)]

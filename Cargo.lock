@@ -2608,13 +2608,13 @@ dependencies = [
 
 [[package]]
 name = "fs-xfs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "crc32c",
  "disk-core",
  "tempfile",
- "zstd 0.14.3",
+ "zstd 0.13.3",
 ]
 
 [[package]]

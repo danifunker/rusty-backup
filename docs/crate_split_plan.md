@@ -33,7 +33,7 @@ All names were checked against crates.io on 2026-10-30 and are free. `fs-core` w
 | `fs-apple2` | `apple-dos`, `prodos`, `ucsd` | |
 | `fs-pc` | `fat`, `exfat`, `ntfs`, `hpfs`, `human68k` | |
 | `fs-unix` | `ext`, `ufs`, `efs`, `jfs`, `btrfs`, `reiserfs`, `vxfs`, `minix`, `bfs` (BeOS), `sun2tape` (+ `tar_section`) | |
-| `fs-xfs` | XFS read, fsck, repair (**GPL-2.0**, §6) | split out so `fs-unix` stays MIT |
+| `fs-xfs` | XFS read, edit, fsck, repair (**MIT** since 0.2.0; GPL-2.0-only through 0.1.x, §6) | split out so `fs-unix` stays MIT |
 | `fs-amiga` | `affs` (AFFS/OFS), `pfs3`, `sfs` | |
 | `fs-squashfs` | read / write / edit / verify; `appimage` (find the SquashFS in an AppImage), `iso` (find it inside a live-CD ISO) | |
 | `fs-cpm` | CP/M + disk-definition catalog | |

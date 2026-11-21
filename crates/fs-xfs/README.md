@@ -8,4 +8,4 @@ XFS for every generation that shipped on real disks, from IRIX v4 (dir1 and dir2
 
 Implements the `disk-core` filesystem traits. Builds on Rust 1.73 and later. Part of [rusty-backup](https://github.com/danifunker/rusty-backup).
 
-Licensed GPL-2.0-only, because the directory name hash follows xfsprogs (`xfs_da_hashname`) line for line. The rest of the crate follows the published XFS on-disk format; see `docs/license_audit.md` in the rusty-backup repository.
+Licensed MIT since 0.2.0 (0.1.x was GPL-2.0-only). The directory name hash and the leaf / node directory editor were rewritten from SGI's *XFS Algorithms & Data Structures*; the repair phases use `xfs_repair -n` as a behavioural reference and validation oracle, with no code taken from it. See `CHANGELOG.md` and `docs/license_audit.md` in the rusty-backup repository.

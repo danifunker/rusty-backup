@@ -4,6 +4,7 @@ Rusty Backup is licensed under AGPL-3.0 (see `LICENSE`). Some parts were written
 
 | Rusty Backup code | Followed | License |
 |---|---|---|
+| `crates/fs-xfs` — the directory name hash and the leaf / node directory editor | SGI, *XFS Algorithms & Data Structures* (3rd ed.), chapters "Directories" and "Variable Length Record B+trees"; used as a format specification, no text reproduced beyond the hash function's steps | CC BY-SA 3.0 (the document); the crate is MIT |
 | `crates/dsk-ghost/src/gho.rs` — Norton Ghost "Z1" Fast-LZ decoder (that crate also ships this notice) | `github.com/nyarime/gho` `fastlz.go` | MIT, Copyright (c) 2026 Nyarime |
 | `crates/fs-8bit` — Oric Jasmin, DragonDOS | MAME `fs_oric_jasmin.cpp`, imgtool `dgndos.cpp` | BSD-3-Clause; full text in `crates/fs-8bit/THIRD_PARTY_NOTICES.md` |
 

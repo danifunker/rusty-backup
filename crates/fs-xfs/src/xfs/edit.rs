@@ -36,9 +36,9 @@
 //!   * **Directory insert** ([`dir_insert_entry`]) / remove ([`dir_remove_entry`]):
 //!     short-form inline add/remove with automatic conversion to a single
 //!     block on overflow. Leaf and node-form directories are edited in
-//!     place by [`dir2_tree`] (the kernel's leaf/node algorithms: data-block
-//!     free space, stale leaf slots, leaf and node splits, root push-down,
-//!     freeindex blocks, root join). The full rebuild — [`plan_dir_layout`]
+//!     place by [`dir2_tree`] (written from XFS Algorithms & Data Structures:
+//!     data-block free space, stale leaf slots, leaf and node splits, root
+//!     push-down, freeindex blocks, root join). The full rebuild — [`plan_dir_layout`]
 //!     picks the smallest form that fits and [`write_dir_layout`] lays it
 //!     down — remains the path for block form, for a full leaf1 index
 //!     (which converts to node form) and for shrinking a directory back
@@ -46,8 +46,8 @@
 //!
 //! On top of these: `create_directory`, `create_file` (single contiguous
 //! extent), and `delete_entry` (empty short-form dirs / single-or-no-extent
-//! files). Behavioural reference: `xfs_repair` @ v3.1.11 + `libxfs/xfs_dir2_sf.c`,
-//! `libxfs/xfs_dir2_block.c`, `libxfs/xfs_ialloc.c`.
+//! files). On-disk layouts per XFS Algorithms & Data Structures; behavioural
+//! reference, validated against `xfs_repair -n`.
 
 use std::io::{Read, Seek, Write};
 
@@ -64,6 +64,8 @@ use disk_core::filesystem::{Filesystem, FilesystemError};
 use disk_core::fsck::RepairReport;
 
 mod dir2_tree;
+#[cfg(test)]
+mod hash_from_disk_tests;
 
 /// Largest single-extent file we write: the on-disk blockcount field is 21 bits.
 const MAX_SINGLE_EXTENT_BLOCKS: u64 = (1 << 21) - 1;
@@ -649,14 +651,13 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// starting fsblock. Each dinode carries `XFS_DINODE_MAGIC`, the volume's
     /// `di_version` (matching every other inode), `di_mode = 0` (the on-disk
     /// "free slot" marker), and `di_next_unlinked = NULLAGINO`. All other
-    /// fields are zero — matching what `xfs_ialloc_inode_init` writes.
+    /// fields are zero, as a freshly allocated inode chunk must be for `xfs_repair -n`.
     ///
     /// **v5 (CRC) volumes**: each slot's v3 core also needs its CRC-header
     /// tuple stamped (`di_uuid` / `di_ino` / `di_lsn` / `di_crc`) so the
     /// inobt-walk readers and `xfs_repair` accept the chunk as a fresh
-    /// 64-slot extension. The kernel's `xfs_ialloc_inode_init` does the
-    /// equivalent stamp via `xfs_dinode_calc_crc` after writing the body;
-    /// we do it inline. v4 callers skip the stamp (no `di_crc` field).
+    /// 64-slot extension; the CRC is stamped inline once the body is written.
+    /// v4 callers skip the stamp (no `di_crc` field).
     fn init_free_inode_chunk(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -2856,28 +2857,24 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     }
 }
 
-/// XFS directory name hash (`xfs_da_hashname`) — used to build the leaf hash
-/// index of a single-block directory.
+/// Directory name hash, per XFS Algorithms & Data Structures, ch. Variable Length
+/// Record B+trees: four bytes per round into a 28-bit-rotated hash, then the 1-3 byte tail.
 fn dir_hashname(name: &[u8]) -> u32 {
     let mut hash: u32 = 0;
-    let mut chunks = name.chunks_exact(4);
-    for c in &mut chunks {
-        hash = ((c[0] as u32) << 21)
-            ^ ((c[1] as u32) << 14)
-            ^ ((c[2] as u32) << 7)
-            ^ (c[3] as u32)
-            ^ hash.rotate_left(7 * 4);
+    let mut quads = name.chunks_exact(4);
+    for q in &mut quads {
+        hash = (u32::from(q[0]) << 21)
+            ^ (u32::from(q[1]) << 14)
+            ^ (u32::from(q[2]) << 7)
+            ^ u32::from(q[3])
+            ^ hash.rotate_left(28);
     }
-    let rem = chunks.remainder();
-    match rem.len() {
-        3 => {
-            ((rem[0] as u32) << 14)
-                ^ ((rem[1] as u32) << 7)
-                ^ (rem[2] as u32)
-                ^ hash.rotate_left(7 * 3)
+    match *quads.remainder() {
+        [a, b, c] => {
+            (u32::from(a) << 14) ^ (u32::from(b) << 7) ^ u32::from(c) ^ hash.rotate_left(21)
         }
-        2 => ((rem[0] as u32) << 7) ^ (rem[1] as u32) ^ hash.rotate_left(7 * 2),
-        1 => (rem[0] as u32) ^ hash.rotate_left(7),
+        [a, b] => (u32::from(a) << 7) ^ u32::from(b) ^ hash.rotate_left(14),
+        [a] => u32::from(a) ^ hash.rotate_left(7),
         _ => hash,
     }
 }

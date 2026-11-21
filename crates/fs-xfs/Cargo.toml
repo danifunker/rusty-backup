@@ -1,9 +1,9 @@
 [package]
 name = "fs-xfs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.73"
-license = "GPL-2.0-only"
+license = "MIT"
 authors = ["Dani Sarfati <dani@funkervogt.com>"]
 description = "Read, edit, check and repair XFS (IRIX v4 through Linux v5) filesystems"
 repository = "https://github.com/danifunker/rusty-backup"

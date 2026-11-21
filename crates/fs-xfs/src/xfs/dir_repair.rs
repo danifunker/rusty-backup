@@ -9,7 +9,7 @@
 //! For every allocated short-form directory we read each entry's child inode;
 //! an entry whose child is free (`di_mode == 0`) or unreadable is dropped. The
 //! inline fork is rebuilt from the surviving entries (preserving each one's
-//! on-disk offset cookie, exactly as `libxfs` `xfs_dir2_sf_removename` does),
+//! on-disk offset cookie, which `xfs_repair -n` expects to stay put),
 //! `di_size` is set to the new fork length, and the directory's link count is
 //! **recomputed** as `2 + (number of surviving subdirectory entries)` — the
 //! standard Unix directory nlink. The surviving children are allocated, so
@@ -284,7 +284,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         }
 
         // Rebuild the inline fork: header (count', i8count, parent) + surviving
-        // entry bytes verbatim (offsets preserved, as libxfs removename does).
+        // entry bytes verbatim (offsets preserved, which xfs_repair -n expects).
         let mut new_fork = Vec::with_capacity(fork.len());
         new_fork.push(survivors.len() as u8); // count
         new_fork.push(entries.i8count); // i8count (parent width unchanged)

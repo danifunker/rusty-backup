@@ -27,9 +27,8 @@
 //! need block allocation (and R2 coupling) and is still reported + skipped.
 //!
 //! v4 only: v5 inobt blocks carry a CRC we don't recompute, so rewriting a
-//! leaf there would invalidate it. Porting reference: `xfs_repair` @ v3.1.11
-//! `repair/dino_chunks.c` (free-mask derivation) + `repair/phase5.c`
-//! (`build_ino_tree` / AGI counters).
+//! leaf there would invalidate it. Behavioural reference, validated against
+//! `xfs_repair -n` (its free-mask and inode-btree / AGI counter checks).
 
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
