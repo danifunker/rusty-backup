@@ -234,13 +234,13 @@ fn parse_object(buf: &[u8], off: usize) -> Option<(SfsObject, usize)> {
     let bits = buf[off + 24];
     let mut p = off + 25;
     let name_end = p + buf[p..].iter().position(|&b| b == 0)?;
-    let name = String::from_utf8_lossy(&buf[p..name_end]).to_string();
+    let name = crate::affs_common::latin1_to_string(&buf[p..name_end]);
     p = name_end + 1;
     if p >= buf.len() {
         return None;
     }
     let comment_end = p + buf[p..].iter().position(|&b| b == 0)?;
-    let comment = String::from_utf8_lossy(&buf[p..comment_end]).to_string();
+    let comment = crate::affs_common::latin1_to_string(&buf[p..comment_end]);
     let mut end = comment_end + 1;
     // Align to even boundary.
     if end & 1 == 1 {
@@ -525,7 +525,14 @@ impl<R: Read + Seek> SfsFilesystem<R> {
             return Ok(None);
         }
         let mut blk = root;
+        let mut depth = 0usize;
         loop {
+            depth += 1;
+            if depth > SFS_BTREE_MAX_DEPTH {
+                return Err(parse_err(
+                    "extent B-tree deeper than the depth limit (a loop?)",
+                ));
+            }
             let buf = self.read_block(blk)?.to_vec();
             validate_block(&buf, BNODECONTAINER_ID, blk)?;
             // fsBNodeContainer layout: 12B header + BTreeContainer:
@@ -843,6 +850,25 @@ impl<R: Read + Seek> SfsFilesystem<R> {
     }
 }
 
+impl<R: Read + Seek + Send> SfsFilesystem<R> {
+    /// [`Self::open`] for a volume in a partition of `partition_len` bytes: refused when it
+    /// declares more, so no edit can write into the next partition (AMI-008).
+    pub fn open_within(
+        reader: R,
+        partition_offset: u64,
+        partition_len: u64,
+    ) -> Result<Self, FilesystemError> {
+        let fs = Self::open(reader, partition_offset)?;
+        let declared = disk_core::filesystem::Filesystem::total_size(&fs);
+        if declared > partition_len {
+            return Err(FilesystemError::Parse(format!(
+                "SFS declares {declared} bytes but its partition holds {partition_len}"
+            )));
+        }
+        Ok(fs)
+    }
+}
+
 impl<R: Read + Seek + Send> Filesystem for SfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         let mut fe = FileEntry::root();
@@ -928,19 +954,11 @@ impl<R: Read + Seek + Send> Filesystem for SfsFilesystem<R> {
                 let size = obj.size_or_firstdirblock as u64;
                 FileEntry::new_file(obj.name.clone(), child_path, size, obj.objectnode as u64)
             };
-            // For files we need to remember the first-data BLCK separately
-            // (we use the `metadata1` slot if available; otherwise size+anode is enough
-            // for non-fragmented reads via lookup, but practical files chain
-            // through the extent btree — store start in a side map by tagging
-            // the location with high bits would be hacky). For now stash
-            // first-data block in fe.modified placeholder is wrong; instead
-            // expose via metadata: amiga_first_data via fe via custom field.
-            // FileEntry doesn't have an extra field, so we use `comment` only
-            // when set; we'll set `comment` for SFS to the comment string and
-            // re-derive first-data via lookup_object_block at read time.
-            let _ = obj.data_or_hashtable;
-            let _ = obj.protection;
-            let _ = obj.comment;
+            // Protection and comment ride along for cross-filesystem copies (AMI-015).
+            fe.amiga_protection = Some(obj.protection);
+            if !obj.comment.is_empty() {
+                fe.amiga_comment = Some(obj.comment.clone());
+            }
             // SFS `datemodified` is 32-bit seconds since 1978-01-01. Shift
             // into the Unix epoch for `modified_unix` + tar_export.
             if obj.datemodified > 0 {
@@ -2545,8 +2563,8 @@ fn build_object(
     name: &str,
     comment: &str,
 ) -> Result<Vec<u8>, FilesystemError> {
-    let name_b = name.as_bytes();
-    let cmt_b = comment.as_bytes();
+    let name_b = &crate::affs_common::string_to_latin1(name)?[..];
+    let cmt_b = &crate::affs_common::string_to_latin1(comment)?[..];
     if name.is_empty() || name_b.len() > 30 {
         return Err(parse_err(format!(
             "build_object: name '{}' must be 1..30 bytes",
@@ -2745,7 +2763,7 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
             ))
         })?;
 
-        if new_name.as_bytes() == obj.name.as_bytes() {
+        if new_name == obj.name {
             return Ok(());
         }
 
@@ -3077,6 +3095,18 @@ fn check_no_duplicate<R: Read + Seek + Send>(
     Ok(())
 }
 
+/// SFS finds objects by name through each directory's hash table (HTAB), which these edits
+/// do not maintain yet (the name hash is unverified without a real SFS volume): a file made
+/// here would not open by name on an Amiga, and a delete cuts other names' chains (AMI-007).
+fn refuse_sfs_edit() -> Result<(), FilesystemError> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    Err(FilesystemError::Unsupported(
+        "SFS volumes are read-only here: directory hash tables are not maintained yet".into(),
+    ))
+}
+
 impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem for SfsFilesystem<R> {
     fn as_filesystem(&self) -> &dyn disk_core::filesystem::Filesystem {
         self
@@ -3092,6 +3122,7 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
         data_len: u64,
         options: &disk_core::filesystem::CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        refuse_sfs_edit()?;
         // SFS stores its datemodified as seconds since 1978-01-01 (the Amiga
         // epoch). Cross-fs copy passes source mtime through unix_times, or an
         // explicit amiga_dates gives (days, mins, ticks) since 1978.
@@ -3112,6 +3143,7 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
         name: &str,
         options: &disk_core::filesystem::CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        refuse_sfs_edit()?;
         let sfs_date = sfs_date_from_options(options.amiga_dates, options.unix_times);
         let snap = self.snapshot();
         match self.do_create_directory(parent, name, sfs_date) {
@@ -3128,6 +3160,7 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
+        refuse_sfs_edit()?;
         let snap = self.snapshot();
         match self.do_delete_entry(parent, entry) {
             Ok(()) => Ok(()),
@@ -3144,6 +3177,7 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
         entry: &FileEntry,
         new_name: &str,
     ) -> Result<(), FilesystemError> {
+        refuse_sfs_edit()?;
         if new_name == entry.name {
             return Ok(());
         }
@@ -3271,8 +3305,8 @@ fn encode_object(
     name: &str,
     comment: &str,
 ) -> usize {
-    let name_bytes = name.as_bytes();
-    let cmt_bytes = comment.as_bytes();
+    let name_bytes = &crate::affs_common::latin1_lossy(name)[..];
+    let cmt_bytes = &crate::affs_common::latin1_lossy(comment)[..];
     let header_len = 25;
     let unaligned = header_len + name_bytes.len() + 1 + cmt_bytes.len() + 1;
     let aligned = (unaligned + 1) & !1;

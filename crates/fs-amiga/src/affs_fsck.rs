@@ -25,6 +25,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use crate::affs::AffsFilesystem;
+use crate::affs_common::is_dircache_variant;
 use disk_core::filesystem::FilesystemError;
 use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
@@ -261,6 +262,17 @@ pub fn repair_affs<R: std::io::Read + std::io::Write + std::io::Seek + Send>(
             unrepairable_count,
         });
     }
+    if unrepairable_count > 0 {
+        // A broken walk misses blocks, so a bitmap rebuilt from it would free them (AMI-001).
+        fixes_failed.push(format!(
+            "bitmap not rebuilt: the directory walk hit {unrepairable_count} structural error(s)"
+        ));
+        return Ok(RepairReport {
+            fixes_applied,
+            fixes_failed,
+            unrepairable_count,
+        });
+    }
 
     let total_diff = missing.len() + extra.len();
     match fs.rewrite_bitmap_from(&observed) {
@@ -280,6 +292,42 @@ pub fn repair_affs<R: std::io::Read + std::io::Write + std::io::Seek + Send>(
         fixes_failed,
         unrepairable_count,
     })
+}
+
+/// DOS\\4 / DOS\\5: a directory's `extension` (0x1F8) heads a chain of type-33 cache blocks
+/// linked at 0x10; they are in use, so mark them (AMI-002).
+fn mark_dircache_chain<R: std::io::Read + std::io::Seek>(
+    fs: &mut AffsFilesystem<R>,
+    dir_block: u32,
+    reach: &mut Reachable,
+) {
+    const T_DIRC: u32 = 33;
+    let Ok(dir) = fs.peek_raw_block(dir_block) else {
+        return;
+    };
+    let rd = |b: &[u8], o: usize| u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let mut next = rd(&dir, 0x1F8);
+    let mut seen: HashSet<u32> = HashSet::new();
+    while next != 0 {
+        if next >= fs.total_blocks() || !seen.insert(next) {
+            reach.broken_chains.push(format!(
+                "dircache chain of dir block {dir_block} reaches block {next} again or past the volume"
+            ));
+            return;
+        }
+        match fs.peek_raw_block(next) {
+            Ok(b) if rd(&b, 0) == T_DIRC => {
+                reach.mark(next);
+                next = rd(&b, 0x10);
+            }
+            _ => {
+                reach.broken_chains.push(format!(
+                    "dircache chain of dir block {dir_block}: block {next} is not a cache block"
+                ));
+                return;
+            }
+        }
+    }
 }
 
 fn walk_directory_tree<R: std::io::Read + std::io::Seek>(
@@ -303,6 +351,9 @@ fn walk_directory_tree<R: std::io::Read + std::io::Seek>(
             }
         };
         reach.directories_checked = reach.directories_checked.saturating_add(1);
+        if is_dircache_variant(fs.variant()) {
+            mark_dircache_chain(fs, dir_block, reach);
+        }
 
         for &head in &hash_table {
             let mut next = head;

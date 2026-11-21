@@ -16,7 +16,7 @@
 
 #[cfg(feature = "rust173-polyfill")]
 use disk_core::rust173::IntIsMultipleOf as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -145,9 +145,10 @@ impl AffsRootBlock {
         let bm_ext = read_u32(buf, 0x1A0);
 
         let disk_name = read_bstr(buf, 0x1B0, MAX_NAME_LEN);
-        let create_days = read_i32(buf, 0x1A4);
-        let create_mins = read_i32(buf, 0x1A8);
-        let create_ticks = read_i32(buf, 0x1AC);
+        // 0x1A4 is the root's alteration date; the volume's creation date is at 0x1E4.
+        let create_days = read_i32(buf, 0x1E4);
+        let create_mins = read_i32(buf, 0x1E8);
+        let create_ticks = read_i32(buf, 0x1EC);
         let modify_days = read_i32(buf, 0x1D8);
         let modify_mins = read_i32(buf, 0x1DC);
         let modify_ticks = read_i32(buf, 0x1E0);
@@ -697,7 +698,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         entry_block: u32,
         name: &str,
     ) -> Result<(), FilesystemError> {
-        let hash = name_hash(name.as_bytes(), self.intl) as usize;
+        let hash = name_hash(&latin1_lossy(name), self.intl) as usize;
         let slot_byte = 0x18 + hash * 4;
         let mut parent = self.read_block(parent_dir_block)?;
         let prev_head = read_u32(&parent, slot_byte);
@@ -732,7 +733,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         entry_block: u32,
         name: &str,
     ) -> Result<(), FilesystemError> {
-        let hash = name_hash(name.as_bytes(), self.intl) as usize;
+        let hash = name_hash(&latin1_lossy(name), self.intl) as usize;
         let slot_byte = 0x18 + hash * 4;
         let entry = self.read_block(entry_block)?;
         let entry_next = read_u32(&entry, 0x1F0);
@@ -754,7 +755,9 @@ impl<R: Read + Seek> AffsFilesystem<R> {
 
         // Walk chain to find predecessor.
         let mut prev = head;
+        let mut seen = HashSet::new();
         loop {
+            self.chain_step(&mut seen, prev)?;
             if prev == 0 {
                 return Err(FilesystemError::NotFound(format!(
                     "hash_chain_remove: entry {entry_block} not in chain of {parent_dir_block}"
@@ -787,6 +790,15 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         Ok(true)
     }
 
+    /// Note `block` in a chain walk; a block seen twice, or more blocks than the volume
+    /// holds, means the chain loops (AMI-012).
+    fn chain_step(&self, seen: &mut HashSet<u32>, block: u32) -> Result<(), FilesystemError> {
+        if !seen.insert(block) || seen.len() as u64 > u64::from(self.total_blocks) {
+            return Err(parse_err(format!("AFFS chain loops at block {block}")));
+        }
+        Ok(())
+    }
+
     fn read_entry(&mut self, block: u32) -> Result<AffsEntry, FilesystemError> {
         let buf = self.read_block(block)?;
         AffsEntry::parse(&buf, block)
@@ -800,7 +812,9 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         let mut out = Vec::new();
         for &head in hash_table {
             let mut next = head;
+            let mut seen = HashSet::new();
             while next != 0 {
+                self.chain_step(&mut seen, next)?;
                 let entry = self.read_entry(next)?;
                 next = entry.next_same_hash;
                 out.push(self.entry_to_file_entry(&entry, parent_path));
@@ -887,6 +901,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         // Walk header → data blocks → next extension block → repeat.
         let mut current_header_blocks = entry.data_blocks.clone();
         let mut next_ext = entry.extension;
+        let mut seen_ext = HashSet::new();
 
         loop {
             for &dblk in &current_header_blocks {
@@ -915,6 +930,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
             if next_ext == 0 || remaining == 0 {
                 break;
             }
+            self.chain_step(&mut seen_ext, next_ext)?;
             let ext = self.read_entry(next_ext)?;
             if ext.sec_type != ST_FILE {
                 return Err(parse_err(format!(
@@ -1009,6 +1025,11 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         Ok(entry.hash_table)
     }
 
+    /// The raw 512 bytes of `block`, for fsck.
+    pub fn peek_raw_block(&mut self, block: u32) -> Result<[u8; BSIZE], FilesystemError> {
+        self.read_block(block)
+    }
+
     /// Parse the entry block at `block` for fsck inspection.
     pub fn peek_entry_block(&mut self, block: u32) -> Result<AffsEntry, FilesystemError> {
         self.read_entry(block)
@@ -1037,7 +1058,8 @@ fn write_bstr(
     if name.is_empty() {
         return Err(FilesystemError::InvalidData("name cannot be empty".into()));
     }
-    let bytes = name.as_bytes();
+    let bytes = string_to_latin1(name)?;
+    let bytes = &bytes[..];
     if bytes.len() > max {
         return Err(FilesystemError::InvalidData(format!(
             "AFFS name '{name}' exceeds {max} bytes"
@@ -1242,7 +1264,7 @@ impl<R: Read + Seek + Send> Filesystem for AffsFilesystem<R> {
                 "AFFS name cannot be empty".into(),
             ));
         }
-        if name.len() > MAX_NAME_LEN {
+        if name.chars().count() > MAX_NAME_LEN {
             return Err(FilesystemError::InvalidData(format!(
                 "AFFS name '{name}' exceeds {MAX_NAME_LEN} bytes (Long Names not yet supported for write)"
             )));
@@ -1262,6 +1284,20 @@ impl<R: Read + Seek + Send> Filesystem for AffsFilesystem<R> {
     }
 }
 
+impl<R: Read + Write + Seek + Send> AffsFilesystem<R> {
+    /// DOS\\4 / DOS\\5 list directories from their cache blocks, which these edits do not
+    /// update, so the change would be invisible on an Amiga (AMI-002).
+    fn refuse_dircache_edit(&self) -> Result<(), FilesystemError> {
+        if is_dircache_variant(self.variant) {
+            return Err(FilesystemError::Unsupported(
+                "AFFS DirCache volumes (DOS\\4 / DOS\\5) are read-only here: the cache is not updated"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
     fn as_filesystem(&self) -> &dyn disk_core::filesystem::Filesystem {
         self
@@ -1277,6 +1313,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        self.refuse_dircache_edit()?;
+        if data_len > u64::from(u32::MAX) {
+            return Err(FilesystemError::InvalidData(
+                "AFFS stores file sizes in 32 bits: 4 GiB is the limit".into(),
+            ));
+        }
         self.validate_name(name)?;
         let parent_block = if parent.location == 0 {
             self.root_block
@@ -1431,6 +1473,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         name: &str,
         options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        self.refuse_dircache_edit()?;
         self.validate_name(name)?;
         let parent_block = if parent.location == 0 {
             self.root_block
@@ -1470,6 +1513,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
+        self.refuse_dircache_edit()?;
         let parent_block = if parent.location == 0 {
             self.root_block
         } else {
@@ -1493,6 +1537,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
                 // Walk data blocks (header + all extensions) and free.
                 let mut cur_data = parsed.data_blocks.clone();
                 let mut next_ext = parsed.extension;
+                let mut seen = HashSet::new();
                 loop {
                     for &dblk in &cur_data {
                         if dblk != 0 {
@@ -1502,6 +1547,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
                     if next_ext == 0 {
                         break;
                     }
+                    self.chain_step(&mut seen, next_ext)?;
                     let ext = self.read_entry(next_ext)?;
                     let this_ext = next_ext;
                     cur_data = ext.data_blocks.clone();
@@ -1526,6 +1572,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         entry: &FileEntry,
         protection: u32,
     ) -> Result<(), FilesystemError> {
+        self.refuse_dircache_edit()?;
         // The protection word lives in the entry's own header block, so this is
         // a read-modify-write of one block plus its checksum - no directory
         // walk, and nothing else in the volume moves.
@@ -1546,6 +1593,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         entry: &FileEntry,
         new_name: &str,
     ) -> Result<(), FilesystemError> {
+        self.refuse_dircache_edit()?;
         if new_name == entry.name {
             return Ok(());
         }
@@ -1692,7 +1740,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         dir_block: u32,
         name: &str,
     ) -> Result<Option<u32>, FilesystemError> {
-        let hash = name_hash(name.as_bytes(), self.intl) as usize;
+        let hash = name_hash(&latin1_lossy(name), self.intl) as usize;
         let dir_buf = if dir_block == self.root_block {
             // Use the cached root hash table to avoid re-parsing the block.
             None
@@ -1703,7 +1751,9 @@ impl<R: Read + Seek> AffsFilesystem<R> {
             Some(buf) => read_u32(buf, 0x18 + hash * 4),
             None => self.root.hash_table[hash],
         };
+        let mut seen = HashSet::new();
         while chain != 0 {
+            self.chain_step(&mut seen, chain)?;
             let entry = self.read_entry(chain)?;
             if names_equal(&entry.name, name, self.intl) {
                 return Ok(Some(chain));
@@ -1717,8 +1767,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
 /// Case-insensitive name comparison using the same case folding as the
 /// hash function. Always operates byte-for-byte on the ISO-8859-1 encoding.
 fn names_equal(a: &str, b: &str, intl: bool) -> bool {
-    let ab = a.as_bytes();
-    let bb = b.as_bytes();
+    let (ab, bb) = (latin1_lossy(a), latin1_lossy(b));
     if ab.len() != bb.len() {
         return false;
     }
@@ -1893,6 +1942,10 @@ pub fn resize_affs_in_place(
             boot[3]
         ));
         return Ok(());
+    }
+    if is_dircache_variant(boot[3]) {
+        // The directory cache blocks name the root as parent and are not rewritten here.
+        anyhow::bail!("AFFS DirCache volumes (DOS\\4 / DOS\\5) cannot be resized here");
     }
 
     // --- 2. Locate the current root block. ---
@@ -2177,6 +2230,29 @@ pub fn resize_affs_in_place(
         ))?;
         device.write_all(&ext)?;
     }
+    // The root's children name it as parent (0x1F4): repoint every entry on its hash chains
+    // before the new root is written, or they would point at a freed block (AMI-003).
+    if new_root != old_root {
+        for slot in 0..HT_SIZE {
+            let mut next = BigEndian::read_u32(&old_root_buf[24 + slot * 4..28 + slot * 4]);
+            let mut seen = std::collections::HashSet::new();
+            while next != 0 && next < new_total && seen.insert(next) {
+                let at = partition_offset + next as u64 * BSIZE_U64;
+                let mut entry = [0u8; BSIZE];
+                device.seek(SeekFrom::Start(at))?;
+                device.read_exact(&mut entry)?;
+                if BigEndian::read_u32(&entry[0x1F4..0x1F8]) == old_root {
+                    BigEndian::write_u32(&mut entry[0x1F4..0x1F8], new_root);
+                    BigEndian::write_u32(&mut entry[0x14..0x18], 0);
+                    let sum = normal_checksum(&entry, 5);
+                    BigEndian::write_u32(&mut entry[0x14..0x18], sum);
+                    device.seek(SeekFrom::Start(at))?;
+                    device.write_all(&entry)?;
+                }
+                next = BigEndian::read_u32(&entry[0x1F0..0x1F4]);
+            }
+        }
+    }
     device.seek(SeekFrom::Start(
         partition_offset + new_root as u64 * BSIZE_U64,
     ))?;
@@ -2236,7 +2312,21 @@ fn find_affs_root_block(
         }
         // A real root's header_key is 0 (R-020); an older image of ours holds its own block.
         let key = read_u32(&buf, 4);
-        Ok((key == 0 || key == blk) && read_u32(&buf, 12) == HT_SIZE as u32)
+        if !((key == 0 || key == blk) && read_u32(&buf, 12) == HT_SIZE as u32) {
+            return Ok(false);
+        }
+        // A stored ADF holds a root too: require a valid checksum, and a first bitmap page
+        // that is a valid bitmap block of this volume, not of the file's own (AMI-004).
+        if !verify_normal_checksum(&buf, 5) {
+            return Ok(false);
+        }
+        let bm0 = read_u32(&buf, 0x13C);
+        if bm0 < 2 || bm0 >= upper_total {
+            return Ok(false);
+        }
+        let mut bm = [0u8; BSIZE];
+        device.read_block(partition_offset + bm0 as u64 * BSIZE_U64, &mut bm)?;
+        Ok(bitmap_checksum(&bm) == read_u32(&bm, 0))
     };
 
     // Adapter: Read+Seek -> AffsRootProbe trait so we can reuse one helper.
@@ -3167,6 +3257,37 @@ mod tests {
         // 880/881 were inside the volume but get marked free in the new
         // bitmap.)
         assert_eq!(alloc, 4, "expected 4 alloc, got {alloc}");
+    }
+
+    /// A grow moves the root; the root's children are repointed at it, so their parent is
+    /// the new root, not the freed old one (AMI-003).
+    #[test]
+    fn resize_repoints_the_root_children_at_the_new_root() {
+        let mut img = create_blank_affs(1024 * 1024, 1, "Kids").expect("format");
+        let mut cur = Cursor::new(std::mem::take(&mut img));
+        add_file(&mut cur, "a.txt", b"one");
+        add_file(&mut cur, "b.txt", b"two");
+        let mut img = cur.into_inner();
+        let new_size = 4 * 1024 * 1024usize;
+        img.resize(new_size, 0);
+        let mut cur = Cursor::new(img);
+        resize_affs_in_place(&mut cur, 0, new_size as u64, &mut |_| {}).expect("grow");
+        let mut fs = AffsFilesystem::open(&mut cur, 0).expect("reopen after grow");
+        let root_blk = fs.root_block_num();
+        let root = fs.root().unwrap();
+        let kids = fs.list_directory(&root).unwrap();
+        assert_eq!(kids.len(), 2);
+        for k in &kids {
+            let b = fs.peek_raw_block(k.location as u32).unwrap();
+            assert_eq!(
+                BigEndian::read_u32(&b[0x1F4..0x1F8]),
+                root_blk,
+                "{}",
+                k.name
+            );
+        }
+        let report = fs.fsck().expect("affs has fsck").unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     /// A formatted volume's root has header_key 0, like a real disk's, and still resizes.

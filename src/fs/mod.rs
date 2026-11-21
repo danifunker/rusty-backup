@@ -2557,16 +2557,16 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 )?));
             }
             s if is_amiga_pfs3_type(s) => {
-                return Ok(Box::new(pfs3::Pfs3Filesystem::open(
-                    reader,
-                    partition_offset,
-                )?));
+                return Ok(Box::new(match partition_len {
+                    Some(len) => pfs3::Pfs3Filesystem::open_within(reader, partition_offset, len)?,
+                    None => pfs3::Pfs3Filesystem::open(reader, partition_offset)?,
+                }));
             }
             s if is_amiga_sfs_type(s) => {
-                return Ok(Box::new(sfs::SfsFilesystem::open(
-                    reader,
-                    partition_offset,
-                )?));
+                return Ok(Box::new(match partition_len {
+                    Some(len) => sfs::SfsFilesystem::open_within(reader, partition_offset, len)?,
+                    None => sfs::SfsFilesystem::open(reader, partition_offset)?,
+                }));
             }
             s if s.starts_with("cpm:") => {
                 let preset_name = &s[4..];

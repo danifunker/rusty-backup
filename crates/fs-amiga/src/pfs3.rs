@@ -123,7 +123,7 @@ impl Pfs3RootBlock {
         // diskname: BSTR at offset 20, length byte then UTF-8 bytes (≤31).
         let name_len = buf[20] as usize;
         let name_bytes = &buf[21..21 + name_len.min(31)];
-        let disk_name = String::from_utf8_lossy(name_bytes).to_string();
+        let disk_name = crate::affs_common::latin1_to_string(name_bytes);
         let last_reserved = rd_u32(buf, 52);
         let first_reserved = rd_u32(buf, 56);
         let reserved_free = rd_u32(buf, 60);
@@ -591,6 +591,7 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
         mut cb: impl FnMut(&[u8], u32) -> bool,
     ) -> Result<(), FilesystemError> {
         let mut anode = self.get_anode(dir_anodenr)?;
+        let mut seen_anodes = std::collections::HashSet::from([dir_anodenr]);
         loop {
             if anode.blocknr == 0 || anode.blocknr == 0xFFFFFFFF {
                 break;
@@ -613,6 +614,12 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
             if anode.next == 0 {
                 break;
             }
+            if !seen_anodes.insert(anode.next) {
+                return Err(parse_err(format!(
+                    "PFS3 anode chain loops at anode {}",
+                    anode.next
+                )));
+            }
             anode = self.get_anode(anode.next)?;
         }
         Ok(())
@@ -628,6 +635,7 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
     ) -> Result<u64, FilesystemError> {
         let mut written: u64 = 0;
         let mut anode = self.get_anode(file_anodenr)?;
+        let mut seen_anodes = std::collections::HashSet::from([file_anodenr]);
         loop {
             if anode.blocknr == 0 || anode.blocknr == 0xFFFFFFFF {
                 break;
@@ -657,6 +665,12 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
             if anode.next == 0 {
                 break;
             }
+            if !seen_anodes.insert(anode.next) {
+                return Err(parse_err(format!(
+                    "PFS3 anode chain loops at anode {}",
+                    anode.next
+                )));
+            }
             anode = self.get_anode(anode.next)?;
         }
         Ok(written)
@@ -673,7 +687,7 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
         let mut sink = std::io::Cursor::new(&mut buf);
         self.stream_file_data(link_anodenr, 2048, &mut sink)?;
         let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
+        Ok(crate::affs_common::latin1_to_string(&buf[..end]))
     }
 }
 
@@ -722,12 +736,12 @@ fn parse_direntry(entries: &[u8], off: usize, largefile: bool) -> Option<DirEntr
     if name_start + nlength > off + next {
         return None;
     }
-    let name = String::from_utf8_lossy(&entries[name_start..name_start + nlength]).to_string();
+    let name = crate::affs_common::latin1_to_string(&entries[name_start..name_start + nlength]);
     let cmt_pos = name_start + nlength;
     let comment = if cmt_pos < off + next {
         let clen = entries[cmt_pos] as usize;
         if cmt_pos + 1 + clen <= off + next {
-            String::from_utf8_lossy(&entries[cmt_pos + 1..cmt_pos + 1 + clen]).to_string()
+            crate::affs_common::latin1_to_string(&entries[cmt_pos + 1..cmt_pos + 1 + clen])
         } else {
             String::new()
         }
@@ -972,6 +986,25 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
             });
         }
         out
+    }
+}
+
+impl<R: Read + Seek + Send> Pfs3Filesystem<R> {
+    /// [`Self::open`] for a volume in a partition of `partition_len` bytes: refused when it
+    /// declares more, so no edit can write into the next partition (AMI-008).
+    pub fn open_within(
+        reader: R,
+        partition_offset: u64,
+        partition_len: u64,
+    ) -> Result<Self, FilesystemError> {
+        let fs = Self::open(reader, partition_offset)?;
+        let declared = disk_core::filesystem::Filesystem::total_size(&fs);
+        if declared > partition_len {
+            return Err(FilesystemError::Parse(format!(
+                "PFS3 declares {declared} bytes but its partition holds {partition_len}"
+            )));
+        }
+        Ok(fs)
     }
 }
 
@@ -1445,7 +1478,7 @@ impl Pfs3RootBlock {
         buf[4..8].copy_from_slice(&self.options.to_be_bytes());
         // datestamp at 8: bump it (callers may want to update separately).
         // creationday/min/tick at 12..18: leave existing bytes alone.
-        let n = self.disk_name.as_bytes();
+        let n = &crate::affs_common::latin1_lossy(&self.disk_name)[..];
         let n_len = n.len().min(31);
         buf[20] = n_len as u8;
         buf[21..21 + n_len].copy_from_slice(&n[..n_len]);
@@ -2170,8 +2203,8 @@ fn build_direntry(
     dates: Option<(i32, i32, i32)>,
     extra_link: Option<u32>,
 ) -> Result<Vec<u8>, FilesystemError> {
-    let name_bytes = name.as_bytes();
-    let comment_bytes = comment.as_bytes();
+    let name_bytes = &crate::affs_common::string_to_latin1(name)?[..];
+    let comment_bytes = &crate::affs_common::string_to_latin1(comment)?[..];
     // Practical cap is the largest `fnsize` PFS3 allows (107 bytes —
     // the LONGFN-enabled max; standard AmigaDOS is 30 bytes). We set
     // `fnsize = 107` in the blank-volume's rootblock extension so
@@ -2490,7 +2523,7 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
         dates: Option<(i32, i32, i32)>,
     ) -> Result<FileEntry, FilesystemError> {
         check_no_duplicate(self, parent, name)?;
-        let target_bytes = target.as_bytes();
+        let target_bytes = &crate::affs_common::string_to_latin1(target)?[..];
         if target_bytes.len() >= HW_SECTOR as usize {
             return Err(parse_err(format!(
                 "create_symlink: target path '{}' exceeds {} bytes",
@@ -2640,8 +2673,8 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
         let de = parse_direntry(&blk[off..off + total], 0, self.largefile)
             .ok_or_else(|| parse_err("rename: failed to re-parse existing direntry"))?;
 
-        let new_bytes = new_name.as_bytes();
-        if new_bytes == de.name.as_bytes() {
+        let new_bytes = &crate::affs_common::string_to_latin1(new_name)?[..];
+        if new_name == de.name {
             return Ok(());
         }
         // Validate via the encoder by building a throwaway direntry; this
@@ -2706,6 +2739,12 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
+        if entry.is_directory() && entry.link_target_cnid.is_some() {
+            // A directory hard link: its location is a link node, not a directory (AMI-009).
+            return Err(FilesystemError::Unsupported(
+                "deleting a PFS3 directory hard link is not supported".into(),
+            ));
+        }
         let parent_anode = parent.location as u32;
         let entry_anode = entry.location as u32;
         // Free the anode chain. For directories, also free the dirblock(s)
@@ -3184,6 +3223,11 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem
         data_len: u64,
         options: &disk_core::filesystem::CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        if data_len > u64::from(u32::MAX) {
+            return Err(FilesystemError::InvalidData(
+                "PFS3 files written here are limited to 4 GiB".into(),
+            ));
+        }
         let comment = options.amiga_comment.as_deref().unwrap_or("");
         let protection = options.amiga_protection.unwrap_or(0) as u8;
         // Explicit amiga_dates always win; otherwise convert unix_times mtime

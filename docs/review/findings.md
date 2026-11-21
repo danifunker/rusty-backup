@@ -270,22 +270,22 @@ excluded. No reference C sources opened.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| AMI-001 | S1 | confirmed | affs_fsck.rs `repair_affs` | AFFS repair rebuilds the bitmap after a broken walk (PFS3 / SFS refuse unless structurally clean): one bad directory checksum frees that subtree's blocks. | open |
-| AMI-002 | S1 | confirmed | affs_fsck.rs `walk_directory_tree`; affs.rs | DOS\4 / DOS\5 dircache not modelled: fsck flags every clean DCFS volume and repair frees the cache blocks; create / delete / rename never update the cache and are not refused. | open |
-| AMI-003 | S1 | confirmed | affs.rs `resize_affs_in_place` | The resize moves the root but leaves the root children's `parent` (0x1F4) pointing at the old root, which is then freed. | open |
-| AMI-004 | S1 | plausible | affs.rs `find_affs_root_block` | The fallback scan accepts the first block that looks like a root (no checksum, no position): an ADF stored on the volume below the real root can be taken for it. | open |
-| AMI-005 | S1 | confirmed | sfs.rs `extent_btree_insert` | Extent length stored as `blocks as u16` with no cap: a file over 65,535 blocks is truncated, its tail leaked. | open |
-| AMI-006 | S1 | confirmed | sfs.rs `is_metadata_block` | Dirty data blocks whose first 4 bytes look like an SFS tag get re-checksummed on read / sync: file content `OBJC...` has bytes 4..8 overwritten. | open |
-| AMI-007 | S1 | confirmed | sfs.rs object-node create / delete / rename | HTAB hash chains never maintained: the SFS handler cannot open new files by name, delete cuts chains, rename leaves entries in the old bucket. | open |
-| AMI-008 | S1 | confirmed | pfs3.rs / sfs.rs `open`; src/fs/mod.rs callers | PFS3 / SFS editors take no partition length: a volume claiming more than its RDB partition gets writes in the next partition. | open |
-| AMI-009 | S1 | plausible | pfs3.rs `do_delete_entry` | Deleting an ST_LINKDIR reads and frees, as a dirblock, the reserved block whose number is the link's parent anode. | open |
-| AMI-010 | S2 | confirmed | affs.rs / pfs3.rs / sfs.rs `create_file` | Sizes of 4 GiB or more stored as `u32` (PFS3 never writes `fsizex`): should be refused. | open |
-| AMI-011 | S2 | confirmed | affs_common.rs `read_bstr` vs affs.rs `write_bstr`; pfs3.rs; sfs.rs | Names read as Latin-1 / lossy UTF-8 but written as UTF-8: AFFS hashes the wrong bytes (NotFound on delete / rename of a non-ASCII name, duplicates on create). | open |
-| AMI-012 | S2 | confirmed | affs.rs, pfs3.rs, sfs.rs, pfs3_clone.rs chain / tree walks | Hash chains, extension chains, anode chains, SFS BNodes and the PFS3 clone walk have no cycle or depth cap: self-links hang or overflow the stack. | open |
-| AMI-013 | S2 | confirmed | pfs3_clone.rs `clone_pfs3_volume`; pfs3.rs `do_create_file` | Clone stages all data in memory and syncs once: peak RAM is the volume's used data. Single-file creates hold the whole file (S3). | open |
-| AMI-014 | S2 | confirmed | affs.rs `CompactAffsReader::new` | Uses `open` not `open_sized`: on an RDB disk the root search fails or the compact size covers the following partitions. | open |
-| AMI-015 | S2 | confirmed | sfs.rs `list_directory`, `create_file` | SFS drops protection, comment and dates on read and ignores them on write; softlinks list as empty files; no volume label. | open |
-| AMI-016 | S4 | confirmed | affs.rs, sfs.rs, pfs3.rs, *_fsck.rs | Duplicates (`sync_metadata` / `flush_metadata`, `fs_type` / `fs_type_label`, `fold`, fsck helpers x3); stale comments; `create_days` read from 0x1A4 (root alteration date). | open |
+| AMI-001 | S1 | confirmed | affs_fsck.rs `repair_affs` | AFFS repair rebuilds the bitmap after a broken walk (PFS3 / SFS refuse unless structurally clean): one bad directory checksum frees that subtree's blocks. | fixed (AFIX) |
+| AMI-002 | S1 | confirmed | affs_fsck.rs `walk_directory_tree`; affs.rs | DOS\4 / DOS\5 dircache not modelled: fsck flags every clean DCFS volume and repair frees the cache blocks; create / delete / rename never update the cache and are not refused. | fixed (AFIX) |
+| AMI-003 | S1 | confirmed | affs.rs `resize_affs_in_place` | The resize moves the root but leaves the root children's `parent` (0x1F4) pointing at the old root, which is then freed. | fixed (AFIX) |
+| AMI-004 | S1 | plausible | affs.rs `find_affs_root_block` | The fallback scan accepts the first block that looks like a root (no checksum, no position): an ADF stored on the volume below the real root can be taken for it. | fixed (AFIX) |
+| AMI-005 | S1 | confirmed | sfs.rs `extent_btree_insert` | Extent length stored as `blocks as u16` with no cap: a file over 65,535 blocks is truncated, its tail leaked. | blocked by AMI-007 (only reachable through the refused SFS edits) |
+| AMI-006 | S1 | confirmed | sfs.rs `is_metadata_block` | Dirty data blocks whose first 4 bytes look like an SFS tag get re-checksummed on read / sync: file content `OBJC...` has bytes 4..8 overwritten. | blocked by AMI-007 (only reachable through the refused SFS edits) |
+| AMI-007 | S1 | confirmed | sfs.rs object-node create / delete / rename | HTAB hash chains never maintained: the SFS handler cannot open new files by name, delete cuts chains, rename leaves entries in the old bucket. | mitigated (AFIX): SFS edits refused until the name hash can be verified on a real SFS volume |
+| AMI-008 | S1 | confirmed | pfs3.rs / sfs.rs `open`; src/fs/mod.rs callers | PFS3 / SFS editors take no partition length: a volume claiming more than its RDB partition gets writes in the next partition. | fixed (AFIX) |
+| AMI-009 | S1 | plausible | pfs3.rs `do_delete_entry` | Deleting an ST_LINKDIR reads and frees, as a dirblock, the reserved block whose number is the link's parent anode. | fixed (AFIX) |
+| AMI-010 | S2 | confirmed | affs.rs / pfs3.rs / sfs.rs `create_file` | Sizes of 4 GiB or more stored as `u32` (PFS3 never writes `fsizex`): should be refused. | fixed (AFIX) |
+| AMI-011 | S2 | confirmed | affs_common.rs `read_bstr` vs affs.rs `write_bstr`; pfs3.rs; sfs.rs | Names read as Latin-1 / lossy UTF-8 but written as UTF-8: AFFS hashes the wrong bytes (NotFound on delete / rename of a non-ASCII name, duplicates on create). | fixed (AFIX) |
+| AMI-012 | S2 | confirmed | affs.rs, pfs3.rs, sfs.rs, pfs3_clone.rs chain / tree walks | Hash chains, extension chains, anode chains, SFS BNodes and the PFS3 clone walk have no cycle or depth cap: self-links hang or overflow the stack. | fixed (AFIX) |
+| AMI-013 | S2 | confirmed | pfs3_clone.rs `clone_pfs3_volume`; pfs3.rs `do_create_file` | Clone stages all data in memory and syncs once: peak RAM is the volume's used data. Single-file creates hold the whole file (S3). | fixed (AFIX) |
+| AMI-014 | S2 | confirmed | affs.rs `CompactAffsReader::new` | Uses `open` not `open_sized`: on an RDB disk the root search fails or the compact size covers the following partitions. | deferred (needs the partition size threaded through compact_partition_reader) |
+| AMI-015 | S2 | confirmed | sfs.rs `list_directory`, `create_file` | SFS drops protection, comment and dates on read and ignores them on write; softlinks list as empty files; no volume label. | fixed (AFIX) |
+| AMI-016 | S4 | confirmed | affs.rs, sfs.rs, pfs3.rs, *_fsck.rs | Duplicates (`sync_metadata` / `flush_metadata`, `fs_type` / `fs_type_label`, `fold`, fsck helpers x3); stale comments; `create_days` read from 0x1A4 (root alteration date). | partly fixed (AFIX): create date offset; duplicates left |
 
 ## crates/fs-mac (remainder)
 
