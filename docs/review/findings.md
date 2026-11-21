@@ -527,3 +527,108 @@ Review by a separate agent, 2026-11-21, read-only.
 | TAR-004 | S2 | plausible | tar_import.rs `open_tar_stream` | Multi-member .tar.gz imports only the first member. | open |
 | TAR-005 | S2 | plausible | tar_export.rs `walk` | Export recursion has no depth / visited guard. | open |
 | TAR-006 | S4 | confirmed | import_sink.rs, tar_export.rs, mem_archive.rs, zstd_compat.rs, zip_import.rs | Stats merge drops a field; stale docs; pure-zstd can't browse .tar.zst; duplicate date code. | open |
+
+## crates/fs-cpm
+
+Review by a separate agent, 2026-11-21, read-only.
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| CPM-001 | S1 | confirmed | cpm.rs `create_file`, `free_blocks`, `is_active` | Slots with user >= 16 (CP/M 3 label / SFCB / password, ZSDOS users 16-31) are treated as free: new files overwrite them and their blocks are reallocated. | open |
+| CPM-002 | S2 | confirmed | cpm.rs `analyze`, `run_repair` | fsck calls user >= 16 entries invalid and repair deletes them (password entries, ZSDOS files). | open |
+| CPM-003 | S2 | confirmed | cpm.rs `encode_dir_entry`, `dir_write_back` | Every write-back re-encodes all slots lossily: SFCB dates, label mode flags and f1'-f4' attributes are lost. | open |
+| CPM-004 | S2 | confirmed | cpm.rs `collect_files`, `read_group` | EXM ignored: on exm > 0 presets (EINSTEIN, SVI328, MULTICOMP) files over 16 KB list short and read truncated. | open |
+| CPM-005 | S1 | confirmed | cpm.rs `create_file` | Writer ignores EXM too: real CP/M sees a different file than we wrote. | open |
+| CPM-006 | S1 | confirmed | cpm_diskdefs.rs `ZX_PLUS3`, `SVI328_CPM` | Data area runs past the disk geometry: allocations and blank images go past the image end. | open |
+| CPM-007 | S2 | confirmed | cpm_diskdefs.rs `ALTAIR_CF`, `SVI328_CPM`; cpm.rs | Directory size from al0/al1 disagrees with drm: ALTAIR_CF creates always fail at sync after writing data. | open |
+| CPM-008 | S1 | confirmed | cpm.rs list / find / delete / rename | User number dropped from name handling: same-named files in two users collide; delete removes both. | open |
+| CPM-009 | S2 | confirmed | cpm.rs `create_file` | Empty files never get an entry; a mid-loop "directory full" leaves a truncated file to be synced. | open |
+| CPM-010 | S2 | plausible | cpm_diskdefs.rs `ALTAIR_8IN`; cpm.rs | No sector skew: ibm-3740 images (skew 6) read garbled. | open |
+| CPM-011 | S3 | confirmed | cpm.rs `validate_cpm_name` | Wildcard / separator characters accepted in names. | open |
+| CPM-012 | S3 | confirmed | cpm.rs | Non-ASCII glyphs in user-visible errors. | open |
+| CPM-013 | S3 | confirmed | cpm.rs `read_file`, `create_file` | Whole-file buffering (DC-006 for this crate; largest preset 4 MiB). | open |
+| CPM-014 | S4 | confirmed | cpm.rs, cpm_diskdefs.rs | Dead locals and unread DPB fields; `tracks` documented as a bounds check but unused. | open |
+
+## crates/dsk-dmg, dsk-clonezilla, dsk-floppy, dsk-flux, dsk-imz, dsk-tape
+
+Review by a separate agent, 2026-11-21, read-only.
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| DMG-001 | S2 | confirmed | dsk-dmg dmg.rs `detect_dmg`, `ensure_cached`, `parse_mish` | XML length, pack / unpack sizes and zero blocks sized from the header unchecked: OOM; offset product overflows. | open |
+| DMG-002 | S2 | confirmed | dsk-dmg dmg.rs `Read for DmgReader`, `copy_match` | A short chunk returns Ok(0) mid-disk (silent truncation); bad ADC distances become zeros. | open |
+| DMG-003 | S2 | confirmed | dsk-dmg dmg_crypto.rs `CryptoContext::open` | `wrap_key_bits` slice panics; offset overflow; PBKDF2 iterations uncapped. | open |
+| DMG-004 | S2 | confirmed | dsk-dmg sparseimage.rs `detect_sparseimage` | Band table sized from header values: 32 GiB from a 4 KiB file. | open |
+| DMG-005 | S2 | confirmed | dsk-dmg ndif.rs `reconstruct_to` | Capacity from an unchecked entry count (~128 GiB). | open |
+| CZL-001 | S2 | confirmed | dsk-clonezilla partclone.rs `parse_header`, `parse_bitmap` | `block_size` / `total_blocks` unvalidated: OOM, a block size of 0 hangs, overflow. | open |
+| CZL-002 | S2 | plausible | dsk-clonezilla partclone.rs `parse_header` | v1 images likely rejected by the magic check; endianness field ignored. | open |
+| CZL-003 | S2 | confirmed | dsk-clonezilla metadata_scan.rs `identify_ext_metadata_blocks` | Off-by-4 bounds check panics the scan thread and poisons the cache mutex. | open |
+| CZL-004 | S2 | confirmed | dsk-clonezilla metadata_scan.rs | Unchecked shifts / underflow; BPB-driven ranges insert billions of entries. | open |
+| CZL-005 | S4 | confirmed | dsk-clonezilla block_cache.rs | Unneeded `unsafe impl Send`. | open |
+| FLP-001 | S2 | confirmed | dsk-floppy edsk.rs, d88.rs flat decode | Missing tracks / sectors shift every later sector (no zero-filled holes). | open |
+| FLP-002 | S2 | plausible | dsk-floppy g64.rs `decode_track` | Sectors crossing the GCR wrap lost; bad-checksum sectors zeroed silently. | open |
+| FLP-003 | S4 | confirmed | dsk-floppy msa.rs, dim.rs | Public encoder panics via `assert_eq!`; dead `if`. | open |
+| FLX-001 | S2 | confirmed | dsk-flux flux/mod.rs `decode_disk` | Heads / cylinders from the max over stray sector IDs: the whole image layout shifts. | open |
+| FLX-002 | S2 | confirmed | dsk-flux flux/mfm.rs `vote` | Voting always checks the MFM CRC: FM / Amiga sectors never recover; false clean votes on Amiga. | open |
+| FLX-003 | S2 | confirmed | dsk-flux flux/mfm.rs `to_bits_pll` | PLL bit stream unbounded: a 100 KB track runs out of memory. | open |
+| FLX-004 | S2 | confirmed | dsk-flux flux/mfm_emu.rs `decode_to` | Seek does not extend the temp file: truncated disk; header-sized allocations unchecked. | open |
+| FLX-005 | S2 | confirmed | dsk-flux flux/kryoflux.rs `parse_stream` | u32 overflow counter overflows (panic / wrong interval). | open |
+| FLX-006 | S4 | confirmed | dsk-flux mfm_emu.rs, mfm.rs | `crc16` twice; byte helpers duplicate disk_core. | open |
+| IMZ-001 | S2 | confirmed | dsk-imz imz.rs `open_with_password` | Capacity from ZIP header sizes; whole entry in RAM with no cap. | open |
+| TAP-001 | S3 | confirmed | dsk-tape sun2tape.rs, sun2tape_edit.rs | Tape files read whole into RAM (up to three copies). | open |
+| TAP-002 | S2 | plausible | dsk-tape sun2tape.rs, sun2tape_edit.rs `build_image` | Zero-length tape files dropped on rebuild: later files renumbered. | open |
+| TAP-003 | S3 | confirmed | dsk-tape tar_section.rs `TarSection::parse` | A leading `./` entry disappears from the rebuilt archive. | open |
+
+## crates/fs-adfs, fs-hpfs, fs-apfs, fs-qnx, qnx2fs
+
+Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| ADF-001 | S1 | confirmed | fs-adfs adfs.rs `alloc_and_write_data` | Fragment bits not rounded to whole sectors: on E-format the next file overwrites the tail of the previous one. | open |
+| ADF-002 | S1 | confirmed | adfs.rs `delete_entry`, `free_fragment` | Delete frees a whole shared fragment (siblings and parent unreadable); multi-fragment files free only the first. | open |
+| ADF-003 | S1 | confirmed | adfs.rs `remove_dir_entry` | Entry shift runs into the directory tail: every delete corrupts the parent pointer, title, name and EndMasSeq. | open |
+| ADF-004 | S1 | confirmed | adfs.rs `insert_dir_entry` | A 78th entry in a full directory overwrites the tail. | open |
+| ADF-005 | S2 | plausible | adfs.rs | Sequence numbers not bumped, check byte not recomputed, entries not sorted. | open |
+| ADF-006 | S2 | confirmed | adfs.rs | Free-space chain broken on allocate and never relinked on delete. | open |
+| ADF-007 | S2 | confirmed | adfs.rs `adfs_calczonecheck` | Truncated last zone underflows and panics (fsck, repair, every write). | open |
+| ADF-008 | S2 | confirmed | adfs.rs `delete_entry` | D-format without FSM panics after rewriting the parent; errors fire after the entry is removed. | open |
+| ADF-009 | S2 | confirmed | adfs.rs `DiscRecord::parse` | id_len / log2bpmb / zone_spare unvalidated: shifts overflow. | open |
+| ADF-010 | S2 | confirmed | adfs.rs `read_dir_block` | Capacity from on-disk root size (4 GiB). | open |
+| ADF-011 | S2 | confirmed | adfs.rs `flush_zone` | Backup map zones 1..n-1 go stale on multi-zone discs. | open |
+| ADF-012 | S2 | plausible | adfs.rs | Free runs / sectors not bounded by the partition; overlapping runs accepted. | open |
+| ADF-013 | S3 | confirmed | adfs.rs `AdfsFsm::read` | Zone load sized by on-disk count (128 MiB); every edit rewrites all zones; quadratic copy. | open |
+| ADF-014 | S3 | confirmed | adfs.rs | Map written before data / entry (leaks on failure); no duplicate-name check. | open |
+| HPF-001 | S1 | confirmed | fs-hpfs hpfs.rs `fix_up_ptrs` etc. | Edit paths follow unchecked dnode pointers and write 2 KiB through an unchecked `write_sectors`. | open |
+| HPF-002 | S2 | confirmed | hpfs.rs `add_dirent` etc. | Dirent walks don't check `len` / `first_free`: infinite loop, panic. | open |
+| HPF-003 | S1 | confirmed | hpfs.rs `flush_bitmaps`, `open` | A bad bitmap pointer is kept: freeing writes 2 KiB to sector 0 or past the partition. | open |
+| HPF-004 | S1 | confirmed | hpfs.rs split / move / delete | Not atomic: DiskFull mid-split drops half a directory; delete frees data before the dirent. | open |
+| HPF-005 | S2 | confirmed | hpfs.rs `free_anode_tree` | Unguarded B+ tree parse on delete: panic, stack overflow, metadata freed. | open |
+| HPF-006 | S2 | confirmed | hpfs.rs | dirband size / start unchecked: panics; overflow. | open |
+| HPF-007 | S2 | confirmed | hpfs.rs `validate_hpfs_name` | Validated trimmed, stored untrimmed: oversized dirents. | open |
+| HPF-008 | S2 | confirmed | hpfs.rs `create_entry` | Size `as u32` with no 2 GiB limit. | open |
+| HPF-009 | S2 | confirmed | hpfs.rs `alloc_file_data` | Fragmented fallback does a full scan per size: effectively a hang. | open |
+| HPF-010 | S3 | confirmed | hpfs.rs `run_fsck` | Cross-link set of every sector (~1 GB); `total - free` underflow. | open |
+| HPF-011 | S2 | confirmed | hpfs.rs `open` | `bitmap_dir + s` overflow; root fnode not range-checked. | open |
+| HPF-012 | S4 | confirmed | hpfs.rs `is_name_long` | Tests the dot, not the character: some long names stored as short. | open |
+| HPF-013 | S4 | confirmed | hpfs.rs `alloc_dnode` | Dead branch. | open |
+| APF-001 | S2 | confirmed | fs-apfs apfs.rs `open_with_passphrase` | Only volume 0 is browsable; a failing volume is skipped silently. | open |
+| APF-002 | S2 | confirmed | apfs.rs `unlock_active_volume` | Only the first KEK tried: other users' passwords / the recovery key fail. | open |
+| APF-003 | S2 | confirmed | apfs.rs `load_omap`, `build_catalog` | No visited set: self-pointing index nodes grow the stack Vec to ~8 GB. | open |
+| APF-004 | S2 | confirmed | apfs.rs `read_block`, `stream_phys` | Physical addresses unchecked against block_count; products overflow. | open |
+| APF-005 | S2 | confirmed | apfs.rs `stream_extents` | 64 GiB cap truncates larger files silently with Ok. | open |
+| APF-006 | S2 | confirmed | apfs.rs `parse_kek_blob`; apfs_crypto.rs | PBKDF2 iterations from the keybag unbounded (hour-long hang). | open |
+| APF-007 | S2 | confirmed | apfs.rs `der_children` | DER length add overflows on 32-bit: panic. | open |
+| APF-008 | S2 | plausible | apfs.rs `stream_phys` | XTS tweak from the physical block, not the extent's crypto_id. | open |
+| APF-009 | S3 | plausible | apfs.rs `build_catalog` | Whole catalog / omap flattened into HashMaps on first browse. | open |
+| QNX-001 | S2 | confirmed | fs-qnx qnx4.rs `extents` | Self-linked empty extent block loops forever. | open |
+| QNX-002 | S2 | confirmed | qnx4.rs `open` | Volume sized to the end of the reader (whole disk for MBR partitions). | open |
+| QNX-003 | S2 | confirmed | qnx4.rs `read_data`, qnx6.rs `read_node` | Allocation by on-disk size before reading; endless hole zero-fill. | open |
+| QNX-004 | S2 | confirmed | qnx6.rs `bmap` | `levels` uncapped: shift overflow. | open |
+| QNX-005 | S3 | confirmed | qnx6.rs `copy_node`, `open` | Block-at-a-time I/O with repeated pointer reads; backup superblock geometry from the primary. | open |
+| QN2-001 | S1 | confirmed | qnx2fs lib.rs `extents`, `mark`, `delete` | Extent spans unchecked: delete frees other files' blocks; `mark` panics; directory writes past the partition. | open |
+| QN2-002 | S1 | confirmed | qnx2fs lib.rs `replace`, `copy_entry` | Space check assumes full extents: a full disk loses the old file. | open |
+| QN2-003 | S2 | confirmed | qnx2fs lib.rs `open`, `read_chain` | Bitmap read grows by on-disk extent sizes before reading (4 GiB). | open |
+| QN2-004 | S2 | confirmed | qnx2fs lib.rs `deleted_state`, `claim` | Per-block loops over 2^32 spans: billions of iterations / issue strings. | open |
+| QN2-005 | S2 | confirmed | qnx2fs lib.rs `copy_entry` | Recursive copy has no depth / visited guard. | open |
+| QN2-006 | S3 | confirmed | qnx2fs lib.rs `create_file`, `free_slot`, `delete` | Data allocated before the slot; spill relink before failure; delete frees before rewriting. | open |
