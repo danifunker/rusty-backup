@@ -21,8 +21,11 @@ to another carries the other slice's prefix and is listed under that slice.
 | iris-sgi-crates work (fs-xfs 0.2.0, sgi-disk, rb-fsimporter, provisioning, shells) | ~6,000 changed | 2026-11-21, separate review agent | 15 |
 | iris-sgi-crates follow-up (fork-export, fs-mac-unicode 0.2.0, fs-amiga 0.2.0) | ~2,700 changed | 2026-11-21, separate review agent | 9 |
 | crates/fs-mac | 42,245 | 2026-11-21 (partial, then the remainder by a separate agent) | 20 |
-| crates/fs-xfs | 18,569 | 2026-11-21, separate agent | 20 |
+| crates/fs-xfs | 18,569 | 2026-11-21, separate agent, fixed in 0.2.0 | 2 deferred |
 | crates/fs-amiga | 16,461 | 2026-11-21, separate agent | 16 |
+| crates/fs-unix | 51,669 | 2026-11-21, separate agent | 61 |
+| crates/fs-8bit | 16,369 | 2026-11-21, separate agent | 16 |
+| crates/dsk-ghost | 10,087 | 2026-11-21, separate agent | 17 |
 | crates/fs-squashfs | 6,425 | (seen in passing) | 1 |
 | src/fs | 14,945 | (seen in passing) | 1 |
 | src/partition, src/rbformats, src/restore | 36,000 | (seen in passing) | 2 |
@@ -311,3 +314,119 @@ B-tree handling, fsck / repair, clone / defrag / journal, codecs.
 | MAC-018 | S3 | confirmed | mfs.rs `create_blank_mfs`; hfv.rs `build_blank_hfv` | Public builders hold the whole volume in RAM, above the 3 MB floppy exception. | open |
 | MAC-019 | S4 | confirmed | hfsplus.rs, hfsplus_defrag.rs, hfs_fsck | Three copies of `catalog_compare`; near-duplicate hardlink creators and fsck pairs. | open |
 | MAC-020 | S4 | confirmed | mfs.rs, mac_roman.rs, mac_alias.rs, CLAUDE.md | Docs that no longer match (MFS "extract-only", name-length doc, map offset, GPL note, HFV limit 2047 vs 4063 MB); mac_alias shows Mac Roman as `?`. | open |
+
+## crates/dsk-ghost
+
+Review by a separate agent, 2026-11-21, read-only.
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| GHO-001 | S1 | confirmed | gho.rs `synthesize_mbr`, `synthesize_ebrs` | Every partition after the first is put in an extended container with an EBR at `hidden - 63`: with two primaries the EBR lands in P1's last track and is served over real data; P2 is unreachable. | open |
+| GHO-002 | S1 | confirmed | gho.rs multi-partition VBR read | Partition size taken from FAT BPB fields only: an NTFS partition gets size 0 and is dropped from the MBR; FAT12 / unknown typed 0x0C. | open |
+| GHO-003 | S2 | confirmed | gho.rs trim / reassign / binary search | Trimmed blocks keep stale offsets in the sorted list, so reads near a partition end hit the wrong block (error or zeros). | open |
+| GHO-004 | S2 | confirmed | gho.rs `ensure_block_cached` | A non-final block that decodes short returns Ok(0) mid-image: the output is silently truncated. | open |
+| GHO-005 | S2 | confirmed | gho.rs `ensure_cluster_decoded` | Each cluster miss decodes the file from its start: O(n^2), effectively a hang on large files. | open |
+| GHO-006 | S2 | confirmed | gho.rs `GhoFileContentReader::fill_next` | Uncompressed body longer than the 33,792-byte buffer panics. | open |
+| GHO-007 | S1 | plausible | gho.rs `build_virtual_fat_image` | create errors swallowed, so files and subtrees silently go missing; layout re-derived from size can change cluster size and run out of space. | open |
+| GHO-008 | S2 | confirmed | gho.rs `build_virtual_fat_image` | DFS without a visited set: a dir pointing back at the root nests until the volume is full, all in RAM. | open |
+| GHO-009 | S2 | confirmed | gho.rs `gather_ghs_siblings` | Spans matched by name prefix only: a neighbouring image's spans are merged in; a relative pick can choose the wrong primary; a missing span is not detected. | open |
+| GHO-010 | S2 | confirmed | gho.rs NTFS file-aware open | VBR `total_sectors` unchecked: a huge value aborts on allocation, products overflow. | open |
+| GHO-011 | S2 | confirmed | gho.rs `open_ntfs_compressed_mft_only`, `extend_ntfs_compressed_index` | Inflate output unbounded (~4 GiB); oversized block shifts later offsets and wrong data is served. | open |
+| GHO-012 | S2 | confirmed | gho.rs lazy NTFS scan; trim | I/O errors swallowed: unmapped clusters served as zeros, real errors treated as padding. | open |
+| GHO-013 | S2 | plausible | gho.rs uncompressed multi-partition | Acknowledged-unsupported layout served as one raw stream instead of refused; later partitions shifted. | open |
+| GHO-014 | S2 | confirmed | gho.rs MBR / EBR synthesis, blocked read | Unchecked subtraction of partition geometry (hidden < 63, overlapping or unsorted) panics or yields garbage. | open |
+| GHO-015 | S3 | confirmed | gho.rs `unsafe impl Send for GhoReader` | Unneeded `unsafe impl Send`. | open |
+| GHO-016 | S4 | confirmed | gho.rs | Dead / duplicated paths (materialize, emit copies, four zlib loops, three Seek impls; one in-RAM volume emitter); 9,850-line file with six jobs. | open |
+| GHO-017 | S4 | confirmed | gho.rs headers | Stale docs (file-aware "deferred", password "errors", "SECTOR only"). | open |
+
+## crates/fs-8bit
+
+Review by a separate agent, 2026-11-21, read-only.
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| B8-001 | S1 | confirmed | cbm.rs `read_bam`, `write_bam`, `create_blank` | D64 40-track BAM for tracks 36-40 overlaps the disk name / ID: blank images get a garbage name, real 40-track disks are misread and their names overwritten. | open |
+| B8-002 | S1 | confirmed | cbm.rs `recompute_bam` / `repair` | GEOS VLIR record chains and info blocks are freed by repair; GEOS disks should be refused like REL. | open |
+| B8-003 | S1 | confirmed | trdos.rs `create_file` | New catalogue slot taken from the disk-info count, not the walk: a wrong count overwrites a live entry or hides the new one. | open |
+| B8-004 | S1 | confirmed | oric.rs `create_file_internal` | Length stored as u16: files over 64 KiB read back truncated. | open |
+| B8-005 | S1 | confirmed | os9.rs `build_fd`, `allocate_segments` | Segment sector counts stored as u16 with no split: a 16 MiB+ contiguous file reads back empty. | open |
+| B8-006 | S1 | plausible | atari_dos.rs create / delete | Enhanced-density (VTOC2) disks are edited as if single-VTOC: VTOC2 goes stale. Writes should be refused on ED. | open |
+| B8-007 | S1 | confirmed | qdos.rs `parse_dir_entry`, `delete_entry` | File type read from the wrong offset: subdirectories list as files and deleting one orphans its contents. | open |
+| B8-008 | S2 | confirmed | ti99.rs `create_file` | More than 76 cluster runs panics after data was written; `n_data as u16` truncates before the size check. | open |
+| B8-009 | S2 | confirmed | os9.rs `dir_add_entry` | Adding an entry rewrites the parent's FD from scratch, zeroing owner, dates and link count. | open |
+| B8-010 | S2 | confirmed | os9.rs `allocate_segments` | LSN 0 can be allocated when the bitmap bit is clear, overwriting the identification sector. | open |
+| B8-011 | S2 | confirmed | os9.rs, qdos.rs, lif.rs reads | Allocations sized from on-disk u32 lengths (4 GiB to ~1 TB). | open |
+| B8-012 | S2 | plausible | qdos.rs `FAT_END_LO` | Chains stop at 0xFFF8+ though clusters up to 65,534 are allowed. | open |
+| B8-013 | S2 | confirmed | dragondos.rs `parse_geometry` | Track counts past the bitmap's 3,488 LSNs flip bits in the directory. | open |
+| B8-014 | S3 | confirmed | cbm.rs, qdos.rs, atari_dos.rs, dragondos.rs, rsdos.rs, trdos.rs | Em dash (U+2014) in user-visible error strings. | open |
+| B8-015 | S4 | confirmed | andos.rs, qdos_mdv.rs | Errors point at moved `src/fs/` paths; andos doc says it lists an empty root. | open |
+| B8-016 | S4 | confirmed | rsdos.rs, atari_dos.rs, dragondos.rs, trdos.rs | Byte-identical name codecs and sector I/O helpers. | open |
+
+## crates/fs-unix
+
+Review by a separate agent (with four sub-forks), 2026-11-21, read-only. Rows that hit several
+drivers are merged.
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| UNX-001 | S1 | confirmed | ext.rs, ufs.rs, efs.rs, efs_v1.rs `delete_entry` | No `nlink` check: deleting one hard-link name frees the inode and blocks the other still uses. | open |
+| UNX-002 | S1 | confirmed | ext.rs `delete_entry`, `inode_data_blocks` | `i_block` read as pointers for fast symlinks / devices / inline data: frees random blocks or panics. | open |
+| UNX-003 | S1 | confirmed | ext.rs `add_dir_entry`, `try_insert_dir_entry` | htree (dir_index) directories not handled: the first insert overwrites `dx_root_info`; leaf inserts ignore hash order. | open |
+| UNX-004 | S1 | confirmed | ext.rs `open`, `build_relocation_map` | No incompat / ro_compat gate: meta_bg, RECOVER (unreplayed journal), bigalloc, inline_data all edited wrongly. | open |
+| UNX-005 | S1 | confirmed | ufs.rs, jfs.rs, efs.rs directory / inode writes | On-disk pointers never checked against the volume size: edits can write into the next partition. | open |
+| UNX-006 | S1 | confirmed | ufs.rs `free_inode_blocks`, `free_frag_run` | Freeing trusts pointers: panics past the CG, frees CG headers / inode tables, frees cross-linked blocks. | open |
+| UNX-007 | S1 | confirmed | efs.rs directory code, efs_fsck.rs, efs_resize.rs | Indirect-extent directories (numextents > 12) treated as direct: insert overwrites an index block, listing shows empty, repair double-links. | open |
+| UNX-008 | S1 | confirmed | efs_v1.rs `allocate_inode`, `dir_insert` | Dirents hold a u16 inum but inodes above 65,535 are handed out: the entry points at the wrong inode. | open |
+| UNX-009 | S1 | confirmed | bfs_fsck.rs `check_inode`, `repair_bfs` | Double-indirect and indirect map blocks never claimed: repair frees them. | open |
+| UNX-010 | S1 | confirmed | ofs_fsck.rs `claim_file`; ofs_write.rs `owned_runs` | Only the first allocation list counted: repair frees chained lists, delete leaks them. | open |
+| UNX-011 | S1 | confirmed | bfs_write.rs `BTree::split_and_promote` | Internal split promotes the wrong key: some keys become unreachable. | open |
+| UNX-012 | S1 | confirmed | bfs_write.rs `write_blank_bfs_into` | 65,537..65,539-block volumes put the root tree past the volume end. | open |
+| UNX-013 | S1 | confirmed | minix.rs `write_blank_minix_into` | `firstdatazone` / `zmap_blocks` stored as u16 unchecked: large V3 volumes overlap data and inodes. | open |
+| UNX-014 | S1 | plausible | minix.rs `parse`, alloc; minix_fsck.rs | Bitmap block counts not checked against zones / inodes: allocation repeats a zone, bit writes hit the inode table. | open |
+| UNX-015 | S1 | plausible | ofs_write.rs `write_sectors`, `claim_slot` | Bound allows one sector past the volume; directory chain pointer can write into the bitmap. | open |
+| UNX-016 | S1 | plausible | jfs_fsck.rs `check_connectivity`, `repair_jfs` | Directories over 4096 bytes skipped: children reported as orphans and double-linked. | open |
+| UNX-017 | S1 | plausible | btrfs.rs `CompactBtrfsReader::new` | Boot area and superblock mirrors zeroed in a compacted backup: restored partition does not boot. | open |
+| UNX-018 | S2 | confirmed | ufs.rs, efs.rs, efs_v1.rs orphan adoption | Children of an orphaned directory adopted twice; UFS `..` and lost+found nlink stale; efs `continue` in the wrong loop. | open |
+| UNX-019 | S2 | confirmed | ext.rs, btrfs.rs, jfs.rs, reiserfs.rs tree walks | No depth cap / level check: self-pointing nodes overflow the stack or loop. | open |
+| UNX-020 | S2 | confirmed | ext, ufs, jfs, jfs1, btrfs, bfs, vxfs | Allocations sized from on-disk fields (symlink size 1<<40 aborts a listing). | open |
+| UNX-021 | S2 | confirmed | efs.rs `open`, `inode_byte_offset` | `cgisize` / `cgfsize` / `ncg` not validated: divide by zero on listing. | open |
+| UNX-022 | S2 | confirmed | ext.rs `try_insert_dir_entry` | `rec_len - actual_len` underflows (panic / wrapped rec_len written). | open |
+| UNX-023 | S2 | confirmed | ext.rs `delete_entry` | Deleting an ext2/3 file over 12 blocks leaks its indirect blocks. | open |
+| UNX-024 | S2 | confirmed | ext.rs `free_blocks_list` | No range / state check: underflow, panic, double-free counted. | open |
+| UNX-025 | S2 | confirmed | ext.rs `open` | Shift before range check, underflow, descriptor Vec sized from disk (up to 128 GiB). | open |
+| UNX-026 | S2 | confirmed | ext.rs `add_block_to_extent_inode` | `eh_entries` / `eh_max` trusted: indexes past `i_block`. | open |
+| UNX-027 | S2 | confirmed | ext.rs `rename` | File type recomputed as dir / regular: symlinks, devices, fifos get the wrong type. | open |
+| UNX-028 | S2 | plausible | ext_fsck.rs; ext.rs | INODE_UNINIT / `itable_unused` ignored: false errors and repairs on lazy-init volumes. | open |
+| UNX-029 | S2 | plausible | ext.rs `grow_ext_add_groups` | Grow ignores reserved GDT blocks and the resize inode. | open |
+| UNX-030 | S2 | plausible | ext.rs; ext_fsck.rs | Block-bitmap checksum covers the whole block, not blocks_per_group / 8. | open |
+| UNX-031 | S2 | plausible | ext.rs `resize_ext_in_place` shrink | Only counts patched: padding bits, descriptor table, inode count stale. | open |
+| UNX-032 | S2 | confirmed | ufs.rs `dir_find`, `dir_remove` | Name slices without the `namlen <= reclen - 8` check: panic on create. | open |
+| UNX-033 | S2 | confirmed | ufs.rs `create_file`, `create_directory` | Rollback runs with size 0 and frees nothing: blocks leak; `cs_ndir` off by one. | open |
+| UNX-034 | S2 | confirmed | ufs.rs `repair_ufs` | Bitmap repair adjusts nffree only: summaries end up wrong. | open |
+| UNX-035 | S2 | confirmed | ufs_fsck.rs `record_frags` | Only the first fragment of each block checked: shared fragments, link counts, cg_cs pass. | open |
+| UNX-036 | S2 | confirmed | ufs.rs | `frag * fsize` on UFS2 64-bit pointers unchecked. | open |
+| UNX-037 | S2 | plausible | ufs.rs `walk_inode_blocks` | Bounded by `di_size` only: a huge size with full triple indirects hangs. | open |
+| UNX-038 | S2 | confirmed | jfs.rs `read_fileset_inode` | pmap read per extent, not per inode: after one delete, other inodes in that extent fail to read. | open |
+| UNX-039 | S2 | confirmed | jfs_fsck.rs; jfs.rs | lost+found inode written before an insert that then fails: each repair leaks a directory. | open |
+| UNX-040 | S2 | confirmed | btrfs.rs `parse_btrfs_superblock` | `sys_chunk_array_size` over 3285 panics at open. | open |
+| UNX-041 | S2 | confirmed | btrfs.rs | Compressed extents read as zeros (should be Unsupported); PREALLOC returns stale bytes; short items zero-filled. | open |
+| UNX-042 | S2 | plausible | btrfs.rs `resize_btrfs_in_place` | DEV_ITEM and mirror superblocks not updated; I/O errors return Ok. | open |
+| UNX-043 | S2 | confirmed | reiserfs.rs `list_directory` | Each child re-walks every leaf: quadratic listing. | open |
+| UNX-044 | S2 | plausible | reiserfs.rs | `s_bmap_nr` unchecked: bitmap reads past the volume; compact stream too long. | open |
+| UNX-045 | S2 | confirmed | jfs.rs, jfs1.rs | Unchecked size multiplications. | open |
+| UNX-046 | S2 | confirmed | bfs.rs `parse`; bfs_fsck.rs | Geometry not cross-checked: fsck loops 2^60 times. | open |
+| UNX-047 | S2 | confirmed | bfs_write.rs `delete_entry` | Tree stored and runs freed before the double-indirect refusal; attribute dirs never freed. | open |
+| UNX-048 | S2 | confirmed | vxfs_edit.rs | Panics on hostile input (namelen slice, underflow, maps / iau indexing). | open |
+| UNX-049 | S2 | confirmed | minix.rs `create_file` | Size stored as u32 (4 GiB+1 records 1); a failure leaks the inode and zones. | open |
+| UNX-050 | S2 | confirmed | minix.rs, vxfs_edit.rs `rename` | Old dirent removed before the insert: DiskFull leaves the inode nameless. | open |
+| UNX-051 | S2 | confirmed | efs_v1.rs `read_dir_entries` vs efs_v1_fsck.rs | Reader drops out-of-range dirents, so fsck's check can never fire. | open |
+| UNX-052 | S2 | plausible | unix_common/compact.rs `MappedBlocks` and callers | One u64 per allocated block (~2 GB for 1 TB); ext's tables add more: breaks the streaming rule. | open |
+| UNX-053 | S3 | confirmed | unix_common/compact.rs `load_block` | One seek + read per block, not 64 KiB-1 MiB runs. | open |
+| UNX-054 | S3 | confirmed | ufs.rs `open` | `total_frags` not compared with `ncg*fpg` or the slice (generic form of SD-001). | open |
+| UNX-055 | S3 | confirmed | btrfs.rs `list_directory` | `Err(_) => continue` drops children silently. | open |
+| UNX-056 | S3 | confirmed | jfs.rs, jfs_fsck.rs | `≥`, `⇒`, `—` in user-visible messages. | open |
+| UNX-057 | S3 | confirmed | bfs_write.rs, ofs_write.rs, ofs.rs | Whole-source `read_to_end`; OFS buffers a whole extent. | open |
+| UNX-058 | S4 | confirmed | bfs_write.rs, minix.rs, vxfs.rs | Each allocation rereads the whole bitmap; VxFS bmap rereads indirects per block. | open |
+| UNX-059 | S4 | confirmed | efs_fsck.rs, efs_v1_fsck.rs, jfs_fsck.rs, ufs_fsck.rs (+ fs-xfs) | Five copies of the fsck `Builder`; belongs in `disk_core::fsck`. | open |
+| UNX-060 | S4 | confirmed | ufs.rs, efs.rs | Full 27-field `FileEntry` literals (DC-008 class). | open |
+| UNX-061 | S4 | confirmed | lib.rs, ufs.rs, efs_resize.rs, ext_format.rs | Stale docs (ofs GPL note, UFS scope, shrink hard-link claim, batch-builder caller). | open |
