@@ -131,6 +131,15 @@ writes, `ntfs_format`, the clone modules. Fixed in **fs-pc 0.1.7** (no API chang
 | FP-010 | S2 | confirmed | [human68k.rs:372](../../crates/fs-pc/src/human68k.rs#L372) | Human68k `open` read the whole FAT into a buffer sized from two u16 BPB fields (up to 4 GiB) with no check. Refused when the FAT overruns the volume or the image. | fixed (fs-pc 0.1.7) |
 | FP-011 | S2 | confirmed | [human68k.rs:394](../../crates/fs-pc/src/human68k.rs#L394) | The chain walker capped at `total_sectors / spc + 16`, so a chain could name 16 clusters past the volume. Now capped at the real last cluster (`cluster_limit`). | fixed (fs-pc 0.1.7) |
 
+**Regression (batch level, 2026-11-21, `d2258bde`, covering part-tables 0.2.0 and fs-pc 0.1.7):**
+preflight green; 821 cases: 572 pass, 12 fail, 237 skip; oracle verify clean. The 12
+failures are 9 vintage Cocoa GUI flows (no desktop session) and the 3 CV-001 convert
+cases; the produce step's 6 missing convert artifacts (`fmt.vhd-*`, `fmt.qcow2`,
+`fmt.vmdk-sparse`, `fmt.chd`, `optical.chdcd`) are CV-001 as well and failed the same
+way before these changes. An earlier attempt was void: the disk filled (see the
+unattended-run notes) and the next one caught an over-strict FAT check, fixed in
+`d2258bde`.
+
 ## crates/fs-squashfs
 
 | ID | Sev | Verdict | Where | Finding | Status |
@@ -154,4 +163,4 @@ writes, `ntfs_format`, the clone modules. Fixed in **fs-pc 0.1.7** (no API chang
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| CV-001 | S3 | confirmed | [classify.rs:81](../../src/model/convert/classify.rs#L81) | A 2 MB FAT image classifies as a floppy, and `--format qcow2` / `vmdk-sparse` / `chd` (hard-disk formats) are then ignored without a word: the output is raw. `subcmd.convert.{qcow2,vmdk-sparse,chd}-reopens` fail on main since the Convert redesign (`da41d419`). Either warn when `--format` doesn't apply to a kind, or let a hard-disk format pull a floppy-sized image along. | open |
+| CV-001 | S3 | confirmed | [classify.rs:81](../../src/model/convert/classify.rs#L81) | A 2 MB FAT image classifies as a floppy, and `--format qcow2` / `vmdk-sparse` / `chd` (hard-disk formats) are then ignored without a word: the output is raw. `subcmd.convert.{qcow2,vmdk-sparse,chd}-reopens` fail on main since the Convert redesign (`da41d419`). Either warn when `--format` doesn't apply to a kind, or let a hard-disk format pull a floppy-sized image along. The produce step's `fmt.vhd-fixed`, `fmt.vhd-dynamic`, `fmt.qcow2`, `fmt.vmdk-sparse`, `fmt.chd` and `optical.chdcd` artifacts are missing for the same reason. | open |
