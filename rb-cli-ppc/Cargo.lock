@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "fs-tar"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bzip2",
@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "fs-unix"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1614,11 +1614,13 @@ dependencies = [
  "qnx2fs",
  "ratatui",
  "rb-fsexporter",
+ "rb-fsimporter",
  "rustyline",
  "self-replace",
  "serde",
  "serde_json",
  "serde_yml",
+ "sgi-disk",
  "sha1",
  "sha2",
  "shell-words",
@@ -1641,6 +1643,17 @@ dependencies = [
  "anyhow",
  "disk-core",
  "fs-mac",
+]
+
+[[package]]
+name = "rb-fsimporter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "flate2",
+ "fs-mac",
+ "fs-tar",
 ]
 
 [[package]]
@@ -1826,6 +1839,17 @@ dependencies = [
  "ryu",
  "serde",
  "version_check",
+]
+
+[[package]]
+name = "sgi-disk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "fs-unix",
+ "fs-xfs",
+ "part-tables",
 ]
 
 [[package]]

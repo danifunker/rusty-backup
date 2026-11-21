@@ -22,7 +22,7 @@ rust173-polyfill = ["disk-core/rust173-polyfill", "part-tables/rust173-polyfill"
 anyhow = "1"
 disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
 part-tables = { path = "../part-tables", version = "0.2", default-features = false, features = ["sgi"] }
-fs-unix = { path = "../fs-unix", version = "0.2", default-features = false, features = ["efs"] }
+fs-unix = { path = "../fs-unix", version = "0.3", default-features = false, features = ["efs"] }
 fs-xfs = { path = "../fs-xfs", version = "0.2", optional = true }
 
 [dev-dependencies]

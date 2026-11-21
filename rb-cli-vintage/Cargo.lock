@@ -856,7 +856,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -879,7 +879,7 @@ checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
 dependencies = [
  "cfg-if",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "fs-tar"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bzip2 0.5.2",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "fs-unix"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1914,11 +1914,13 @@ dependencies = [
  "qnx2fs",
  "ratatui",
  "rb-fsexporter",
+ "rb-fsimporter",
  "rustyline",
  "self-replace",
  "serde",
  "serde_json",
  "serde_yml",
+ "sgi-disk",
  "sha1",
  "sha2",
  "shell-words",
@@ -1942,6 +1944,17 @@ dependencies = [
  "anyhow",
  "disk-core",
  "fs-mac",
+]
+
+[[package]]
+name = "rb-fsimporter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "flate2",
+ "fs-mac",
+ "fs-tar",
 ]
 
 [[package]]
@@ -2035,7 +2048,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2048,7 +2061,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2206,6 +2219,17 @@ dependencies = [
  "ryu",
  "serde",
  "version_check",
+]
+
+[[package]]
+name = "sgi-disk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "fs-unix",
+ "fs-xfs",
+ "part-tables",
 ]
 
 [[package]]

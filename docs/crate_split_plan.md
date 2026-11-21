@@ -46,7 +46,14 @@ All names were checked against crates.io on 2026-10-30 and are free. `fs-core` w
 | Crate | Contents |
 |---|---|
 | `fs-tar` | export any `disk-core` filesystem (or a folder in it) to `.tar` / `.tar.gz` / `.tar.zst`, and import a tar into any editable filesystem. Handles permissions, symlinks, times and case-insensitive filesystems. Builds on the `tar` crate. |
+| `rb-fsimporter` | import a host folder into any editable `disk-core` filesystem (the mirror of `rb-fsexporter`): tar / zip expansion, progress and cancel through a `Host`, Mac archives and disk images through a caller's `Expander`; `mac` feature for forks (GPL via `fs-mac-unicode`, off by default). Moved from `src/fs/dir_import.rs` 2026-11-21 |
 | `rb-fsexporter` | export any `disk-core` filesystem (a file, a folder, a whole volume) to a host folder: Mac forks in every `fs-mac` mode, symlinks (a text file where the host refuses one), existing-file / error / case-collision policies, POSIX modes, progress and cancel through a `Host` trait. Depends on `disk-core` and `fs-mac` only. Added in Phase 2 slice 19 (docs/phase2_commander_plan.md). |
+
+### Disk builders (1)
+
+| Crate | Contents |
+|---|---|
+| `sgi-disk` | SGI / IRIX disks: build a volume header + EFS, XFS (feature `xfs`) or label-only root, data-only or root-plus-swap, 16 x 63 geometry by default; open an SGI partition as a `disk-core` filesystem over any reader. Moved from `src/partition/sgi_hdd_builder.rs` 2026-11-21 (the first HDD builder to leave the app: part-tables cannot depend on fs-unix, and IRIS needs it MIT) |
 
 ### Partition tables (1)
 

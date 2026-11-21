@@ -26,7 +26,7 @@ rust173-polyfill = ["disk-core/rust173-polyfill", "fs-tar/rust173-polyfill", "fs
 [dependencies]
 anyhow = "1"
 disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
-fs-tar = { path = "../fs-tar", version = "0.1", default-features = false, features = ["zip"] }
+fs-tar = { path = "../fs-tar", version = "0.2", default-features = false, features = ["zip"] }
 fs-mac = { path = "../fs-mac", version = "0.1", default-features = false, features = ["forks"], optional = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
