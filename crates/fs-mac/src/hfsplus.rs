@@ -2494,6 +2494,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             &mut self.reader,
             self.partition_offset,
             self.vh.block_size,
+            self.vh.total_blocks,
             &self.vh.extents_file,
             data,
         )
@@ -2513,6 +2514,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             &mut self.reader,
             self.partition_offset,
             self.vh.block_size,
+            self.vh.total_blocks,
             &self.vh.attributes_file,
             HFSPLUS_ATTRIBUTES_FILE_ID,
             0,
@@ -2529,6 +2531,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             &mut self.reader,
             self.partition_offset,
             self.vh.block_size,
+            self.vh.total_blocks,
             &self.vh.catalog_file,
             HFSPLUS_CATALOG_FILE_ID,
             0,
@@ -2544,6 +2547,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                 &mut self.reader,
                 self.partition_offset,
                 self.vh.block_size,
+                self.vh.total_blocks,
                 &self.vh.allocation_file,
                 bm,
             )?;
@@ -3943,10 +3947,24 @@ pub fn probe_hfsplus_volume_label<R: Read + Seek>(
 }
 
 /// Write data through a fork's extent descriptors.
+/// An extent read from disk must lie inside the volume before anything is written through it.
+fn check_extent(start: u32, count: u32, total_blocks: u32) -> Result<(), FilesystemError> {
+    if start
+        .checked_add(count)
+        .map_or(true, |end| end > total_blocks)
+    {
+        return Err(FilesystemError::InvalidData(format!(
+            "extent at block {start} for {count} blocks runs past the {total_blocks}-block volume"
+        )));
+    }
+    Ok(())
+}
+
 fn write_fork_data<R: Write + Seek>(
     writer: &mut R,
     partition_offset: u64,
     block_size: u32,
+    total_blocks: u32,
     fork: &ForkData,
     data: &[u8],
 ) -> Result<(), FilesystemError> {
@@ -3955,6 +3973,7 @@ fn write_fork_data<R: Write + Seek>(
         if ext.is_empty() || written >= data.len() {
             break;
         }
+        check_extent(ext.start_block, ext.block_count, total_blocks)?;
         let offset = partition_offset + ext.start_block as u64 * block_size as u64;
         let extent_len = ext.block_count as u64 * block_size as u64;
         let to_write = extent_len.min((data.len() - written) as u64) as usize;
@@ -3976,6 +3995,7 @@ fn write_fork_data_with_overflow<R: Write + Seek>(
     writer: &mut R,
     partition_offset: u64,
     block_size: u32,
+    total_blocks: u32,
     fork: &ForkData,
     file_id: u32,
     fork_type: u8,
@@ -3987,6 +4007,7 @@ fn write_fork_data_with_overflow<R: Write + Seek>(
         if ext.block_count == 0 || *written >= data.len() {
             return Ok(false);
         }
+        check_extent(ext.start_block, ext.block_count, total_blocks)?;
         let offset = partition_offset + ext.start_block as u64 * block_size as u64;
         let extent_len = ext.block_count as u64 * block_size as u64;
         let to_write = extent_len.min((data.len() - *written) as u64) as usize;
@@ -10098,5 +10119,38 @@ mod tests {
             return;
         }
         panic!("the clock ticked during every attempt");
+    }
+}
+
+#[cfg(test)]
+mod extent_bound_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// FM-002: a B-tree fork extent past the volume is refused, and nothing is written.
+    #[test]
+    fn writing_a_fork_past_the_volume_is_refused() {
+        let total = 1000u32;
+        let mut fork = ForkData {
+            logical_size: 8192,
+            clump_size: 0,
+            total_blocks: 2,
+            extents: [ExtentDescriptor {
+                start_block: 0,
+                block_count: 0,
+            }; 8],
+        };
+        fork.extents[0] = ExtentDescriptor {
+            start_block: total - 1,
+            block_count: 2,
+        };
+        let mut out = Cursor::new(vec![0u8; 4096]);
+        assert!(write_fork_data(&mut out, 0, 4096, total, &fork, &[0xAA; 8192]).is_err());
+        assert!(out.get_ref().iter().all(|&b| b == 0));
+        fork.extents[0].start_block = u32::MAX;
+        assert!(
+            write_fork_data(&mut out, 0, 4096, total, &fork, &[0xAA; 16]).is_err(),
+            "overflow"
+        );
     }
 }

@@ -1992,6 +1992,7 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
             if written >= self.catalog_data.len() {
                 break;
             }
+            check_hfs_extent(&self.mdb, ext.start_block, ext.block_count)?;
             let off = first_alloc + ext.start_block as u64 * self.mdb.block_size as u64;
             let len = (ext.block_count as usize * self.mdb.block_size as usize)
                 .min(self.catalog_data.len() - written);
@@ -4269,6 +4270,7 @@ fn write_extents_overflow_data<W: std::io::Write + Seek>(
         if extent.block_count == 0 {
             break;
         }
+        check_hfs_extent(mdb, extent.start_block, extent.block_count)?;
         let block_off = alloc_start + extent.start_block as u64 * mdb.block_size as u64;
         let byte_len = extent.block_count as usize * mdb.block_size as usize;
         let data_end = (data_start + byte_len).min(data.len());
@@ -4315,6 +4317,21 @@ fn write_fork_data_to<R: Read + Seek>(
 }
 
 /// Write fork data to disk through extent descriptors.
+/// An extent read from disk must lie inside the volume before anything is written through it.
+fn check_hfs_extent(
+    mdb: &HfsMasterDirectoryBlock,
+    start: u16,
+    count: u16,
+) -> Result<(), FilesystemError> {
+    if start as u32 + count as u32 > mdb.total_blocks as u32 {
+        return Err(FilesystemError::InvalidData(format!(
+            "extent at block {start} for {count} blocks runs past the {}-block volume",
+            mdb.total_blocks
+        )));
+    }
+    Ok(())
+}
+
 fn write_hfs_fork_data<R: Write + Seek>(
     writer: &mut R,
     partition_offset: u64,
@@ -4328,6 +4345,7 @@ fn write_hfs_fork_data<R: Write + Seek>(
         if ext.block_count == 0 || written >= data.len() {
             break;
         }
+        check_hfs_extent(mdb, ext.start_block, ext.block_count)?;
         let offset = first_alloc_offset + ext.start_block as u64 * mdb.block_size as u64;
         let extent_len = ext.block_count as u64 * mdb.block_size as u64;
         let to_write = extent_len.min((data.len() - written) as u64) as usize;
@@ -7912,5 +7930,51 @@ mod tests {
             return;
         }
         panic!("the clock ticked during every attempt");
+    }
+}
+
+#[cfg(test)]
+mod extent_bound_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// FM-001: a fork extent past the volume is refused, and nothing is written.
+    #[test]
+    fn writing_through_an_extent_past_the_volume_is_refused() {
+        let img = create_blank_hfs(4 * 1024 * 1024, 4096, "Bound").unwrap();
+        let mdb = HfsMasterDirectoryBlock::parse(&img[1024..1536]).unwrap();
+        let past = [
+            HfsExtDescriptor {
+                start_block: mdb.total_blocks - 1,
+                block_count: 2,
+            },
+            HfsExtDescriptor {
+                start_block: 0,
+                block_count: 0,
+            },
+            HfsExtDescriptor {
+                start_block: 0,
+                block_count: 0,
+            },
+        ];
+        let mut out = Cursor::new(img.clone());
+        assert!(write_hfs_fork_data(&mut out, 0, &mdb, &past, &[0xAA; 8192]).is_err());
+        assert_eq!(out.into_inner(), img);
+        let inside = [
+            HfsExtDescriptor {
+                start_block: mdb.total_blocks - 2,
+                block_count: 2,
+            },
+            HfsExtDescriptor {
+                start_block: 0,
+                block_count: 0,
+            },
+            HfsExtDescriptor {
+                start_block: 0,
+                block_count: 0,
+            },
+        ];
+        let mut out = Cursor::new(img.clone());
+        write_hfs_fork_data(&mut out, 0, &mdb, &inside, &[0xAA; 16]).unwrap();
     }
 }

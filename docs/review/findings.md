@@ -18,6 +18,7 @@ to another carries the other slice's prefix and is listed under that slice.
 | crates/disk-core | 4,943 | 2026-11-21, fixed in 0.3.0 | 1 (DC-006, per driver) |
 | crates/part-tables | 10,220 | 2026-11-21, fixed in 0.2.0 | 0 |
 | crates/fs-pc | 27,123 | 2026-11-21, fixed in 0.1.7 | 0 |
+| crates/fs-mac | 42,245 | partial (write paths through extents), fixed in 0.1.11 | review not finished |
 | crates/fs-squashfs | 6,425 | (seen in passing) | 1 |
 | src/fs | 14,945 | (seen in passing) | 1 |
 | src/partition, src/rbformats, src/restore | 36,000 | (seen in passing) | 2 |
@@ -139,6 +140,18 @@ cases; the produce step's 6 missing convert artifacts (`fmt.vhd-*`, `fmt.qcow2`,
 way before these changes. An earlier attempt was void: the disk filled (see the
 unattended-run notes) and the next one caught an over-strict FAT check, fixed in
 `d2258bde`.
+
+## crates/fs-mac (partial)
+
+Read so far: the in-memory blank builders (test-only callers, so within the
+streaming rule) and every HFS / HFS+ write that goes through on-disk extents.
+Still to read: MFS, B-tree node-size and catalog-size handling, fsck repair, the
+clone / defrag / journal modules. A regression run for 0.1.11 is still owed.
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| FM-001 | S1 | confirmed | [hfs.rs](../../crates/fs-mac/src/hfs.rs) | The HFS catalog, extents-overflow and fork write-backs (`write_hfs_fork_data`, `write_extents_overflow_data`, the catalog's overflow loop) wrote through extents read from the MDB and the extents B-tree with no check that they end inside `total_blocks`, so a corrupt tree sent B-tree writes past the volume. `check_hfs_extent` now refuses them before any write. | fixed (fs-mac 0.1.11) |
+| FM-002 | S1 | confirmed | [hfsplus.rs](../../crates/fs-mac/src/hfsplus.rs) | HFS+ `write_fork_data` / `write_fork_data_with_overflow` (catalog, extents and attributes B-trees) had the same gap. They take `total_blocks` and refuse an extent that overflows or ends past it. | fixed (fs-mac 0.1.11) |
 
 ## crates/fs-squashfs
 
