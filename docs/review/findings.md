@@ -17,6 +17,7 @@ to another carries the other slice's prefix and is listed under that slice.
 |---|---:|---|---:|
 | crates/disk-core | 4,943 | 2026-11-21, fixed in 0.3.0 | 1 (DC-006, per driver) |
 | crates/part-tables | 10,220 | 2026-11-21, fixed in 0.2.0 | 0 |
+| crates/fs-pc | 27,123 | 2026-11-21, fixed in 0.1.7 | 0 |
 | crates/fs-squashfs | 6,425 | (seen in passing) | 1 |
 | src/fs | 14,945 | (seen in passing) | 1 |
 | src/partition, src/rbformats, src/restore | 36,000 | (seen in passing) | 2 |
@@ -107,6 +108,28 @@ fix. Fixed in **part-tables 0.2.0** (breaking: `patch_mbr_entries`, `build_ebr_c
 | PT-010 | S2 | plausible | [x68k.rs:334](../../crates/part-tables/src/x68k.rs#L334) | Moving an X68k partition overwrote the start word's high byte, which holds the active / flags bits, with zero, and a start past 24 bits wrapped silently. The flags byte is now kept and a too-large start is refused. The app's own `restore_patch::patch_x68k` already kept it (see PR-001). | fixed (part-tables 0.2.0) |
 | PT-011 | S1 | confirmed | [mbr.rs](../../crates/part-tables/src/mbr.rs) | `build_ebr_chain` subtracted LBAs unchecked; an impossible layout wrote EBRs at wrapped positions. Now an error; `restore::build_restore_ebr_chain` returns `Result<Option<_>>` so a restore stops instead of dropping the logical partitions. | fixed (part-tables 0.2.0) |
 | PT-012 | S4 | confirmed | [mbr.rs](../../crates/part-tables/src/mbr.rs) | Dead code in `Mbr::parse` (`let _ = &mut entries`). Removed. The crate's private `Cursor` / `be16` / `le32` helpers move onto `disk_core::bytes` when each module is next touched (DC-011). | fixed (part-tables 0.2.0) |
+
+## crates/fs-pc
+
+Read: every open / boot-sector parse (FAT, exFAT, NTFS, Human68k), the chain and
+run followers that reads and writes go through, NTFS run decoding and fixups, and
+the bitmap and FAT buffers sized from on-disk fields. Not yet read line by line:
+the FAT resize / repack rebuild (fat.rs 2400-2800), the four fsck modules' repair
+writes, `ntfs_format`, the clone modules. Fixed in **fs-pc 0.1.7** (no API change).
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| FP-001 | S2 | confirmed | [fat.rs:132](../../crates/fs-pc/src/fat.rs#L132) | `open` never checked the BPB layout, and `scan_used_clusters` (run at every open) allocated `sectors_per_fat * bytes_per_sector`: a damaged BPB asked for up to TiBs and the allocation failure aborted the app. Now refused when there are no FATs, the regions overrun the volume, or the FAT runs past the image's end (when the reader knows its length; a raw device that reports 0 is not refused). | fixed (fs-pc 0.1.7) |
+| FP-002 | S1 | confirmed | [fat.rs:427](../../crates/fs-pc/src/fat.rs#L427) | `next_cluster` accepted any link below the format's reserved range, not just up to the last data cluster, and `write_cluster_chain` wrote wherever the link pointed: a corrupt chain sent writes past the FAT volume into whatever follows it. Links past `total_clusters + 1` now end the chain, for every reader and writer. | fixed (fs-pc 0.1.7) |
+| FP-003 | S4 | confirmed | [fat.rs](../../crates/fs-pc/src/fat.rs) | `total_clusters as u32 + 2` could wrap in the used-cluster scan. Saturates now. | fixed (fs-pc 0.1.7) |
+| FP-004 | S1 | confirmed | [exfat.rs:272](../../crates/fs-pc/src/exfat.rs#L272) | exFAT `next_cluster` range-checked the cluster it was given but returned any `next` up to the end-of-chain marker, which the caller then read or wrote. Now `2 <= next < cluster_count + 2`. | fixed (fs-pc 0.1.7) |
+| FP-005 | S2 | confirmed | [exfat.rs:38](../../crates/fs-pc/src/exfat.rs#L38) | The sectors-per-cluster shift was not checked: `1 << shift` panicked in debug for 64+ and gave a wrong cluster size in release. Refused when the two shifts sum past 25 (32 MiB clusters), as the spec caps them. | fixed (fs-pc 0.1.7) |
+| FP-006 | S2 | confirmed | [exfat.rs:413](../../crates/fs-pc/src/exfat.rs#L413) | The allocation-bitmap length from the root directory sized a buffer unchecked. Refused past one bit per cluster plus a cluster of slack. | fixed (fs-pc 0.1.7) |
+| FP-007 | S2 | confirmed | [ntfs.rs:113](../../crates/fs-pc/src/ntfs.rs#L113) | The index-record size did `1 << -raw` on an i8: `0x80` overflowed the negation (panic) and large shifts panicked or masked. Now decoded by `mft_record_bytes`, with the existing 4096 fallback. | fixed (fs-pc 0.1.7) |
+| FP-008 | S1 | confirmed | [ntfs.rs:2391](../../crates/fs-pc/src/ntfs.rs#L2391) | `write_data_to_runs` wrote at each on-disk run's cluster with no check that the run ends inside the volume, so overwriting a file (or $Bitmap) on a corrupt volume could write past the partition; the $Bitmap resize indexed its buffer with those runs (panic). `check_runs` now refuses a negative or past-the-end run before any write or bitmap update. | fixed (fs-pc 0.1.7) |
+| FP-009 | S3 | confirmed | [ntfs.rs:177](../../crates/fs-pc/src/ntfs.rs#L177) | `decode_data_runs` added relative offsets unchecked (panic in debug on a crafted run list). Stops the list now. | fixed (fs-pc 0.1.7) |
+| FP-010 | S2 | confirmed | [human68k.rs:372](../../crates/fs-pc/src/human68k.rs#L372) | Human68k `open` read the whole FAT into a buffer sized from two u16 BPB fields (up to 4 GiB) with no check. Refused when the FAT overruns the volume or the image. | fixed (fs-pc 0.1.7) |
+| FP-011 | S2 | confirmed | [human68k.rs:394](../../crates/fs-pc/src/human68k.rs#L394) | The chain walker capped at `total_sectors / spc + 16`, so a chain could name 16 clusters past the volume. Now capped at the real last cluster (`cluster_limit`). | fixed (fs-pc 0.1.7) |
 
 ## crates/fs-squashfs
 

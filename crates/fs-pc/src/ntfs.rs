@@ -109,12 +109,8 @@ pub fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
     })?;
 
     // Clusters per index record at 0x44: same signed encoding as 0x40.
-    let clusters_per_index_raw = vbr[0x44] as i8;
-    let index_record_size = if clusters_per_index_raw < 0 {
-        1u32 << ((-clusters_per_index_raw) as u32)
-    } else {
-        clusters_per_index_raw as u32 * sectors_per_cluster as u32 * bytes_per_sector as u32
-    };
+    // A value mft_record_bytes refuses (0x80's negation overflows) falls back to 4096 below.
+    let index_record_size = mft_record_bytes(vbr[0x44] as i8, cluster_bytes).unwrap_or(0);
 
     Ok(NtfsVbr {
         bytes_per_sector,
@@ -228,7 +224,10 @@ pub(crate) fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
             }
             pos += offset_size;
 
-            let abs_offset = prev_offset + offset;
+            // A run list whose offsets overflow is corrupt; stop rather than panic.
+            let Some(abs_offset) = prev_offset.checked_add(offset) else {
+                break;
+            };
             prev_offset = abs_offset;
 
             runs.push(DataRun {
@@ -2390,6 +2389,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
 
     /// Write data to disk through data runs.
     fn write_data_to_runs(&mut self, runs: &[DataRun], data: &[u8]) -> Result<(), FilesystemError> {
+        self.check_runs(runs)?;
         let mut written = 0usize;
         for run in runs {
             if written >= data.len() {
@@ -2406,6 +2406,23 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
             self.reader.seek(SeekFrom::Start(offset))?;
             self.reader.write_all(&data[written..written + to_write])?;
             written += to_write;
+        }
+        Ok(())
+    }
+
+    /// Refuse runs (read from disk) that start before the volume or end past it: writing them would leave the volume.
+    fn check_runs(&self, runs: &[DataRun]) -> Result<(), FilesystemError> {
+        let total = self.total_sectors * self.bytes_per_sector / self.cluster_size;
+        for r in runs.iter().filter(|r| !r.sparse) {
+            let end = u64::try_from(r.cluster_offset)
+                .ok()
+                .and_then(|start| start.checked_add(r.length));
+            if end.map_or(true, |e| e > total) {
+                return Err(FilesystemError::InvalidData(format!(
+                    "data run at cluster {} for {} clusters lies outside the {total}-cluster volume",
+                    r.cluster_offset, r.length
+                )));
+            }
         }
         Ok(())
     }
@@ -2828,6 +2845,8 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         let (pos, _) = find_attr_pos(&record, ATTR_DATA, false)
             .ok_or_else(|| FilesystemError::Parse("$Bitmap $DATA attribute not found".into()))?;
         let instance = [record[pos + 0x0E], record[pos + 0x0F]];
+        // The runs come from disk and index the bitmap below.
+        self.check_runs(&old_runs)?;
         let allocated_clusters: u64 = old_runs
             .iter()
             .filter(|r| !r.sparse)
@@ -7316,5 +7335,62 @@ mod backup_boot_sector_tests {
         fs.parse_index_entry_list(&data, "/", &mut listed).unwrap();
         let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["WTSRV", "pagefile.sys"]);
+    }
+}
+
+#[cfg(test)]
+mod review_fix_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn blank_ntfs() -> Vec<u8> {
+        let mut blank = Cursor::new(Vec::new());
+        crate::ntfs_format::create_blank_ntfs(&mut blank, 32 * 1024 * 1024, 64, Some("T")).unwrap();
+        blank.into_inner()
+    }
+
+    /// FP-007: an index-record byte of 0x80 (its negation overflows an i8) falls back instead of panicking.
+    #[test]
+    fn a_hostile_index_record_size_falls_back() {
+        let mut vbr = [0u8; 512];
+        vbr.copy_from_slice(&blank_ntfs()[..512]);
+        vbr[0x44] = 0x80;
+        assert_eq!(parse_vbr(&vbr).unwrap().index_record_size, 4096);
+        vbr[0x44] = 0xE0; // 2^32
+        assert_eq!(parse_vbr(&vbr).unwrap().index_record_size, 4096);
+    }
+
+    /// FP-009: a run list whose relative offsets overflow ends instead of panicking.
+    #[test]
+    fn overflowing_run_offsets_stop_the_run_list() {
+        // Two runs, each one cluster at a +i64::MAX-ish offset.
+        let mut list = vec![0x81, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F];
+        list.extend_from_slice(&[
+            0x81, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0x00,
+        ]);
+        assert_eq!(decode_data_runs(&list).len(), 1);
+    }
+
+    /// FP-008: a run from disk that lies past the volume is refused, and nothing is written.
+    #[test]
+    fn writing_through_a_run_past_the_volume_is_refused() {
+        let mut img = blank_ntfs();
+        let before = img.clone();
+        let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let total = fs.total_sectors * fs.bytes_per_sector / fs.cluster_size;
+        let past = [DataRun {
+            cluster_offset: total as i64 - 1,
+            length: 2,
+            sparse: false,
+        }];
+        assert!(fs.write_data_to_runs(&past, &[0xAA; 4096]).is_err());
+        let negative = [DataRun {
+            cluster_offset: -1,
+            length: 1,
+            sparse: false,
+        }];
+        assert!(fs.write_data_to_runs(&negative, &[0xAA; 16]).is_err());
+        drop(fs);
+        assert_eq!(img, before);
     }
 }

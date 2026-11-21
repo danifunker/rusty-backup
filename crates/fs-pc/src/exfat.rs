@@ -75,6 +75,12 @@ fn parse_exfat_vbr(vbr: &[u8; 512]) -> Result<ExfatVbr, FilesystemError> {
             bytes_per_sector_shift
         )));
     }
+    // The spec caps a cluster at 32 MiB: the two shifts sum to at most 25.
+    if bytes_per_sector_shift as u32 + sectors_per_cluster_shift as u32 > 25 {
+        return Err(FilesystemError::Parse(format!(
+            "invalid exFAT sectors per cluster shift: {sectors_per_cluster_shift}"
+        )));
+    }
 
     Ok(ExfatVbr {
         volume_length,
@@ -280,7 +286,8 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
         self.reader.read_exact(&mut buf)?;
         let next = u32::from_le_bytes(buf);
 
-        if !(2..0xFFFFFFF8).contains(&next) {
+        // A link past the last cluster is corrupt; following it would leave the volume.
+        if !(2..self.cluster_count.saturating_add(2)).contains(&next) {
             Ok(None)
         } else {
             Ok(Some(next))
@@ -420,6 +427,14 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                             root_data[pos + 30],
                             root_data[pos + 31],
                         ]);
+                        // The bitmap is one bit per cluster; a larger length from a corrupt entry must not size a buffer.
+                        let spec_size = (self.cluster_count as u64).div_ceil(8);
+                        if self.bitmap_size > spec_size + self.cluster_size {
+                            return Err(FilesystemError::Parse(format!(
+                                "exFAT allocation bitmap of {} bytes for {} clusters",
+                                self.bitmap_size, self.cluster_count
+                            )));
+                        }
                     }
                 ENTRY_TYPE_VOLUME_LABEL => {
                     // Volume label entry: character count at offset 1, name at offset 2 (UTF-16LE)
@@ -3628,5 +3643,54 @@ mod tests {
         let main_boot: Vec<u8> = image[..12 * 512].to_vec();
         let backup_boot = &image[12 * 512..24 * 512];
         assert_eq!(main_boot, backup_boot);
+    }
+
+    fn blank_exfat() -> Vec<u8> {
+        let template = super::ExfatFormatTemplate {
+            bytes_per_sector: 512,
+            sectors_per_cluster: 8,
+            label: None,
+        };
+        let mut cur = Cursor::new(Vec::<u8>::new());
+        super::create_blank_exfat(&mut cur, &template, 16 * 1024 * 1024).unwrap();
+        cur.into_inner()
+    }
+
+    /// FP-004: a FAT link past the last cluster ends the chain.
+    #[test]
+    fn an_exfat_link_past_the_volume_ends_the_chain() {
+        let mut fs = super::ExfatFilesystem::open(Cursor::new(blank_exfat()), 0).unwrap();
+        let count = fs.cluster_count;
+        fs.write_fat_entry(2, count + 1).unwrap();
+        assert_eq!(
+            fs.next_cluster(2).unwrap(),
+            Some(count + 1),
+            "the last cluster is valid"
+        );
+        fs.write_fat_entry(2, count + 2).unwrap();
+        assert_eq!(fs.next_cluster(2).unwrap(), None);
+    }
+
+    /// FP-005: a cluster shift beyond the spec's 32 MiB cluster is refused, not shifted.
+    #[test]
+    fn an_exfat_cluster_shift_past_the_spec_is_refused() {
+        let mut img = blank_exfat();
+        img[0x6D] = 64;
+        assert!(super::ExfatFilesystem::open(Cursor::new(img), 0).is_err());
+    }
+
+    /// FP-006: an allocation bitmap far larger than its clusters need is refused before it is read.
+    #[test]
+    fn an_oversized_exfat_bitmap_is_refused() {
+        let img = blank_exfat();
+        let fs = super::ExfatFilesystem::open(Cursor::new(img.clone()), 0).unwrap();
+        let root = fs.cluster_offset(fs.root_cluster) as usize;
+        let mut img = img;
+        let entry = (0..fs.cluster_size as usize)
+            .step_by(32)
+            .find(|&o| img[root + o] == super::ENTRY_TYPE_ALLOCATION_BITMAP)
+            .expect("bitmap entry in the root");
+        img[root + entry + 24..root + entry + 32].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        assert!(super::ExfatFilesystem::open(Cursor::new(img), 0).is_err());
     }
 }
