@@ -30,8 +30,8 @@
 //! BinHex, MacZip, ...) and disk images expand only through an [`Expander`] the
 //! caller passes in; rusty-backup supplies one, other callers may pass `None`. The
 //! `mac` feature rejoins Mac resource forks from `._name` / `.rsrc` sidecars and
-//! MacBinary / AppleSingle wrappers onto HFS / MFS / ProDOS targets; it pulls in
-//! `fs-mac` and with it the GPL-2.0-only `fs-mac-unicode`, so it is off by default.
+//! MacBinary / AppleSingle wrappers onto HFS / MFS / ProDOS targets; it uses only
+//! `fs-mac`'s MIT `codecs` (no HFS), and is off by default.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};

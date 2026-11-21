@@ -41,7 +41,7 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 ## Dependencies
 
-Only `disk-core`, `fs-mac` (feature `forks`) and `anyhow`. `fs-mac` pulls in the GPL-2.0-only `fs-mac-unicode`, so a build with this crate is GPL as a whole.
+Only `disk-core`, `fs-mac` (feature `fork-export`: the fork writers, no HFS) and `anyhow`. The tree is MIT end to end; it no longer pulls in the GPL-2.0-only `fs-mac-unicode`.
 
 Builds on Rust 1.73 and later. Part of [rusty-backup](https://github.com/danifunker/rusty-backup).
 

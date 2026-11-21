@@ -12,6 +12,7 @@ First release. Moved out of rusty-backup's `src/fs/dir_import.rs`, with:
   Every method has a default body (no detection, an "unsupported" error), and
   the types its methods take (`ImportOptions`, `ImportStats`, `Importer`,
   `FileEntry`, `EditableFilesystem`) are re-exported from the crate root.
+- The `mac` feature uses `fs-mac`'s MIT-only `codecs`, so every build is MIT.
 - `preflight_dir_with` / `measure_dir_with` taking the expander; `measure_dir`
   takes it too.
 - Feature `mac` for Mac fork rejoining (off by default).

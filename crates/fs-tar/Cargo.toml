@@ -16,8 +16,8 @@ default = ["native-zstd"]
 # zstd backend for .tar.zst: the C libzstd (fast) or the pure-Rust, bit-exact port.
 native-zstd = ["dep:zstd"]
 pure-zstd = ["dep:libzstd-bitexact-rs"]
-# Join macOS `._name` AppleDouble sidecars to their files as resource forks (pulls in fs-mac,
-# which depends on the GPL-2.0-only fs-mac-unicode). Without it sidecars are skipped and counted.
+# Join macOS `._name` AppleDouble sidecars to their files as resource forks (fs-mac's MIT-only
+# codecs, no HFS). Without it sidecars are skipped and counted.
 appledouble = ["dep:fs-mac"]
 # Only for a Rust 1.73 toolchain; see disk-core.
 # Browse a tar as a read-only filesystem (`mem_archive`).
@@ -39,7 +39,7 @@ chrono = { version = "0.4", optional = true }
 tempfile = "3"
 zstd = { version = ">=0.13, <0.15", optional = true }
 libzstd-bitexact-rs = { version = "0.157", optional = true }
-fs-mac = { path = "../fs-mac", version = "0.1", default-features = false, features = ["forks"], optional = true }
+fs-mac = { path = "../fs-mac", version = "0.1.11", default-features = false, features = ["codecs"], optional = true }
 zip = { version = ">=2.4.2, <10", default-features = false, optional = true }
 
 [dev-dependencies]

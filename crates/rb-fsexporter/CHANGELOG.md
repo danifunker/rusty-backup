@@ -3,6 +3,13 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.4
+
+### Changed
+- Depends on `fs-mac` 0.1.11 with its new `fork-export` feature (the
+  AppleDouble / MacBinary / BinHex writers, no HFS), so a build no longer pulls
+  in the GPL-2.0-only `fs-mac-unicode`: the crate's tree is MIT end to end.
+
 ## 0.1.3
 
 ### Fixed

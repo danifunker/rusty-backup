@@ -8,7 +8,7 @@ Tar archives in and out of any [`disk-core`](https://crates.io/crates/disk-core)
 Features:
 
 - `native-zstd` (default) / `pure-zstd`: the zstd backend for `.tar.zst`.
-- `appledouble`: join macOS `._name` sidecars to their files as a resource fork plus type / creator codes. It pulls in `fs-mac`, and through it the GPL-2.0-only `fs-mac-unicode`, so a build with it on is GPL as a whole. Without it, sidecars are skipped and counted.
+- `appledouble`: join macOS `._name` sidecars to their files as a resource fork plus type / creator codes. It uses only `fs-mac`'s `codecs` feature (no HFS, no `fs-mac-unicode`), so the tree stays MIT. Without it, sidecars are skipped and counted.
 
 Builds on Rust 1.73 and later. Part of [rusty-backup](https://github.com/danifunker/rusty-backup).
 

@@ -14,8 +14,8 @@ categories = ["filesystem", "emulators"]
 [features]
 default = ["native-zstd"]
 # Rejoin Mac resource forks from `._name` / `.rsrc` sidecars and MacBinary / AppleSingle
-# wrappers on HFS / MFS / ProDOS targets. Pulls in fs-mac, which depends on the
-# GPL-2.0-only fs-mac-unicode, so a build with it is GPL as a whole.
+# wrappers on HFS / MFS / ProDOS targets. Uses fs-mac's MIT-only codecs
+# (no HFS, no fs-mac-unicode).
 mac = ["dep:fs-mac", "fs-tar/appledouble"]
 # .tar.zst expansion backend, forwarded to fs-tar.
 native-zstd = ["fs-tar/native-zstd"]
@@ -27,7 +27,7 @@ rust173-polyfill = ["disk-core/rust173-polyfill", "fs-tar/rust173-polyfill", "fs
 anyhow = "1"
 disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
 fs-tar = { path = "../fs-tar", version = "0.2", default-features = false, features = ["zip"] }
-fs-mac = { path = "../fs-mac", version = "0.1", default-features = false, features = ["forks"], optional = true }
+fs-mac = { path = "../fs-mac", version = "0.1.11", default-features = false, features = ["codecs"], optional = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]

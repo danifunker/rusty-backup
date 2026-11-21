@@ -19,7 +19,7 @@
 
 #[cfg(feature = "codecs")]
 pub mod binhex;
-#[cfg(feature = "forks")]
+#[cfg(feature = "fork-export")]
 pub mod fork_export;
 #[cfg(feature = "hfs")]
 pub mod hfs;
