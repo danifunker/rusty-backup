@@ -461,7 +461,7 @@ Review by a separate agent, 2026-11-21, read-only.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| XRX-001 | S1 | confirmed | alto/write.rs `build_disk` | VDAs and freePages stored as u16: Trident packs always fail fsck and point at wrong pages past 65535. | fixed (XFIX2): rebuild of packs over 65535 pages refused |
+| XRX-001 | S1 | confirmed | alto/write.rs `build_disk` | VDAs and freePages stored as u16: Trident packs always fail fsck and point at wrong pages past 65535. | fixed (0c22507d): rebuild of packs over 65535 pages refused |
 | XRX-002 | S1 | plausible | alto/write.rs `extract_files`, `build_disk` | Every edit / repair rebuilds from SysDir only: sub-directory files dropped, boot page not copied. | open |
 | XRX-003 | S2 | confirmed | alto/bfs.rs `sync_metadata`, `repair`; src/model/browse_session.rs | Non-atomic save, always PDI: a Salto `.dsk` overwritten as PDI. | open |
 | XRX-004 | S2 | confirmed | alto/pdi.rs `read_header` | Label / data sizes unchecked against the family: panic on open; product overflow. | open |
@@ -471,7 +471,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | XRX-008 | S2 | confirmed | alto/pilot.rs `parse_client_directory` | Reads a word past the page. | open |
 | XRX-009 | S2 | confirmed | alto/pilot.rs volume / file builders | Loops over on-disk u32 counts unclamped: long hangs, huge run tables. | open |
 | XRX-010 | S2 | confirmed | alto/pilot.rs `rebuild_vam`, `delete_file` | Direct sector indexing from descriptor sizes: panic on add / delete. | open |
-| XRX-011 | S1 | confirmed | alto/pilot.rs `add_file` | Runs stored `as u16`: files over 32 MiB read back truncated. | fixed (XFIX2) |
+| XRX-011 | S1 | confirmed | alto/pilot.rs `add_file` | Runs stored `as u16`: files over 32 MiB read back truncated. | fixed (0c22507d) |
 
 ## crates/arc-mac
 
