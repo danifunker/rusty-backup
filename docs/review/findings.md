@@ -430,3 +430,100 @@ drivers are merged.
 | UNX-059 | S4 | confirmed | efs_fsck.rs, efs_v1_fsck.rs, jfs_fsck.rs, ufs_fsck.rs (+ fs-xfs) | Five copies of the fsck `Builder`; belongs in `disk_core::fsck`. | open |
 | UNX-060 | S4 | confirmed | ufs.rs, efs.rs | Full 27-field `FileEntry` literals (DC-008 class). | open |
 | UNX-061 | S4 | confirmed | lib.rs, ufs.rs, efs_resize.rs, ext_format.rs | Stale docs (ofs GPL note, UFS scope, shrink hard-link claim, batch-builder caller). | open |
+
+## crates/fs-apple2
+
+Review by a separate agent, 2026-11-21, read-only.
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| AP2-001 | S1 | confirmed | apple_dos.rs `read_file_bytes` + `read_file` | Type-B header stripped twice: some payloads read back as 1 byte. | open |
+| AP2-002 | S1 | confirmed | apple_dos.rs `create_file` | B header length `as u16`: files over 64 KiB read back truncated. | open |
+| AP2-003 | S1 | confirmed | prodos.rs `create_file` | Exactly 16 MiB accepted; EOF stored as 0, file reads empty, blocks stay allocated. | open |
+| AP2-004 | S2 | confirmed | prodos.rs directory-chain walks | No cycle guard: a self-linked dir block hangs list / create / delete. | open |
+| AP2-005 | S2 | confirmed | prodos.rs `free_file_blocks` | Index pointers not range-checked before freeing: panic, or the volume directory freed. | open |
+| AP2-006 | S2 | confirmed | prodos.rs read / write_to / delete | Storage type 5 (forked) treated as seedling: extract returns the fork descriptor; delete leaks both forks. | open |
+| AP2-007 | S2 | plausible | prodos.rs `resize_prodos_in_place` | Shrink guard uses the used-block count, not the highest used block; stale buffer on a failed read. | open |
+| AP2-008 | S2 | plausible | prodos.rs subdirectory builders | Subdir metadata off-spec (0-based parent entry number, EOF 0, counts not updated, volume dir grows past 4 blocks). | open |
+| AP2-009 | S2 | plausible | prodos.rs `allocate_block`; ucsd.rs `find_gap` | Block 0 allocatable; volume size not checked against the partition. | open |
+| AP2-010 | S2 | confirmed | apple_dos.rs `read_file_bytes` | Sparse (0,0) T/S pairs skipped instead of zero-filled: records shift. | open |
+| AP2-011 | S2 | confirmed | apple_dos.rs `alloc_one_sector`, `free_sector_count` | Track 34 counted free but never allocated: creates fail half-way. | open |
+| AP2-012 | S2 | confirmed | apple_dos.rs `bitmap_mark_free` | Freed T/S pairs not range-checked: panic. | open |
+| AP2-013 | S2 | confirmed | apple_dos.rs `encode_apple_name` | Trailing spaces accepted, trimmed on read: failed create, then duplicates. | open |
+| AP2-014 | S2 | confirmed | ucsd.rs `byte_size`, `read_file` | `last_byte` not clamped: reads spill into following files. | open |
+| AP2-015 | S2 | confirmed | ucsd.rs `repair_ucsd` | BadName repair drops the entry and frees the file's blocks. | open |
+| AP2-016 | S2 | confirmed | ucsd.rs `create_file` | Block count `as u16` wraps at 32 MiB; slice panics. | open |
+| AP2-017 | S3 | confirmed | prodos.rs, apple_dos.rs, ucsd.rs, sector_order.rs | Em dash / multiplication sign in user-visible errors. | open |
+| AP2-018 | S3 | confirmed | prodos_types.rs `parse_json` | Format crate reads the app config dir; a bad override file is silently ignored. | open |
+| AP2-019 | S4 | confirmed | apple_dos.rs, prodos.rs | Catalog walk copied 5 times; read_* duplicate write_*_to; fork walkers duplicated. | open |
+
+## crates/fs-xerox
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| XRX-001 | S1 | confirmed | alto/write.rs `build_disk` | VDAs and freePages stored as u16: Trident packs always fail fsck and point at wrong pages past 65535. | open |
+| XRX-002 | S1 | plausible | alto/write.rs `extract_files`, `build_disk` | Every edit / repair rebuilds from SysDir only: sub-directory files dropped, boot page not copied. | open |
+| XRX-003 | S2 | confirmed | alto/bfs.rs `sync_metadata`, `repair`; src/model/browse_session.rs | Non-atomic save, always PDI: a Salto `.dsk` overwritten as PDI. | open |
+| XRX-004 | S2 | confirmed | alto/pdi.rs `read_header` | Label / data sizes unchecked against the family: panic on open; product overflow. | open |
+| XRX-005 | S2 | confirmed | alto/copydisk.rs `read` | Allocation from u16 geometry before reading: OOM / panic. | open |
+| XRX-006 | S2 | confirmed | alto/zdisk.rs `inflate` | Uncapped inflate: zlib bomb. | open |
+| XRX-007 | S2 | confirmed | alto/pilot.rs `leader_name` | Property read past the 512-byte page: panic on open. | open |
+| XRX-008 | S2 | confirmed | alto/pilot.rs `parse_client_directory` | Reads a word past the page. | open |
+| XRX-009 | S2 | confirmed | alto/pilot.rs volume / file builders | Loops over on-disk u32 counts unclamped: long hangs, huge run tables. | open |
+| XRX-010 | S2 | confirmed | alto/pilot.rs `rebuild_vam`, `delete_file` | Direct sector indexing from descriptor sizes: panic on add / delete. | open |
+| XRX-011 | S1 | confirmed | alto/pilot.rs `add_file` | Runs stored `as u16`: files over 32 MiB read back truncated. | open |
+
+## crates/arc-mac
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| ARC-001 | S2 | confirmed | stuffit_huffman.rs, stuffit_lzah.rs, stuffit_lzh.rs; arsenic, compactpro reserves | Decoders don't stop at end of input and reserve the header length up front: 4 GiB bombs. | open |
+| ARC-002 | S2 | confirmed | stuffit_lzw.rs `decompress`, `BitCursor::skip` | Pad skip after CLEAR overruns: panic (reachable from dsk-tape `.Z`). | open |
+| ARC-003 | S2 | confirmed | stuffit_lzw.rs | `.Z` max bits not capped at 16; output unbounded. | open |
+| ARC-004 | S2 | confirmed | maczip.rs `inflate` | Inflate uncapped, size checked after. | open |
+| ARC-005 | S2 | plausible | mar.rs, compactpro.rs, stuffit.rs | Unbounded folder nesting recursion; per-level path clones. | open |
+| ARC-006 | S2 | confirmed | extract.rs `write_entry` | Entries mapping to the same host path overwrite each other and existing files. | open |
+| ARC-007 | S2 | confirmed | extract.rs `write_entry` | MacBinary / AppleDouble output drops dates and Finder flags. | open |
+| ARC-008 | S2 | plausible | stuffit.rs, stuffit5.rs | usize overflow on 32-bit targets: infinite loop / panic. | open |
+| ARC-009 | S3 | confirmed | stuffit.rs, mar.rs writers | Sizes / counts truncated and names cut silently, returning Ok. | open |
+| ARC-010 | S3 | confirmed | extract.rs, mar.rs, maczip.rs | Archives held whole in RAM, several copies. | open |
+| ARC-011 | S3 | confirmed | maczip.rs, stuffit5.rs `parse` | Unreadable forks dropped silently; ZIP CRC unchecked; truncated SIT5 unreported. | open |
+| ARC-012 | S2 | plausible | stuffit_arsenic.rs `read_block` | Zero-run counters overflow (panic / spin). | open |
+| ARC-013 | S4 | confirmed | arsenic, lzah, lzh, detect.rs | Duplicate bit readers / PrefixCode / three CRC-32s; BinHex decoded twice. | open |
+
+## crates/dsk-apple
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| DAP-001 | S2 | confirmed | woz.rs data-field decoders | WOZ sector checksums never checked (3.5" eats a checksum nibble as data); missing 5.25" sectors zeroed silently. | open |
+| DAP-002 | S2 | plausible | woz.rs | `bit_count * 2` from the TRK descriptor overflows. | open |
+| DAP-003 | S2 | plausible | dc42.rs `encode_dc42_with_tags`; dart.rs | Tag checksum range, format byte and disk_format look off-spec; tagged DARTs all named "Lisa". | open |
+| DAP-004 | S4 | confirmed | dc42.rs | Disk names UTF-8 instead of Mac Roman. | open |
+| DAP-005 | S4 | plausible | woz_write.rs `FORMAT_35_SSDD` | 400K format byte disagrees with dc42.rs; 3.5" WOZ marked Apple ][. | open |
+| DAP-006 | S4 | confirmed | woz.rs, moof.rs | Duplicate readers, extra TRKS copy, WOZ CRC unchecked, dead code. | open |
+
+## crates/fs-squashfs, crates/dsk-vm, crates/fs-tar
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| SQ-002 | S2 | confirmed | squashfs.rs `decompress`, `decompress_zstd` | XZ / LZMA / zstd output uncapped: GiB-scale bombs. | open |
+| SQ-003 | S2 | confirmed | squashfs.rs `Superblock::parse` | `block_log` unbounded: shift panic, 2 GiB blocks. | open |
+| SQ-004 | S2 | confirmed | squashfs.rs `build_node`; squashfs_verify.rs | No directory-cycle guard: stack overflow / endless verify. | open |
+| SQ-005 | S2 | confirmed | squashfs.rs `read_metadata_span` and table loads | Capacities taken from on-disk u32s (4 GiB / 64 GiB). | open |
+| SQ-006 | S3 | confirmed | squashfs_write.rs `write_node`; `read_build_tree` | Dir `parent` written wrong; hard links duplicated on rebuild. | open |
+| SQ-007 | S4 | confirmed | squashfs.rs, squashfs_write.rs | Comment contradicts code; whole-Vec clone per file; near-duplicate table loaders. | open |
+| DVM-001 | S1 | plausible | qcow2.rs `open`, `ensure_free_cluster_index` | Edits accepted on dirty / corrupt images; with lazy refcounts live clusters are reused. | open |
+| DVM-002 | S2 | confirmed | qcow2.rs `export_qcow2` | One-cluster refcount table overflows into the first L2 table at small cluster sizes (latent). | open |
+| DVM-003 | S1 | confirmed | vmdk_sparse.rs `export_vmdk_sparse` | Host offset `as u32` sectors: disks past 2 TiB written corrupt. | open |
+| DVM-004 | S2 | confirmed | vmdk.rs descriptor parse / `open_with` | Absolute or `..` extent paths opened read-write: an edit can write into an arbitrary host file. | open |
+| DVM-005 | S2 | confirmed | vhd.rs `write`, `allocate_block` | Unchecked BAT index, 4 GiB block buffers, offset overflow, unaligned file length shifts data. | open |
+| DVM-006 | S2 | confirmed | vmdk_sparse.rs header parse | Grain size / GT entries unbounded: 8 GiB / 1 TiB allocations. | open |
+| DVM-007 | S2 | plausible | vmdk.rs `read_descriptor` | Only 64 KiB of descriptor parsed: many-extent disks fail or silently shorten. | open |
+| DVM-008 | S2 | plausible | qcow2.rs `open`, `allocate_cluster` | Unaligned file length gives unaligned new clusters and wrong refcounts. | open |
+| DVM-009 | S4 | confirmed | vmdk.rs, lib.rs, qemu_img_test.rs | Test-only public fn; helpers duplicated with src/rbformats. | open |
+| TAR-001 | S1 | plausible | tar_import.rs `NormalizedTar::fill` | Data blocks counted from the ustar size only: pax sizes / GNU sparse headers make data be rewritten as headers (silent corruption). | open |
+| TAR-002 | S2 | confirmed | tar_import.rs; zip_import.rs `plan` | `skip_appledouble=false` ignored: `._` files always consumed; preflight disagrees. | open |
+| TAR-003 | S2 | confirmed | mem_archive.rs | Small compressed archives inflated fully into RAM uncapped; indexed path fills disk; zip capacity from declared size. | open |
+| TAR-004 | S2 | plausible | tar_import.rs `open_tar_stream` | Multi-member .tar.gz imports only the first member. | open |
+| TAR-005 | S2 | plausible | tar_export.rs `walk` | Export recursion has no depth / visited guard. | open |
+| TAR-006 | S4 | confirmed | import_sink.rs, tar_export.rs, mem_archive.rs, zstd_compat.rs, zip_import.rs | Stats merge drops a field; stale docs; pure-zstd can't browse .tar.zst; duplicate date code. | open |
