@@ -1260,7 +1260,8 @@ pub fn add_file(
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for lp in allocated_lps {
         match runs.last_mut() {
-            Some((first, len)) if *first + *len == lp => *len += 1,
+            // A run's size is a 16-bit word in the run table: split at 0xFFFF (XRX-011).
+            Some((first, len)) if *first + *len == lp && *len < 0xFFFF => *len += 1,
             _ => runs.push((lp, 1)),
         }
     }
