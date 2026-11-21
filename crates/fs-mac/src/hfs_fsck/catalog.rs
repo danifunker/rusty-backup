@@ -725,21 +725,13 @@ pub(super) fn repair_catalog_consistency(
                         dir_id
                     ));
                 } else {
-                    // Thread insertion failed (node full). Remove the orphaned
-                    // directory record instead — without a thread, Mac OS
-                    // cannot resolve this CNID and some operations will fail.
-                    let decoded = mac_roman_to_utf8(name);
-                    if remove_record_by_key(catalog_data, node_size, parent_id, name) {
-                        report.fixes_applied.push(format!(
-                            "Removed directory CNID {} '{}' (could not create missing thread)",
-                            dir_id, decoded
-                        ));
-                    } else {
-                        report.fixes_failed.push(format!(
-                            "Failed to insert or remove directory thread for CNID {} '{}'",
-                            dir_id, decoded
-                        ));
-                    }
+                    // The leaf is full and this repair does not split nodes. Deleting the
+                    // directory instead would orphan its whole subtree, so leave it (MAC-003).
+                    report.fixes_failed.push(format!(
+                        "Could not insert the missing directory thread for CNID {} '{}' (leaf full)",
+                        dir_id,
+                        mac_roman_to_utf8(name)
+                    ));
                 }
             }
             Some((thr_parent, thr_name)) => {
@@ -873,7 +865,7 @@ fn insert_thread_record(
         crate::hfs_common::btree_find_insert_leaf(catalog_data, &header, &key_record, &compare);
 
     let offset = leaf_idx as usize * node_size;
-    if offset + node_size > catalog_data.len() {
+    if leaf_idx == 0 || offset + node_size > catalog_data.len() {
         return false;
     }
 
@@ -897,19 +889,23 @@ fn fix_thread_record(
     correct_parent_id: u32,
     correct_name: &[u8],
 ) -> bool {
-    // First remove the existing thread
+    // Remove the old thread, insert the corrected one; if it does not fit, put the old back.
+    let before = catalog_data.to_vec();
     if !remove_thread_record(catalog_data, node_size, cnid) {
         return false;
     }
-    // Then insert the correct one
-    insert_thread_record(
+    let ok = insert_thread_record(
         catalog_data,
         node_size,
         cnid,
         thread_type,
         correct_parent_id,
         correct_name,
-    )
+    );
+    if !ok {
+        catalog_data.copy_from_slice(&before);
+    }
+    ok
 }
 
 /// Scan all leaf nodes for thread records with incorrect data lengths and
@@ -1005,56 +1001,6 @@ fn remove_thread_record(catalog_data: &mut [u8], node_size: usize, cnid: u32) ->
     let compare = crate::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare;
     let search_key =
         crate::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::build_catalog_key(cnid, &[]);
-
-    let header = BTreeHeader::read(catalog_data);
-    let mut node_idx = header.first_leaf_node;
-    let mut visited = HashSet::new();
-
-    while node_idx != 0 {
-        if !visited.insert(node_idx) {
-            break;
-        }
-        let off = node_idx as usize * node_size;
-        if off + node_size > catalog_data.len() {
-            break;
-        }
-        let num_records = BigEndian::read_u16(&catalog_data[off + 10..off + 12]) as usize;
-        for i in 0..num_records {
-            let (rec_start, rec_end) =
-                btree_record_range(&catalog_data[off..off + node_size], node_size, i);
-            if rec_start >= rec_end || rec_end > node_size {
-                continue;
-            }
-            let key_len = catalog_data[off + rec_start] as usize;
-            let key_end = rec_start + 1 + key_len;
-            if key_end > rec_end {
-                continue;
-            }
-            let key_portion = &catalog_data[off + rec_start..off + key_end];
-            if compare(key_portion, &search_key) == std::cmp::Ordering::Equal {
-                let node = &mut catalog_data[off..off + node_size];
-                crate::hfs_common::btree_remove_record(node, node_size, i);
-                let mut h = BTreeHeader::read(catalog_data);
-                h.leaf_records = h.leaf_records.saturating_sub(1);
-                h.write(catalog_data);
-                return true;
-            }
-        }
-        node_idx = BigEndian::read_u32(&catalog_data[off..off + 4]);
-    }
-    false
-}
-
-/// Remove a catalog record by (parent_id, name) key from the catalog B-tree.
-fn remove_record_by_key(
-    catalog_data: &mut [u8],
-    node_size: usize,
-    parent_id: u32,
-    name: &[u8],
-) -> bool {
-    let compare = crate::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare;
-    let search_key =
-        crate::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::build_catalog_key(parent_id, name);
 
     let header = BTreeHeader::read(catalog_data);
     let mut node_idx = header.first_leaf_node;

@@ -407,6 +407,48 @@ fn mark_extents(
 }
 
 /// Phase 3: Fix extent issues (out-of-range and overlapping extents).
+/// Check one fork's three extents: an extent past the volume or overlapping blocks already
+/// claimed is zeroed, and so is every later extent of the fork, which readers would no
+/// longer reach. Blocks are claimed only by an extent that passes (MAC-005).
+fn repair_fork_extents(
+    catalog_data: &mut [u8],
+    ext_base: usize,
+    used_blocks: &mut HashSet<u32>,
+    total_blocks: u32,
+    file_id: u32,
+    kind: &str,
+    report: &mut RepairReport,
+) {
+    let mut cut = false;
+    for j in 0..3 {
+        let ext_off = ext_base + j * 4;
+        let start = BigEndian::read_u16(&catalog_data[ext_off..ext_off + 2]) as u32;
+        let count = BigEndian::read_u16(&catalog_data[ext_off + 2..ext_off + 4]) as u32;
+        if count == 0 {
+            continue;
+        }
+        let why = if cut {
+            Some("follows a zeroed extent")
+        } else if start + count > total_blocks {
+            Some("is out of range")
+        } else if (start..start + count).any(|b| used_blocks.contains(&b)) {
+            Some("overlaps another")
+        } else {
+            None
+        };
+        match why {
+            None => used_blocks.extend(start..start + count),
+            Some(why) => {
+                cut = true;
+                catalog_data[ext_off..ext_off + 4].fill(0);
+                report.fixes_applied.push(format!(
+                    "Zeroed {kind} extent {j} of file CNID {file_id}, which {why}: data loss possible"
+                ));
+            }
+        }
+    }
+}
+
 pub(super) fn repair_extents(
     mdb: &HfsMasterDirectoryBlock,
     catalog_data: &mut [u8],
@@ -471,83 +513,16 @@ pub(super) fn repair_extents(
             let file_id =
                 BigEndian::read_u32(&catalog_data[rec_data_offset + 20..rec_data_offset + 24]);
 
-            // Check data fork extents at rec_data_offset + 74
-            for j in 0..3 {
-                let ext_off = rec_data_offset + 74 + j * 4;
-                let start = BigEndian::read_u16(&catalog_data[ext_off..ext_off + 2]) as u32;
-                let count = BigEndian::read_u16(&catalog_data[ext_off + 2..ext_off + 4]) as u32;
-                if count == 0 {
-                    continue;
-                }
-
-                if start + count > total_blocks {
-                    // Truncate out-of-range extent
-                    BigEndian::write_u16(&mut catalog_data[ext_off..ext_off + 2], 0);
-                    BigEndian::write_u16(&mut catalog_data[ext_off + 2..ext_off + 4], 0);
-                    report.fixes_applied.push(format!(
-                        "Truncated out-of-range data extent for file CNID {} — data loss possible",
-                        file_id
-                    ));
-                } else {
-                    // Check for overlaps
-                    let mut overlaps = false;
-                    for b in start..start + count {
-                        if !used_blocks.insert(b) {
-                            overlaps = true;
-                            break;
-                        }
-                    }
-                    if overlaps {
-                        // Remove all blocks we just added, then zero the extent
-                        for b in start..start + count {
-                            used_blocks.remove(&b);
-                        }
-                        BigEndian::write_u16(&mut catalog_data[ext_off..ext_off + 2], 0);
-                        BigEndian::write_u16(&mut catalog_data[ext_off + 2..ext_off + 4], 0);
-                        report.fixes_applied.push(format!(
-                            "Zeroed overlapping data extent for file CNID {} — data loss possible",
-                            file_id
-                        ));
-                    }
-                }
-            }
-
-            // Check resource fork extents at rec_data_offset + 86
-            for j in 0..3 {
-                let ext_off = rec_data_offset + 86 + j * 4;
-                let start = BigEndian::read_u16(&catalog_data[ext_off..ext_off + 2]) as u32;
-                let count = BigEndian::read_u16(&catalog_data[ext_off + 2..ext_off + 4]) as u32;
-                if count == 0 {
-                    continue;
-                }
-
-                if start + count > total_blocks {
-                    BigEndian::write_u16(&mut catalog_data[ext_off..ext_off + 2], 0);
-                    BigEndian::write_u16(&mut catalog_data[ext_off + 2..ext_off + 4], 0);
-                    report.fixes_applied.push(format!(
-                        "Truncated out-of-range resource extent for file CNID {} — data loss possible",
-                        file_id
-                    ));
-                } else {
-                    let mut overlaps = false;
-                    for b in start..start + count {
-                        if !used_blocks.insert(b) {
-                            overlaps = true;
-                            break;
-                        }
-                    }
-                    if overlaps {
-                        for b in start..start + count {
-                            used_blocks.remove(&b);
-                        }
-                        BigEndian::write_u16(&mut catalog_data[ext_off..ext_off + 2], 0);
-                        BigEndian::write_u16(&mut catalog_data[ext_off + 2..ext_off + 4], 0);
-                        report.fixes_applied.push(format!(
-                            "Zeroed overlapping resource extent for file CNID {} — data loss possible",
-                            file_id
-                        ));
-                    }
-                }
+            for (base, kind) in [(74usize, "data"), (86, "resource")] {
+                repair_fork_extents(
+                    catalog_data,
+                    rec_data_offset + base,
+                    &mut used_blocks,
+                    total_blocks,
+                    file_id,
+                    kind,
+                    report,
+                );
             }
         }
         node_idx = BigEndian::read_u32(&catalog_data[off..off + 4]);

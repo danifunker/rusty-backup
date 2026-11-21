@@ -294,26 +294,26 @@ B-tree handling, fsck / repair, clone / defrag / journal, codecs.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| MAC-001 | S1 | confirmed | mfs.rs `MfsDirEntry::encode` | Directory names up to 255 bytes parse but are cut to 27 on every directory write-back: any edit renames every file with a longer name. | open |
-| MAC-002 | S1 | confirmed | mfs.rs `MfsMdb::parse`, `alloc_block_offset`, `map_set`, `map_write_back` | MDB geometry unchecked: the map can overlap the directory, allocations can pass the volume end, more than 4094 blocks wrap the 12-bit links, counters overflow. | open |
-| MAC-003 | S1 | confirmed | hfs_fsck/catalog.rs `repair_catalog_consistency`, `fix_thread_record` | When a missing thread does not fit its leaf, repair deletes the directory record (orphaning the subtree) or removes the old thread first and leaves none. | open |
-| MAC-004 | S1 | confirmed | hfs.rs `repair`; hfs_fsck/bitmap.rs | The extents-overflow tree is read with `.ok()`: a read error rebuilds the bitmap without overflow extents and frees fragmented files' later extents. | open |
-| MAC-005 | S2 | confirmed | hfs_fsck/bitmap.rs `repair_extents` | On an overlap the whole range is dropped from the used set, so a later cross-link with the first file survives repair; zeroing extent j keeps j+1. | open |
-| MAC-006 | S1 | plausible | hfs_fsck/btree.rs `rebuild_index_nodes`; hfs.rs `repair` | A failed index rebuild leaves `root_node` on a zeroed node and the catalog is written anyway. | open |
-| MAC-007 | S2 | confirmed | hfs.rs `list_children`, file-extents lookup; hfs_clone.rs `walk_catalog` | Classic HFS leaf-chain walks have no visited set: a self-linked leaf hangs list, read and clone. | open |
-| MAC-008 | S2 | confirmed | hfs.rs, hfs_clone.rs, hfsplus.rs, hfs_common.rs `btree_node_free_space` | `node_size - 2*(i+1)` from on-disk numRecords underflows and panics; HFS+ open accepts node sizes 1-13. | open |
-| MAC-009 | S2 | confirmed | hfs_common.rs `btree_node_bitmap_range` | Header-node record offsets unchecked: panics on small catalogs. | open |
-| MAC-010 | S2 | confirmed | hfs_common.rs `btree_find_insert_leaf`, `btree_insert_full` | `root_node` past the file panics; an index cycle inserts out of order (or into the header node); a zeroed root field orphans every leaf. | open |
-| MAC-011 | S1 | plausible | hfs_common.rs insert budget, `btree_split_leaf_with_insert` | The free-node budget assumes a 2-way split; a 3-way split can run out mid-cascade and the retry inserts twice. | open |
-| MAC-012 | S2 | confirmed | hfsplus_journal.rs `read_transaction`, `replay_journal` | Journal block targets unbounded (outside the checksum): replay can write past the partition; the multiply can overflow. | open |
-| MAC-013 | S2 | confirmed | fork_export.rs; resource_fork.rs `build_appledouble`, `build_macbinary` | Export drops Finder flags (invisible, custom icon, bundle) in BinHex, MacBinary and AppleDouble. | open |
-| MAC-014 | S2 | confirmed | binhex.rs `parse_decoded`; resource_fork.rs `parse_macbinary`; mac_alias.rs | Unchecked `usize` adds of u32 lengths wrap on 32-bit targets and panic. | open |
-| MAC-015 | S2 | plausible | hfs.rs `read_fork_data`; lisa.rs `open` | Allocations sized by on-disk u32 fields before checking the stream length. | open |
-| MAC-016 | S2 | plausible | hfsplus_wrapper_clone.rs `patch_mdb_in_place` | A wrapper shrink keeps the bad-block extent at the old length, past the new volume end. | open |
-| MAC-017 | S3 | confirmed | hfsplus_defrag.rs `emit_progress` | `eprintln!` in library code; thread-local progress sink; no `cancel_check` for whole-volume streams. | open |
-| MAC-018 | S3 | confirmed | mfs.rs `create_blank_mfs`; hfv.rs `build_blank_hfv` | Public builders hold the whole volume in RAM, above the 3 MB floppy exception. | open |
-| MAC-019 | S4 | confirmed | hfsplus.rs, hfsplus_defrag.rs, hfs_fsck | Three copies of `catalog_compare`; near-duplicate hardlink creators and fsck pairs. | open |
-| MAC-020 | S4 | confirmed | mfs.rs, mac_roman.rs, mac_alias.rs, CLAUDE.md | Docs that no longer match (MFS "extract-only", name-length doc, map offset, GPL note, HFV limit 2047 vs 4063 MB); mac_alias shows Mac Roman as `?`. | open |
+| MAC-001 | S1 | confirmed | mfs.rs `MfsDirEntry::encode` | Directory names up to 255 bytes parse but are cut to 27 on every directory write-back: any edit renames every file with a longer name. | fixed (MFIX) |
+| MAC-002 | S1 | confirmed | mfs.rs `MfsMdb::parse`, `alloc_block_offset`, `map_set`, `map_write_back` | MDB geometry unchecked: the map can overlap the directory, allocations can pass the volume end, more than 4094 blocks wrap the 12-bit links, counters overflow. | fixed (MFIX) |
+| MAC-003 | S1 | confirmed | hfs_fsck/catalog.rs `repair_catalog_consistency`, `fix_thread_record` | When a missing thread does not fit its leaf, repair deletes the directory record (orphaning the subtree) or removes the old thread first and leaves none. | fixed (MFIX) |
+| MAC-004 | S1 | confirmed | hfs.rs `repair`; hfs_fsck/bitmap.rs | The extents-overflow tree is read with `.ok()`: a read error rebuilds the bitmap without overflow extents and frees fragmented files' later extents. | fixed (MFIX) |
+| MAC-005 | S2 | confirmed | hfs_fsck/bitmap.rs `repair_extents` | On an overlap the whole range is dropped from the used set, so a later cross-link with the first file survives repair; zeroing extent j keeps j+1. | fixed (MFIX) |
+| MAC-006 | S1 | plausible | hfs_fsck/btree.rs `rebuild_index_nodes`; hfs.rs `repair` | A failed index rebuild leaves `root_node` on a zeroed node and the catalog is written anyway. | fixed (MFIX) |
+| MAC-007 | S2 | confirmed | hfs.rs `list_children`, file-extents lookup; hfs_clone.rs `walk_catalog` | Classic HFS leaf-chain walks have no visited set: a self-linked leaf hangs list, read and clone. | fixed (MFIX) |
+| MAC-008 | S2 | confirmed | hfs.rs, hfs_clone.rs, hfsplus.rs, hfs_common.rs `btree_node_free_space` | `node_size - 2*(i+1)` from on-disk numRecords underflows and panics; HFS+ open accepts node sizes 1-13. | fixed (MFIX) |
+| MAC-009 | S2 | confirmed | hfs_common.rs `btree_node_bitmap_range` | Header-node record offsets unchecked: panics on small catalogs. | fixed (MFIX) |
+| MAC-010 | S2 | confirmed | hfs_common.rs `btree_find_insert_leaf`, `btree_insert_full` | `root_node` past the file panics; an index cycle inserts out of order (or into the header node); a zeroed root field orphans every leaf. | fixed (MFIX) |
+| MAC-011 | S1 | plausible | hfs_common.rs insert budget, `btree_split_leaf_with_insert` | The free-node budget assumes a 2-way split; a 3-way split can run out mid-cascade and the retry inserts twice. | fixed (MFIX) |
+| MAC-012 | S2 | confirmed | hfsplus_journal.rs `read_transaction`, `replay_journal` | Journal block targets unbounded (outside the checksum): replay can write past the partition; the multiply can overflow. | fixed (MFIX) |
+| MAC-013 | S2 | confirmed | fork_export.rs; resource_fork.rs `build_appledouble`, `build_macbinary` | Export drops Finder flags (invisible, custom icon, bundle) in BinHex, MacBinary and AppleDouble. | fixed (MFIX) |
+| MAC-014 | S2 | confirmed | binhex.rs `parse_decoded`; resource_fork.rs `parse_macbinary`; mac_alias.rs | Unchecked `usize` adds of u32 lengths wrap on 32-bit targets and panic. | fixed (MFIX) |
+| MAC-015 | S2 | plausible | hfs.rs `read_fork_data`; lisa.rs `open` | Allocations sized by on-disk u32 fields before checking the stream length. | fixed (MFIX) |
+| MAC-016 | S2 | plausible | hfsplus_wrapper_clone.rs `patch_mdb_in_place` | A wrapper shrink keeps the bad-block extent at the old length, past the new volume end. | deferred (needs a shrunk OS 8.1 wrapper volume to confirm with fsck_hfs) |
+| MAC-017 | S3 | confirmed | hfsplus_defrag.rs `emit_progress` | `eprintln!` in library code; thread-local progress sink; no `cancel_check` for whole-volume streams. | fixed (MFIX) |
+| MAC-018 | S3 | confirmed | mfs.rs `create_blank_mfs`; hfv.rs `build_blank_hfv` | Public builders hold the whole volume in RAM, above the 3 MB floppy exception. | deferred (app caps MFS at 800 KB and build_blank_hfv is test-only; streaming builders are their own change) |
+| MAC-019 | S4 | confirmed | hfsplus.rs, hfsplus_defrag.rs, hfs_fsck | Three copies of `catalog_compare`; near-duplicate hardlink creators and fsck pairs. | deferred (refactor, own change) |
+| MAC-020 | S4 | confirmed | mfs.rs, mac_roman.rs, mac_alias.rs, CLAUDE.md | Docs that no longer match (MFS "extract-only", name-length doc, map offset, GPL note, HFV limit 2047 vs 4063 MB); mac_alias shows Mac Roman as `?`. | fixed (MFIX) |
 
 ## crates/dsk-ghost
 

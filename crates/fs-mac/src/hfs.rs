@@ -541,7 +541,8 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         let mut results = Vec::new();
         let mut node_idx = first_leaf;
 
-        while node_idx != 0 {
+        let mut seen_nodes = std::collections::HashSet::new();
+        while node_idx != 0 && seen_nodes.insert(node_idx) {
             let offset = node_idx as usize * node_size as usize;
             if offset + node_size as usize > self.catalog_data.len() {
                 break;
@@ -555,7 +556,9 @@ impl<R: Read + Seek> HfsFilesystem<R> {
 
             for i in 0..num_records as usize {
                 // Record offset is stored at end of node, growing backward
-                let offset_pos = node_size as usize - 2 * (i + 1);
+                let Some(offset_pos) = (node_size as usize).checked_sub(2 * (i + 1)) else {
+                    break; // numRecords larger than the node (MAC-008)
+                };
                 if offset_pos + 2 > node.len() {
                     break;
                 }
@@ -693,7 +696,8 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         let first_leaf = BigEndian::read_u32(&header_node[24..28]);
 
         let mut node_idx = first_leaf;
-        while node_idx != 0 {
+        let mut seen_nodes = std::collections::HashSet::new();
+        while node_idx != 0 && seen_nodes.insert(node_idx) {
             let offset = node_idx as usize * node_size as usize;
             if offset + node_size as usize > self.catalog_data.len() {
                 break;
@@ -703,7 +707,9 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             let num_records = BigEndian::read_u16(&node[10..12]);
 
             for i in 0..num_records as usize {
-                let offset_pos = node_size as usize - 2 * (i + 1);
+                let Some(offset_pos) = (node_size as usize).checked_sub(2 * (i + 1)) else {
+                    break; // numRecords larger than the node (MAC-008)
+                };
                 if offset_pos + 2 > node.len() {
                     break;
                 }
@@ -893,7 +899,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         );
 
         let off = leaf_idx as usize * node_size;
-        if off + node_size > self.catalog_data.len() {
+        if leaf_idx == 0 || off + node_size > self.catalog_data.len() {
             return None;
         }
         let node = &self.catalog_data[off..off + node_size];
@@ -3989,7 +3995,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
                 &self.mdb.extents_file_extents,
                 self.mdb.extents_file_size as u64,
             )
-            .ok()
+            // Unreadable, the overflow extents would be missing from the rebuilt bitmap and
+            // freed, so the repair stops instead (MAC-004).
+            .map(Some)
+            .map_err(|e| {
+                FilesystemError::InvalidData(format!(
+                    "the extents overflow B-tree cannot be read ({e}); not repairing"
+                ))
+            })?
         } else {
             None
         };
@@ -4158,6 +4171,13 @@ fn read_fork_data<R: Read + Seek>(
     extents: &[HfsExtDescriptor; 3],
     size: u64,
 ) -> Result<Vec<u8>, FilesystemError> {
+    let volume_bytes = mdb.total_blocks as u64 * mdb.block_size as u64;
+    if size > volume_bytes {
+        // The size is an on-disk field: refuse before allocating for it (MAC-015).
+        return Err(FilesystemError::InvalidData(format!(
+            "HFS B-tree file of {size} bytes is larger than the {volume_bytes}-byte volume"
+        )));
+    }
     let mut data = Vec::with_capacity(size as usize);
     let first_alloc_offset = partition_offset + mdb.first_alloc_block as u64 * 512;
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Mac Roman names: the codec every classic Mac format shares (HFS and MFS catalogs, StuffIt,
 //! Compact Pro, MacBinary, BinHex, mar). Always built, so a crate that wants only names, BinHex
-//! and resource forks (feature `codecs`) needs neither HFS nor the GPL `fs-mac-unicode` tables;
+//! and resource forks (feature `codecs`) needs neither HFS nor the `fs-mac-unicode` tables;
 //! `hfs` re-exports it under its old paths.
 
 use disk_core::filesystem::FilesystemError;

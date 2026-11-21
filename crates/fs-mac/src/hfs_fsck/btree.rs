@@ -1242,6 +1242,24 @@ pub(crate) fn rebuild_index_nodes(
     node_size: usize,
     report: &mut RepairReport,
 ) {
+    // The rebuild frees every index node first; if it then fails, the old tree is put back
+    // rather than leaving the root on a zeroed node (MAC-006).
+    let before = catalog_data.to_vec();
+    let failed = report.fixes_failed.len();
+    rebuild_index_nodes_in_place(catalog_data, node_size, report);
+    if report.fixes_failed.len() > failed {
+        catalog_data.copy_from_slice(&before);
+        report
+            .fixes_failed
+            .push("index rebuild failed part-way; the catalog was left as it was".into());
+    }
+}
+
+fn rebuild_index_nodes_in_place(
+    catalog_data: &mut [u8],
+    node_size: usize,
+    report: &mut RepairReport,
+) {
     use crate::hfs_common::{btree_alloc_node, btree_free_node, init_node};
 
     let header = BTreeHeader::read(catalog_data);

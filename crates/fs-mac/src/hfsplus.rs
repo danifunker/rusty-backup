@@ -733,6 +733,13 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             ));
         }
         let catalog_header = BTreeHeaderRecord::parse(&catalog_data[14..14 + 106]);
+        let ns = catalog_header.node_size as usize;
+        if !ns.is_power_of_two() || !(512..=32768).contains(&ns) {
+            // TN1150: node sizes are powers of two from 512 to 32768 (MAC-008).
+            return Err(FilesystemError::Parse(format!(
+                "HFS+ catalog node size {ns} is not a power of two in 512..=32768"
+            )));
+        }
         log::debug!(
             "[HFS+ open] catalog btree: depth={}, root_node={}, first_leaf={}, last_leaf={}, \
              node_size={}, total_nodes={}, free_nodes={}",
@@ -1451,7 +1458,9 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
             for i in 0..desc.num_records as usize {
                 // Record offsets are stored at end of node, growing backward
-                let offset_pos = node_size - 2 * (i + 1);
+                let Some(offset_pos) = node_size.checked_sub(2 * (i + 1)) else {
+                    break; // numRecords larger than the node (MAC-008)
+                };
                 if offset_pos + 2 > node.len() {
                     break;
                 }

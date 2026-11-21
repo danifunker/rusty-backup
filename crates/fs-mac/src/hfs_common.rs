@@ -644,7 +644,9 @@ pub fn btree_node_free_space(node: &[u8], node_size: usize) -> usize {
         return table_start - data_end - 2;
     }
     // Last record ends at the offset stored in the (num_records) position of offset table
-    let free_offset_pos = node_size - 2 * (num_records + 1);
+    let Some(free_offset_pos) = node_size.checked_sub(2 * (num_records + 1)) else {
+        return 0; // numRecords larger than the node: no room (MAC-008)
+    };
     let last_rec_end = BigEndian::read_u16(&node[free_offset_pos..free_offset_pos + 2]) as usize;
     // Offset table currently occupies: 2*(num_records+1) bytes at end of node
     // Adding a record would need 2 more bytes for a new offset slot
@@ -875,11 +877,17 @@ pub fn btree_remove_record(node: &mut [u8], node_size: usize, rec_idx: usize) {
 pub fn btree_node_bitmap_range(catalog_data: &[u8], node_size: usize) -> (usize, usize) {
     // Node 0 has 3 records: [0]=header, [1]=user data, [2]=bitmap
     // The bitmap record starts at the offset stored for record 2
+    if node_size < 14 + 8 || catalog_data.len() < node_size {
+        return (0, 0);
+    }
     let offset_pos = node_size - 2 * 3; // record 2 offset
     let bitmap_start = BigEndian::read_u16(&catalog_data[offset_pos..offset_pos + 2]) as usize;
     let next_pos = node_size - 2 * 4; // free space offset
     let bitmap_end = BigEndian::read_u16(&catalog_data[next_pos..next_pos + 2]) as usize;
-    (bitmap_start, bitmap_end.saturating_sub(bitmap_start))
+    // On-disk offsets: keep the range inside node 0's record area (MAC-009).
+    let start = bitmap_start.clamp(14, next_pos);
+    let end = bitmap_end.clamp(start, next_pos);
+    (start, end - start)
 }
 
 /// Bytes of bitmap stored in a single map node at the given node_size.
@@ -2383,16 +2391,20 @@ where
     let mut visited = std::collections::HashSet::new();
 
     loop {
-        // Cycle detection: bail to first leaf if we revisit a node
-        if !visited.insert(current_node) {
-            return (header.first_leaf_node, parent_chain);
+        // A loop, a node past the file or a node that is neither index nor leaf has no
+        // right answer: return 0, never a leaf, and let the caller refuse (MAC-010).
+        if current_node == 0 || !visited.insert(current_node) {
+            return (0, parent_chain);
         }
         let offset = current_node as usize * node_size;
         if offset + node_size > catalog_data.len() {
-            return (current_node, parent_chain);
+            return (0, parent_chain);
         }
         let node = &catalog_data[offset..offset + node_size];
         let kind = node[8] as i8;
+        if kind != BTREE_LEAF_NODE && kind != BTREE_INDEX_NODE {
+            return (0, parent_chain);
+        }
         let num_records = BigEndian::read_u16(&node[10..12]) as usize;
 
         parent_chain.push((current_node, parent_node));
@@ -2473,6 +2485,12 @@ where
     // depth=0/root=0 with no leaf). Allocate and initialise the root leaf so
     // the normal insert path below has somewhere to land.
     if header.depth == 0 || header.root_node == 0 {
+        if header.leaf_records > 0 {
+            // A tree with records but no root is damaged; a fresh root would orphan them.
+            return Err(disk_core::filesystem::FilesystemError::InvalidData(
+                "B-tree has records but no root node; check the volume first".into(),
+            ));
+        }
         let leaf = btree_alloc_node(data, node_size, header.total_nodes)?;
         let off = leaf as usize * node_size;
         let node = &mut data[off..off + node_size];
@@ -2490,6 +2508,11 @@ where
     }
 
     let (leaf_idx, parent_chain) = btree_find_insert_leaf(data, &header, key_record, cmp);
+    if leaf_idx == 0 {
+        return Err(disk_core::filesystem::FilesystemError::InvalidData(
+            "B-tree index is damaged (loop or bad node); check the volume first".into(),
+        ));
+    }
 
     let off = leaf_idx as usize * node_size;
     let node = &mut data[off..off + node_size];
@@ -2535,7 +2558,14 @@ where
             // `HfsPlusFilesystem::insert_catalog_record` et al.). The bound is
             // exact, not padded, so classic HFS (which has no grow path) still
             // fills its pre-sized catalog right up to genuine capacity.
-            if h.free_nodes < h.depth as u32 + 1 {
+            // A record over a third of the payload can split a leaf three ways, two new nodes a
+            // level (MAC-011); classic HFS records never get that big, so its bound stays exact.
+            let per_level = if key_record.len() * 3 > node_size - 14 {
+                2
+            } else {
+                1
+            };
+            if h.free_nodes < (h.depth as u32 + 1) * per_level {
                 return Err(disk_core::filesystem::FilesystemError::DiskFull(
                     "no free B-tree nodes".into(),
                 ));

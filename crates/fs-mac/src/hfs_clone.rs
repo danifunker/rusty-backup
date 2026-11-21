@@ -163,7 +163,8 @@ fn walk_catalog(catalog: &[u8]) -> (Vec<SourceDirSnapshot>, Vec<SourceFileSnapsh
     // which starts 14 bytes into node 0 → absolute offset 24..28.
     let mut node_idx = BigEndian::read_u32(&catalog[24..28]);
 
-    while node_idx != 0 {
+    let mut seen_nodes = std::collections::HashSet::new();
+    while node_idx != 0 && seen_nodes.insert(node_idx) {
         let offset = node_idx as usize * node_size;
         if offset + node_size > catalog.len() {
             break;
@@ -177,7 +178,9 @@ fn walk_catalog(catalog: &[u8]) -> (Vec<SourceDirSnapshot>, Vec<SourceFileSnapsh
         let num_records = BigEndian::read_u16(&node[10..12]) as usize;
 
         for i in 0..num_records {
-            let offset_pos = node_size - 2 * (i + 1);
+            let Some(offset_pos) = node_size.checked_sub(2 * (i + 1)) else {
+                break; // numRecords larger than the node (MAC-008)
+            };
             if offset_pos + 2 > node.len() {
                 break;
             }
