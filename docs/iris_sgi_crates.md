@@ -45,12 +45,17 @@ publishes them all (`.github/workflows/publish-crates.yml`). To publish by hand,
 dependency order:
 
 1. `disk-core` 0.3.0
-2. `fs-mac` 0.1.11
-3. `fs-pc` 0.1.7
-4. `part-tables` 0.2.0
-5. `fs-xfs` 0.2.0
-6. `fs-unix` 0.3.0
-7. `fs-tar` 0.2.0
-8. `rb-fsexporter` 0.1.4
-9. `rb-fsimporter` 0.1.0
-10. `sgi-disk` 0.1.0
+2. `fs-mac-unicode` 0.2.0
+3. `fs-mac` 0.1.11
+4. `fs-amiga` 0.2.0
+5. `fs-pc` 0.1.7
+6. `part-tables` 0.2.0
+7. `fs-xfs` 0.2.0
+8. `fs-unix` 0.3.0
+9. `fs-tar` 0.2.0
+10. `rb-fsexporter` 0.1.4
+11. `rb-fsimporter` 0.1.0
+12. `sgi-disk` 0.1.0
+
+`fs-amiga` and `fs-mac-unicode` are not used by iris; they are in this batch because they were
+relicensed MIT on the same branch.
