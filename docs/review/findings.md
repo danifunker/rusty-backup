@@ -437,9 +437,9 @@ Review by a separate agent, 2026-11-21, read-only.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| AP2-001 | S1 | confirmed | apple_dos.rs `read_file_bytes` + `read_file` | Type-B header stripped twice: some payloads read back as 1 byte. | fixed (PFIX) |
-| AP2-002 | S1 | confirmed | apple_dos.rs `create_file` | B header length `as u16`: files over 64 KiB read back truncated. | fixed (PFIX) |
-| AP2-003 | S1 | confirmed | prodos.rs `create_file` | Exactly 16 MiB accepted; EOF stored as 0, file reads empty, blocks stay allocated. | fixed (PFIX) |
+| AP2-001 | S1 | confirmed | apple_dos.rs `read_file_bytes` + `read_file` | Type-B header stripped twice: some payloads read back as 1 byte. | fixed (39c02adb) |
+| AP2-002 | S1 | confirmed | apple_dos.rs `create_file` | B header length `as u16`: files over 64 KiB read back truncated. | fixed (39c02adb) |
+| AP2-003 | S1 | confirmed | prodos.rs `create_file` | Exactly 16 MiB accepted; EOF stored as 0, file reads empty, blocks stay allocated. | fixed (39c02adb) |
 | AP2-004 | S2 | confirmed | prodos.rs directory-chain walks | No cycle guard: a self-linked dir block hangs list / create / delete. | open |
 | AP2-005 | S2 | confirmed | prodos.rs `free_file_blocks` | Index pointers not range-checked before freeing: panic, or the volume directory freed. | open |
 | AP2-006 | S2 | confirmed | prodos.rs read / write_to / delete | Storage type 5 (forked) treated as seedling: extract returns the fork descriptor; delete leaks both forks. | open |
