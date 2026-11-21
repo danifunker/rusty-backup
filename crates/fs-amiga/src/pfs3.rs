@@ -48,8 +48,8 @@ const ROOTBLOCK_SECTOR: u32 = 2;
 const MODE_HARDDISK: u32 = 1;
 const MODE_SPLITTED_ANODES: u32 = 2;
 // Gates whether tools honor the per-direntry datestamps at offsets 10..16.
-// pfs3aio auto-sets it on first write-mount (`volume.c:546`), so any real
-// PFS3 volume that's been touched has it set. We mirror that for blank
+// A PFS3 handler sets it on its first read-write mount, so any real
+// PFS3 volume that's been touched has it set. We set it on blank
 // volumes so dates we write into direntries are honored without needing a
 // real-Amiga mount to flip the bit.
 const MODE_DATESTAMP: u32 = 64;
@@ -664,8 +664,8 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
 
     /// Read a `ST_SOFTLINK` direntry's target path. The link's anode
     /// points at one or more data blocks holding a NUL-terminated path
-    /// string (per pfs3aio `CreateSoftLink`: a 1024-byte buffer is
-    /// allocated, `strcpy`'d, and written verbatim). We follow the
+    /// string (the target path, NUL-terminated, padded to the block
+    /// size). We follow the
     /// anode, read up to 2048 bytes (well past any practical Amiga path
     /// length), and truncate at the first NUL.
     fn read_softlink_target(&mut self, link_anodenr: u32) -> Result<String, FilesystemError> {
@@ -734,7 +734,7 @@ fn parse_direntry(entries: &[u8], off: usize, largefile: bool) -> Option<DirEntr
     } else {
         String::new()
     };
-    // Extrafields layout (pfs3aio `AddExtraFields`/`GetExtraFields`):
+    // Extrafields layout (PFS3 on-disk format):
     // packed at the END of the direntry, terminated by a u16 `flags`
     // bitmap. Each set bit (LSB first) prepends one u16 field, walking
     // backwards from the flags word. Field order matches the `struct
@@ -1320,7 +1320,7 @@ impl<R: Read + Seek> Read for CompactPfs3Reader<R> {
 /// Set bit = free (AmigaDOS convention).
 ///
 /// On-disk bitmap is u32 BE words; within a word, bit position `31 - i`
-/// represents sector `i` of that word (pfs3aio allocation.c:318).
+/// represents sector `i` of that word (MSB = lowest sector).
 ///
 /// Returns an empty vector when the bitmap structure is unreadable or
 /// no bitmap-index pointers are present — the compact reader then falls
@@ -1423,7 +1423,7 @@ fn read_user_bitmap<R: Read + Seek>(
 const PFS3_ANODE_USERFIRST: u32 = 6;
 const PFS3_ANODE_EOF_SENTINEL: u32 = 0xFFFFFFFF;
 
-/// Direntry type byte (i8 on disk). Values per pfs3aio / amitools:
+/// Direntry type byte (i8 on disk), per the PFS3 on-disk format:
 /// `ST_USERDIR=2`, `ST_SOFTLINK=3`, `ST_LINKDIR=4`, `ST_FILE=-3`,
 /// `ST_LINKFILE=-4`, `ST_ROLLOVERFILE=-16` (PFS extension).
 /// Positive does NOT imply "is a directory" — `ST_SOFTLINK=3` is a
@@ -1636,7 +1636,7 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
 
     /// Find an unused anode slot (clustersize=0 AND blocknr=0 AND
     /// next=0) anywhere in the anodeblock chain and mark it allocated
-    /// by writing the `(0, 0xFFFFFFFF, 0)` sentinel pfs3aio uses.
+    /// by writing the `(0, 0xFFFFFFFF, 0)` allocated-but-empty sentinel.
     /// Returns the anodenr.
     ///
     /// Walks anodeblock seqnrs 0, 1, 2, … resolving each via
@@ -2172,7 +2172,7 @@ fn build_direntry(
 ) -> Result<Vec<u8>, FilesystemError> {
     let name_bytes = name.as_bytes();
     let comment_bytes = comment.as_bytes();
-    // Practical cap matches pfs3aio's `fnsize` ceiling (107 bytes —
+    // Practical cap is the largest `fnsize` PFS3 allows (107 bytes —
     // the LONGFN-enabled max; standard AmigaDOS is 30 bytes). We set
     // `fnsize = 107` in the blank-volume's rootblock extension so
     // tools accept long names without truncation. The hard cap from
@@ -2269,7 +2269,7 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
     /// walking `target.extrafields.link` + `linknode.next` find the
     /// new link.
     ///
-    /// Behavior matches pfs3aio `CreateLink` (`directory.c:2703-2727`):
+    /// On disk the first link sits in the target's `extrafields.link`; later ones chain via `linknode.next`:
     /// - If target has no extrafields.link yet, patch its direntry
     ///   in place to add `extrafields.link = new_link_anode`. The new
     ///   linknode's `next` stays 0 (the linknode itself was already
@@ -2478,9 +2478,8 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
     /// Create a softlink direntry. Allocates one data block (HW sector)
     /// for the target path, writes it NUL-terminated, registers the
     /// anode pointing at that block, then adds an `ST_SOFTLINK`
-    /// direntry to the parent with `fsize = target.len()`. Matches
-    /// pfs3aio `CreateSoftLink` semantics; capped at 510 bytes target
-    /// (one HW sector minus a NUL terminator).
+    /// direntry to the parent with `fsize = target.len()`. The target
+    /// is capped at 510 bytes (one HW sector minus a NUL terminator).
     fn do_create_symlink(
         &mut self,
         parent: &FileEntry,
@@ -2577,7 +2576,7 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
             ST_LINKFILE
         };
         let new_anode = self.alloc_anode_in_memory()?;
-        // Linknode: clustersize is target-parent anode in pfs3aio
+        // Linknode: clustersize is the target's parent-dir anode on disk
         // (used for "which dir holds the target" lookups), blocknr is
         // link-parent anode (used to find the link's location).
         // Without scanning every dirblock to find target's parent, we
@@ -3143,7 +3142,7 @@ fn append_link_extrafield_to_direntry<R: Read + Write + Seek>(
 /// Walk the linknode chain via `anode.next` starting at `first_anode`
 /// and set the tail's `next` to `new_link_anode`. Returns the tail's
 /// own anode for diagnostics. Errors if the chain is cyclic (defensive
-/// — pfs3aio doesn't emit cycles but on-disk corruption shouldn't loop
+/// — a valid volume has no cycles, but on-disk corruption shouldn't loop
 /// us forever).
 fn append_to_linknode_chain<R: Read + Write + Seek>(
     fs: &mut Pfs3Filesystem<R>,
@@ -3330,8 +3329,8 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem
 // === Phase 6: formatter for a blank PFS3 volume =============================
 //
 // Produces a minimum mountable empty PFS3 volume so the write path has a
-// known-good starting state for round-trip tests. Mirrors the layout that
-// `pfs3aio/format.c::FDSFormat` would emit for a small "small-mode" disk:
+// known-good starting state for round-trip tests. Lays out a minimal
+// small-mode PFS3 volume:
 //
 // Reserved layout (1 KiB reserved blocks, 32 reserved total, first at HW
 // sector 2; reserved block N starts at HW sector `2 + N*2`):
@@ -3349,7 +3348,7 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem
 //
 // We set `MODE_HARDDISK | MODE_SPLITTED_ANODES | MODE_EXTENSION |
 // MODE_DATESTAMP` in `options`. DATESTAMP is required so tooling
-// (pfs3aio, real Amigas) honors the per-direntry dates we write — the
+// (PFS3 handlers, real Amigas) honors the per-direntry dates we write — the
 // date bytes at direntry offsets 10..16 always exist regardless of the
 // mode bit, but without it set they're ignored. DIR_EXTENSION / LONGFN
 // add extra direntry tail fields and remain off to keep the formatter +
@@ -4517,7 +4516,7 @@ mod tests {
     }
 
     /// Verify the extrafields back-walker extracts `link` from a packed
-    /// trailer. Layout per pfs3aio: u16 fields packed at the tail,
+    /// trailer. On-disk layout: u16 fields packed at the tail,
     /// terminated by a u16 `flags` bitmap (LSB-first; bit 0 = link_hi,
     /// bit 1 = link_lo).
     #[test]
@@ -5174,7 +5173,7 @@ mod tests {
             .find(|e| e.name == "ln")
             .expect("hardlink visible");
         assert_eq!(link.link_target_cnid, Some(target_anode));
-        // The link's size mirrors the target's size (per pfs3aio).
+        // A hardlink direntry carries the target's size.
         assert_eq!(link.size, payload.len() as u64);
     }
 

@@ -4,8 +4,7 @@
 //! 512 bytes for floppies (`.adf`) and matches the RDB DosEnv block size for
 //! hard-disk partitions (also 512 in practice).
 //!
-//! Layout reference: the AmigaDOS reference manual and the ADF FAQ; ADFlib was
-//! used as a cross-check only.
+//! Layout reference: the AmigaDOS reference manual and the ADF FAQ.
 
 /// AFFS logical block size in bytes. Both ADF floppies and AmigaDOS hard
 /// disks use 512 bytes — block sizes other than 512 require routing

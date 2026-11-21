@@ -352,8 +352,8 @@ impl<R: Read + Seek> AffsFilesystem<R> {
 
         // Root block: floor((reserved + total) / 2) — reserved=2, total =
         // total blocks. For an 880K floppy this is (2 + 1760)/2 = 881.
-        // ADFlib uses ((reserved + numBlocks - 1) / 2) which gives 880 for
-        // 1760 sectors; that's the canonical value.
+        // The canonical floppy root is (reserved + numBlocks - 1) / 2, i.e.
+        // 880 for 1760 sectors.
         //
         // `total_blocks` comes from the end of the *reader*, which for a bare
         // ADF is the end of the volume and for a partition inside an RDB disk
