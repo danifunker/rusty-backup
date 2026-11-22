@@ -2081,7 +2081,7 @@ mod tests {
         raw[510] = 0x55;
         raw[511] = 0xAA;
 
-        let msa = encode_msa_bytes(header, &raw);
+        let msa = encode_msa_bytes(header, &raw).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("atari.msa");

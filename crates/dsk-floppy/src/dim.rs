@@ -209,13 +209,9 @@ pub fn encode_dim_bytes(flat: &[u8], geom: FloppyGeometry) -> Result<Vec<u8>> {
         );
     }
     let dim_media = DimMedia::from_media(media)?;
+    // Every DIFC media is at most 77 x 2 or 80 x 2 tracks, inside the 170-entry bitmap.
     let total_tracks = geom.cyls as usize * geom.heads as usize;
-    if total_tracks > TRACK_BITMAP_LEN {
-        bail!(
-            "DIM encode: geometry produces {total_tracks} tracks, exceeding the \
-             {TRACK_BITMAP_LEN}-entry DIFC track bitmap"
-        );
-    }
+    debug_assert!(total_tracks <= TRACK_BITMAP_LEN);
 
     let mut out = vec![0u8; HEADER_SIZE + flat.len()];
     out[0] = dim_media.byte();

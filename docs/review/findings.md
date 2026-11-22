@@ -564,7 +564,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | CZL-002 | S2 | plausible | dsk-clonezilla partclone.rs `parse_header` | v1 images likely rejected by the magic check; endianness field ignored. | open: needs a partclone v1 sample |
 | CZL-003 | S2 | confirmed | dsk-clonezilla metadata_scan.rs `identify_ext_metadata_blocks` | Off-by-4 bounds check panics the scan thread and poisons the cache mutex. | fixed (64152ec1) |
 | CZL-004 | S2 | confirmed | dsk-clonezilla metadata_scan.rs | Unchecked shifts / underflow; BPB-driven ranges insert billions of entries. | fixed (64152ec1) |
-| CZL-005 | S4 | confirmed | dsk-clonezilla block_cache.rs | Unneeded `unsafe impl Send`. | open |
+| CZL-005 | S4 | confirmed | dsk-clonezilla block_cache.rs | Unneeded `unsafe impl Send`. | fixed (f7ecbb34) |
 | FLP-001 | S2 | confirmed | dsk-floppy edsk.rs, d88.rs flat decode | Missing tracks / sectors shift every later sector (no zero-filled holes). | fixed (1c1db841) |
 | FLP-002 | S2 | plausible | dsk-floppy g64.rs `decode_track` | Sectors crossing the GCR wrap lost; bad-checksum sectors zeroed silently. | fixed (1c1db841) |
 | FLP-003 | S4 | confirmed | dsk-floppy msa.rs, dim.rs | Public encoder panics via `assert_eq!`; dead `if`. | open |

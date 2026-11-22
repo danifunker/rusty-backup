@@ -242,8 +242,14 @@ fn decode_rle_track_into(
 }
 
 /// Encode a flat raw sector stream into an MSA buffer, the inverse of [`decode_msa_bytes`].
-pub fn encode_msa_bytes(header: MsaHeader, raw: &[u8]) -> Vec<u8> {
-    assert_eq!(raw.len(), header.decoded_size(), "raw size mismatch");
+pub fn encode_msa_bytes(header: MsaHeader, raw: &[u8]) -> Result<Vec<u8>> {
+    if raw.len() != header.decoded_size() {
+        bail!(
+            "MSA encode: {} bytes given for a header that holds {}",
+            raw.len(),
+            header.decoded_size()
+        );
+    }
     let track_size = header.sectors_per_track as usize * MSA_SECTOR_SIZE;
     let num_tracks = header.track_count() as usize * (header.sides as usize + 1);
 
@@ -268,7 +274,7 @@ pub fn encode_msa_bytes(header: MsaHeader, raw: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&len_buf);
         out.extend_from_slice(track);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -317,7 +323,7 @@ mod tests {
             end_track: 79,
         };
         let raw = build_st_floppy_pattern(header);
-        let msa = encode_msa_bytes(header, &raw);
+        let msa = encode_msa_bytes(header, &raw).unwrap();
         let decoded = decode_msa_bytes(&msa).unwrap();
         assert_eq!(decoded.len(), 720 * 1024);
         assert_eq!(decoded, raw);
@@ -332,7 +338,7 @@ mod tests {
             end_track: 79,
         };
         let raw = build_st_floppy_pattern(header);
-        let msa = encode_msa_bytes(header, &raw);
+        let msa = encode_msa_bytes(header, &raw).unwrap();
         let decoded = decode_msa_bytes(&msa).unwrap();
         assert_eq!(decoded.len(), 800 * 1024);
         assert_eq!(decoded, raw);
