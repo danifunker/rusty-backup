@@ -156,7 +156,7 @@ pub fn fsck_jfs<R: Read + Seek + Send>(
                 "PmapAllocatedInodeIsZero",
                 format!(
                     "fileset inum {inum}: pmap says allocated but di_mode = 0 \
-                     (no posix type) — pmap/dinode skew"
+                     (no posix type) - pmap/dinode skew"
                 ),
             );
             continue;
@@ -255,7 +255,7 @@ fn check_ait<R: Read + Seek + Send>(fs: &mut JfsFilesystem<R>, b: &mut Builder) 
             b.err(
                 "AitSystemInodeEmpty",
                 format!(
-                    "AIT inum {inum} ({}) has di_size = 0 — expected non-zero",
+                    "AIT inum {inum} ({}) has di_size = 0 - expected non-zero",
                     role(inum).unwrap()
                 ),
             );
@@ -276,7 +276,7 @@ fn check_iags<R: Read + Seek + Send>(
             "FilesystemInodeTooSmall",
             format!(
                 "FILESYSTEM_I di_size {} bytes is too small to hold any IAG \
-                 (need ≥ 2 logical pages)",
+                 (need >= 2 logical pages)",
                 fs_ino.size
             ),
         );

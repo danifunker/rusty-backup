@@ -544,8 +544,8 @@ Review by a separate agent, 2026-11-21, read-only.
 | CPM-008 | S1 | confirmed | cpm.rs list / find / delete / rename | User number dropped from name handling: same-named files in two users collide; delete removes both. | fixed (13054e1c) |
 | CPM-009 | S2 | confirmed | cpm.rs `create_file` | Empty files never get an entry; a mid-loop "directory full" leaves a truncated file to be synced. | fixed (6cd952f5) |
 | CPM-010 | S2 | plausible | cpm_diskdefs.rs `ALTAIR_8IN`; cpm.rs | No sector skew: ibm-3740 images (skew 6) read garbled. | open: needs a skewed 8-inch sample |
-| CPM-011 | S3 | confirmed | cpm.rs `validate_cpm_name` | Wildcard / separator characters accepted in names. | open |
-| CPM-012 | S3 | confirmed | cpm.rs | Non-ASCII glyphs in user-visible errors. | open |
+| CPM-011 | S3 | confirmed | cpm.rs `validate_cpm_name` | Wildcard / separator characters accepted in names. | fixed (9bd44acf) |
+| CPM-012 | S3 | confirmed | cpm.rs | Non-ASCII glyphs in user-visible errors. | fixed (9bd44acf) |
 | CPM-013 | S3 | confirmed | cpm.rs `read_file`, `create_file` | Whole-file buffering (DC-006 for this crate; largest preset 4 MiB). | open |
 | CPM-014 | S4 | confirmed | cpm.rs, cpm_diskdefs.rs | Dead locals and unread DPB fields; `tracks` documented as a bounds check but unused. | open |
 

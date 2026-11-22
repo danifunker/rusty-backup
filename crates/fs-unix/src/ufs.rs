@@ -609,6 +609,22 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
                 v as u64
             }
         };
+        // Every fragment belongs to a cylinder group; a size past them all is a bad superblock.
+        if total_frags > ncg as u64 * fpg as u64 {
+            return Err(FilesystemError::Parse(format!(
+                "ufs: size {total_frags} fragments exceeds {ncg} groups of {fpg}"
+            )));
+        }
+        if let Ok(end) = reader.seek(SeekFrom::End(0)) {
+            let want = partition_offset.saturating_add(total_frags.saturating_mul(fsize));
+            if want > end {
+                log::warn!(
+                    "ufs: superblock spans {} bytes but the source ends {} bytes short",
+                    total_frags.saturating_mul(fsize),
+                    want - end
+                );
+            }
+        }
 
         // Refuse a softupdate-journaled volume that is also dirty. The
         // safe path on those is "let FreeBSD fsck_ffs replay the journal

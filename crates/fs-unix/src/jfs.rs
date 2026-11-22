@@ -582,7 +582,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         self.ensure_bmap_cache()?;
         self.bmap_walk_cache.as_ref().ok_or_else(|| {
             FilesystemError::Unsupported(
-                "JFS: aggregate exceeds the in-tree BMAP walker (≥ 2^23 blocks; \
+                "JFS: aggregate exceeds the in-tree BMAP walker (>= 2^23 blocks; \
                  dmapctl multi-level walker is a follow-up)"
                     .into(),
             )
@@ -614,7 +614,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         if logical_pages < 2 {
             return Err(FilesystemError::Parse(format!(
                 "jfs: FILESYSTEM_I di_size {} bytes is too small to hold any IAG \
-                 (need ≥ 2 logical pages)",
+                 (need >= 2 logical pages)",
                 fs_ino.size
             )));
         }
@@ -622,7 +622,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         if iag_no >= max_iag {
             return Err(FilesystemError::Unsupported(format!(
                 "jfs: requested IAG {iag_no} is past the fileset's last IAG \
-                 (di_size = {} bytes ⇒ max iag_no = {})",
+                 (di_size = {} bytes => max iag_no = {})",
                 fs_ino.size,
                 max_iag.saturating_sub(1)
             )));
@@ -1283,7 +1283,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
     ) -> Result<XtreeRoot, FilesystemError> {
         if buf.len() < XTHEADER_SIZE {
             return Err(FilesystemError::Parse(format!(
-                "jfs: xtpage buffer too small ({} < {XTHEADER_SIZE}) — {context}",
+                "jfs: xtpage buffer too small ({} < {XTHEADER_SIZE}) - {context}",
                 buf.len()
             )));
         }
@@ -1291,7 +1291,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         let nextindex = u16::from_le_bytes([buf[XTH_OFF_NEXTINDEX], buf[XTH_OFF_NEXTINDEX + 1]]);
         if nextindex < 2 {
             return Err(FilesystemError::Parse(format!(
-                "jfs: xtpage nextindex {nextindex} < 2 (header takes 2 slots) — {context}"
+                "jfs: xtpage nextindex {nextindex} < 2 (header takes 2 slots) - {context}"
             )));
         }
         let xad_count = (nextindex as usize) - 2;
@@ -1299,7 +1299,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         if xad_count > max_xad_slots {
             return Err(FilesystemError::Parse(format!(
                 "jfs: xtpage has {xad_count} XADs but the buffer only holds {max_xad_slots} slots \
-                 — {context}"
+                 - {context}"
             )));
         }
         let mut xads = Vec::with_capacity(xad_count);
@@ -1407,7 +1407,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
             iter_budget += 1;
             if iter_budget > 1_000_000 {
                 return Err(FilesystemError::Parse(
-                    "jfs: walk_xtree_leaves exceeded 1M node visits — likely cyclic xtree".into(),
+                    "jfs: walk_xtree_leaves exceeded 1M node visits - likely cyclic xtree".into(),
                 ));
             }
             if node.flag & BT_LEAF_FLAG != 0 {
@@ -3694,7 +3694,7 @@ mod tests {
         // — connectivity pass should walk root + subdir.
         assert!(
             result.stats.directories_checked >= 2,
-            "expected ≥2 dirs walked (/ + /subdir), got {}",
+            "expected >=2 dirs walked (/ + /subdir), got {}",
             result.stats.directories_checked
         );
         // Should report at least the BMAP stats + IAG count + allocated
