@@ -24,6 +24,7 @@ fs-mac = { path = "../fs-mac", version = "0.2", default-features = false, featur
 dsk-apple = { path = "../dsk-apple", version = "0.2", default-features = false, features = ["dc42"] }
 anyhow = "1"
 byteorder = "1"
+log = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]

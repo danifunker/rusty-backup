@@ -364,6 +364,7 @@ dependencies = [
  "dsk-apple",
  "flate2",
  "fs-mac",
+ "log",
  "sha1 0.10.7",
  "tempfile",
 ]

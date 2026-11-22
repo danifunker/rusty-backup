@@ -129,6 +129,8 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
     // Safety bound: never iterate more times than there are possible entries.
     let max_iters = data.len() / 48 + numfiles + 16;
     let mut iters = 0usize;
+    // The furthest byte the entries need, to report an archive cut short.
+    let mut needed = 0u64;
 
     while done < total {
         iters += 1;
@@ -136,6 +138,7 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
             bail!("StuffIt 5: entry walk did not terminate");
         }
         if cur.pos.saturating_add(48) > data.len() {
+            needed = needed.max(cur.pos as u64 + 48);
             break;
         }
         let offs = cur.pos as u32;
@@ -294,14 +297,19 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
                 .checked_add(resourcecomplen as usize)
                 .and_then(|p| p.checked_add(datacomplen as usize))
                 .ok_or_else(|| anyhow::anyhow!("StuffIt 5: fork sizes overflow"))?;
+            needed = needed.max(next as u64);
             cur.seek(next);
         }
         done += 1;
     }
 
+    let truncated = (needed > data.len() as u64).then_some(crate::stuffit::SitTruncation {
+        declared: needed,
+        available: data.len() as u64,
+    });
     Ok(StuffItArchive {
         entries,
-        truncated: None,
+        truncated,
         damage: Vec::new(),
     })
 }

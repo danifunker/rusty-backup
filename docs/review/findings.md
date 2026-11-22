@@ -213,7 +213,7 @@ clone / defrag / journal modules. A regression run for 0.1.11 is still owed.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| CV-001 | S3 | confirmed | [classify.rs:81](../../src/model/convert/classify.rs#L81) | A 2 MB FAT image classifies as a floppy, and `--format qcow2` / `vmdk-sparse` / `chd` (hard-disk formats) are then ignored without a word: the output is raw. `subcmd.convert.{qcow2,vmdk-sparse,chd}-reopens` fail on main since the Convert redesign (`da41d419`). Either warn when `--format` doesn't apply to a kind, or let a hard-disk format pull a floppy-sized image along. The produce step's `fmt.vhd-fixed`, `fmt.vhd-dynamic`, `fmt.qcow2`, `fmt.vmdk-sparse`, `fmt.chd` and `optical.chdcd` artifacts are missing for the same reason. | open |
+| CV-001 | S3 | confirmed | [classify.rs:81](../../src/model/convert/classify.rs#L81) | A 2 MB FAT image classifies as a floppy, and `--format qcow2` / `vmdk-sparse` / `chd` (hard-disk formats) are then ignored without a word: the output is raw. `subcmd.convert.{qcow2,vmdk-sparse,chd}-reopens` fail on main since the Convert redesign (`da41d419`). Either warn when `--format` doesn't apply to a kind, or let a hard-disk format pull a floppy-sized image along. The produce step's `fmt.vhd-fixed`, `fmt.vhd-dynamic`, `fmt.qcow2`, `fmt.vmdk-sparse`, `fmt.chd` and `optical.chdcd` artifacts are missing for the same reason. | fixed (73ecadb2) |
 
 ## iris-sgi-crates follow-up review (2026-11-21)
 

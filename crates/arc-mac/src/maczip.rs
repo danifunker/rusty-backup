@@ -67,6 +67,7 @@ fn le32(b: &[u8], off: usize) -> Option<u32> {
 struct CentralEntry {
     name: String,
     method: u16,
+    crc32: u32,
     comp_size: u32,
     uncomp_size: u32,
     local_offset: u32,
@@ -108,6 +109,7 @@ fn read_central_directory(bytes: &[u8]) -> Result<Vec<CentralEntry>> {
     let mut p = cd_offset;
     while p + 46 <= bytes.len() && &bytes[p..p + 4] == CEN_SIG {
         let method = le16(bytes, p + 10).context("central header truncated")?;
+        let crc32 = le32(bytes, p + 16).context("central header truncated")?;
         let comp_size = le32(bytes, p + 20).context("central header truncated")?;
         let uncomp_size = le32(bytes, p + 24).context("central header truncated")?;
         let name_len = le16(bytes, p + 28).context("central header truncated")? as usize;
@@ -128,6 +130,7 @@ fn read_central_directory(bytes: &[u8]) -> Result<Vec<CentralEntry>> {
         entries.push(CentralEntry {
             name,
             method,
+            crc32,
             comp_size,
             uncomp_size,
             local_offset,
@@ -334,6 +337,11 @@ fn read_entry_payload<'a>(bytes: &'a [u8], e: &CentralEntry) -> Result<(Vec<u8>,
             e.uncomp_size
         );
     }
+    let mut crc = flate2::Crc::new();
+    crc.update(&data);
+    if crc.sum() != e.crc32 {
+        bail!("CRC mismatch for {} (the fork is damaged)", e.name);
+    }
     Ok((data, local_extra))
 }
 
@@ -391,7 +399,11 @@ pub fn parse(bytes: &[u8]) -> Result<(Vec<u8>, StuffItArchive)> {
 
         let (payload, local_extra) = match read_entry_payload(bytes, e) {
             Ok(v) => v,
-            Err(_) => continue, // skip an unreadable fork; keep the rest
+            Err(err) => {
+                // Keep the rest of the archive, but say which fork was lost.
+                log::warn!("MacZip: skipping a fork of {}: {err:#}", e.name);
+                continue;
+            }
         };
         let mac3 = find_mac3(local_extra);
         let jlee = mac3.is_none().then(|| find_jlee(local_extra)).flatten();
