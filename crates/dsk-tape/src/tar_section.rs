@@ -37,6 +37,8 @@ pub struct TarSection {
     members: Vec<Member>,
     /// Whether the archive spells its names `./x` (SunOS install tapes do); new names follow suit.
     dot_prefix: bool,
+    /// Raw bytes of root members (`./`), which have no path of their own but are kept on rebuild.
+    root_raw: Vec<u8>,
 }
 
 fn clean(path: &str) -> String {
@@ -52,6 +54,7 @@ impl TarSection {
     pub fn parse(bytes: &[u8]) -> Result<Self, FilesystemError> {
         let mut archive = tar::Archive::new(Cursor::new(bytes));
         let mut members = Vec::new();
+        let mut root_raw = Vec::new();
         let mut dotted = 0usize;
         let mut prev_end = 0usize;
         let entries = archive
@@ -79,6 +82,7 @@ impl TarSection {
                 .map_err(|e| invalid(format!("tar read {path}: {e}")))?;
             let link = entry.link_name_bytes().map(|l| l.into_owned());
             if path.is_empty() {
+                root_raw.extend_from_slice(raw.as_deref().unwrap_or(&[]));
                 continue;
             }
             members.push(Member {
@@ -98,12 +102,13 @@ impl TarSection {
         Ok(Self {
             members,
             dot_prefix,
+            root_raw,
         })
     }
 
     /// Serialize: original bytes for untouched members, V7 headers for the rest.
     pub fn to_bytes(&self) -> Result<Vec<u8>, FilesystemError> {
-        let mut out = Vec::new();
+        let mut out = self.root_raw.clone();
         for m in &self.members {
             if let Some(raw) = &m.raw {
                 out.extend_from_slice(raw);
@@ -309,6 +314,22 @@ mod tests {
             b.append_data(&mut h, name, *body).unwrap();
         }
         b.into_inner().unwrap()
+    }
+
+    #[test]
+    fn a_leading_dot_slash_entry_survives_a_rebuild() {
+        let mut h = tar::Header::new_old();
+        h.as_old_mut().name[..2].copy_from_slice(b"./");
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_mode(0o755);
+        h.set_size(0);
+        h.set_cksum();
+        let mut bytes = h.as_bytes().to_vec();
+        bytes.extend_from_slice(&v7(&[("./a", b"hi")]));
+        let mut sec = TarSection::parse(&bytes).unwrap();
+        sec.add_file("b", b"new".to_vec(), 0o644, 0, 0, 0).unwrap();
+        let out = sec.to_bytes().unwrap();
+        assert_eq!(&out[..BLOCK], h.as_bytes());
     }
 
     #[test]

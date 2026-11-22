@@ -422,9 +422,9 @@ drivers are merged.
 | UNX-051 | S2 | confirmed | efs_v1.rs `read_dir_entries` vs efs_v1_fsck.rs | Reader drops out-of-range dirents, so fsck's check can never fire. | fixed (303f658d) |
 | UNX-052 | S2 | plausible | unix_common/compact.rs `MappedBlocks` and callers | One u64 per allocated block (~2 GB for 1 TB); ext's tables add more: breaks the streaming rule. | fixed (ea96f43c) |
 | UNX-053 | S3 | confirmed | unix_common/compact.rs `load_block` | One seek + read per block, not 64 KiB-1 MiB runs. | fixed (ea96f43c) |
-| UNX-054 | S3 | confirmed | ufs.rs `open` | `total_frags` not compared with `ncg*fpg` or the slice (generic form of SD-001). | open |
+| UNX-054 | S3 | confirmed | ufs.rs `open` | `total_frags` not compared with `ncg*fpg` or the slice (generic form of SD-001). | fixed (5694446c) |
 | UNX-055 | S3 | confirmed | btrfs.rs `list_directory` | `Err(_) => continue` drops children silently. | fixed (4fb60164) |
-| UNX-056 | S3 | confirmed | jfs.rs, jfs_fsck.rs | `≥`, `⇒`, `—` in user-visible messages. | open |
+| UNX-056 | S3 | confirmed | jfs.rs, jfs_fsck.rs | `≥`, `⇒`, `—` in user-visible messages. | fixed (5694446c) |
 | UNX-057 | S3 | confirmed | bfs_write.rs, ofs_write.rs, ofs.rs | Whole-source `read_to_end`; OFS buffers a whole extent. | open |
 | UNX-058 | S4 | confirmed | bfs_write.rs, minix.rs, vxfs.rs | Each allocation rereads the whole bitmap; VxFS bmap rereads indirects per block. | open |
 | UNX-059 | S4 | confirmed | efs_fsck.rs, efs_v1_fsck.rs, jfs_fsck.rs, ufs_fsck.rs (+ fs-xfs) | Five copies of the fsck `Builder`; belongs in `disk_core::fsck`. | open |
