@@ -116,7 +116,7 @@ fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let path = std::env::args().nth(1).expect("path to GHO");
     let mut r = GhoReader::open(std::path::Path::new(&path))?;
-    r.prepare_full_image();
+    r.prepare_full_image().expect("prepare GHO");
 
     // Mapped LCN ranges -> a sorted Vec for binary-search coverage tests.
     let mapped = r.ntfs_mapped_ranges().expect("not an NTFS file-aware GHO");

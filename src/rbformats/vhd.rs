@@ -389,7 +389,7 @@ pub fn export_whole_disk_vhd(
         let mut reader: super::BoxReadSeek =
             if crate::model::source_reader::is_gho_path(source_path) {
                 let mut gho = dsk_ghost::gho::GhoReader::open(source_path)?;
-                gho.prepare_full_image();
+                gho.prepare_full_image()?;
                 Box::new(gho)
             } else {
                 crate::model::source_reader::open_read(source_path)?

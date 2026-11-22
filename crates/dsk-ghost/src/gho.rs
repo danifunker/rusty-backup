@@ -619,6 +619,13 @@ fn strip_trailing_numeric(s: &str) -> &str {
     &s[..end]
 }
 
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 fn gather_ghs_siblings(
     dir: &Path,
     logical_prefix: &str,
@@ -662,17 +669,13 @@ fn gather_ghs_siblings(
         }
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let stem_prefix = strip_trailing_numeric(stem).to_ascii_lowercase();
-        let matches_any = prefixes
-            .iter()
-            .any(|p| stem_prefix == *p || (!p.is_empty() && stem_prefix.starts_with(p)));
-        if !matches_any {
+        // Exact match only: `backup` must not pull in `backupold001.ghs` from another image.
+        if !prefixes.contains(&stem_prefix) {
             continue;
         }
         if ext == "gho" {
-            // Prefer the picked file as primary if it is the .GHO; otherwise
-            // first .GHO wins. (Either way, a .GHO acts as primary; spans
-            // are .GHS.)
-            if primary.is_none() || entry.path() == picked {
+            // The picked .GHO is the primary; otherwise the first one found.
+            if primary.is_none() || same_path(&entry.path(), picked) {
                 primary = Some(entry.path());
             }
         } else {
@@ -681,6 +684,31 @@ fn gather_ghs_siblings(
         }
     }
     spans.sort_by(|a, b| a.0.cmp(&b.0));
+    // Spans are numbered 001, 002, ...: a gap means a missing piece, and reading on would
+    // serve the next span's bytes in its place.
+    for (i, (name, _)) in spans.iter().enumerate() {
+        let stem = Path::new(name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let digits: String = stem
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if let Ok(n) = digits.parse::<usize>() {
+            if n != i + 1 {
+                bail!(
+                    "Ghost span {} is missing from {} (found {name})",
+                    i + 1,
+                    dir.display()
+                );
+            }
+        }
+    }
 
     let mut out = Vec::new();
     if let Some(p) = primary {
@@ -692,7 +720,7 @@ fn gather_ghs_siblings(
     }
     for (_, p) in spans {
         // Don't double-include the picked file.
-        if out.first().map(|x| x.as_path()) != Some(p.as_path()) {
+        if !out.first().is_some_and(|x| same_path(x, &p)) {
             out.push(p);
         }
     }
@@ -1245,6 +1273,8 @@ fn decode_sector_block_stream<R: Read + Seek, W: Write>(
 // non-final block ever decompresses to a different size.
 
 const GHO_BLOCK_DECOMPRESSED_SIZE: usize = FAST_LZ_BLOCK_SIZE; // 32 KiB
+/// The most one zlib block may inflate to before the scanner treats it as a false start.
+const GHO_MAX_INFLATE: u64 = (FAST_LZ_BLOCK_SIZE + 1024) as u64;
 
 #[derive(Debug, Clone)]
 struct GhoBlockEntry {
@@ -1281,7 +1311,7 @@ pub struct GhoReader {
 struct FileAwarePartition {
     disk_offset: u64,
     image: VirtualFatImage,
-    cluster_cache: Option<(u32, Vec<u8>)>,
+    cluster_cache: ClusterCache,
 }
 
 // Exactly one GhoReaderMode exists per GhoReader, moved by value only once at
@@ -1529,7 +1559,7 @@ impl GhoReader {
                         partitions: vec![FileAwarePartition {
                             disk_offset: 0,
                             image: virtual_image,
-                            cluster_cache: None,
+                            cluster_cache: ClusterCache::default(),
                         }],
                         compression: header.compression,
                         mbr: [0u8; 512],
@@ -1596,7 +1626,7 @@ impl GhoReader {
                 fa_parts.push(FileAwarePartition {
                     disk_offset,
                     image: virtual_image,
-                    cluster_cache: None,
+                    cluster_cache: ClusterCache::default(),
                 });
             }
 
@@ -1723,6 +1753,17 @@ impl GhoReader {
                                 blocks[end - 1].decompressed_len = n as u32;
                                 break;
                             }
+                            // A read failing is the image, not trailer padding (which may run
+                            // off the end of the file).
+                            Err(e)
+                                if e.chain().any(|c| {
+                                    c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                                        io.kind() != std::io::ErrorKind::UnexpectedEof
+                                    })
+                                }) =>
+                            {
+                                return Err(e);
+                            }
                             Err(_) => {
                                 end -= 1;
                             }
@@ -1783,6 +1824,16 @@ impl GhoReader {
                 for (i, abs) in abs_offsets.iter().enumerate() {
                     part_infos[i].0 = *abs;
                 }
+
+                // Only blocks inside a partition range got their offsets placed; the trimmed
+                // ones keep stale ones and would break the binary search (GHO-003).
+                let mut kept: Vec<GhoBlockEntry> = ranges
+                    .iter()
+                    .flat_map(|r| r.clone())
+                    .map(|i| blocks[i].clone())
+                    .collect();
+                kept.sort_by_key(|b| b.output_offset);
+                let blocks = kept;
 
                 // Synthesize MBR + EBRs. Filter out empty partitions.
                 let slices: Vec<GhoPartitionSlice> = part_infos
@@ -1868,18 +1919,21 @@ impl GhoReader {
         cache_buf.resize(GHO_BLOCK_DECOMPRESSED_SIZE + 1024, 0);
         let n = decode_block_into(&mut self.inner, block, *compression, cache_buf)
             .map_err(|e| disk_core::io_other(format!("GHO block {}: {:#}", idx, e)))?;
-        debug_assert_eq!(
-            n as u32, block.decompressed_len,
-            "block {} decompressed to {} bytes, index says {}",
-            idx, n, block.decompressed_len
-        );
+        // A block short of its indexed length would end the image early without a word.
+        if n as u32 != block.decompressed_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "GHO block {idx} decoded to {n} bytes, the index says {}",
+                    block.decompressed_len
+                ),
+            ));
+        }
         cache_buf.truncate(n);
         *cache_block_index = Some(idx);
         Ok(())
     }
 }
-
-unsafe impl Send for GhoReader {}
 
 impl Read for GhoReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -2013,18 +2067,18 @@ impl GhoReader {
     /// Export paths call this (via `open_source_reader`); inspect/browse don't,
     /// so they keep fast lazy opens (and serve VBR + zeros for `$Boot`, which is
     /// fine since they never need the boot code).
-    pub fn prepare_full_image(&mut self) {
+    pub fn prepare_full_image(&mut self) -> std::io::Result<()> {
         let GhoReaderMode::NtfsFileAware {
             index, compressed, ..
         } = &mut self.mode
         else {
-            return;
+            return Ok(());
         };
 
         // Complete the run index so $Bitmap and $Boot recovery see every run.
         if let Some(cs) = compressed.as_mut() {
             if cs.lazy_scan.is_some() {
-                extend_ntfs_compressed_index(&mut self.inner, index, cs, u64::MAX);
+                extend_ntfs_compressed_index(&mut self.inner, index, cs, u64::MAX)?;
             }
         }
 
@@ -2076,6 +2130,7 @@ impl GhoReader {
                 ntfs_scan_cache_store(&key, index, cs);
             }
         }
+        Ok(())
     }
 
     /// Mapped NTFS cluster runs as `(lcn_start, cluster_count)`, sorted by LCN.
@@ -2209,7 +2264,7 @@ fn read_partition_data_at(
     inner: &mut SpanReader,
     image: &VirtualFatImage,
     compression: GhoCompression,
-    cluster_cache: &mut Option<(u32, Vec<u8>)>,
+    cluster_cache: &mut ClusterCache,
     pos_in_part: u64,
     out: &mut [u8],
     to_read: usize,
@@ -2276,9 +2331,9 @@ fn ensure_cluster_decoded(
     file_id: u32,
     cluster_index_in_file: u32,
     cluster_id: u32,
-    cache: &mut Option<(u32, Vec<u8>)>,
+    cache: &mut ClusterCache,
 ) -> std::io::Result<Vec<u8>> {
-    if let Some((cached_id, cached_bytes)) = cache {
+    if let Some((cached_id, cached_bytes)) = &cache.last {
         if *cached_id == cluster_id {
             return Ok(cached_bytes.clone());
         }
@@ -2288,11 +2343,22 @@ fn ensure_cluster_decoded(
     let cluster_size = image.cluster_size as usize;
     let byte_in_file = cluster_index_in_file as u64 * image.cluster_size;
 
+    // Start at the last record known to begin at or before this cluster, not at the file's
+    // start: decoding from byte 0 on every miss made a large file quadratic (GHO-005).
+    let starts = cache
+        .record_starts
+        .entry(file_id)
+        .or_insert_with(|| vec![0]);
+    let k = match starts.binary_search(&byte_in_file) {
+        Ok(i) => i,
+        Err(i) => i - 1,
+    };
+    let first = starts[k];
     let mut content =
-        GhoFileContentReader::new(inner, file.records.clone(), compression, file.file_size);
+        GhoFileContentReader::new_at(inner, &file.records, compression, file.file_size, k, first);
 
     // Skip to the start of this cluster's bytes within the file.
-    let mut skip = byte_in_file;
+    let mut skip = byte_in_file - first;
     let mut sink = [0u8; 8192];
     while skip > 0 {
         let want = (skip as usize).min(sink.len());
@@ -2316,8 +2382,28 @@ fn ensure_cluster_decoded(
     out.truncate(filled.max(cluster_size).min(cluster_size));
     out.resize(cluster_size, 0);
 
-    *cache = Some((cluster_id, out.clone()));
+    // Remember where each record we just decoded starts, for the next miss.
+    let starts = cache
+        .record_starts
+        .get_mut(&file_id)
+        .expect("inserted above");
+    let mut at = first;
+    for (j, size) in content.record_sizes.iter().enumerate() {
+        at += *size as u64;
+        if k + j + 1 == starts.len() && k + j + 1 < file.records.len() {
+            starts.push(at);
+        }
+    }
+    cache.last = Some((cluster_id, out.clone()));
     Ok(out)
+}
+
+/// What file-aware reads remember between calls: the last cluster served, and per file the
+/// decoded byte offset of each record start found so far.
+#[derive(Default)]
+pub(crate) struct ClusterCache {
+    last: Option<(u32, Vec<u8>)>,
+    record_starts: std::collections::HashMap<u32, Vec<u64>>,
 }
 
 impl Seek for GhoReader {
@@ -3526,7 +3612,9 @@ pub fn parse_checksum_record_body(body: &[u8]) -> Result<u32> {
 /// over-spill if the source happened to pad).
 pub struct GhoFileContentReader<'a, R: Read + Seek> {
     reader: &'a mut R,
-    record_meta: Vec<(u64, u16)>, // (body_start, body_len) — type code is irrelevant for decode
+    record_meta: std::borrow::Cow<'a, [(u64, u16)]>, // (body_start, body_len)
+    /// Decoded size of each record read so far, from the first one this reader started at.
+    record_sizes: Vec<usize>,
     compression: GhoCompression,
     next_idx: usize,
     decoded: Vec<u8>,
@@ -3545,7 +3633,8 @@ impl<'a, R: Read + Seek> GhoFileContentReader<'a, R> {
     ) -> Self {
         Self {
             reader,
-            record_meta,
+            record_meta: std::borrow::Cow::Owned(record_meta),
+            record_sizes: Vec::new(),
             compression,
             next_idx: 0,
             decoded: vec![0u8; FAST_LZ_BLOCK_SIZE + 1024],
@@ -3556,8 +3645,31 @@ impl<'a, R: Read + Seek> GhoFileContentReader<'a, R> {
         }
     }
 
+    /// A reader over `records` that starts at record `start_idx`, `bytes_before` bytes into the file.
+    fn new_at(
+        reader: &'a mut R,
+        records: &'a [(u64, u16)],
+        compression: GhoCompression,
+        file_size: u64,
+        start_idx: usize,
+        bytes_before: u64,
+    ) -> Self {
+        let mut r = Self::new(reader, Vec::new(), compression, file_size);
+        r.record_meta = std::borrow::Cow::Borrowed(records);
+        r.next_idx = start_idx;
+        r.total_left = file_size.saturating_sub(bytes_before);
+        r
+    }
+
     fn fill_next(&mut self) -> std::io::Result<bool> {
         if self.next_idx >= self.record_meta.len() {
+            // Records ran out before the file did: the data is missing, not the file shorter.
+            if self.total_left > 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("GHO file data ends {} bytes short", self.total_left),
+                ));
+            }
             return Ok(false);
         }
         let (body_start, body_len) = self.record_meta[self.next_idx];
@@ -3569,6 +3681,9 @@ impl<'a, R: Read + Seek> GhoFileContentReader<'a, R> {
         self.reader.read_exact(body)?;
         let n = match self.compression {
             GhoCompression::None => {
+                if self.decoded.len() < body.len() {
+                    self.decoded.resize(body.len(), 0);
+                }
                 self.decoded[..body_len as usize].copy_from_slice(body);
                 body_len as usize
             }
@@ -3585,6 +3700,7 @@ impl<'a, R: Read + Seek> GhoFileContentReader<'a, R> {
         };
         self.pos = 0;
         self.end = n;
+        self.record_sizes.push(n);
         Ok(true)
     }
 }
@@ -5352,6 +5468,30 @@ fn parse_inline_mft_records<R: Read + Seek>(
 
 /// Build the NTFS cluster run index by walking the packed data stream.
 ///
+/// `(cluster bytes, volume bytes)` from an NTFS boot sector, refusing values no NTFS volume
+/// has, since the volume size sizes allocations (the synthesized `$Bitmap`) downstream.
+fn ntfs_vbr_geometry(vbr: &fs_pc::ntfs::NtfsVbr) -> Result<(u64, u64)> {
+    let (bps, spc) = (vbr.bytes_per_sector, vbr.sectors_per_cluster);
+    if !(512..=4096).contains(&bps) || !bps.is_power_of_two() || spc == 0 || spc > 4096 {
+        bail!("NTFS boot sector: {bps}-byte sectors, {spc} per cluster");
+    }
+    let cluster = bps * spc;
+    let volume = vbr
+        .total_sectors
+        .checked_mul(bps)
+        .filter(|v| v / cluster <= u32::MAX as u64)
+        .ok_or_else(|| {
+            anyhow!(
+                "NTFS boot sector: {} sectors is too many",
+                vbr.total_sectors
+            )
+        })?;
+    if !(256..=65536).contains(&vbr.mft_record_size) {
+        bail!("NTFS boot sector: MFT record size {}", vbr.mft_record_size);
+    }
+    Ok((cluster, volume))
+}
+
 /// Strategy: the first run is always the MFT. We read it, parse every
 /// MFT record to collect all non-resident `$DATA` attribute data runs,
 /// and build a queue of `(LCN, cluster_count)` entries sorted by MFT
@@ -5365,8 +5505,7 @@ fn index_ntfs_file_aware<R: Read + Seek>(
 ) -> Result<NtfsGhoIndex> {
     use fs_pc::ntfs::{apply_fixup, parse_mft_attributes};
 
-    let cluster_size = vbr.bytes_per_sector * vbr.sectors_per_cluster;
-    let volume_size = vbr.total_sectors * vbr.bytes_per_sector;
+    let (cluster_size, volume_size) = ntfs_vbr_geometry(vbr)?;
     let mft_record_size = vbr.mft_record_size as usize;
 
     // Scan for the first run header. For raw files the GHPR metadata
@@ -5730,8 +5869,7 @@ fn open_ntfs_compressed_mft_only(
     use fs_pc::ntfs::{apply_fixup, parse_mft_attributes};
 
     let _ = compression;
-    let cluster_size = vbr.bytes_per_sector * vbr.sectors_per_cluster;
-    let volume_size = vbr.total_sectors * vbr.bytes_per_sector;
+    let (cluster_size, volume_size) = ntfs_vbr_geometry(vbr)?;
     let mft_record_size = vbr.mft_record_size as usize;
 
     let end = file_size;
@@ -5819,6 +5957,11 @@ fn open_ntfs_compressed_mft_only(
         loop {
             let in_before = decompress.total_in() as usize;
             let out_before = decompress.total_out();
+            // A Ghost block inflates to 32 KiB; more means this was not a block start.
+            if out_before > GHO_MAX_INFLATE {
+                ok = false;
+                break;
+            }
             let out_off = (decompress.total_out() as usize) % decomp_buf.len();
             match decompress.decompress(
                 &input[total_in..],
@@ -6166,9 +6309,9 @@ fn extend_ntfs_compressed_index(
     index: &mut NtfsGhoIndex,
     comp: &mut NtfsCompressedState,
     target_lcn: u64,
-) -> bool {
+) -> std::io::Result<bool> {
     let Some(scan) = &mut comp.lazy_scan else {
-        return false;
+        return Ok(false);
     };
 
     let io_chunk: usize = 4 * 1024 * 1024;
@@ -6179,13 +6322,9 @@ fn extend_ntfs_compressed_index(
 
     let mut chunk_buf = vec![0u8; io_chunk + 64 * 1024];
     let mut chunk_start = scan.file_offset;
-    if inner.seek(SeekFrom::Start(chunk_start)).is_err() {
-        return false;
-    }
-    let mut chunk_len = match read_fully_or_eof(inner, &mut chunk_buf) {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
+    // A read error is the image failing, not padding: report it rather than serve zeros.
+    inner.seek(SeekFrom::Start(chunk_start))?;
+    let mut chunk_len = read_fully_or_eof(inner, &mut chunk_buf).map_err(disk_core::io_other)?;
     let mut local = 0usize;
     let mut found_target = false;
     let mut consecutive_fails = 0u32;
@@ -6231,16 +6370,9 @@ fn extend_ntfs_compressed_index(
             chunk_buf.copy_within(local..chunk_len, 0);
             chunk_start += local as u64;
             local = 0;
-            if inner
-                .seek(SeekFrom::Start(chunk_start + remaining as u64))
-                .is_err()
-            {
-                break;
-            }
-            let extra = match read_fully_or_eof(inner, &mut chunk_buf[remaining..]) {
-                Ok(n) => n,
-                Err(_) => break,
-            };
+            inner.seek(SeekFrom::Start(chunk_start + remaining as u64))?;
+            let extra = read_fully_or_eof(inner, &mut chunk_buf[remaining..])
+                .map_err(disk_core::io_other)?;
             chunk_len = remaining + extra;
         }
         if local + 4 > chunk_len {
@@ -6271,6 +6403,11 @@ fn extend_ntfs_compressed_index(
             loop {
                 let in_before = decompress.total_in() as usize;
                 let out_before = decompress.total_out();
+                // A Ghost block inflates to 32 KiB; more means this was not a block start.
+                if out_before > GHO_MAX_INFLATE {
+                    ok = false;
+                    break;
+                }
                 match decompress.decompress(
                     &input[total_in..],
                     &mut discard[..],
@@ -6338,6 +6475,11 @@ fn extend_ntfs_compressed_index(
         loop {
             let in_before = decompress.total_in() as usize;
             let out_before = decompress.total_out();
+            // A Ghost block inflates to 32 KiB; more means this was not a block start.
+            if out_before > GHO_MAX_INFLATE {
+                ok = false;
+                break;
+            }
             let out_off = (decompress.total_out() as usize) % decomp_buf.len();
             match decompress.decompress(
                 &input[total_in..],
@@ -6576,7 +6718,7 @@ fn extend_ntfs_compressed_index(
         );
     }
 
-    found_target
+    Ok(found_target)
 }
 
 /// Try to open an NTFS file-aware GHO. Returns the reader mode and
@@ -7862,7 +8004,7 @@ fn read_ntfs_file_aware_into(
         if index.synth_bitmap.is_empty() {
             if let Some(cs) = compressed.as_mut() {
                 if cs.lazy_scan.is_some() {
-                    extend_ntfs_compressed_index(inner, index, cs, u64::MAX);
+                    extend_ntfs_compressed_index(inner, index, cs, u64::MAX)?;
                 }
             }
             let total_clusters = index.volume_size / index.cluster_size;
@@ -7934,7 +8076,7 @@ fn read_ntfs_file_aware_into(
                     .iter()
                     .any(|&(l, c)| lcn >= l && lcn < l + c);
                 if is_known_lcn {
-                    extend_ntfs_compressed_index(inner, index, cs, lcn);
+                    extend_ntfs_compressed_index(inner, index, cs, lcn)?;
                     found_idx = find_run(&index.runs, *last_run_hint);
                 }
             }
@@ -8007,6 +8149,12 @@ mod tests {
         let o = 446 + i * 16;
         let le = |a: usize| u32::from_le_bytes(sector[a..a + 4].try_into().unwrap());
         (sector[o + 4], le(o + 8), le(o + 12))
+    }
+
+    #[test]
+    fn the_reader_is_send_without_an_unsafe_impl() {
+        fn is_send<T: Send>() {}
+        is_send::<GhoReader>();
     }
 
     #[test]

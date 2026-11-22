@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let mut r = GhoReader::open(std::path::Path::new(&path))?;
-    r.prepare_full_image();
+    r.prepare_full_image().expect("prepare GHO");
 
     let vbr = read_at(&mut r, 0, 512)?;
     let bps = rd_u16(&vbr, 0x0B) as usize;

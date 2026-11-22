@@ -121,7 +121,7 @@ fn main() -> anyhow::Result<()> {
     println!("corrupt hive: size={} used_end={used}", hive.len());
 
     let mut r = GhoReader::open(std::path::Path::new(&gho))?;
-    r.prepare_full_image();
+    r.prepare_full_image().expect("prepare GHO");
     let mut sentinels = r.debug_sentinel_runs_full(1 << 20); // up to 1 MiB per run
     println!("sentinel runs available: {}", sentinels.len());
 

@@ -396,7 +396,7 @@ pub fn open_source_reader(source_path: &Path) -> Result<(super::BoxReadSeek, u64
         // export mountable AND bootable. Only export goes through here; inspect
         // uses source_reader::open_read and keeps its fast lazy open.
         let mut gho = dsk_ghost::gho::GhoReader::open(source_path)?;
-        gho.prepare_full_image();
+        gho.prepare_full_image()?;
         let size = gho.seek(SeekFrom::End(0))?;
         gho.seek(SeekFrom::Start(0))?;
         Ok((Box::new(gho), size))
