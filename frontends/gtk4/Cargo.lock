@@ -167,6 +167,7 @@ dependencies = [
  "dsk-apple",
  "flate2",
  "fs-mac",
+ "log",
 ]
 
 [[package]]
@@ -1124,6 +1125,7 @@ dependencies = [
  "anyhow",
  "byteorder",
  "disk-core",
+ "log",
 ]
 
 [[package]]
@@ -1412,6 +1414,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "disk-core",
+ "log",
  "serde",
  "serde_json",
 ]
