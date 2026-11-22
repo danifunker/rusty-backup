@@ -1541,14 +1541,8 @@ impl GhoReader {
             // Multi-partition: resolve absolute offsets, then build
             // one VirtualFatImage per partition.
             resolve_absolute_offsets(&mut slices);
-            let mbr = synthesize_mbr(&slices);
-            let primary_end = slices[0].hidden_sectors + slices[0].partition_size / 512;
-            let ext_slices: Vec<GhoPartitionSlice> = slices[1..].to_vec();
-            let ebrs = if !ext_slices.is_empty() {
-                synthesize_ebrs(&ext_slices, primary_end)
-            } else {
-                std::collections::HashMap::new()
-            };
+            let mut ebrs = synthesize_partition_table(&slices)?;
+            let mbr = ebrs.remove(&0).expect("the table has an MBR");
 
             log::info!(
                 "Reconstructing {} partitions from sparsely populated Ghost image...",
@@ -1748,22 +1742,7 @@ impl GhoReader {
                     let first = &blocks[range.start];
                     let n = decode_block_into(&mut inner, first, header.compression, &mut tmp)?;
                     if n >= 64 {
-                        let bpb = &tmp[..n];
-                        let bps = u16::from_le_bytes([bpb[11], bpb[12]]) as u64;
-                        let hidden =
-                            u32::from_le_bytes([bpb[28], bpb[29], bpb[30], bpb[31]]) as u64;
-                        let tot16 = u16::from_le_bytes([bpb[19], bpb[20]]) as u64;
-                        let tot32 = u32::from_le_bytes([bpb[32], bpb[33], bpb[34], bpb[35]]) as u64;
-                        let total = if tot16 != 0 { tot16 } else { tot32 };
-                        let fs = if n >= 90 && &bpb[82..87] == b"FAT32" {
-                            "FAT32"
-                        } else if n >= 62 && &bpb[54..59] == b"FAT16" {
-                            "FAT16"
-                        } else {
-                            "Unknown"
-                        };
-                        let size = total * bps.max(512);
-                        part_infos.push((hidden, size, fs.to_string()));
+                        part_infos.push(vbr_geometry(&tmp[..n]));
                     } else {
                         part_infos.push((0, 0, "Unknown".to_string()));
                     }
@@ -1818,17 +1797,7 @@ impl GhoReader {
                         reserved_record_index: None,
                     })
                     .collect();
-                let mbr = synthesize_mbr(&slices);
-                let mut synth_sectors = std::collections::HashMap::new();
-                synth_sectors.insert(0u64, mbr);
-
-                if slices.len() > 1 {
-                    let primary_end = slices[0].hidden_sectors + slices[0].partition_size / 512;
-                    let ext_slices: Vec<GhoPartitionSlice> = slices[1..].to_vec();
-                    for (lba, ebr) in synthesize_ebrs(&ext_slices, primary_end) {
-                        synth_sectors.insert(lba, ebr);
-                    }
-                }
+                let synth_sectors = synthesize_partition_table(&slices)?;
 
                 let logical_size = max_end.max(512);
 
@@ -3908,11 +3877,25 @@ fn build_virtual_fat_image(
 
     let root = fs.root().map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut stack: Vec<(u32, FileEntry)> = vec![(tree.root_cluster, root)];
+    // A directory that points back at an ancestor is emitted once, not nested until the volume fills.
+    let mut seen_dirs = std::collections::HashSet::new();
 
     let mut files: Vec<FileContentRef> = Vec::new();
     let mut cluster_to_file: HashMap<u32, (u32, u32)> = HashMap::new();
+    // Out of space means the derived layout is wrong, so the image can't be served whole.
+    let skip = |name: &str, e: disk_core::filesystem::FilesystemError| -> Result<()> {
+        if matches!(e, disk_core::filesystem::FilesystemError::DiskFull(_)) {
+            bail!("virtual FAT image ran out of space at {name}: {e}");
+        }
+        log::warn!("GHO: skipping {name}: {e}");
+        Ok(())
+    };
 
     while let Some((src_cluster, parent_entry)) = stack.pop() {
+        if !seen_dirs.insert(src_cluster) {
+            log::warn!("GHO: directory cluster {src_cluster} is listed twice; skipping the repeat");
+            continue;
+        }
         let Some(child_idxs) = children_by_parent.get(&src_cluster) else {
             continue;
         };
@@ -3924,10 +3907,10 @@ fn build_virtual_fat_image(
             };
 
             if entry.is_directory() {
-                if let Ok(dir_entry) =
-                    fs.create_directory(&parent_entry, &name, &CreateDirectoryOptions::default())
+                match fs.create_directory(&parent_entry, &name, &CreateDirectoryOptions::default())
                 {
-                    stack.push((entry.source_cluster, dir_entry));
+                    Ok(dir_entry) => stack.push((entry.source_cluster, dir_entry)),
+                    Err(e) => skip(&name, e)?,
                 }
             } else {
                 let mut meta: Vec<(u64, u16)> =
@@ -3943,6 +3926,7 @@ fn build_virtual_fat_image(
                     }
                 }
                 if missing {
+                    log::warn!("GHO: skipping {name}: its data records are not in the image");
                     continue;
                 }
                 let file_size = entry.file_size as u64;
@@ -3955,7 +3939,10 @@ fn build_virtual_fat_image(
                 };
                 let f = match fs.create_file(&parent_entry, &name, &mut empty, file_size, &opts) {
                     Ok(f) => f,
-                    Err(_) => continue,
+                    Err(e) => {
+                        skip(&name, e)?;
+                        continue;
+                    }
                 };
                 let file_id = files.len() as u32;
                 files.push(FileContentRef {
@@ -4310,28 +4297,38 @@ fn parse_vbr_geometry<R: Read + Seek>(
         bail!("boot-sector body too short: {} bytes", rec.body_len);
     }
     let bpb_vec = read_record_body(reader, rec, cache)?;
-    let bpb = &bpb_vec;
-    let n = bpb.len();
-    let byts_per_sec = u16::from_le_bytes([bpb[11], bpb[12]]) as u64;
+    let byts_per_sec = u16::from_le_bytes([bpb_vec[11], bpb_vec[12]]) as u64;
     if byts_per_sec == 0 || byts_per_sec > 4096 {
         bail!("invalid bytes_per_sector: {}", byts_per_sec);
     }
+    Ok(vbr_geometry(&bpb_vec))
+}
+
+/// (hidden sectors, partition bytes, fs type) from a FAT or NTFS boot sector of at least 64 bytes.
+fn vbr_geometry(bpb: &[u8]) -> (u64, u64, String) {
+    let n = bpb.len();
+    let bps = (u16::from_le_bytes([bpb[11], bpb[12]]) as u64).max(512);
     let hidden = u32::from_le_bytes([bpb[28], bpb[29], bpb[30], bpb[31]]) as u64;
+    if n >= 0x30 && &bpb[3..11] == b"NTFS    " {
+        // NTFS counts its sectors at 0x28; the backup boot sector sits one past them.
+        let mut t = [0u8; 8];
+        t.copy_from_slice(&bpb[0x28..0x30]);
+        let total = u64::from_le_bytes(t).saturating_add(1);
+        return (hidden, total.saturating_mul(bps), "NTFS".to_string());
+    }
     let tot16 = u16::from_le_bytes([bpb[19], bpb[20]]) as u64;
     let tot32 = u32::from_le_bytes([bpb[32], bpb[33], bpb[34], bpb[35]]) as u64;
     let total_sectors = if tot16 != 0 { tot16 } else { tot32 };
-    let size = total_sectors * byts_per_sec;
-
     let fs_type = if n >= 90 && &bpb[82..87] == b"FAT32" {
-        "FAT32".to_string()
+        "FAT32"
     } else if n >= 62 && &bpb[54..59] == b"FAT16" {
-        "FAT16".to_string()
+        "FAT16"
     } else if n >= 62 && &bpb[54..59] == b"FAT12" {
-        "FAT12".to_string()
+        "FAT12"
     } else {
-        "Unknown".to_string()
+        "Unknown"
     };
-    Ok((hidden, size, fs_type))
+    (hidden, total_sectors * bps, fs_type.to_string())
 }
 
 /// Split a multi-partition file-aware `GhoImage` into per-partition
@@ -4497,68 +4494,100 @@ const MBR_TYPE_FAT16_LBA: u8 = 0x0E;
 /// MBR partition type byte for extended (LBA).
 const MBR_TYPE_EXTENDED_LBA: u8 = 0x0F;
 
-/// Synthesize an MBR sector from a list of partitions discovered in
-/// a multi-partition GHO. Returns 512 bytes with a valid partition
-/// table and `0x55AA` signature.
-///
-/// The function handles extended partitions: if any partition's
-/// `hidden_sectors` indicates it lives inside another partition's
-/// range, it builds an extended container with EBR chain.
-fn synthesize_mbr(slices: &[GhoPartitionSlice]) -> [u8; 512] {
+/// MBR type byte for a partition Ghost recorded as `fs`.
+fn mbr_type_for(fs: &str) -> u8 {
+    match fs {
+        "FAT32" => MBR_TYPE_FAT32_LBA,
+        "FAT16" => MBR_TYPE_FAT16_LBA,
+        "FAT12" => 0x01,
+        "NTFS" => 0x07,
+        _ => 0xDA, // non-FS data: nothing guesses a filesystem from it
+    }
+}
+
+/// The MBR (at LBA 0) and any EBRs for a multi-partition image, keyed by LBA.
+/// The second partition on are logical when each has 63 free sectors before it for its EBR;
+/// otherwise up to four are primaries, so no EBR is ever served over partition data.
+fn synthesize_partition_table(
+    slices: &[GhoPartitionSlice],
+) -> Result<std::collections::HashMap<u64, [u8; 512]>> {
+    let mut out = std::collections::HashMap::new();
     let mut mbr = [0u8; 512];
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
-
-    if slices.is_empty() {
-        return mbr;
-    }
-
-    // Sort partitions by hidden_sectors (disk LBA order).
     let mut parts: Vec<(u64, u64, u8)> = slices
         .iter()
         .map(|s| {
-            let type_byte = match s.fs_type.as_str() {
-                "FAT32" => MBR_TYPE_FAT32_LBA,
-                "FAT16" => MBR_TYPE_FAT16_LBA,
-                _ => MBR_TYPE_FAT32_LBA,
-            };
-            let sectors = s.partition_size / 512;
-            (s.hidden_sectors, sectors, type_byte)
+            (
+                s.hidden_sectors,
+                s.partition_size / 512,
+                mbr_type_for(&s.fs_type),
+            )
         })
         .collect();
     parts.sort_by_key(|p| p.0);
-
-    // Detect extended partitions: a partition whose start_lba falls
-    // inside the range of the gap between the first partition's end
-    // and the disk's end, with hidden_sectors suggesting an EBR offset
-    // (hidden == container_start + 63 or similar).
-    //
-    // Heuristic: the first partition is primary. If there are multiple
-    // subsequent partitions, they're in an extended container. The
-    // extended container starts right after the first partition.
-    if parts.len() == 1 {
-        write_mbr_entry(&mut mbr, 0, parts[0].0, parts[0].1, parts[0].2, true);
-    } else {
-        // First partition is primary.
-        write_mbr_entry(&mut mbr, 0, parts[0].0, parts[0].1, parts[0].2, true);
-
-        // Extended partition contains all remaining partitions.
-        // Extended start = first partition end.
-        let ext_start = parts[0].0 + parts[0].1;
-        let ext_end = parts.last().map(|p| p.0 + p.1).unwrap_or(ext_start);
-        let ext_sectors = ext_end - ext_start;
-
-        write_mbr_entry(
-            &mut mbr,
-            1,
-            ext_start,
-            ext_sectors,
-            MBR_TYPE_EXTENDED_LBA,
-            false,
-        );
+    let mut prev_end = 1u64;
+    for &(start, len, _) in &parts {
+        if start < prev_end {
+            bail!("GHO partitions overlap or start in the MBR (LBA {start})");
+        }
+        if start.saturating_add(len) > u32::MAX as u64 {
+            bail!("GHO partition at LBA {start} is past what an MBR can address");
+        }
+        prev_end = start + len;
     }
-
-    mbr
+    // Logical partitions as Ghost's source had them, when each has a free gap for its EBR.
+    let logicals = &parts[1..];
+    let mut prev_end = parts[0].0 + parts[0].1;
+    let mut room = true;
+    for &(start, len, _) in logicals {
+        room &= start >= prev_end + 63;
+        prev_end = start + len;
+    }
+    if !room || parts.len() == 1 {
+        if parts.len() > 4 {
+            bail!(
+                "GHO has {} partitions and no room for the EBRs of logical ones",
+                parts.len()
+            );
+        }
+        for (i, &(start, len, t)) in parts.iter().enumerate() {
+            write_mbr_entry(&mut mbr, i, start, len, t, i == 0);
+        }
+        out.insert(0, mbr);
+        return Ok(out);
+    }
+    write_mbr_entry(&mut mbr, 0, parts[0].0, parts[0].1, parts[0].2, true);
+    let ext_start = logicals[0].0 - 63;
+    write_mbr_entry(
+        &mut mbr,
+        1,
+        ext_start,
+        prev_end - ext_start,
+        MBR_TYPE_EXTENDED_LBA,
+        false,
+    );
+    out.insert(0, mbr);
+    for (i, &(start, len, t)) in logicals.iter().enumerate() {
+        let mut ebr = [0u8; 512];
+        ebr[510] = 0x55;
+        ebr[511] = 0xAA;
+        let ebr_lba = start - 63;
+        write_mbr_entry(&mut ebr, 0, 63, len, t, false);
+        if let Some(&(nstart, nlen, _)) = logicals.get(i + 1) {
+            let next_ebr = nstart - 63;
+            write_mbr_entry(
+                &mut ebr,
+                1,
+                next_ebr - ext_start,
+                nlen + 63,
+                MBR_TYPE_EXTENDED_LBA,
+                false,
+            );
+        }
+        out.insert(ebr_lba, ebr);
+    }
+    Ok(out)
 }
 
 /// Write one 16-byte MBR partition entry at slot `idx` (0..3).
@@ -4582,68 +4611,6 @@ fn write_mbr_entry(
     mbr[off + 7] = 0xFF;
     mbr[off + 8..off + 12].copy_from_slice(&(start_lba as u32).to_le_bytes());
     mbr[off + 12..off + 16].copy_from_slice(&(sectors as u32).to_le_bytes());
-}
-
-/// Synthesize Extended Boot Records (EBRs) for logical partitions
-/// inside the extended container. Returns a map of `(disk_lba ->
-/// [u8; 512])` for each EBR sector.
-fn synthesize_ebrs(
-    slices: &[GhoPartitionSlice],
-    ext_start: u64,
-) -> std::collections::HashMap<u64, [u8; 512]> {
-    let mut ebrs = std::collections::HashMap::new();
-    // Sort logical partitions by disk LBA.
-    let mut logicals: Vec<&GhoPartitionSlice> = slices.iter().collect();
-    logicals.sort_by_key(|s| s.hidden_sectors);
-
-    for (i, part) in logicals.iter().enumerate() {
-        // EBR lives 63 sectors before the partition's VBR.
-        let ebr_lba = part.hidden_sectors - 63;
-        let mut ebr = [0u8; 512];
-        ebr[510] = 0x55;
-        ebr[511] = 0xAA;
-
-        // Entry 0: the logical partition (offset relative to this EBR).
-        let type_byte = match part.fs_type.as_str() {
-            "FAT32" => MBR_TYPE_FAT32_LBA,
-            "FAT16" => MBR_TYPE_FAT16_LBA,
-            _ => MBR_TYPE_FAT32_LBA,
-        };
-        let part_sectors = part.partition_size / 512;
-        // Offset from EBR to partition start = 63 sectors.
-        let entry0_off = 446;
-        ebr[entry0_off + 4] = type_byte;
-        ebr[entry0_off + 1] = 0xFE;
-        ebr[entry0_off + 2] = 0xFF;
-        ebr[entry0_off + 3] = 0xFF;
-        ebr[entry0_off + 5] = 0xFE;
-        ebr[entry0_off + 6] = 0xFF;
-        ebr[entry0_off + 7] = 0xFF;
-        ebr[entry0_off + 8..entry0_off + 12].copy_from_slice(&63u32.to_le_bytes());
-        ebr[entry0_off + 12..entry0_off + 16].copy_from_slice(&(part_sectors as u32).to_le_bytes());
-
-        // Entry 1: chain to next EBR (relative to ext_start).
-        if i + 1 < logicals.len() {
-            let next = logicals[i + 1];
-            let next_ebr_lba = next.hidden_sectors - 63;
-            let next_part_sectors = next.partition_size / 512;
-            let entry1_off = 446 + 16;
-            ebr[entry1_off + 4] = MBR_TYPE_EXTENDED_LBA;
-            ebr[entry1_off + 1] = 0xFE;
-            ebr[entry1_off + 2] = 0xFF;
-            ebr[entry1_off + 3] = 0xFF;
-            ebr[entry1_off + 5] = 0xFE;
-            ebr[entry1_off + 6] = 0xFF;
-            ebr[entry1_off + 7] = 0xFF;
-            let offset_from_ext = (next_ebr_lba - ext_start) as u32;
-            let chain_size = (63 + next_part_sectors) as u32;
-            ebr[entry1_off + 8..entry1_off + 12].copy_from_slice(&offset_from_ext.to_le_bytes());
-            ebr[entry1_off + 12..entry1_off + 16].copy_from_slice(&chain_size.to_le_bytes());
-        }
-
-        ebrs.insert(ebr_lba, ebr);
-    }
-    ebrs
 }
 
 /// Decode every `0x0002` data-block record in `image` into `writer`,
@@ -8024,6 +7991,66 @@ fn read_ntfs_file_aware_into(
 
 #[cfg(test)]
 mod tests {
+
+    fn slice(hidden: u64, sectors: u64, fs: &str) -> GhoPartitionSlice {
+        GhoPartitionSlice {
+            boot_record_index: 0,
+            record_range: 0..0,
+            partition_size: sectors * 512,
+            hidden_sectors: hidden,
+            fs_type: fs.to_string(),
+            reserved_record_index: None,
+        }
+    }
+
+    fn entry(sector: &[u8; 512], i: usize) -> (u8, u32, u32) {
+        let o = 446 + i * 16;
+        let le = |a: usize| u32::from_le_bytes(sector[a..a + 4].try_into().unwrap());
+        (sector[o + 4], le(o + 8), le(o + 12))
+    }
+
+    #[test]
+    fn two_primaries_get_two_mbr_entries_and_no_ebr() {
+        let t = synthesize_partition_table(&[slice(63, 1000, "FAT16"), slice(1063, 500, "NTFS")])
+            .unwrap();
+        assert_eq!(t.len(), 1, "no EBR over the first partition's last track");
+        assert_eq!(entry(&t[&0], 0), (0x0E, 63, 1000));
+        assert_eq!(entry(&t[&0], 1), (0x07, 1063, 500));
+        // With a free gap the second is logical, as Ghost's source disks have it.
+        let t = synthesize_partition_table(&[slice(63, 1000, "FAT16"), slice(1126, 500, "NTFS")])
+            .unwrap();
+        assert_eq!(entry(&t[&0], 1).0, MBR_TYPE_EXTENDED_LBA);
+        assert_eq!(entry(&t[&1063], 0), (0x07, 63, 500));
+    }
+
+    #[test]
+    fn logicals_need_room_for_their_ebr() {
+        let five: Vec<_> = (0..5)
+            .map(|i| slice(63 + i * 1063, 1000, "FAT32"))
+            .collect();
+        let t = synthesize_partition_table(&five).unwrap();
+        assert_eq!(t.len(), 5);
+        assert_eq!(entry(&t[&0], 1).0, MBR_TYPE_EXTENDED_LBA);
+        assert_eq!(entry(&t[&1063], 0), (0x0C, 63, 1000));
+        let tight: Vec<_> = (0..5)
+            .map(|i| slice(63 + i * 1000, 1000, "FAT32"))
+            .collect();
+        assert!(synthesize_partition_table(&tight).is_err());
+        assert!(
+            synthesize_partition_table(&[slice(63, 1000, "FAT32"), slice(500, 10, "FAT32")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_ntfs_boot_sector_is_sized_from_its_own_field() {
+        let mut b = [0u8; 512];
+        b[3..11].copy_from_slice(b"NTFS    ");
+        b[11..13].copy_from_slice(&512u16.to_le_bytes());
+        b[28..32].copy_from_slice(&2048u32.to_le_bytes());
+        b[0x28..0x30].copy_from_slice(&99_999u64.to_le_bytes());
+        assert_eq!(vbr_geometry(&b), (2048, 100_000 * 512, "NTFS".to_string()));
+    }
 
     /// A synthetic High-compression NTFS Ghost stream: junk, the MFT run header, `mft`, a tail.
     fn ghost_ntfs_stream(mft: &[u8], cluster: u64, block: usize) -> Vec<u8> {

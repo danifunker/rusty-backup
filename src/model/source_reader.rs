@@ -1609,6 +1609,14 @@ pub fn open_container_rw(path: &Path) -> Result<ContainerRw> {
                 .with_context(|| format!("opening QCOW2 {} for edit", path.display()))?;
             // Shared clusters and no copy-on-write: a snapshot-bearing image
             // (a UTM suspended VM, typically) would be corrupted by an edit.
+            if reader.is_unclean() {
+                return Ok(ContainerRw::ReadOnly(
+                    "this QCOW2 is marked dirty or corrupt (the VM did not shut down \
+                     cleanly), so its free-space counts can't be trusted for an edit. \
+                     Repair it with `qemu-img check -r all <file>`, then retry."
+                        .to_string(),
+                ));
+            }
             if reader.is_read_only() {
                 return Ok(ContainerRw::ReadOnly(format!(
                     "this QCOW2 has {} internal snapshot(s) and opens read-only \

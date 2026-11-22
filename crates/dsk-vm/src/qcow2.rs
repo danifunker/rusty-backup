@@ -139,6 +139,8 @@ pub struct Qcow2Reader<R: Read + Seek> {
     /// do. UTM stores its suspend state as a snapshot, so this is the common
     /// case for classic-Mac VM disks.
     snapshot_count: u32,
+    /// Set when the header marks the image dirty or corrupt: its refcounts can't be trusted to allocate.
+    unclean: bool,
 }
 
 impl<R: Read + Seek> Qcow2Reader<R> {
@@ -190,6 +192,7 @@ impl<R: Read + Seek> Qcow2Reader<R> {
         // separate structure we never follow. Remember the count so the editor
         // can refuse to write (shared clusters need copy-on-write) and open.
         let snapshot_count = u32::from_be_bytes(head[60..64].try_into().unwrap());
+        let mut unclean = false;
 
         if version == 3 {
             if total_len < 104 {
@@ -202,6 +205,7 @@ impl<R: Read + Seek> Qcow2Reader<R> {
                      refusing to open"
                 );
             }
+            unclean = incompat & 0b11 != 0;
             if incompat & 0b0_0100 != 0 {
                 bail!("QCOW2 with an external data file is not supported");
             }
@@ -288,6 +292,7 @@ impl<R: Read + Seek> Qcow2Reader<R> {
             free_clusters: None,
             host_end: total_len,
             snapshot_count,
+            unclean,
         })
     }
 
@@ -312,10 +317,14 @@ impl<R: Read + Seek> Qcow2Reader<R> {
         self.snapshot_count
     }
 
-    /// True when in-place edits are refused because the image carries internal
-    /// snapshots (their clusters are shared and we have no copy-on-write path).
+    /// True when the header marks the image dirty or corrupt.
+    pub fn is_unclean(&self) -> bool {
+        self.unclean
+    }
+
+    /// True when in-place edits are refused: internal snapshots, or a dirty / corrupt header.
     pub fn is_read_only(&self) -> bool {
-        self.snapshot_count != 0
+        self.snapshot_count != 0 || self.unclean
     }
 
     /// Load (and cache) the L2 table at `host_offset`.
@@ -447,6 +456,13 @@ impl<R: Read + Write + Seek> Write for Qcow2Reader<R> {
                      qemu-img convert -O qcow2 in.qcow2 out.qcow2)",
                     self.snapshot_count
                 ),
+            ));
+        }
+        if self.unclean {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "QCOW2 image is marked dirty or corrupt and opens read-only; \
+                 repair it first (qemu-img check -r all)",
             ));
         }
         if self.pos >= self.header.size {
@@ -1146,6 +1162,19 @@ mod tests {
                 "expected {msg:?}, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn a_dirty_image_reads_but_refuses_writes() {
+        let cluster_bits = 9;
+        let cluster_size = 1u64 << cluster_bits;
+        let payload = make_pattern(cluster_size as usize);
+        let mut img = build_minimal_qcow2(3, cluster_bits, cluster_size, &[], &[(0, payload)]);
+        img[79] |= 1; // incompatible_features: dirty
+        let mut r = Qcow2Reader::open(Cursor::new(img)).unwrap();
+        assert!(r.is_unclean() && r.is_read_only());
+        let err = r.write(&[0xAB; 16]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     /// UTM parks the VM's suspend state in an internal snapshot, so nearly every

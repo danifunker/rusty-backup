@@ -626,8 +626,8 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 | QNX-003 | S2 | confirmed | qnx4.rs `read_data`, qnx6.rs `read_node` | Allocation by on-disk size before reading; endless hole zero-fill. | open |
 | QNX-004 | S2 | confirmed | qnx6.rs `bmap` | `levels` uncapped: shift overflow. | open |
 | QNX-005 | S3 | confirmed | qnx6.rs `copy_node`, `open` | Block-at-a-time I/O with repeated pointer reads; backup superblock geometry from the primary. | open |
-| QN2-001 | S1 | confirmed | qnx2fs lib.rs `extents`, `mark`, `delete` | Extent spans unchecked: delete frees other files' blocks; `mark` panics; directory writes past the partition. | open |
-| QN2-002 | S1 | confirmed | qnx2fs lib.rs `replace`, `copy_entry` | Space check assumes full extents: a full disk loses the old file. | open |
+| QN2-001 | S1 | confirmed | qnx2fs lib.rs `extents`, `mark`, `delete` | Extent spans unchecked: delete frees other files' blocks; `mark` panics; directory writes past the partition. | fixed (36314812) |
+| QN2-002 | S1 | confirmed | qnx2fs lib.rs `replace`, `copy_entry` | Space check assumes full extents: a full disk loses the old file. | fixed (36314812) |
 | QN2-003 | S2 | confirmed | qnx2fs lib.rs `open`, `read_chain` | Bitmap read grows by on-disk extent sizes before reading (4 GiB). | open |
 | QN2-004 | S2 | confirmed | qnx2fs lib.rs `deleted_state`, `claim` | Per-block loops over 2^32 spans: billions of iterations / issue strings. | open |
 | QN2-005 | S2 | confirmed | qnx2fs lib.rs `copy_entry` | Recursive copy has no depth / visited guard. | open |
