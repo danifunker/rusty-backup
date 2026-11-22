@@ -382,10 +382,10 @@ drivers are merged.
 | UNX-011 | S1 | confirmed | bfs_write.rs `BTree::split_and_promote` | Internal split promotes the wrong key: some keys become unreachable. | fixed (f55f13c6) |
 | UNX-012 | S1 | confirmed | bfs_write.rs `write_blank_bfs_into` | 65,537..65,539-block volumes put the root tree past the volume end. | fixed (f55f13c6) |
 | UNX-013 | S1 | confirmed | minix.rs `write_blank_minix_into` | `firstdatazone` / `zmap_blocks` stored as u16 unchecked: large V3 volumes overlap data and inodes. | fixed (f55f13c6) |
-| UNX-014 | S1 | plausible | minix.rs `parse`, alloc; minix_fsck.rs | Bitmap block counts not checked against zones / inodes: allocation repeats a zone, bit writes hit the inode table. | open |
-| UNX-015 | S1 | plausible | ofs_write.rs `write_sectors`, `claim_slot` | Bound allows one sector past the volume; directory chain pointer can write into the bitmap. | open |
-| UNX-016 | S1 | plausible | jfs_fsck.rs `check_connectivity`, `repair_jfs` | Directories over 4096 bytes skipped: children reported as orphans and double-linked. | open |
-| UNX-017 | S1 | plausible | btrfs.rs `CompactBtrfsReader::new` | Boot area and superblock mirrors zeroed in a compacted backup: restored partition does not boot. | open |
+| UNX-014 | S1 | plausible | minix.rs `parse`, alloc; minix_fsck.rs | Bitmap block counts not checked against zones / inodes: allocation repeats a zone, bit writes hit the inode table. | fixed (e9e11e89) |
+| UNX-015 | S1 | plausible | ofs_write.rs `write_sectors`, `claim_slot` | Bound allows one sector past the volume; directory chain pointer can write into the bitmap. | fixed (e9e11e89) |
+| UNX-016 | S1 | plausible | jfs_fsck.rs `check_connectivity`, `repair_jfs` | Directories over 4096 bytes skipped: children reported as orphans and double-linked. | fixed (e9e11e89) |
+| UNX-017 | S1 | plausible | btrfs.rs `CompactBtrfsReader::new` | Boot area and superblock mirrors zeroed in a compacted backup: restored partition does not boot. | fixed (e9e11e89) |
 | UNX-018 | S2 | confirmed | ufs.rs, efs.rs, efs_v1.rs orphan adoption | Children of an orphaned directory adopted twice; UFS `..` and lost+found nlink stale; efs `continue` in the wrong loop. | open |
 | UNX-019 | S2 | confirmed | ext.rs, btrfs.rs, jfs.rs, reiserfs.rs tree walks | No depth cap / level check: self-pointing nodes overflow the stack or loop. | open |
 | UNX-020 | S2 | confirmed | ext, ufs, jfs, jfs1, btrfs, bfs, vxfs | Allocations sized from on-disk fields (symlink size 1<<40 aborts a listing). | open |
@@ -462,7 +462,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
 | XRX-001 | S1 | confirmed | alto/write.rs `build_disk` | VDAs and freePages stored as u16: Trident packs always fail fsck and point at wrong pages past 65535. | fixed (0c22507d): rebuild of packs over 65535 pages refused |
-| XRX-002 | S1 | plausible | alto/write.rs `extract_files`, `build_disk` | Every edit / repair rebuilds from SysDir only: sub-directory files dropped, boot page not copied. | open |
+| XRX-002 | S1 | plausible | alto/write.rs `extract_files`, `build_disk` | Every edit / repair rebuilds from SysDir only: sub-directory files dropped, boot page not copied. | fixed (4599565b) |
 | XRX-003 | S2 | confirmed | alto/bfs.rs `sync_metadata`, `repair`; src/model/browse_session.rs | Non-atomic save, always PDI: a Salto `.dsk` overwritten as PDI. | open |
 | XRX-004 | S2 | confirmed | alto/pdi.rs `read_header` | Label / data sizes unchecked against the family: panic on open; product overflow. | open |
 | XRX-005 | S2 | confirmed | alto/copydisk.rs `read` | Allocation from u16 geometry before reading: OOM / panic. | open |
@@ -521,7 +521,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | DVM-007 | S2 | plausible | vmdk.rs `read_descriptor` | Only 64 KiB of descriptor parsed: many-extent disks fail or silently shorten. | open |
 | DVM-008 | S2 | plausible | qcow2.rs `open`, `allocate_cluster` | Unaligned file length gives unaligned new clusters and wrong refcounts. | open |
 | DVM-009 | S4 | confirmed | vmdk.rs, lib.rs, qemu_img_test.rs | Test-only public fn; helpers duplicated with src/rbformats. | open |
-| TAR-001 | S1 | plausible | tar_import.rs `NormalizedTar::fill` | Data blocks counted from the ustar size only: pax sizes / GNU sparse headers make data be rewritten as headers (silent corruption). | open |
+| TAR-001 | S1 | plausible | tar_import.rs `NormalizedTar::fill` | Data blocks counted from the ustar size only: pax sizes / GNU sparse headers make data be rewritten as headers (silent corruption). | fixed (8126d65f) |
 | TAR-002 | S2 | confirmed | tar_import.rs; zip_import.rs `plan` | `skip_appledouble=false` ignored: `._` files always consumed; preflight disagrees. | open |
 | TAR-003 | S2 | confirmed | mem_archive.rs | Small compressed archives inflated fully into RAM uncapped; indexed path fills disk; zip capacity from declared size. | open |
 | TAR-004 | S2 | plausible | tar_import.rs `open_tar_stream` | Multi-member .tar.gz imports only the first member. | open |
