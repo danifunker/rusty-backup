@@ -735,13 +735,12 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
                  (extent not allocated)"
             )));
         }
-        // Verify the pmap bit is set — bit (31 - local_extent%32) of
-        // word local_extent/32, MSB-first.
-        let pmap_word = iag.pmap[local_extent / 32];
-        let pmap_bit_pos = 31 - (local_extent % 32);
+        // pmap[e] holds one bit per inode of extent e, MSB first: check this inode's own bit.
+        let pmap_word = iag.pmap[local_extent];
+        let pmap_bit_pos = 31 - in_extent as u32;
         if (pmap_word >> pmap_bit_pos) & 1 != 1 {
             return Err(FilesystemError::Parse(format!(
-                "jfs: fileset inode {fino}: pmap says extent {local_extent} is free"
+                "jfs: fileset inode {fino} is free in the pmap"
             )));
         }
 
@@ -1065,7 +1064,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         file_inode: &JfsDinode,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let mut out = Vec::with_capacity((file_inode.size as usize).min(max_bytes));
+        let mut out = Vec::with_capacity((file_inode.size as usize).min(max_bytes).min(1 << 20));
         self.copy_file_data(file_inode, max_bytes as u64, &mut out)?;
         Ok(out)
     }
@@ -1829,6 +1828,37 @@ impl<R: Read + Write + Seek + Send> JfsFilesystem<R> {
     /// `rebuild_dir_index` writes), so no inline dir-table upkeep is needed
     /// and `di_next_index` stays valid for every existing entry. fsck does
     /// not validate directory `di_size`, so the parent's size is left as-is.
+    /// Whether `name` fits in `dir_fino`'s inline dtroot, checked before anything is allocated
+    /// for it (a repair that allocates first leaks on every refusal).
+    pub(crate) fn dtree_has_room(
+        &mut self,
+        dir_fino: u32,
+        name: &str,
+    ) -> Result<(), FilesystemError> {
+        let dir = self.read_fileset_inode_global(dir_fino)?;
+        let base = DI_OFF_TYPE_AREA;
+        if dir.raw.len() < base + DTROOT_SIZE {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: directory inode {dir_fino} buffer too small for dtroot"
+            )));
+        }
+        if dir.raw[base + DTROOT_OFF_FLAG] & BT_INTERNAL_FLAG != 0 {
+            return Err(FilesystemError::Unsupported(format!(
+                "jfs: directory inode {dir_fino} has an external dtree"
+            )));
+        }
+        let namlen = name.encode_utf16().count();
+        let slots_needed = (4 + namlen).div_ceil(15);
+        let nextindex = dir.raw[base + DTROOT_OFF_NEXTINDEX] as usize;
+        let freecnt = dir.raw[base + DTROOT_OFF_FREECNT] as i8 as i32;
+        if namlen == 0 || namlen > 255 || nextindex >= 8 || (freecnt as usize) < slots_needed {
+            return Err(FilesystemError::Unsupported(format!(
+                "jfs: no room for {name:?} in directory inode {dir_fino}'s inline dtroot"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn dtree_insert(
         &mut self,
         dir_fino: u32,

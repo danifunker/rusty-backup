@@ -546,6 +546,7 @@ fn create_lost_found<R: Read + Write + Seek + Send>(
     const IFJOURNAL: u32 = 0x0001_0000;
     const IFDIR: u32 = 0x0000_4000;
     let mode = IFJOURNAL | IFDIR | 0o700;
+    fs.dtree_has_room(FILESET_ROOT_INO, "lost+found")?;
     let lf = fs.create_empty_dir_inode(FILESET_ROOT_INO, mode)?;
     fs.dtree_insert(FILESET_ROOT_INO, "lost+found", lf)?;
     fs.bump_nlink(FILESET_ROOT_INO, 1)?;

@@ -141,7 +141,12 @@ impl<R: Read + Seek + Send> Jfs1Filesystem<R> {
         let base = if ag == 0 {
             AG0_INODES
         } else {
-            ag * self.ag_frags * self.frag_size
+            ag.checked_mul(self.ag_frags)
+                .and_then(|f| f.checked_mul(self.frag_size))
+                .filter(|&b| b < self.total_bytes)
+                .ok_or_else(|| {
+                    FilesystemError::Parse(format!("AIX JFS: inode {ino} is past the volume"))
+                })?
         };
         let mut b = [0u8; INODE_SIZE as usize];
         self.read_at(base + idx * INODE_SIZE, &mut b)?;
@@ -278,6 +283,13 @@ impl<R: Read + Seek + Send> Filesystem for Jfs1Filesystem<R> {
         if dir.mode & S_IFMT != S_IFDIR {
             return Err(FilesystemError::NotADirectory(entry.path.clone()));
         }
+        // A directory of more than 16 MiB is a corrupt size, not a listing to allocate for.
+        if dir.size > 16 << 20 {
+            return Err(FilesystemError::Parse(format!(
+                "AIX JFS: directory size {} is implausible",
+                dir.size
+            )));
+        }
         let mut data = vec![0u8; dir.size as usize];
         self.read_inode(&dir, 0, &mut data)?;
         let mut found = Vec::new();
@@ -315,7 +327,14 @@ impl<R: Read + Seek + Send> Filesystem for Jfs1Filesystem<R> {
     ) -> Result<Vec<u8>, FilesystemError> {
         self.refuse_compressed()?;
         let inode = self.inode(entry.location as u32)?;
-        let mut out = vec![0u8; (inode.size as usize).min(max_bytes)];
+        let want = (inode.size as usize).min(max_bytes);
+        if want as u64 > self.total_bytes {
+            return Err(FilesystemError::InvalidData(format!(
+                "AIX JFS: file size {} is larger than the volume; stream it instead",
+                inode.size
+            )));
+        }
+        let mut out = vec![0u8; want];
         self.read_inode(&inode, 0, &mut out)?;
         Ok(out)
     }

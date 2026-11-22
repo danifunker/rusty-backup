@@ -400,17 +400,17 @@ drivers are merged.
 | UNX-029 | S2 | plausible | ext.rs `grow_ext_add_groups` | Grow ignores reserved GDT blocks and the resize inode. | open |
 | UNX-030 | S2 | plausible | ext.rs; ext_fsck.rs | Block-bitmap checksum covers the whole block, not blocks_per_group / 8. | open |
 | UNX-031 | S2 | plausible | ext.rs `resize_ext_in_place` shrink | Only counts patched: padding bits, descriptor table, inode count stale. | open |
-| UNX-032 | S2 | confirmed | ufs.rs `dir_find`, `dir_remove` | Name slices without the `namlen <= reclen - 8` check: panic on create. | open |
-| UNX-033 | S2 | confirmed | ufs.rs `create_file`, `create_directory` | Rollback runs with size 0 and frees nothing: blocks leak; `cs_ndir` off by one. | open |
-| UNX-034 | S2 | confirmed | ufs.rs `repair_ufs` | Bitmap repair adjusts nffree only: summaries end up wrong. | open |
-| UNX-035 | S2 | confirmed | ufs_fsck.rs `record_frags` | Only the first fragment of each block checked: shared fragments, link counts, cg_cs pass. | open |
-| UNX-036 | S2 | confirmed | ufs.rs | `frag * fsize` on UFS2 64-bit pointers unchecked. | open |
-| UNX-037 | S2 | plausible | ufs.rs `walk_inode_blocks` | Bounded by `di_size` only: a huge size with full triple indirects hangs. | open |
+| UNX-032 | S2 | confirmed | ufs.rs `dir_find`, `dir_remove` | Name slices without the `namlen <= reclen - 8` check: panic on create. | fixed (4fb60164) |
+| UNX-033 | S2 | confirmed | ufs.rs `create_file`, `create_directory` | Rollback runs with size 0 and frees nothing: blocks leak; `cs_ndir` off by one. | fixed (4fb60164) |
+| UNX-034 | S2 | confirmed | ufs.rs `repair_ufs` | Bitmap repair adjusts nffree only: summaries end up wrong. | fixed (4fb60164) |
+| UNX-035 | S2 | confirmed | ufs_fsck.rs `record_frags` | Only the first fragment of each block checked: shared fragments, link counts, cg_cs pass. | fixed (4fb60164) |
+| UNX-036 | S2 | confirmed | ufs.rs | `frag * fsize` on UFS2 64-bit pointers unchecked. | fixed (4fb60164) |
+| UNX-037 | S2 | plausible | ufs.rs `walk_inode_blocks` | Bounded by `di_size` only: a huge size with full triple indirects hangs. | fixed (4fb60164) |
 | UNX-038 | S2 | confirmed | jfs.rs `read_fileset_inode` | pmap read per extent, not per inode: after one delete, other inodes in that extent fail to read. | open |
 | UNX-039 | S2 | confirmed | jfs_fsck.rs; jfs.rs | lost+found inode written before an insert that then fails: each repair leaks a directory. | open |
-| UNX-040 | S2 | confirmed | btrfs.rs `parse_btrfs_superblock` | `sys_chunk_array_size` over 3285 panics at open. | open |
-| UNX-041 | S2 | confirmed | btrfs.rs | Compressed extents read as zeros (should be Unsupported); PREALLOC returns stale bytes; short items zero-filled. | open |
-| UNX-042 | S2 | plausible | btrfs.rs `resize_btrfs_in_place` | DEV_ITEM and mirror superblocks not updated; I/O errors return Ok. | open |
+| UNX-040 | S2 | confirmed | btrfs.rs `parse_btrfs_superblock` | `sys_chunk_array_size` over 3285 panics at open. | fixed (4fb60164) |
+| UNX-041 | S2 | confirmed | btrfs.rs | Compressed extents read as zeros (should be Unsupported); PREALLOC returns stale bytes; short items zero-filled. | fixed (4fb60164) |
+| UNX-042 | S2 | plausible | btrfs.rs `resize_btrfs_in_place` | DEV_ITEM and mirror superblocks not updated; I/O errors return Ok. | fixed (4fb60164); DEV_ITEM patch not yet run past btrfs check |
 | UNX-043 | S2 | confirmed | reiserfs.rs `list_directory` | Each child re-walks every leaf: quadratic listing. | open |
 | UNX-044 | S2 | plausible | reiserfs.rs | `s_bmap_nr` unchecked: bitmap reads past the volume; compact stream too long. | open |
 | UNX-045 | S2 | confirmed | jfs.rs, jfs1.rs | Unchecked size multiplications. | open |
@@ -423,7 +423,7 @@ drivers are merged.
 | UNX-052 | S2 | plausible | unix_common/compact.rs `MappedBlocks` and callers | One u64 per allocated block (~2 GB for 1 TB); ext's tables add more: breaks the streaming rule. | open |
 | UNX-053 | S3 | confirmed | unix_common/compact.rs `load_block` | One seek + read per block, not 64 KiB-1 MiB runs. | open |
 | UNX-054 | S3 | confirmed | ufs.rs `open` | `total_frags` not compared with `ncg*fpg` or the slice (generic form of SD-001). | open |
-| UNX-055 | S3 | confirmed | btrfs.rs `list_directory` | `Err(_) => continue` drops children silently. | open |
+| UNX-055 | S3 | confirmed | btrfs.rs `list_directory` | `Err(_) => continue` drops children silently. | fixed (4fb60164) |
 | UNX-056 | S3 | confirmed | jfs.rs, jfs_fsck.rs | `≥`, `⇒`, `—` in user-visible messages. | open |
 | UNX-057 | S3 | confirmed | bfs_write.rs, ofs_write.rs, ofs.rs | Whole-source `read_to_end`; OFS buffers a whole extent. | open |
 | UNX-058 | S4 | confirmed | bfs_write.rs, minix.rs, vxfs.rs | Each allocation rereads the whole bitmap; VxFS bmap rereads indirects per block. | open |

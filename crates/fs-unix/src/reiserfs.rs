@@ -47,6 +47,7 @@
 
 #[cfg(feature = "rust173-polyfill")]
 use disk_core::rust173::IntIsMultipleOf as _;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::unix_common::bitmap::BitmapReader;
@@ -179,12 +180,15 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
         // sentinel meaning "compute from block_count". One bitmap block
         // covers `block_size * 8` data blocks.
         let bmap_nr_disk = u16::from_le_bytes([sb[0x46], sb[0x47]]) as u32;
-        let bmap_nr = if bmap_nr_disk == 0 {
-            let blocks_per_bitmap = block_size * 8;
-            block_count.div_ceil(blocks_per_bitmap) as u32
-        } else {
-            bmap_nr_disk
-        };
+        let needed = block_count.div_ceil(block_size * 8);
+        // The stored count must match what the block count needs: a larger one sends bitmap
+        // reads past the volume, a smaller one leaves blocks no bitmap covers.
+        if needed > u32::MAX as u64 || (bmap_nr_disk != 0 && bmap_nr_disk as u64 != needed) {
+            return Err(FilesystemError::Parse(format!(
+                "reiserfs: s_bmap_nr {bmap_nr_disk} does not fit {block_count} blocks"
+            )));
+        }
+        let bmap_nr = needed as u32;
 
         // Volume label: only present on v3.6 (lives in the V2 extension at
         // offset 100). v3.5 has no label field; return None.
@@ -380,14 +384,16 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
         let mut leaves: Vec<u32> = Vec::new();
         // DFS via an explicit stack; children pushed in reverse so the
         // returned leaf order matches the on-disk key order.
-        let mut stack: Vec<u32> = vec![self.root_block];
+        // Each entry carries the level its parent says it has: a child must sit exactly one
+        // level lower, so a node pointing at itself or an ancestor is caught at once.
+        let mut stack: Vec<(u32, Option<u16>)> = vec![(self.root_block, None)];
         // Bound the worst-case traversal so a corrupt tree can't run away.
         // 1M tree nodes covers any realistic volume (a 1 TB FS with 4 KiB
         // blocks tops out at ~262M data blocks but the tree's internal +
         // leaf count is a tiny fraction of that).
         const MAX_VISITED: u32 = 1 << 20;
         let mut visited: u32 = 0;
-        while let Some(block_num) = stack.pop() {
+        while let Some((block_num, want_level)) = stack.pop() {
             visited = visited.saturating_add(1);
             if visited > MAX_VISITED {
                 return Err(FilesystemError::Parse(
@@ -396,12 +402,19 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
             }
             let block = self.read_tree_block(block_num)?;
             let head = BlockHead::parse(&block)?;
+            if want_level.is_some_and(|w| w != head.level) {
+                return Err(FilesystemError::Parse(format!(
+                    "reiserfs: block {block_num} is at level {} under a parent expecting {}",
+                    head.level,
+                    want_level.unwrap_or(0)
+                )));
+            }
             if head.is_leaf() {
                 leaves.push(block_num);
                 continue;
             }
-            // Internal node. Refuse impossibly tall trees up-front.
-            if head.level > MAX_TREE_LEVEL {
+            // Internal node. Refuse a free block (level 0) and impossibly tall trees up-front.
+            if head.level <= LEAF_LEVEL || head.level > MAX_TREE_LEVEL {
                 return Err(FilesystemError::Parse(format!(
                     "reiserfs: tree level {} exceeds MAX_TREE_LEVEL {}",
                     head.level, MAX_TREE_LEVEL
@@ -419,7 +432,7 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
                         "reiserfs: internal node child pointer is 0".into(),
                     ));
                 }
-                stack.push(child.block_number);
+                stack.push((child.block_number, Some(head.level - 1)));
             }
         }
         Ok(leaves)
@@ -462,6 +475,40 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
         Ok(out)
     }
 
+    /// The first item of type `want` for each of `keys`, from one walk over the leaves.
+    fn first_items_of_type(
+        &mut self,
+        keys: &HashSet<(u32, u32)>,
+        want: fn(&ItemType) -> bool,
+    ) -> Result<HashMap<(u32, u32), Vec<u8>>, FilesystemError> {
+        let mut out = HashMap::new();
+        if keys.is_empty() {
+            return Ok(out);
+        }
+        for leaf_num in self.collect_leaf_block_numbers()? {
+            let block = self.read_tree_block(leaf_num)?;
+            for ih in parse_leaf_item_heads(&block)? {
+                let k = (ih.key.dir_id(), ih.key.objectid());
+                if !keys.contains(&k) || out.contains_key(&k) {
+                    continue;
+                }
+                if !want(&ih.key.item_type(ih.key_format()?)) {
+                    continue;
+                }
+                let loc = ih.item_location as usize;
+                let end = loc.saturating_add(ih.item_len as usize);
+                if end > block.len() {
+                    return Err(FilesystemError::Parse(format!(
+                        "reiserfs: item bytes {loc}..{end} exceed block size {}",
+                        block.len()
+                    )));
+                }
+                out.insert(k, block[loc..end].to_vec());
+            }
+        }
+        Ok(out)
+    }
+
     /// Read an object's StatData. Errors if the object has no SD item
     /// (corrupt) or the item's body doesn't decode.
     fn read_statdata(&mut self, dir_id: u32, objectid: u32) -> Result<StatData, FilesystemError> {
@@ -474,28 +521,6 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
         }
         Err(FilesystemError::Parse(format!(
             "reiserfs: object ({dir_id}, {objectid}) has no StatData item"
-        )))
-    }
-
-    /// Read a symlink's target text. Symlink bodies live in a Direct
-    /// item (always one block or smaller in practice). We truncate to
-    /// the StatData-recorded size to drop the slot's NUL padding.
-    fn read_symlink_target(
-        &mut self,
-        dir_id: u32,
-        objectid: u32,
-        sd_size: u64,
-    ) -> Result<String, FilesystemError> {
-        let items = self.collect_items_for_object(dir_id, objectid)?;
-        for (ih, body) in items {
-            let fmt = ih.key_format()?;
-            if matches!(ih.key.item_type(fmt), ItemType::Direct) {
-                let take = (sd_size as usize).min(body.len());
-                return Ok(String::from_utf8_lossy(&body[..take]).into_owned());
-            }
-        }
-        Err(FilesystemError::Parse(format!(
-            "reiserfs: symlink ({dir_id}, {objectid}) has no Direct item"
         )))
     }
 }
@@ -702,18 +727,45 @@ impl<R: Read + Seek + Send> Filesystem for ReiserFsFilesystem<R> {
     fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
         let (dir_id, objectid) = unpack_loc(entry.location);
         let items = self.collect_items_for_object(dir_id, objectid)?;
-        let mut children: Vec<FileEntry> = Vec::new();
+        let mut ents = Vec::new();
         for (ih, body) in items {
             let fmt = ih.key_format()?;
             if !matches!(ih.key.item_type(fmt), ItemType::DirEntry) {
                 continue;
             }
-            let parsed = parse_dirent_item(&body, ih.free_space_or_entry_count)?;
-            for ent in parsed {
-                if ent.name == "." || ent.name == ".." || ent.name == REISERFS_PRIV_NAME {
-                    continue;
+            for ent in parse_dirent_item(&body, ih.free_space_or_entry_count)? {
+                if ent.name != "." && ent.name != ".." && ent.name != REISERFS_PRIV_NAME {
+                    ents.push(ent);
                 }
-                let child_sd = self.read_statdata(ent.deh_dir_id, ent.deh_objectid)?;
+            }
+        }
+        // One leaf walk for every child's StatData and one for the symlinks' targets, not a
+        // full walk per child (which made a listing quadratic).
+        let keys: HashSet<(u32, u32)> = ents
+            .iter()
+            .map(|e| (e.deh_dir_id, e.deh_objectid))
+            .collect();
+        let sds = self.first_items_of_type(&keys, |t| matches!(t, ItemType::StatData))?;
+        let mut stats = HashMap::new();
+        let mut links = HashSet::new();
+        for (k, body) in &sds {
+            let sd = StatData::parse(body)?;
+            if matches!(unix_file_type(sd.mode), UnixFileType::Symlink) {
+                links.insert(*k);
+            }
+            stats.insert(*k, sd);
+        }
+        let targets = self.first_items_of_type(&links, |t| matches!(t, ItemType::Direct))?;
+        let mut children: Vec<FileEntry> = Vec::new();
+        {
+            for ent in ents {
+                let k = (ent.deh_dir_id, ent.deh_objectid);
+                let child_sd = stats.get(&k).cloned().ok_or_else(|| {
+                    FilesystemError::Parse(format!(
+                        "reiserfs: object ({}, {}) has no StatData item",
+                        k.0, k.1
+                    ))
+                })?;
                 let parent_path = if entry.path == "/" {
                     String::new()
                 } else {
@@ -726,11 +778,14 @@ impl<R: Read + Seek + Send> Filesystem for ReiserFsFilesystem<R> {
                         FileEntry::new_directory(ent.name.clone(), child_path, child_loc)
                     }
                     UnixFileType::Symlink => {
-                        let target = self.read_symlink_target(
-                            ent.deh_dir_id,
-                            ent.deh_objectid,
-                            child_sd.size,
-                        )?;
+                        let body = targets.get(&k).ok_or_else(|| {
+                            FilesystemError::Parse(format!(
+                                "reiserfs: symlink ({}, {}) has no Direct item",
+                                k.0, k.1
+                            ))
+                        })?;
+                        let take = (child_sd.size as usize).min(body.len());
+                        let target = String::from_utf8_lossy(&body[..take]).into_owned();
                         FileEntry::new_symlink(
                             ent.name.clone(),
                             child_path,
@@ -1644,14 +1699,15 @@ mod tests {
 
     #[test]
     fn computes_bmap_nr_from_explicit_field() {
-        // Override s_bmap_nr to a non-zero value and confirm we use it
-        // verbatim instead of computing.
+        // A stored s_bmap_nr must match the block count: 1000 blocks need one bitmap.
         let mut buf = synth_volume(MAGIC_V3_6, 1000, 0, 4096, None, 2);
         let sb_off = REISERFS_SUPERBLOCK_OFFSET as usize;
+        buf[sb_off + 0x46..sb_off + 0x48].copy_from_slice(&1u16.to_le_bytes());
+        let fs = ReiserFsFilesystem::open(Cursor::new(buf.clone()), 0).expect("open");
+        assert_eq!(fs.bmap_nr, 1);
+        // Seven would send bitmap reads past the volume.
         buf[sb_off + 0x46..sb_off + 0x48].copy_from_slice(&7u16.to_le_bytes());
-
-        let fs = ReiserFsFilesystem::open(Cursor::new(buf), 0).expect("open");
-        assert_eq!(fs.bmap_nr, 7);
+        assert!(ReiserFsFilesystem::open(Cursor::new(buf), 0).is_err());
     }
 
     // ---- R.3a: S+tree on-disk structure tests ----
