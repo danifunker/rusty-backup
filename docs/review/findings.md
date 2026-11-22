@@ -426,7 +426,7 @@ drivers are merged.
 | UNX-055 | S3 | confirmed | btrfs.rs `list_directory` | `Err(_) => continue` drops children silently. | fixed (4fb60164) |
 | UNX-056 | S3 | confirmed | jfs.rs, jfs_fsck.rs | `≥`, `⇒`, `—` in user-visible messages. | fixed (5694446c) |
 | UNX-057 | S3 | confirmed | bfs_write.rs, ofs_write.rs, ofs.rs | Whole-source `read_to_end`; OFS buffers a whole extent. | fixed (58e7a44e) |
-| UNX-058 | S4 | confirmed | bfs_write.rs, minix.rs, vxfs.rs | Each allocation rereads the whole bitmap; VxFS bmap rereads indirects per block. | partly fixed (this branch): BFS caches its bitmap and writes back only the changed bitmap blocks; minix and VxFS still reread |
+| UNX-058 | S4 | confirmed | bfs_write.rs, minix.rs, vxfs.rs | Each allocation rereads the whole bitmap; VxFS bmap rereads indirects per block. | partly fixed (this branch): BFS and minix cache their bitmaps (BFS writes back only changed blocks; minix resumes each search past the last zone); VxFS bmap still rereads indirects |
 | UNX-059 | S4 | confirmed | efs_fsck.rs, efs_v1_fsck.rs, jfs_fsck.rs, ufs_fsck.rs (+ fs-xfs) | Five copies of the fsck `Builder`; belongs in `disk_core::fsck`. | deferred (moving the fsck Builder into disk_core touches five drivers and fs-xfs) |
 | UNX-060 | S4 | confirmed | ufs.rs, efs.rs | Full 27-field `FileEntry` literals (DC-008 class). | deferred (FileEntry constructors: the DC-008 refactor, across drivers) |
 | UNX-061 | S4 | confirmed | lib.rs, ufs.rs, efs_resize.rs, ext_format.rs | Stale docs (ofs GPL note, UFS scope, shrink hard-link claim, batch-builder caller). | fixed (705602dc) |

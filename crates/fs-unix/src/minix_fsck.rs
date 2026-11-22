@@ -376,6 +376,8 @@ pub fn repair_minix<R: Read + Write + Seek + Send>(
     if old_zmap != new_zmap {
         let start = fs.zmap_start();
         fs.write_at(start, &new_zmap)?;
+        // The allocator's cached copy is stale now.
+        fs.zmap = None;
         report
             .fixes_applied
             .push("rebuilt the zone bitmap".to_string());
