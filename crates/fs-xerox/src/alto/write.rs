@@ -89,6 +89,13 @@ pub fn extract_files(disk: &Disk) -> Result<Vec<FileImage>, FilesystemError> {
         if bare.eq_ignore_ascii_case("SysDir") || bare.eq_ignore_ascii_case("DiskDescriptor") {
             continue;
         }
+        // The rebuild lays out SysDir's files only: a sub-directory's own files would be lost.
+        if e.sn_w1 & DIR_BIT != 0 {
+            return Err(FilesystemError::Unsupported(format!(
+                "{} is a sub-directory; rebuilding a volume with sub-directories is not supported",
+                e.name
+            )));
+        }
         let leader_sec = disk.sector(e.leader_vda).ok_or_else(|| {
             FilesystemError::InvalidData(format!("leader VDA {} out of range", e.leader_vda))
         })?;
