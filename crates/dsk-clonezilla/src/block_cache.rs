@@ -413,6 +413,8 @@ impl Seek for PartcloneBlockReader {
     }
 }
 
-// Safety: PartcloneBlockReader is Send because Arc<Mutex<>> is Send.
-// The Mutex ensures only one thread accesses the decompressor at a time.
-unsafe impl Send for PartcloneBlockReader {}
+// Send follows from Arc<Mutex<_>>; the compiler checks it, no unsafe needed.
+const _: fn() = || {
+    fn send<T: Send>() {}
+    send::<PartcloneBlockReader>();
+};
