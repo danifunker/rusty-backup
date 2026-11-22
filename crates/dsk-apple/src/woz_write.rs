@@ -286,7 +286,7 @@ const GAP2_35_SELF_SYNC: usize = 5;
 const GAP3_35_SELF_SYNC: usize = 36;
 
 /// Number of 3-byte groups in 6-and-2 524-byte encoding: ceil(524 / 3) = 175.
-const CHUNK_62_524: usize = 175;
+pub(crate) const CHUNK_62_524: usize = 175;
 
 /// Standard format byte for double-sided double-density 3.5" disks (interleave 2).
 pub const FORMAT_35_DSDD: u8 = 0x22;
@@ -1033,7 +1033,11 @@ mod tests {
     fn assert_track_35_round_trip(track: u8, side: u8, format: u8, num_sectors: usize) {
         let sectors = make_pattern_sectors_35(num_sectors, track ^ side ^ format);
         let (data, bit_count) = generate_track_35(track, side, format, &sectors);
-        let decoded = crate::woz::decode_35_track(&data, bit_count, num_sectors);
+        let (decoded, bad) = crate::woz::decode_35_track_checked(&data, bit_count, num_sectors);
+        assert!(
+            bad.is_empty(),
+            "track {track} side {side}: bad checksums {bad:?}"
+        );
         for (i, sec) in decoded.iter().enumerate() {
             let expected = sectors[i].as_ref().unwrap();
             let got = sec
@@ -1054,6 +1058,24 @@ mod tests {
         {
             assert_track_35_round_trip(track, side, FORMAT_35_DSDD, num_sectors);
         }
+    }
+
+    #[test]
+    fn track_35_flipped_data_bit_fails_checksum() {
+        let sectors = make_pattern_sectors_35(12, 7);
+        let (mut data, bit_count) = generate_track_35(0, 0, FORMAT_35_DSDD, &sectors);
+        let (_, bad) = crate::woz::decode_35_track_checked(&data, bit_count, 12);
+        assert!(bad.is_empty());
+        // Swap one data nibble of the first sector for another valid nibble.
+        let prologue = data
+            .windows(3)
+            .position(|w| w == [0xD5, 0xAA, 0xAD])
+            .unwrap();
+        let at = prologue + 3 + 40;
+        let alt = if data[at] == 0x96 { 0x97 } else { 0x96 };
+        data[at] = alt;
+        let (_, bad) = crate::woz::decode_35_track_checked(&data, bit_count, 12);
+        assert!(!bad.is_empty(), "corruption not caught");
     }
 
     #[test]

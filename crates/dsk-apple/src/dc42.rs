@@ -300,7 +300,7 @@ pub fn encode_dc42_with_tags(name: &str, data: &[u8], tags: &[u8]) -> Vec<u8> {
     let name_bytes = name.as_bytes();
     let name_len = name_bytes.len().clamp(1, 63);
     let effective_name: &[u8] = if name_bytes.is_empty() {
-        b"Lisa"
+        b"Untitled"
     } else {
         &name_bytes[..name_len]
     };
@@ -312,9 +312,14 @@ pub fn encode_dc42_with_tags(name: &str, data: &[u8], tags: &[u8]) -> Vec<u8> {
     header[64..68].copy_from_slice(&(data.len() as u32).to_be_bytes());
     header[68..72].copy_from_slice(&(tags.len() as u32).to_be_bytes());
     header[72..76].copy_from_slice(&dc42_checksum(data).to_be_bytes());
-    header[76..80].copy_from_slice(&dc42_checksum(tags).to_be_bytes());
+    // DiskCopy leaves the first sector's 12 tag bytes out of the tag checksum.
+    header[76..80].copy_from_slice(&dc42_checksum(tags.get(12..).unwrap_or(&[])).to_be_bytes());
     header[80] = disk_format;
-    header[81] = DC42_FMT_SINGLE_SIDED;
+    header[81] = if disk_format == DC42_DISK_400K {
+        DC42_FMT_SINGLE_SIDED
+    } else {
+        DC42_FMT_DOUBLE_SIDED
+    };
     header[82..84].copy_from_slice(&DC42_PRIVATE_MAGIC.to_be_bytes());
 
     let mut out = Vec::with_capacity(84 + data.len() + tags.len());

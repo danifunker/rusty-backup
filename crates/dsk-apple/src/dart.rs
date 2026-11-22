@@ -226,8 +226,9 @@ pub fn decode_dart<R: Read + Seek>(mut reader: R) -> Result<DartImage, String> {
 pub fn decode_dart_to_image(buf: &[u8]) -> Result<Vec<u8>, String> {
     let img = decode_dart_bytes(buf)?;
     if img.has_nonzero_tags() {
+        let name = if img.is_lisa() { "Lisa" } else { "Untitled" };
         Ok(crate::dc42::encode_dc42_with_tags(
-            "Lisa", &img.data, &img.tags,
+            name, &img.data, &img.tags,
         ))
     } else {
         Ok(img.data)
