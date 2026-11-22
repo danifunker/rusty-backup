@@ -174,8 +174,9 @@ impl DecodedDisk {
 /// A track decoder: one encoding's sectors from a track's flux.
 type TrackDecoder = fn(&[u32]) -> Vec<Sector>;
 
-/// The encoding that reads the most clean sectors from a few sample tracks.
-fn pick_encoding(tracks: &[FluxTrack]) -> TrackDecoder {
+/// The encoding that reads the most clean sectors from a few sample tracks, and whether it is
+/// MFM (the only one whose damaged copies can be voted: the vote re-checks an MFM CRC).
+fn pick_encoding(tracks: &[FluxTrack]) -> (TrackDecoder, bool) {
     let decoders: [TrackDecoder; 3] = [mfm::decode_track, amiga::decode_track, fm::decode_track];
     let step = (tracks.len() / 3).max(1);
     let sample: Vec<&FluxTrack> = tracks.iter().step_by(step).take(3).collect();
@@ -185,23 +186,23 @@ fn pick_encoding(tracks: &[FluxTrack]) -> TrackDecoder {
             .map(|t| d(&t.intervals_ns).iter().filter(|s| s.ok).count())
             .sum()
     };
-    let mut best = decoders[0];
-    let mut best_score = score(&best);
-    for d in &decoders[1..] {
+    let mut best = 0;
+    let mut best_score = score(&decoders[0]);
+    for (i, d) in decoders.iter().enumerate().skip(1) {
         // MFM is the common case; only switch when another encoding clearly reads more.
         let n = score(d);
         if n > best_score {
-            best = *d;
+            best = i;
             best_score = n;
         }
     }
-    best
+    (decoders[best], best == 0)
 }
 
 /// Decode every track and lay the sectors out by their own ID fields, so a 40-track
 /// disk captured on an 80-track drive lands on the right cylinders.
 pub fn decode_disk(tracks: &[FluxTrack]) -> Option<DecodedDisk> {
-    let decode = pick_encoding(tracks);
+    let (decode, is_mfm) = pick_encoding(tracks);
     let mut found: BTreeMap<(u32, u32, u32), Sector> = BTreeMap::new();
     let mut damaged: BTreeMap<(u32, u32, u32), Vec<Sector>> = BTreeMap::new();
     for t in tracks {
@@ -220,7 +221,7 @@ pub fn decode_disk(tracks: &[FluxTrack]) -> Option<DecodedDisk> {
     }
     // No clean copy: vote the damaged ones byte by byte and keep the result only if its CRC holds.
     for (key, copies) in damaged {
-        if found.get(&key).is_some_and(|s| !s.ok) {
+        if is_mfm && found.get(&key).is_some_and(|s| !s.ok) {
             if let Some(voted) = mfm::vote(&copies) {
                 found.insert(key, voted);
             }
@@ -244,8 +245,23 @@ pub fn decode_disk(tracks: &[FluxTrack]) -> Option<DecodedDisk> {
     // Records usually count from 1; Acorn DFS and others start at 0.
     let first = *usual.iter().min()?;
     let spt = usual.iter().max()? - first + 1;
-    let heads = good.iter().map(|s| s.head as u32).max()? + 1;
-    let cylinders = good.iter().map(|s| s.cyl as u32).max()? + 1;
+    // Heads and cylinders the same way: a stray sector ID (noise, copy protection) must not
+    // stretch the whole layout. A cylinder or head counts when it holds at least a quarter
+    // as many good sectors as the fullest one.
+    let usual_max = |key: &dyn Fn(&Sector) -> u32| -> Option<u32> {
+        let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+        for s in &good {
+            *counts.entry(key(s)).or_default() += 1;
+        }
+        let top = counts.values().copied().max()?;
+        counts
+            .iter()
+            .filter(|(_, &n)| n * 4 >= top)
+            .map(|(&k, _)| k)
+            .max()
+    };
+    let heads = usual_max(&|s| s.head as u32)? + 1;
+    let cylinders = usual_max(&|s| s.cyl as u32)? + 1;
     let mut image = vec![0u8; (cylinders * heads * spt) as usize * sector_size];
     let mut faults = Vec::new();
     for c in 0..cylinders {

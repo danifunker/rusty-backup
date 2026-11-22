@@ -17,10 +17,10 @@ const SCK_HZ: f64 = 18_432_000.0 * 73.0 / 14.0 / 2.0;
 /// Transition intervals of one stream file, in nanoseconds.
 pub fn parse_stream(data: &[u8]) -> Vec<u32> {
     let mut out = Vec::with_capacity(data.len());
-    let mut ovl = 0u32;
+    let mut ovl = 0u64;
     let mut i = 0usize;
-    let mut push = |ticks: u32, ovl: &mut u32| {
-        out.push(((ticks + *ovl) as f64 * 1e9 / SCK_HZ) as u32);
+    let mut push = |ticks: u32, ovl: &mut u64| {
+        out.push(((ticks as u64 + *ovl) as f64 * 1e9 / SCK_HZ).min(u32::MAX as f64) as u32);
         *ovl = 0;
     };
     while i < data.len() {
@@ -34,7 +34,7 @@ pub fn parse_stream(data: &[u8]) -> Vec<u32> {
             0x09 => i += 2,
             0x0A => i += 3,
             0x0B => {
-                ovl += 0x1_0000;
+                ovl = ovl.saturating_add(0x1_0000);
                 i += 1;
             }
             0x0C if i + 2 < data.len() => {

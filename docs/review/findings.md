@@ -560,10 +560,10 @@ Review by a separate agent, 2026-11-21, read-only.
 | DMG-003 | S2 | confirmed | dsk-dmg dmg_crypto.rs `CryptoContext::open` | `wrap_key_bits` slice panics; offset overflow; PBKDF2 iterations uncapped. | fixed (70f1b62d) |
 | DMG-004 | S2 | confirmed | dsk-dmg sparseimage.rs `detect_sparseimage` | Band table sized from header values: 32 GiB from a 4 KiB file. | fixed (70f1b62d) |
 | DMG-005 | S2 | confirmed | dsk-dmg ndif.rs `reconstruct_to` | Capacity from an unchecked entry count (~128 GiB). | fixed (70f1b62d) |
-| CZL-001 | S2 | confirmed | dsk-clonezilla partclone.rs `parse_header`, `parse_bitmap` | `block_size` / `total_blocks` unvalidated: OOM, a block size of 0 hangs, overflow. | open |
-| CZL-002 | S2 | plausible | dsk-clonezilla partclone.rs `parse_header` | v1 images likely rejected by the magic check; endianness field ignored. | open |
-| CZL-003 | S2 | confirmed | dsk-clonezilla metadata_scan.rs `identify_ext_metadata_blocks` | Off-by-4 bounds check panics the scan thread and poisons the cache mutex. | open |
-| CZL-004 | S2 | confirmed | dsk-clonezilla metadata_scan.rs | Unchecked shifts / underflow; BPB-driven ranges insert billions of entries. | open |
+| CZL-001 | S2 | confirmed | dsk-clonezilla partclone.rs `parse_header`, `parse_bitmap` | `block_size` / `total_blocks` unvalidated: OOM, a block size of 0 hangs, overflow. | fixed (64152ec1) |
+| CZL-002 | S2 | plausible | dsk-clonezilla partclone.rs `parse_header` | v1 images likely rejected by the magic check; endianness field ignored. | open: needs a partclone v1 sample |
+| CZL-003 | S2 | confirmed | dsk-clonezilla metadata_scan.rs `identify_ext_metadata_blocks` | Off-by-4 bounds check panics the scan thread and poisons the cache mutex. | fixed (64152ec1) |
+| CZL-004 | S2 | confirmed | dsk-clonezilla metadata_scan.rs | Unchecked shifts / underflow; BPB-driven ranges insert billions of entries. | fixed (64152ec1) |
 | CZL-005 | S4 | confirmed | dsk-clonezilla block_cache.rs | Unneeded `unsafe impl Send`. | open |
 | FLP-001 | S2 | confirmed | dsk-floppy edsk.rs, d88.rs flat decode | Missing tracks / sectors shift every later sector (no zero-filled holes). | open |
 | FLP-002 | S2 | plausible | dsk-floppy g64.rs `decode_track` | Sectors crossing the GCR wrap lost; bad-checksum sectors zeroed silently. | open |

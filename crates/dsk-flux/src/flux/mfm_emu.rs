@@ -187,7 +187,18 @@ pub fn decode_to<R: Read + Seek, W: Write + Seek>(
         .and_then(|s| s.split(',').nth(1))
         .and_then(|n| n.parse::<u32>().ok())
         .unwrap_or(0);
+    // Header values size the buffers below: keep them to what a real drive can have.
+    if h.cylinders > 4096 || h.heads > 64 || spt == 0 || spt > 256 {
+        return Err(bad(format!(
+            "MFM emulator file: geometry {}x{}x{spt} is implausible",
+            h.cylinders, h.heads
+        )));
+    }
+    if h.track_len > 16 << 20 || h.track_header_len > 4096 {
+        return Err(bad("MFM emulator file: track sizes are implausible".into()));
+    }
     let mut seen = vec![0u8; (h.cylinders * h.heads * spt) as usize];
+    let mut written_end = 0u64;
     r.seek(SeekFrom::Start(h.header_len))?;
     let mut th = vec![0u8; h.track_header_len as usize];
     let mut track = vec![0u8; h.track_len as usize];
@@ -209,10 +220,17 @@ pub fn decode_to<R: Read + Seek, W: Write + Seek>(
             }
             out.seek(SeekFrom::Start(lba as u64 * 512))?;
             out.write_all(&data)?;
+            written_end = written_end.max(lba as u64 * 512 + data.len() as u64);
             seen[lba] = if ok { 2 } else { 1 };
         }
     }
     let total = seen.len() as u64 * 512;
+    // A seek alone doesn't make a file longer: write the last byte so missing tail sectors
+    // read as zeros instead of the disk ending early.
+    if written_end < total {
+        out.seek(SeekFrom::Start(total - 1))?;
+        out.write_all(&[0])?;
+    }
     out.seek(SeekFrom::Start(total))?;
     let mut faults = Vec::new();
     for (lba, &state) in seen.iter().enumerate() {

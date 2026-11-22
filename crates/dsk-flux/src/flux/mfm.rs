@@ -87,8 +87,15 @@ pub(super) fn to_bits_pll(
             if ticks < clock / 2.0 {
                 break;
             }
-            bits.push(0);
+            // MFM never has more than three zeros running; a long gap (unformatted area, a
+            // dropout, a corrupt interval) is no data, so cap it rather than emit billions of bits.
+            if zeros < 64 {
+                bits.push(0);
+            }
             zeros += 1;
+            if zeros >= 64 {
+                ticks = ticks.rem_euclid(clock);
+            }
         }
         bits.push(1);
         // In lock, steer the period by the phase error; after a long gap, drift back to nominal.
