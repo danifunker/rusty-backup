@@ -345,10 +345,16 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
             .find(|g| g.user == user && g.formatted_name().eq_ignore_ascii_case(name))
     }
 
-    /// Read all bytes of a file given its grouped extents.
-    fn read_group(&mut self, group: &CpmFileGroup) -> Result<Vec<u8>, FilesystemError> {
-        let mut data = Vec::with_capacity(group.total_size as usize);
+    /// Stream up to `limit` bytes of a file given its grouped extents, one block at a time.
+    fn copy_group(
+        &mut self,
+        group: &CpmFileGroup,
+        limit: u64,
+        out: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        let mut copied = 0u64;
         let bs = self.dpb.block_size();
+        let mut buf = vec![0u8; bs];
         let last_extent_num = group.extents.last().map(|e| e.extent);
         for ext in &group.extents {
             // Bytes covered = sum of non-zero pointers, but trimmed
@@ -372,16 +378,19 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
                         self.dpb.total_blocks()
                     )));
                 }
+                if copied >= limit {
+                    return Ok(copied);
+                }
                 let off = self.partition_offset + self.block_byte_offset(ptr);
                 self.reader.seek(SeekFrom::Start(off))?;
-                let want = (bs as u64).min(remaining) as usize;
-                let mut buf = vec![0u8; want];
-                self.reader.read_exact(&mut buf)?;
-                data.extend_from_slice(&buf);
+                let want = (bs as u64).min(remaining).min(limit - copied) as usize;
+                self.reader.read_exact(&mut buf[..want])?;
+                out.write_all(&buf[..want])?;
+                copied += want as u64;
                 remaining -= want as u64;
             }
         }
-        Ok(data)
+        Ok(copied)
     }
 }
 
@@ -631,9 +640,22 @@ impl<R: Read + Seek + Send> Filesystem for CpmFilesystem<R> {
             .ok_or_else(|| {
                 FilesystemError::NotFound(format!("CP/M file {} not found", entry.name))
             })?;
-        let mut data = self.read_group(&group)?;
-        data.truncate(max_bytes);
+        let mut data = Vec::with_capacity((group.total_size as usize).min(max_bytes));
+        self.copy_group(&group, max_bytes as u64, &mut data)?;
         Ok(data)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        let group = self
+            .find_group(&entry.name, entry.location)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!("CP/M file {} not found", entry.name))
+            })?;
+        self.copy_group(&group, u64::MAX, writer)
     }
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
@@ -740,23 +762,27 @@ impl<R: Read + Write + Seek + Send> CpmFilesystem<R> {
     }
 
     /// Write data into the named extent's block pointers.
-    fn write_blocks(&mut self, ptrs: &[u16], data: &[u8]) -> Result<(), FilesystemError> {
+    /// Copy `len` bytes of `data` into the blocks `ptrs`, one block at a time, zero-padding the last.
+    fn write_blocks_from(
+        &mut self,
+        ptrs: &[u16],
+        data: &mut dyn std::io::Read,
+        len: u64,
+    ) -> Result<(), FilesystemError> {
         let bs = self.dpb.block_size();
-        let mut off_in_data = 0usize;
+        let mut left = len;
+        let mut chunk = vec![0u8; bs];
         for &ptr in ptrs {
-            if ptr == 0 {
+            if ptr == 0 || left == 0 {
                 continue;
             }
+            let want = (bs as u64).min(left) as usize;
+            chunk.fill(0);
+            data.read_exact(&mut chunk[..want])?;
             let abs = self.partition_offset + self.block_byte_offset(ptr);
             self.reader.seek(SeekFrom::Start(abs))?;
-            let want = (bs).min(data.len() - off_in_data);
-            let mut chunk = vec![0u8; bs];
-            chunk[..want].copy_from_slice(&data[off_in_data..off_in_data + want]);
             self.reader.write_all(&chunk)?;
-            off_in_data += want;
-            if off_in_data >= data.len() {
-                return Ok(());
-            }
+            left -= want as u64;
         }
         Ok(())
     }
@@ -863,22 +889,17 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
                 "CP/M file '{name}' already exists"
             )));
         }
-        let mut payload = Vec::with_capacity(data_len as usize);
-        data.read_to_end(&mut payload)?;
-        if payload.len() as u64 != data_len {
-            return Err(FilesystemError::InvalidData(format!(
-                "data_len {data_len} != actual {}",
-                payload.len()
-            )));
-        }
+        // The data streams into its blocks below rather than being held in memory (CPM-013).
+        let len = usize::try_from(data_len)
+            .map_err(|_| FilesystemError::DiskFull(format!("{name} is too large for CP/M")))?;
 
         // Round up to record (128 B) boundary for record-count accounting.
-        let total_records = payload.len().div_ceil(128) as u32;
-        let bytes_in_last_record = (payload.len() % 128) as u8;
+        let total_records = len.div_ceil(128) as u32;
+        let bytes_in_last_record = (len % 128) as u8;
 
         // Allocate blocks (none for an empty file, which still gets its one entry).
         let bs = self.dpb.block_size();
-        let blocks_needed = payload.len().div_ceil(bs);
+        let blocks_needed = len.div_ceil(bs);
         let free = self.free_blocks();
         if free.len() < blocks_needed {
             return Err(FilesystemError::InvalidData(format!(
@@ -927,9 +948,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
                 "CP/M directory full: {name} needs {extents_needed} entries, {free_slots} free"
             )));
         }
-        if !payload.is_empty() {
-            // Treat payload as a single contiguous write across picked blocks.
-            self.write_blocks(&picked, &payload)?;
+        if len > 0 {
+            // Directory entries are written only after this, so a short source leaves no file.
+            self.write_blocks_from(&picked, data, data_len)?;
         }
 
         let mut records_left = total_records;
@@ -976,12 +997,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
         let formatted = format!("{}.{}", n8.trim_end(), e3.trim_end())
             .trim_end_matches('.')
             .to_string();
-        let fe = FileEntry::new_file(
-            formatted.clone(),
-            format!("/{formatted}"),
-            payload.len() as u64,
-            0,
-        );
+        let fe = FileEntry::new_file(formatted.clone(), format!("/{formatted}"), data_len, 0);
         Ok(fe)
     }
 
