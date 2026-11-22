@@ -235,6 +235,8 @@ pub enum ConvertAction {
     SetVerify(bool),
     SetMultiBin(bool),
     SetSelected(usize, bool),
+    /// Convert a floppy-sized item as a hard disk, for a hard-disk format asked for by name.
+    TreatAsHardDisk(usize),
     SelectAll,
     SelectNone,
     /// The CHD options from the shell's CHD controls, used where a CHD format is chosen.
@@ -1046,6 +1048,14 @@ impl Controller for ConvertController {
             ConvertAction::SetSelected(n, on) => {
                 if let Some(i) = self.items.get_mut(n) {
                     i.selected = on;
+                }
+            }
+            ConvertAction::TreatAsHardDisk(n) => {
+                // A floppy image is a valid raw disk; a disc is not.
+                if let Some(Ok(found)) = self.items.get_mut(n).map(|i| i.found.as_mut()) {
+                    if found.kind == ImageKind::Floppy {
+                        found.kind = ImageKind::HardDisk;
+                    }
                 }
             }
             ConvertAction::SelectAll => self.items.iter_mut().for_each(|i| i.selected = true),

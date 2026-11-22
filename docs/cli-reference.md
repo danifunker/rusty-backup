@@ -622,7 +622,7 @@ Usage: convert [OPTIONS] <IN> <OUT>
 
 **Options**
 
-- `--format` — Output format, for every kind that offers it: raw, vhd, vhd-dynamic, qcow2, vmdk-flat, vmdk-sparse, 2mg, chd (hard disks); raw, 2mg, woz, moof, dc42, xdf, hdm, dim, d88 (floppies); chd-cd, chd-dvd, bincue, iso (discs)
+- `--format` — Output format, for every kind that offers it: raw, vhd, vhd-dynamic, qcow2, vmdk-flat, vmdk-sparse, 2mg, chd (hard disks); raw, 2mg, woz, moof, dc42, xdf, hdm, dim, d88 (floppies); chd-cd, chd-dvd, bincue, iso (discs). Default chd. A single floppy-sized file named with a hard-disk format is converted as a hard disk
 - `--floppy-to` — The floppies' format, overriding --format for them
 - `--disc-to` — The discs' format, overriding --format for them
 - `--extension` — Output extension (no leading dot) for the kinds --format sets. Defaults to the format's

@@ -107,3 +107,18 @@ fn the_slow_filesystem_help_names_them() {
     let text = hints::measure_slow();
     assert!(text.contains("HFS+,") && text.contains(" ext,"), "{text}");
 }
+
+#[test]
+fn a_floppy_sized_item_can_go_as_a_hard_disk() {
+    let src = tempfile::tempdir().unwrap();
+    let path = src.path().join("a.img");
+    floppy(&path);
+    let mut c = controller();
+    c.apply(ConvertAction::SetSource(path));
+    settle(&mut c);
+    assert_eq!(c.shown_kinds(), vec![ImageKind::Floppy]);
+    c.apply(ConvertAction::TreatAsHardDisk(0));
+    assert_eq!(c.shown_kinds(), vec![ImageKind::HardDisk]);
+    c.apply(ConvertAction::SetFormat(ImageKind::HardDisk, Format::Qcow2));
+    assert_eq!(c.extension(ImageKind::HardDisk), "qcow2");
+}

@@ -510,7 +510,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | SQ-003 | S2 | confirmed | squashfs.rs `Superblock::parse` | `block_log` unbounded: shift panic, 2 GiB blocks. | fixed (32313343) |
 | SQ-004 | S2 | confirmed | squashfs.rs `build_node`; squashfs_verify.rs | No directory-cycle guard: stack overflow / endless verify. | fixed (32313343) |
 | SQ-005 | S2 | confirmed | squashfs.rs `read_metadata_span` and table loads | Capacities taken from on-disk u32s (4 GiB / 64 GiB). | fixed (32313343) |
-| SQ-006 | S3 | confirmed | squashfs_write.rs `write_node`; `read_build_tree` | Dir `parent` written wrong; hard links duplicated on rebuild. | open |
+| SQ-006 | S3 | confirmed | squashfs_write.rs `write_node`; `read_build_tree` | Dir `parent` written wrong; hard links duplicated on rebuild. | fixed (0309cc99) |
 | SQ-007 | S4 | confirmed | squashfs.rs, squashfs_write.rs | Comment contradicts code; whole-Vec clone per file; near-duplicate table loaders. | open |
 | DVM-001 | S1 | plausible | qcow2.rs `open`, `ensure_free_cluster_index` | Edits accepted on dirty / corrupt images; with lazy refcounts live clusters are reused. | fixed (3612a6a6) |
 | DVM-002 | S2 | confirmed | qcow2.rs `export_qcow2` | One-cluster refcount table overflows into the first L2 table at small cluster sizes (latent). | fixed (f8e6b89b) |
