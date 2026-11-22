@@ -15,7 +15,7 @@
 //! framing (or where the password is wrong) surface as an explicit error.
 
 use crate::zip_compat::ZipEntryName as _;
-#[cfg(feature = "rust173-polyfill")]
+#[cfg(all(feature = "rust173-polyfill", feature = "crypto"))]
 use disk_core::rust173::IntIsMultipleOf as _;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -34,6 +34,22 @@ use aes::Aes128;
 use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 #[cfg(any(feature = "crypto", test))]
 use md5::{Digest, Md5};
+
+/// Largest image an IMZ may unpack to; WinImage images are floppies of a few MB.
+const MAX_IMZ_BYTES: u64 = 64 << 20;
+
+/// Copy at most [`MAX_IMZ_BYTES`] from `entry`, refusing an entry that holds more.
+fn copy_capped(entry: &mut dyn Read, out: &mut dyn io::Write, name: &str) -> Result<u64> {
+    let n = io::copy(&mut entry.take(MAX_IMZ_BYTES + 1), out)
+        .with_context(|| format!("decompressing IMZ entry \"{name}\""))?;
+    if n > MAX_IMZ_BYTES {
+        bail!(
+            "IMZ entry \"{name}\" unpacks past {} MiB; not a floppy image",
+            MAX_IMZ_BYTES >> 20
+        );
+    }
+    Ok(n)
+}
 
 /// IMZ magic = ZIP local file header signature.
 pub const IMZ_MAGIC: &[u8; 4] = b"PK\x03\x04";
@@ -240,8 +256,14 @@ fn open_entry<'a>(
                 let raw = archive.by_index_raw(idx)?;
                 (raw.compressed_size(), raw.entry_name(), raw.size())
             };
+            if csz > MAX_IMZ_BYTES {
+                bail!("IMZ entry \"{name}\" is {csz} bytes compressed; not a floppy image");
+            }
             let mut raw_body = Vec::with_capacity(csz as usize);
-            archive.by_index_raw(idx)?.read_to_end(&mut raw_body)?;
+            archive
+                .by_index_raw(idx)?
+                .take(MAX_IMZ_BYTES)
+                .read_to_end(&mut raw_body)?;
 
             if let Ok(deflate_bytes) = decrypt_winimage_body(&raw_body, pw) {
                 let dec = flate2::read::DeflateDecoder::new(Cursor::new(deflate_bytes));
@@ -305,8 +327,7 @@ pub fn materialize_imz_to_temp_with_password(
     let out_path = guard.path().join(format!("{}.ima", stem));
     let mut out =
         File::create(&out_path).with_context(|| format!("creating {}", out_path.display()))?;
-    let copied = io::copy(&mut entry, &mut out)
-        .with_context(|| format!("decompressing IMZ entry \"{}\"", entry_name))?;
+    let copied = copy_capped(&mut entry, &mut out, &entry_name)?;
     out.sync_all().ok();
 
     log::info!(
@@ -317,9 +338,14 @@ pub fn materialize_imz_to_temp_with_password(
         entry_name
     );
 
+    if copied != logical_size {
+        log::warn!(
+            "IMZ entry \"{entry_name}\": header says {logical_size} bytes, unpacked {copied}"
+        );
+    }
     Ok(ImzMaterialized {
         temp_path: out_path,
-        logical_size,
+        logical_size: copied,
         guard,
         entry_name,
     })
@@ -362,10 +388,9 @@ impl ImzReader {
             .with_context(|| format!("parsing IMZ {} as ZIP", path.display()))?;
         let idx = pick_entry_index(&mut archive)?;
 
-        let (mut entry, entry_name, logical_size) = open_entry(&mut archive, idx, password, path)?;
-        let mut buf = Vec::with_capacity(logical_size as usize);
-        io::copy(&mut entry, &mut buf)
-            .with_context(|| format!("decompressing IMZ entry \"{}\"", entry_name))?;
+        let (mut entry, entry_name, _) = open_entry(&mut archive, idx, password, path)?;
+        let mut buf = Vec::new();
+        let logical_size = copy_capped(&mut entry, &mut buf, &entry_name)?;
 
         Ok(Self {
             cursor: Cursor::new(buf),

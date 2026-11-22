@@ -55,9 +55,14 @@ impl DriverDescriptorRecord {
                 kind: BigEndian::read_u16(&ddr_buf[off + 6..off + 8]),
             });
         }
+        // A zeroed block size would divide by zero on restore; 512 is what such disks mean.
+        let block_size = match BigEndian::read_u16(&ddr_buf[2..4]) {
+            0 => 512,
+            n => n,
+        };
         Ok(DriverDescriptorRecord {
             signature: sig,
-            block_size: BigEndian::read_u16(&ddr_buf[2..4]),
+            block_size,
             block_count: BigEndian::read_u32(&ddr_buf[4..8]),
             dev_type: BigEndian::read_u16(&ddr_buf[8..10]),
             dev_id: BigEndian::read_u16(&ddr_buf[10..12]),
@@ -386,8 +391,13 @@ impl Apm {
         &self,
         overrides: &[PartitionSizeOverride],
         target_block_count: u32,
-    ) -> Apm {
-        let block_size = self.ddr.block_size as u64;
+    ) -> Result<Apm, PartitionError> {
+        let block_size = self.ddr.block_size.max(1) as u64;
+        let fit = |v: u64, what: &str| {
+            u32::try_from(v).map_err(|_| {
+                PartitionError::InvalidApm(format!("{what} {v} does not fit a 32-bit APM field"))
+            })
+        };
         let mut patched = self.clone();
         patched.ddr.block_count = target_block_count;
 
@@ -395,18 +405,18 @@ impl Apm {
             // Match override by start_block (converted to LBA via block_size/512)
             let entry_lba = entry.start_block as u64 * block_size / 512;
             if let Some(ov) = overrides.iter().find(|o| o.start_lba == entry_lba) {
-                let new_blocks = (ov.export_size / block_size) as u32;
+                let new_blocks = fit(ov.export_size / block_size, "block count")?;
                 entry.block_count = new_blocks;
                 entry.data_count = new_blocks;
 
                 if let Some(new_lba) = ov.new_start_lba {
-                    entry.start_block = (new_lba * 512 / block_size) as u32;
+                    entry.start_block = fit(new_lba * 512 / block_size, "start block")?;
                     entry.data_start = 0; // data starts at beginning of partition
                 }
             }
         }
 
-        patched
+        Ok(patched)
     }
 }
 
@@ -815,7 +825,7 @@ mod tests {
             60000 * 512,
         )];
 
-        let patched = apm.patch_for_restore(&overrides, 120000);
+        let patched = apm.patch_for_restore(&overrides, 120000).unwrap();
         assert_eq!(patched.ddr.block_count, 120000);
         assert_eq!(patched.entries[1].block_count, 60000);
         assert_eq!(patched.entries[1].data_count, 60000);
@@ -906,5 +916,34 @@ mod tests {
         // A PM map is not a TS map, and the APM parser rejects a TS map.
         let manhole = manhole_blocks();
         assert!(Apm::parse(&mut Cursor::new(manhole)).is_err());
+    }
+
+    /// PT-006: a DDR with a zeroed block size reads as 512, so restore never divides by zero.
+    #[test]
+    fn a_zero_ddr_block_size_reads_as_512() {
+        let mut data = build_synthetic_apm(&[
+            ("Apple", "Apple_partition_map", 1, 3),
+            ("MacOS", "Apple_HFS", 64, 50000),
+        ]);
+        data[2..4].fill(0);
+        let apm = Apm::parse(&mut Cursor::new(data)).unwrap();
+        assert_eq!(apm.ddr.block_size, 512);
+        let ov = PartitionSizeOverride::size_only(0, 64, 50000 * 512, 60000 * 512);
+        assert_eq!(
+            apm.patch_for_restore(&[ov], 120000).unwrap().entries[1].block_count,
+            60000
+        );
+    }
+
+    /// PT-009: a size the 32-bit block count cannot hold is refused, not wrapped.
+    #[test]
+    fn an_apm_size_past_32_bits_is_refused() {
+        let data = build_synthetic_apm(&[
+            ("Apple", "Apple_partition_map", 1, 3),
+            ("MacOS", "Apple_HFS", 64, 50000),
+        ]);
+        let apm = Apm::parse(&mut Cursor::new(data)).unwrap();
+        let ov = PartitionSizeOverride::size_only(0, 64, 50000 * 512, 3 << 40);
+        assert!(apm.patch_for_restore(&[ov], u32::MAX).is_err());
     }
 }

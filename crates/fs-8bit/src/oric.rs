@@ -564,6 +564,13 @@ impl<R: Read + Seek> OricFilesystem<R> {
         if self.file_find(name).is_some() {
             return Err(FilesystemError::AlreadyExists(name.to_string()));
         }
+        if data.len() > 0xFFFF {
+            // The header's length field is 16 bits: a longer file would read back truncated (B8-004).
+            return Err(FilesystemError::InvalidData(format!(
+                "Oric DOS stores file lengths in 16 bits; {} bytes is too long",
+                data.len()
+            )));
+        }
         let dsecs = data.len().div_ceil(SECTOR).max(1) as u32;
         let isecs = dsecs.div_ceil(125);
         let need_ns = dsecs + isecs;

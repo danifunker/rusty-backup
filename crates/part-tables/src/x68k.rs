@@ -335,7 +335,8 @@ pub fn patch_x68k_entries(
     buf: &mut [u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE],
     overrides: &[PartitionSizeOverride],
     sector_size: u64,
-) {
+) -> Result<(), crate::PartitionError> {
+    use crate::PartitionError;
     let sector_size = if sector_size == 0 {
         X68K_DEFAULT_SECTOR_SIZE
     } else {
@@ -355,15 +356,30 @@ pub fn patch_x68k_entries(
             // as patch_mbr_entries). This catches sidecar drift.
             continue;
         }
-        let new_sectors = (ps.export_size / sector_size) as u32;
+        let new_sectors = u32::try_from(ps.export_size / sector_size).map_err(|_| {
+            PartitionError::InvalidX68k(format!(
+                "X68k partition {} is too large for its 32-bit sector count",
+                ps.index + 1
+            ))
+        })?;
         if let Some(new_start_lba) = ps.new_start_lba {
-            // Convert the requested 512-byte start LBA back into logical
-            // sectors for the on-disk field.
-            let new_start_sector = (new_start_lba * 512 / sector_size) as u32 & 0x00FF_FFFF;
-            BigEndian::write_u32(&mut buf[entry_off + 8..entry_off + 12], new_start_sector);
+            // The start word is 24 bits; its high byte carries flags, which a move keeps.
+            let new_start_sector = new_start_lba * 512 / sector_size;
+            if new_start_sector > 0x00FF_FFFF {
+                return Err(PartitionError::InvalidX68k(format!(
+                    "X68k partition {} would start past sector 0xFFFFFF",
+                    ps.index + 1
+                )));
+            }
+            let flags = BigEndian::read_u32(&buf[entry_off + 8..entry_off + 12]) & 0xFF00_0000;
+            BigEndian::write_u32(
+                &mut buf[entry_off + 8..entry_off + 12],
+                flags | new_start_sector as u32,
+            );
         }
         BigEndian::write_u32(&mut buf[entry_off + 12..entry_off + 16], new_sectors);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -607,7 +623,7 @@ mod tests {
             PartitionSizeOverride::size_only(0, 64, 0x1000 * 512, 0x2000 * 512),
             PartitionSizeOverride::size_only(1, 0x1040, 0x800 * 512, 0x800 * 512),
         ];
-        patch_x68k_entries(&mut buf, &overrides, 512);
+        patch_x68k_entries(&mut buf, &overrides, 512).unwrap();
 
         // Slot 0 grew to 0x2000 sectors; slot 1 unchanged.
         let off0 = X68K_TABLE_HEADER_SIZE;
@@ -643,7 +659,7 @@ mod tests {
             0x1000 * 512,
             0x2000 * 512,
         )];
-        patch_x68k_entries(&mut buf, &overrides, 512);
+        patch_x68k_entries(&mut buf, &overrides, 512).unwrap();
 
         // Slot 0 length stays at 0x1000 (refused).
         let off0 = X68K_TABLE_HEADER_SIZE;
@@ -675,7 +691,7 @@ mod tests {
             heads: 0,
             sectors_per_track: 0,
         }];
-        patch_x68k_entries(&mut buf, &overrides, 512);
+        patch_x68k_entries(&mut buf, &overrides, 512).unwrap();
 
         let off0 = X68K_TABLE_HEADER_SIZE;
         assert_eq!(
@@ -708,7 +724,7 @@ mod tests {
             0x1000 * 1024,
             new_bytes,
         )];
-        patch_x68k_entries(&mut buf, &overrides, 1024);
+        patch_x68k_entries(&mut buf, &overrides, 1024).unwrap();
 
         let off0 = X68K_TABLE_HEADER_SIZE;
         // Length must be expressed in 1024-byte sectors, not 512-byte ones.
@@ -752,5 +768,30 @@ mod tests {
         assert_eq!(table.entries.len(), table2.entries.len());
         // Bytes round-trip the same.
         assert_eq!(table.to_bytes(), table2.to_bytes());
+    }
+
+    /// PT-010: moving a partition keeps the flags byte of its start word.
+    #[test]
+    fn a_moved_x68k_partition_keeps_its_flags() {
+        let table = X68kPartitionTable {
+            disk_size_field: 0x4000,
+            entries: vec![X68kEntry {
+                name_raw: *b"Human68k",
+                name_display: "Human68k".into(),
+                start_sector: 64,
+                length_sectors: 0x1000,
+            }],
+        };
+        let mut buf = table.to_bytes();
+        let e = X68K_TABLE_HEADER_SIZE + 8;
+        buf[e] = 0x01; // the "active" byte some references describe
+        let mut ov = PartitionSizeOverride::size_only(0, 64, 0x1000 * 512, 0x1000 * 512);
+        ov.new_start_lba = Some(128);
+        patch_x68k_entries(&mut buf, &[ov.clone()], 512).unwrap();
+        assert_eq!(BigEndian::read_u32(&buf[e..e + 4]), 0x0100_0080);
+        // A start past 24 bits is an error, never a silent wrap onto sector 0.
+        let mut far = PartitionSizeOverride::size_only(0, 128, 0x1000 * 512, 0x1000 * 512);
+        far.new_start_lba = Some(1 << 24);
+        assert!(patch_x68k_entries(&mut buf, &[far], 512).is_err());
     }
 }

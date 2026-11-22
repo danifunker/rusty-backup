@@ -541,7 +541,8 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         let mut results = Vec::new();
         let mut node_idx = first_leaf;
 
-        while node_idx != 0 {
+        let mut seen_nodes = std::collections::HashSet::new();
+        while node_idx != 0 && seen_nodes.insert(node_idx) {
             let offset = node_idx as usize * node_size as usize;
             if offset + node_size as usize > self.catalog_data.len() {
                 break;
@@ -555,7 +556,9 @@ impl<R: Read + Seek> HfsFilesystem<R> {
 
             for i in 0..num_records as usize {
                 // Record offset is stored at end of node, growing backward
-                let offset_pos = node_size as usize - 2 * (i + 1);
+                let Some(offset_pos) = (node_size as usize).checked_sub(2 * (i + 1)) else {
+                    break; // numRecords larger than the node (MAC-008)
+                };
                 if offset_pos + 2 > node.len() {
                     break;
                 }
@@ -693,7 +696,8 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         let first_leaf = BigEndian::read_u32(&header_node[24..28]);
 
         let mut node_idx = first_leaf;
-        while node_idx != 0 {
+        let mut seen_nodes = std::collections::HashSet::new();
+        while node_idx != 0 && seen_nodes.insert(node_idx) {
             let offset = node_idx as usize * node_size as usize;
             if offset + node_size as usize > self.catalog_data.len() {
                 break;
@@ -703,7 +707,9 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             let num_records = BigEndian::read_u16(&node[10..12]);
 
             for i in 0..num_records as usize {
-                let offset_pos = node_size as usize - 2 * (i + 1);
+                let Some(offset_pos) = (node_size as usize).checked_sub(2 * (i + 1)) else {
+                    break; // numRecords larger than the node (MAC-008)
+                };
                 if offset_pos + 2 > node.len() {
                     break;
                 }
@@ -893,7 +899,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         );
 
         let off = leaf_idx as usize * node_size;
-        if off + node_size > self.catalog_data.len() {
+        if leaf_idx == 0 || off + node_size > self.catalog_data.len() {
             return None;
         }
         let node = &self.catalog_data[off..off + node_size];
@@ -1992,6 +1998,7 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
             if written >= self.catalog_data.len() {
                 break;
             }
+            check_hfs_extent(&self.mdb, ext.start_block, ext.block_count)?;
             let off = first_alloc + ext.start_block as u64 * self.mdb.block_size as u64;
             let len = (ext.block_count as usize * self.mdb.block_size as usize)
                 .min(self.catalog_data.len() - written);
@@ -3988,7 +3995,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
                 &self.mdb.extents_file_extents,
                 self.mdb.extents_file_size as u64,
             )
-            .ok()
+            // Unreadable, the overflow extents would be missing from the rebuilt bitmap and
+            // freed, so the repair stops instead (MAC-004).
+            .map(Some)
+            .map_err(|e| {
+                FilesystemError::InvalidData(format!(
+                    "the extents overflow B-tree cannot be read ({e}); not repairing"
+                ))
+            })?
         } else {
             None
         };
@@ -4157,6 +4171,13 @@ fn read_fork_data<R: Read + Seek>(
     extents: &[HfsExtDescriptor; 3],
     size: u64,
 ) -> Result<Vec<u8>, FilesystemError> {
+    let volume_bytes = mdb.total_blocks as u64 * mdb.block_size as u64;
+    if size > volume_bytes {
+        // The size is an on-disk field: refuse before allocating for it (MAC-015).
+        return Err(FilesystemError::InvalidData(format!(
+            "HFS B-tree file of {size} bytes is larger than the {volume_bytes}-byte volume"
+        )));
+    }
     let mut data = Vec::with_capacity(size as usize);
     let first_alloc_offset = partition_offset + mdb.first_alloc_block as u64 * 512;
 
@@ -4269,6 +4290,7 @@ fn write_extents_overflow_data<W: std::io::Write + Seek>(
         if extent.block_count == 0 {
             break;
         }
+        check_hfs_extent(mdb, extent.start_block, extent.block_count)?;
         let block_off = alloc_start + extent.start_block as u64 * mdb.block_size as u64;
         let byte_len = extent.block_count as usize * mdb.block_size as usize;
         let data_end = (data_start + byte_len).min(data.len());
@@ -4315,6 +4337,21 @@ fn write_fork_data_to<R: Read + Seek>(
 }
 
 /// Write fork data to disk through extent descriptors.
+/// An extent read from disk must lie inside the volume before anything is written through it.
+fn check_hfs_extent(
+    mdb: &HfsMasterDirectoryBlock,
+    start: u16,
+    count: u16,
+) -> Result<(), FilesystemError> {
+    if start as u32 + count as u32 > mdb.total_blocks as u32 {
+        return Err(FilesystemError::InvalidData(format!(
+            "extent at block {start} for {count} blocks runs past the {}-block volume",
+            mdb.total_blocks
+        )));
+    }
+    Ok(())
+}
+
 fn write_hfs_fork_data<R: Write + Seek>(
     writer: &mut R,
     partition_offset: u64,
@@ -4328,6 +4365,7 @@ fn write_hfs_fork_data<R: Write + Seek>(
         if ext.block_count == 0 || written >= data.len() {
             break;
         }
+        check_hfs_extent(mdb, ext.start_block, ext.block_count)?;
         let offset = first_alloc_offset + ext.start_block as u64 * mdb.block_size as u64;
         let extent_len = ext.block_count as u64 * mdb.block_size as u64;
         let to_write = extent_len.min((data.len() - written) as u64) as usize;
@@ -5022,7 +5060,7 @@ mod tests {
     #[test]
     fn classic_hfs_stamps_are_local_time_and_round_trip_to_utc() {
         use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-        use disk_core::times::{local_utc_offset_secs, unix_to_mac_epoch, UnixTimes};
+        use disk_core::times::{unix_to_mac_epoch, utc_offset_at, UnixTimes};
         const T: u64 = 1_700_000_000; // 2023-11-14 22:13:20 UTC
         let mut img = create_blank_hfs(4 * 1024 * 1024, 4096, "Zone").unwrap();
         let mut fs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
@@ -5042,7 +5080,7 @@ mod tests {
             .unwrap();
         assert_eq!(entry.modified_unix, Some(T), "UTC must round-trip");
         let raw = entry.mac_dates.expect("raw Mac dates").1;
-        let expected = (T as i64 + local_utc_offset_secs()) as u64;
+        let expected = (T as i64 + utc_offset_at(T)) as u64;
         assert_eq!(
             raw,
             unix_to_mac_epoch(expected),
@@ -7912,5 +7950,51 @@ mod tests {
             return;
         }
         panic!("the clock ticked during every attempt");
+    }
+}
+
+#[cfg(test)]
+mod extent_bound_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// FM-001: a fork extent past the volume is refused, and nothing is written.
+    #[test]
+    fn writing_through_an_extent_past_the_volume_is_refused() {
+        let img = create_blank_hfs(4 * 1024 * 1024, 4096, "Bound").unwrap();
+        let mdb = HfsMasterDirectoryBlock::parse(&img[1024..1536]).unwrap();
+        let past = [
+            HfsExtDescriptor {
+                start_block: mdb.total_blocks - 1,
+                block_count: 2,
+            },
+            HfsExtDescriptor {
+                start_block: 0,
+                block_count: 0,
+            },
+            HfsExtDescriptor {
+                start_block: 0,
+                block_count: 0,
+            },
+        ];
+        let mut out = Cursor::new(img.clone());
+        assert!(write_hfs_fork_data(&mut out, 0, &mdb, &past, &[0xAA; 8192]).is_err());
+        assert_eq!(out.into_inner(), img);
+        let inside = [
+            HfsExtDescriptor {
+                start_block: mdb.total_blocks - 2,
+                block_count: 2,
+            },
+            HfsExtDescriptor {
+                start_block: 0,
+                block_count: 0,
+            },
+            HfsExtDescriptor {
+                start_block: 0,
+                block_count: 0,
+            },
+        ];
+        let mut out = Cursor::new(img.clone());
+        write_hfs_fork_data(&mut out, 0, &mdb, &inside, &[0xAA; 16]).unwrap();
     }
 }

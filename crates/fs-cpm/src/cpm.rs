@@ -79,6 +79,17 @@ impl CpmDirEntry {
         self.user < 16
     }
 
+    /// An unused slot: only 0xE5 marks one. Labels (0x20), timestamps (0x21), CP/M 3 passwords
+    /// and ZSDOS user areas 16..31 are in use (CPM-001).
+    pub fn is_free_slot(&self) -> bool {
+        self.user == 0xE5
+    }
+
+    /// Entries whose block pointers are allocation: files in user areas 0..31.
+    pub fn owns_blocks(&self) -> bool {
+        self.user < 32
+    }
+
     /// "<name>.<ext>" trimmed (CP/M-style), with attribute high-bits
     /// stripped.
     pub fn formatted_name(&self) -> String {
@@ -140,6 +151,31 @@ pub fn parse_dir_entry(buf: &[u8; 32], dpb: &Dpb) -> CpmDirEntry {
         byte_count: bc,
         block_ptrs,
     }
+}
+
+/// Write `de` back over the bytes it was read from: an unchanged entry keeps them exactly (SFCB
+/// dates, label mode bits), and a changed one keeps the f1'-f8' attribute bits of its name.
+fn encode_dir_entry_onto(base: &[u8; 32], de: &CpmDirEntry, dpb: &Dpb) -> [u8; 32] {
+    let old = parse_dir_entry(base, dpb);
+    let unchanged = old.user == de.user
+        && old.name == de.name
+        && old.ext == de.ext
+        && old.attrs == de.attrs
+        && old.extent == de.extent
+        && old.record_count == de.record_count
+        && old.byte_count == de.byte_count
+        && old.block_ptrs == de.block_ptrs;
+    if unchanged {
+        return *base;
+    }
+    let mut out = encode_dir_entry(de, dpb);
+    // Live entries keep the name's interface attributes; a deleted one keeps its old bytes.
+    if de.user != 0xE5 && old.user != 0xE5 && old.name == de.name {
+        for i in 1..9 {
+            out[i] |= base[i] & 0x80;
+        }
+    }
+    out
 }
 
 /// Serialize a directory entry to 32 bytes for write-back.
@@ -205,6 +241,9 @@ pub struct CpmFilesystem<R: Read + Seek + Send> {
     /// All decoded directory entries (active + deleted) in original
     /// on-disk order. Edits push to / mutate this Vec.
     entries: Vec<CpmDirEntry>,
+    /// Allocation blocks the image really holds: a preset's data area can run past the
+    /// disk, and blocks past its end are never handed out (CPM-006).
+    usable_blocks: u32,
     /// Cached directory bytes from disk; needed because the directory
     /// occupies `(al0/al1 bitmap)` block(s) which we re-pack on write.
     dir_bytes_cache: Vec<u8>,
@@ -219,15 +258,26 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
     ) -> Result<Self, FilesystemError> {
         let dir_bytes = read_directory(&mut reader, partition_offset, &dpb)?;
         let mut entries = Vec::with_capacity(dir_bytes.len() / 32);
-        for chunk in dir_bytes.chunks_exact(32) {
+        // CP/M reads drm+1 entries; anything past them in the directory blocks isn't one.
+        for chunk in dir_bytes
+            .chunks_exact(32)
+            .take(dpb.max_dir_entries() as usize)
+        {
             let arr: &[u8; 32] = chunk.try_into().unwrap();
             entries.push(parse_dir_entry(arr, &dpb));
         }
+        let image_len = reader
+            .seek(SeekFrom::End(0))?
+            .saturating_sub(partition_offset);
+        let reserved = dpb.off as u64 * dpb.spt as u64 * 128;
+        let fit = image_len.saturating_sub(reserved) / (dpb.block_size() as u64).max(1);
+        let usable_blocks = dpb.total_blocks().min(fit.min(u64::from(u32::MAX)) as u32);
         Ok(CpmFilesystem {
             reader,
             partition_offset,
             dpb,
             entries,
+            usable_blocks,
             dir_bytes_cache: dir_bytes,
         })
     }
@@ -265,10 +315,11 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
             let mut total: u64 = 0;
             let last_idx = exts.len() - 1;
             for (i, e) in exts.iter().enumerate() {
+                let records = entry_records(e, self.dpb.exm);
                 if i == last_idx && e.byte_count != 0 {
-                    total += (e.record_count.saturating_sub(1) as u64) * 128 + e.byte_count as u64;
+                    total += records.saturating_sub(1) * 128 + e.byte_count as u64;
                 } else {
-                    total += e.record_count as u64 * 128;
+                    total += records * 128;
                 }
             }
             out.push(CpmFileGroup {
@@ -285,10 +336,13 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
     }
 
     /// Find a group by formatted name (case-insensitive).
-    fn find_group(&self, name: &str) -> Option<CpmFileGroup> {
+    /// The file named `name` in the user area `entry_location` carries (its top byte, as
+    /// `list_directory` sets it): same-named files in two user areas are different files (CPM-008).
+    fn find_group(&self, name: &str, entry_location: u64) -> Option<CpmFileGroup> {
+        let user = (entry_location >> 56) as u8;
         self.collect_files()
             .into_iter()
-            .find(|g| g.formatted_name().eq_ignore_ascii_case(name))
+            .find(|g| g.user == user && g.formatted_name().eq_ignore_ascii_case(name))
     }
 
     /// Read all bytes of a file given its grouped extents.
@@ -302,10 +356,11 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
             // to extent.record_count * 128. The very last extent uses
             // byte_count (CP/M-3) for the trailing trim when non-zero.
             let is_last = Some(ext.extent) == last_extent_num;
+            let records = entry_records(ext, self.dpb.exm);
             let bytes_in_ext = if is_last && ext.byte_count != 0 {
-                (ext.record_count.saturating_sub(1) as u64) * 128 + ext.byte_count as u64
+                records.saturating_sub(1) * 128 + ext.byte_count as u64
             } else {
-                ext.record_count as u64 * 128
+                records * 128
             };
             let mut remaining = bytes_in_ext;
             for &ptr in &ext.block_ptrs {
@@ -354,6 +409,13 @@ impl CpmFileGroup {
             format!("{n}.{e}")
         }
     }
+}
+
+/// Records one directory entry covers. With an extent mask (EXM) an entry spans several
+/// 16 KiB logical extents: the low EXM bits of its extent number count the full ones before
+/// the last, which holds `rc` records.
+fn entry_records(e: &CpmDirEntry, exm: u8) -> u64 {
+    (e.extent as u64 & exm as u64) * 128 + e.record_count as u64
 }
 
 /// Read the directory bytes from disk based on the DPB's al0/al1 bitmap.
@@ -428,8 +490,13 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
             if e.user == 0x20 || e.user == 0x21 {
                 continue;
             }
-            if e.user >= 16 {
-                invalid.push(i); // not a user area, label, SFCB, or 0xE5
+            // 16..31 are CP/M 3 password entries or ZSDOS / P2DOS user areas: in use, so never
+            // "repaired" away. Only bytes past 0x21 (other than 0xE5) are garbage.
+            if e.user > 0x21 {
+                invalid.push(i);
+                continue;
+            }
+            if e.user >= 16 && !e.owns_blocks() {
                 continue;
             }
             files.insert((e.user, e.name.clone(), e.ext.clone()));
@@ -562,9 +629,11 @@ impl<R: Read + Seek + Send> Filesystem for CpmFilesystem<R> {
         entry: &FileEntry,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let group = self.find_group(&entry.name).ok_or_else(|| {
-            FilesystemError::NotFound(format!("CP/M file {} not found", entry.name))
-        })?;
+        let group = self
+            .find_group(&entry.name, entry.location)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!("CP/M file {} not found", entry.name))
+            })?;
         let mut data = self.read_group(&group)?;
         data.truncate(max_bytes);
         Ok(data)
@@ -625,11 +694,16 @@ fn validate_cpm_name(name: &str) -> Result<(String, String), FilesystemError> {
     }
     if e.len() > 3 {
         return Err(FilesystemError::InvalidData(format!(
-            "ext part '{e}' must be ≤ 3 chars"
+            "ext part '{e}' must be <= 3 chars"
         )));
     }
     for c in n.chars().chain(e.chars()) {
-        if !c.is_ascii() || !(0x20..=0x7E).contains(&(c as u8)) || c.is_ascii_whitespace() {
+        // The CCP parses these as wildcards or separators, so a file named with one is unreachable.
+        if !c.is_ascii()
+            || !(0x20..=0x7E).contains(&(c as u8))
+            || c.is_ascii_whitespace()
+            || "<>.,;:=?*[]|\"".contains(c)
+        {
             return Err(FilesystemError::InvalidData(format!(
                 "filename '{name}' contains invalid char '{c}'"
             )));
@@ -647,7 +721,7 @@ impl<R: Read + Write + Seek + Send> CpmFilesystem<R> {
     /// by any active directory entry (and excluding the directory
     /// blocks themselves).
     fn free_blocks(&self) -> Vec<u16> {
-        let total = self.dpb.total_blocks() as u16;
+        let total = self.usable_blocks as u16;
         let bitmap = ((self.dpb.al0 as u16) << 8) | self.dpb.al1 as u16;
         let mut used = vec![false; total as usize];
         for b in 0..16u16 {
@@ -656,7 +730,7 @@ impl<R: Read + Write + Seek + Send> CpmFilesystem<R> {
             }
         }
         for e in &self.entries {
-            if !e.is_active() {
+            if !e.owns_blocks() {
                 continue;
             }
             for &ptr in &e.block_ptrs {
@@ -693,15 +767,16 @@ impl<R: Read + Write + Seek + Send> CpmFilesystem<R> {
     /// Re-pack the entries Vec back into directory bytes and write to disk.
     fn dir_write_back(&mut self) -> Result<(), FilesystemError> {
         // Recompute the directory byte buffer from the entries Vec.
-        let mut new_bytes = vec![0xE5u8; self.dir_bytes_cache.len()];
+        let mut new_bytes = self.dir_bytes_cache.clone();
         for (i, e) in self.entries.iter().enumerate() {
-            let bytes = encode_dir_entry(e, &self.dpb);
             let off = i * 32;
             if off + 32 > new_bytes.len() {
                 return Err(FilesystemError::InvalidData(
                     "directory full: more entries than DPB.drm".into(),
                 ));
             }
+            let base: [u8; 32] = new_bytes[off..off + 32].try_into().expect("32 bytes");
+            let bytes = encode_dir_entry_onto(&base, e, &self.dpb);
             new_bytes[off..off + 32].copy_from_slice(&bytes);
         }
         self.dir_bytes_cache = new_bytes.clone();
@@ -781,6 +856,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
                 "CP/M is flat; only the root accepts new files".into(),
             ));
         }
+        if self.dpb.exm > 0 {
+            // One entry spans several logical extents here; the writer lays them out one per
+            // entry, which real CP/M reads as a different file (CPM-005).
+            return Err(FilesystemError::Unsupported(format!(
+                "writing to {} is not supported (extent mask {} not implemented)",
+                self.dpb.name, self.dpb.exm
+            )));
+        }
         let (n8, e3) = validate_cpm_name(name)?;
         if self
             .collect_files()
@@ -804,9 +887,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
         let total_records = payload.len().div_ceil(128) as u32;
         let bytes_in_last_record = (payload.len() % 128) as u8;
 
-        // Allocate blocks.
+        // Allocate blocks (none for an empty file, which still gets its one entry).
         let bs = self.dpb.block_size();
-        let blocks_needed = payload.len().div_ceil(bs).max(1);
+        let blocks_needed = payload.len().div_ceil(bs);
         let free = self.free_blocks();
         if free.len() < blocks_needed {
             return Err(FilesystemError::InvalidData(format!(
@@ -815,12 +898,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
             )));
         }
         let picked: Vec<u16> = free.into_iter().take(blocks_needed).collect();
-
-        // Write data into those blocks.
-        if !payload.is_empty() {
-            // Treat payload as a single contiguous write across picked blocks.
-            self.write_blocks(&picked, &payload)?;
-        }
 
         // Build directory extents. Each extent holds 16 or 8 block
         // pointers, but Rc is capped at 128 records per extent. For
@@ -831,8 +908,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
         let records_per_extent_via_ptrs = ptrs_per_ext as u32 * records_per_block;
         let records_per_extent = records_per_extent_via_ptrs.min(128);
 
-        // Find a free entry slot to extend / push into.
-        let max_entries = self.dpb.max_dir_entries() as usize;
+        // The directory is what its al0/al1 blocks hold, even if drm claims more (CPM-007).
+        let max_entries =
+            (self.dpb.max_dir_entries() as usize).min(self.dir_bytes_cache.len() / 32);
         if self.entries.len() < max_entries {
             self.entries.resize(
                 max_entries,
@@ -853,12 +931,28 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
             );
         }
 
+        // Every extent needs a slot: check them all before any data is written (CPM-009).
+        let extents_needed = (total_records.div_ceil(records_per_extent) as usize).max(1);
+        let free_slots = self.entries.iter().filter(|e| e.is_free_slot()).count();
+        if free_slots < extents_needed {
+            return Err(FilesystemError::DiskFull(format!(
+                "CP/M directory full: {name} needs {extents_needed} entries, {free_slots} free"
+            )));
+        }
+        if !payload.is_empty() {
+            // Treat payload as a single contiguous write across picked blocks.
+            self.write_blocks(&picked, &payload)?;
+        }
+
         let mut placed = 0usize;
         let mut records_left = total_records;
         let mut block_cursor = 0usize;
         let mut ext_idx: u16 = 0;
-        while records_left > 0 {
-            let slot = self.entries.iter().position(|e| !e.is_active());
+        // An empty file is one entry with no records.
+        let mut first = true;
+        while records_left > 0 || first {
+            first = false;
+            let slot = self.entries.iter().position(|e| e.is_free_slot());
             let Some(idx) = slot else {
                 return Err(FilesystemError::InvalidData(
                     "directory full: no free entry slot for new extent".into(),
@@ -909,7 +1003,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "CP/M has no directory hierarchy — files are addressed by (user, name)".into(),
+            "CP/M has no directory hierarchy - files are addressed by (user, name)".into(),
         ))
     }
 
@@ -918,6 +1012,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
+        let entry_user = (entry.location >> 56) as u8;
         if parent.path != "/" {
             return Err(FilesystemError::Unsupported(
                 "CP/M is flat; only files in the root are deletable".into(),
@@ -946,7 +1041,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
             if !e.is_active() {
                 continue;
             }
-            if e.name.eq_ignore_ascii_case(&n8) && e.ext.eq_ignore_ascii_case(&e3) {
+            if e.user == entry_user
+                && e.name.eq_ignore_ascii_case(&n8)
+                && e.ext.eq_ignore_ascii_case(&e3)
+            {
                 e.user = 0xE5;
                 hit = true;
             }
@@ -965,6 +1063,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
         entry: &FileEntry,
         new_name: &str,
     ) -> Result<(), FilesystemError> {
+        let entry_user = (entry.location >> 56) as u8;
         if parent.path != "/" {
             return Err(FilesystemError::Unsupported(
                 "CP/M is flat; only files in the root are renameable".into(),
@@ -1017,7 +1116,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
             if !e.is_active() {
                 continue;
             }
-            if e.name.eq_ignore_ascii_case(&old_n8) && e.ext.eq_ignore_ascii_case(&old_e3) {
+            if e.user == entry_user
+                && e.name.eq_ignore_ascii_case(&old_n8)
+                && e.ext.eq_ignore_ascii_case(&old_e3)
+            {
                 e.name = new_n8.clone();
                 e.ext = new_e3.clone();
                 hit = true;
@@ -1192,6 +1294,10 @@ mod tests {
         assert!(validate_cpm_name("FOO.BARS").is_err());
         // Empty.
         assert!(validate_cpm_name("").is_err());
+        // Wildcards and CCP separators.
+        for bad in ["A*.TXT", "A?.TXT", "A.B.C", "A,B", "A=B", "A[1]"] {
+            assert!(validate_cpm_name(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

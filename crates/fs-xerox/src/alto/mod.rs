@@ -55,6 +55,48 @@ pub fn open_pack(bytes: &[u8]) -> Result<Disk, FilesystemError> {
     }
 }
 
+/// The container a pack was read from, so an edit is written back the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackFormat {
+    Pdi,
+    Salto,
+    Trident,
+    /// Formats with no writer here (CopyDisk, ContrAlto Diablo `.dsk`, zdisk): saving one would
+    /// turn it into something else, so edits are refused.
+    ReadOnly,
+}
+
+/// The [`PackFormat`] [`open_pack`] would read `bytes` as.
+pub fn pack_format(bytes: &[u8]) -> PackFormat {
+    if bytes.len() >= pdi::MAGIC.len() && &bytes[..pdi::MAGIC.len()] == pdi::MAGIC {
+        PackFormat::Pdi
+    } else if zdisk::is_zdisk(bytes) {
+        PackFormat::ReadOnly
+    } else if salto::is_salto_image(bytes) {
+        if salto::read(bytes).is_ok() {
+            PackFormat::Salto
+        } else {
+            PackFormat::ReadOnly
+        }
+    } else if trident::is_trident_image(bytes) {
+        PackFormat::Trident
+    } else {
+        PackFormat::ReadOnly
+    }
+}
+
+/// Encode `disk` in `format`, for writing an edited pack back.
+pub fn write_pack(disk: &Disk, format: PackFormat) -> Result<Vec<u8>, FilesystemError> {
+    match format {
+        PackFormat::Pdi => Ok(pdi::write(disk)),
+        PackFormat::Salto => salto::write(disk),
+        PackFormat::Trident => trident::write(disk),
+        PackFormat::ReadOnly => Err(FilesystemError::Unsupported(
+            "this pack's container can't be written back; convert it to PDI first".into(),
+        )),
+    }
+}
+
 /// Cheap pre-check for [`open_pack`]: could a file whose first bytes are `magic`
 /// and whose total length is `len` be an Alto / Pilot disk pack? Lets a caller
 /// (e.g. the CLI `fsck` verb) gate an expensive full read + `open_pack` without
@@ -132,10 +174,12 @@ pub struct Geometry {
 impl Geometry {
     /// Total sectors in the pack (= the VDA count).
     pub fn total_sectors(&self) -> usize {
-        self.n_disks as usize
-            * self.n_cylinders as usize
-            * self.n_heads as usize
-            * self.n_sectors as usize
+        // Four 16-bit factors can pass usize::MAX on a 32-bit target: saturate, then the
+        // size checks against the image refuse it.
+        (self.n_disks as usize)
+            .saturating_mul(self.n_cylinders as usize)
+            .saturating_mul(self.n_heads as usize)
+            .saturating_mul(self.n_sectors as usize)
     }
 
     /// Convert a Diablo real disk-address word to a linear virtual disk

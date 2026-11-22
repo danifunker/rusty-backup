@@ -3,6 +3,15 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.2.0
+
+### Changed
+- Built on `disk-core` 0.3 (its `Filesystem` types are in this crate's API), so
+  a minor bump rather than 0.1.4.
+- Depends on `fs-mac` 0.2 with its new `fork-export` feature (the
+  AppleDouble / MacBinary / BinHex writers, no HFS), so a build no longer pulls
+  in `fs-mac-unicode` (GPL-2.0-only before its 0.2.0).
+
 ## 0.1.3
 
 ### Fixed

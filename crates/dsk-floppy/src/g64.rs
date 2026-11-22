@@ -145,10 +145,16 @@ fn read_bytes(bits: &[bool], pos: &mut usize, n: usize) -> Option<Vec<u8>> {
 /// authoritative. This keeps the 1571 side-1 path robust regardless of
 /// whether the on-disk header numbers side-1 tracks logically (36-70) or
 /// physically (1-35).
-fn decode_track(track_gcr: &[u8]) -> std::collections::HashMap<u8, Vec<u8>> {
-    let bits = bits_of(track_gcr);
+/// Sector number to (data, checksum held).
+type TrackSectors = std::collections::HashMap<u8, (Vec<u8>, bool)>;
+
+/// Each value carries whether its checksum held; a clean copy wins over a bad one.
+fn decode_track(track_gcr: &[u8]) -> TrackSectors {
+    // The track is a loop: scan syncs in one lap, read blocks on into a second copy.
+    let mut bits = bits_of(track_gcr);
     let n = bits.len();
-    let mut sectors = std::collections::HashMap::new();
+    bits.extend_from_within(..);
+    let mut sectors = TrackSectors::new();
     let mut last_header_sector: Option<u8> = None;
 
     let mut i = 0usize;
@@ -159,7 +165,7 @@ fn decode_track(track_gcr: &[u8]) -> std::collections::HashMap<u8, Vec<u8>> {
             continue;
         }
         let run_start = i;
-        while i < n && bits[i] {
+        while i < bits.len() && bits[i] {
             i += 1;
         }
         if i - run_start < 10 {
@@ -187,9 +193,11 @@ fn decode_track(track_gcr: &[u8]) -> std::collections::HashMap<u8, Vec<u8>> {
                     let data = &block[0..CBM_SECTOR];
                     let cksum = block[CBM_SECTOR];
                     let computed = data.iter().fold(0u8, |a, &b| a ^ b);
-                    if cksum == computed {
-                        if let Some(s) = last_header_sector.take() {
-                            sectors.entry(s).or_insert_with(|| data.to_vec());
+                    let ok = cksum == computed;
+                    if let Some(s) = last_header_sector.take() {
+                        let slot = sectors.entry(s).or_insert_with(|| (data.to_vec(), ok));
+                        if ok && !slot.1 {
+                            *slot = (data.to_vec(), true);
                         }
                     }
                 }
@@ -198,6 +206,30 @@ fn decode_track(track_gcr: &[u8]) -> std::collections::HashMap<u8, Vec<u8>> {
         }
     }
     sectors
+}
+
+/// Counts of sectors placed, to warn about bad checksums and zero-filled holes.
+#[derive(Default)]
+struct Tally {
+    placed: usize,
+    bad: usize,
+}
+
+impl Tally {
+    fn note(&mut self, ok: bool) {
+        self.placed += 1;
+        self.bad += usize::from(!ok);
+    }
+
+    fn report(&self, kind: &str, total: usize) {
+        let missing = total.saturating_sub(self.placed);
+        if missing + self.bad > 0 {
+            log::warn!(
+                "{kind}: {missing} of {total} sector(s) not found (zero-filled), {} kept with a bad checksum",
+                self.bad
+            );
+        }
+    }
 }
 
 /// Sectors on a 1-based D71 track: tracks 1-35 are side 0 (1541 zone map),
@@ -259,7 +291,7 @@ pub fn decode_g64_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
 
 /// 1541 path: whole tracks 1..=40 at half-track index (T-1)*2 -> flat D64.
 fn decode_g64_1541(bytes: &[u8], num_halftracks: usize) -> Result<Vec<u8>> {
-    let mut decoded: Vec<(u8, std::collections::HashMap<u8, Vec<u8>>)> = Vec::new();
+    let mut decoded: Vec<(u8, TrackSectors)> = Vec::new();
     let mut highest_track = 0u8;
     for track in 1..=40u8 {
         let ht = (track as usize - 1) * 2;
@@ -281,18 +313,21 @@ fn decode_g64_1541(bytes: &[u8], num_halftracks: usize) -> Result<Vec<u8>> {
         .map(|t| sectors_in_track(t) as usize)
         .sum();
     let mut d64 = vec![0u8; total_sectors * CBM_SECTOR];
+    let mut tally = Tally::default();
     for (track, sectors) in decoded {
         if track > total_tracks {
             continue;
         }
-        for (sector, data) in sectors {
+        for (sector, (data, ok)) in sectors {
             if sector >= sectors_in_track(track) {
                 continue;
             }
+            tally.note(ok);
             let off = d64_offset(track, sector);
             d64[off..off + CBM_SECTOR].copy_from_slice(&data);
         }
     }
+    tally.report("G64", total_sectors);
     Ok(d64)
 }
 
@@ -303,6 +338,7 @@ fn decode_g71(bytes: &[u8], num_halftracks: usize) -> Result<Vec<u8>> {
     let total_sectors: usize = (1..=70u8).map(|t| d71_sectors_in_track(t) as usize).sum();
     let mut d71 = vec![0u8; total_sectors * CBM_SECTOR];
     let mut any = false;
+    let mut tally = Tally::default();
     for track in 1..=70u8 {
         let ht = if track <= 35 {
             (track as usize - 1) * 2
@@ -318,10 +354,11 @@ fn decode_g71(bytes: &[u8], num_halftracks: usize) -> Result<Vec<u8>> {
         }
         any = true;
         let spt = d71_sectors_in_track(track);
-        for (sector, data) in sectors {
+        for (sector, (data, ok)) in sectors {
             if sector >= spt {
                 continue;
             }
+            tally.note(ok);
             let off = d71_offset(track, sector);
             d71[off..off + CBM_SECTOR].copy_from_slice(&data);
         }
@@ -329,6 +366,7 @@ fn decode_g71(bytes: &[u8], num_halftracks: usize) -> Result<Vec<u8>> {
     if !any {
         bail!("G71 decoded no readable sectors");
     }
+    tally.report("G71", total_sectors);
     Ok(d71)
 }
 

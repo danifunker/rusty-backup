@@ -117,6 +117,9 @@ pub fn parse(bytes: &[u8]) -> Result<StuffItArchive> {
     })
 }
 
+/// Deepest folder nesting an archive may have (the Finder's own limit is far lower).
+const MAX_FOLDER_DEPTH: usize = 256;
+
 fn parse_directory(
     bytes: &[u8],
     pos: &mut usize,
@@ -124,6 +127,10 @@ fn parse_directory(
     mut numentries: usize,
     entries: &mut Vec<StuffItEntry>,
 ) -> Result<()> {
+    // Each level recurses: a crafted index nesting folders deeper would overflow the stack.
+    if parent.len() > MAX_FOLDER_DEPTH {
+        bail!("Compact Pro: folders nested more than {MAX_FOLDER_DEPTH} deep");
+    }
     while numentries > 0 {
         let namelen = *bytes
             .get(*pos)
@@ -385,7 +392,7 @@ fn rle_next(st: &mut RleState, src: &mut dyn ByteSource) -> Option<u8> {
 }
 
 fn rle_decode(src: &mut dyn ByteSource, out_len: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(out_len);
+    let mut out = Vec::with_capacity(out_len.min(1 << 24));
     let mut st = RleState::default();
     while out.len() < out_len {
         match rle_next(&mut st, src) {

@@ -115,8 +115,15 @@ pub fn export_file_with_fork_opts(
     if mode == ResourceForkMode::MacBinary && has_rsrc {
         let data = read_data(fs)?;
         let rsrc = read_rsrc(fs)?;
-        let mb =
-            resource_fork::build_macbinary(safe, &type_code, &creator_code, dates, &data, &rsrc);
+        let mb = resource_fork::build_macbinary_with_flags(
+            safe,
+            &type_code,
+            &creator_code,
+            entry.finder_flags.unwrap_or(0),
+            dates,
+            &data,
+            &rsrc,
+        );
         let out = dest_dir.join(format!("{safe}.bin"));
         std::fs::write(&out, &mb).with_context(|| format!("writing {}", out.display()))?;
         return Ok(data.len() as u64 + rsrc.len() as u64);
@@ -129,7 +136,7 @@ pub fn export_file_with_fork_opts(
             name: entry.name.clone(),
             type_code,
             creator_code,
-            flags: 0,
+            flags: entry.finder_flags.unwrap_or(0),
             data_fork: data,
             resource_fork: rsrc,
         };
@@ -171,7 +178,14 @@ pub fn export_file_with_fork_opts(
         }
         ResourceForkMode::AppleDouble if has_rsrc || has_finfo => {
             let rsrc = if has_rsrc { read_rsrc(fs)? } else { Vec::new() };
-            let ad = resource_fork::build_appledouble(&type_code, &creator_code, dates, &rsrc);
+            let flags = entry.finder_flags.unwrap_or(0);
+            let ad = resource_fork::build_appledouble_with_flags(
+                &type_code,
+                &creator_code,
+                flags,
+                dates,
+                &rsrc,
+            );
             let p = dest_dir.join(format!("._{safe}"));
             std::fs::write(&p, &ad)
                 .with_context(|| format!("writing AppleDouble sidecar of '{}'", entry.name))?;

@@ -53,6 +53,38 @@ const BTRFS_FT_SOCK: u8 = 6;
 const BTRFS_FT_SYMLINK: u8 = 7;
 
 // Extent data types
+/// btrfs trees are at most 8 levels deep (`BTRFS_MAX_LEVEL`).
+const BTRFS_MAX_LEVEL: u8 = 8;
+
+/// A node's level, which must sit below its parent's: a node pointing at itself or an
+/// ancestor would otherwise recurse until the stack overflowed.
+fn node_level(node: &[u8], below: u8) -> Result<u8, FilesystemError> {
+    let level = node[NODE_HEADER_SIZE - 1];
+    if level >= below {
+        return Err(FilesystemError::Parse(format!(
+            "btrfs: node at level {level} under a level-{below} parent"
+        )));
+    }
+    Ok(level)
+}
+
+/// Refuse what this reader can't serve faithfully: compressed extents (zlib / lzo / zstd)
+/// read as zeros would be silent data loss, and a truncated item is corruption.
+fn check_extent_item(data: &[u8], extent_type: u8) -> Result<(), FilesystemError> {
+    if data[16] != 0 {
+        return Err(FilesystemError::Unsupported(
+            "btrfs: compressed extents are not supported yet".into(),
+        ));
+    }
+    if extent_type != BTRFS_FILE_EXTENT_INLINE && data.len() < 53 {
+        return Err(FilesystemError::Parse(format!(
+            "btrfs: file extent item of {} bytes",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
 const BTRFS_FILE_EXTENT_INLINE: u8 = 0;
 const BTRFS_FILE_EXTENT_REG: u8 = 1;
 const BTRFS_FILE_EXTENT_PREALLOC: u8 = 2;
@@ -163,6 +195,12 @@ fn parse_btrfs_superblock<R: Read + Seek>(
         None
     };
 
+    // The array lives in the superblock's last 2048 bytes; a larger size field is corruption.
+    if sys_chunk_array_size as usize > 2048 || 0x32B + sys_chunk_array_size as usize > sb.len() {
+        return Err(FilesystemError::Parse(format!(
+            "btrfs: sys_chunk_array_size {sys_chunk_array_size} is past the superblock"
+        )));
+    }
     let sys_chunk_data = &sb[0x32B..0x32B + sys_chunk_array_size as usize];
     let mut chunk_map = parse_sys_chunk_array(sys_chunk_data)?;
     chunk_map.sort_by_key(|c| c.logical);
@@ -193,7 +231,7 @@ pub struct BtrfsFilesystem<R> {
     fs_tree_root: u64,
 }
 
-impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
+impl<R: Read + Seek> BtrfsFilesystem<R> {
     /// Open a btrfs filesystem at the given partition offset.
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
         let sb_info = parse_btrfs_superblock(&mut reader, partition_offset)?;
@@ -278,8 +316,16 @@ impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
 
     /// Read the chunk tree and add all CHUNK_ITEM mappings to chunk_map.
     fn read_chunk_tree(&mut self, chunk_root_logical: u64) -> Result<(), FilesystemError> {
-        let node = self.read_node(chunk_root_logical)?;
-        let level = node[NODE_HEADER_SIZE - 1];
+        self.read_chunk_tree_below(chunk_root_logical, BTRFS_MAX_LEVEL)
+    }
+
+    fn read_chunk_tree_below(
+        &mut self,
+        logical: u64,
+        max_level: u8,
+    ) -> Result<(), FilesystemError> {
+        let node = self.read_node(logical)?;
+        let level = node_level(&node, max_level)?;
         let nritems = le32(&node, NODE_HEADER_SIZE - 5);
 
         if level == 0 {
@@ -293,7 +339,7 @@ impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
                     break;
                 }
                 let child_logical = le64(&node, ptr_off + 17);
-                self.read_chunk_tree(child_logical)?;
+                self.read_chunk_tree_below(child_logical, level)?;
             }
         }
         Ok(())
@@ -352,8 +398,17 @@ impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
         tree_root: u64,
         search_key: &BtrfsKey,
     ) -> Result<Option<(BtrfsKey, Vec<u8>)>, FilesystemError> {
+        self.find_item_ge_below(tree_root, search_key, BTRFS_MAX_LEVEL)
+    }
+
+    fn find_item_ge_below(
+        &mut self,
+        tree_root: u64,
+        search_key: &BtrfsKey,
+        max_level: u8,
+    ) -> Result<Option<(BtrfsKey, Vec<u8>)>, FilesystemError> {
         let node = self.read_node(tree_root)?;
-        let level = node[NODE_HEADER_SIZE - 1];
+        let level = node_level(&node, max_level)?;
         let nritems = le32(&node, NODE_HEADER_SIZE - 5);
 
         if nritems == 0 {
@@ -366,7 +421,7 @@ impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
         } else {
             // Internal node — find the right child to descend into
             let child = self.find_child_for_key(&node, nritems, search_key)?;
-            self.find_item_ge(child, search_key)
+            self.find_item_ge_below(child, search_key, level)
         }
     }
 
@@ -420,6 +475,35 @@ impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
         Ok(le64(node, ptr_off + 17))
     }
 
+    /// The physical address of the leaf holding exactly `key`, and the byte offset of its data.
+    fn locate_item(
+        &mut self,
+        root: u64,
+        key: &BtrfsKey,
+    ) -> Result<Option<(u64, usize)>, FilesystemError> {
+        let (mut logical, mut below) = (root, BTRFS_MAX_LEVEL);
+        loop {
+            let node = self.read_node(logical)?;
+            let level = node_level(&node, below)?;
+            let nritems = le32(&node, NODE_HEADER_SIZE - 5);
+            if level == 0 {
+                for i in 0..nritems as usize {
+                    let off = NODE_HEADER_SIZE + i * 25;
+                    if off + 25 > node.len() {
+                        break;
+                    }
+                    if BtrfsKey::parse(&node, off) == *key {
+                        let data = le32(&node, off + 17) as usize + NODE_HEADER_SIZE;
+                        return Ok(Some((self.logical_to_physical(logical)?, data)));
+                    }
+                }
+                return Ok(None);
+            }
+            logical = self.find_child_for_key(&node, nritems, key)?;
+            below = level;
+        }
+    }
+
     /// Find all items in range [min_key, max_key] in the tree rooted at `tree_root`.
     fn find_items_in_range(
         &mut self,
@@ -439,8 +523,19 @@ impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
         max_key: &BtrfsKey,
         results: &mut Vec<(BtrfsKey, Vec<u8>)>,
     ) -> Result<(), FilesystemError> {
+        self.collect_items_below(logical, min_key, max_key, results, BTRFS_MAX_LEVEL)
+    }
+
+    fn collect_items_below(
+        &mut self,
+        logical: u64,
+        min_key: &BtrfsKey,
+        max_key: &BtrfsKey,
+        results: &mut Vec<(BtrfsKey, Vec<u8>)>,
+        max_level: u8,
+    ) -> Result<(), FilesystemError> {
         let node = self.read_node(logical)?;
-        let level = node[NODE_HEADER_SIZE - 1];
+        let level = node_level(&node, max_level)?;
         let nritems = le32(&node, NODE_HEADER_SIZE - 5);
 
         if nritems == 0 {
@@ -503,7 +598,7 @@ impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
                     break;
                 }
 
-                self.collect_items_in_range(child_logical, min_key, max_key, results)?;
+                self.collect_items_below(child_logical, min_key, max_key, results, level)?;
             }
         }
 
@@ -626,30 +721,22 @@ impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
                 }
             }
 
-            let compression = data[16];
             let extent_type = data[20];
+            check_extent_item(data, extent_type)?;
             match extent_type {
                 BTRFS_FILE_EXTENT_INLINE => {
                     let len = (data.len().saturating_sub(21)) as u64;
                     let to_emit = len.min(limit - written);
-                    if compression == 0 {
-                        let inline_data = &data[21..21 + to_emit as usize];
-                        writer.write_all(inline_data)?;
-                    } else {
-                        // Compressed inline — surface as zeros (matches read_file_data).
-                        write_zeros(writer, &zeros, to_emit)?;
-                    }
+                    writer.write_all(&data[21..21 + to_emit as usize])?;
                     written += to_emit;
                 }
                 BTRFS_FILE_EXTENT_REG | BTRFS_FILE_EXTENT_PREALLOC => {
-                    if data.len() < 53 {
-                        continue;
-                    }
                     let disk_bytenr = le64(data, 21);
                     let extent_offset = le64(data, 37);
                     let num_bytes = le64(data, 45);
                     let to_emit = num_bytes.min(limit - written);
-                    if compression != 0 || disk_bytenr == 0 {
+                    // A hole, or space preallocated but never written: both read as zeros.
+                    if disk_bytenr == 0 || extent_type == BTRFS_FILE_EXTENT_PREALLOC {
                         write_zeros(writer, &zeros, to_emit)?;
                         written += to_emit;
                         continue;
@@ -712,15 +799,11 @@ impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
             }
 
             // generation(8) + ram_bytes(8) + compression(1) + encryption(1) + other_encoding(2) + type(1)
-            let compression = data[16];
             let extent_type = data[20];
+            check_extent_item(data, extent_type)?;
 
             match extent_type {
                 BTRFS_FILE_EXTENT_INLINE => {
-                    if compression != 0 {
-                        // Can't decompress — return what we have so far
-                        continue;
-                    }
                     // Inline data starts at offset 21
                     let inline_data = &data[21..];
                     let copy_len = inline_data.len().min(limit - file_offset);
@@ -728,11 +811,8 @@ impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
                         .copy_from_slice(&inline_data[..copy_len]);
                 }
                 BTRFS_FILE_EXTENT_REG | BTRFS_FILE_EXTENT_PREALLOC => {
-                    if data.len() < 53 {
-                        continue;
-                    }
-                    if compression != 0 {
-                        continue;
+                    if extent_type == BTRFS_FILE_EXTENT_PREALLOC {
+                        continue; // preallocated, never written: zeros
                     }
                     // disk_bytenr(8) + disk_num_bytes(8) + offset(8) + num_bytes(8)
                     let disk_bytenr = le64(data, 21);
@@ -771,6 +851,8 @@ impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
         inode_num: u64,
         size: u64,
     ) -> Result<String, FilesystemError> {
+        // A target is a path (PATH_MAX 4096); a larger size must not size the read.
+        let size = size.min(4096);
         let data = self.read_file_data(tree_root, inode_num, size, size as usize)?;
         let len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
         Ok(String::from_utf8_lossy(&data[..len]).to_string())
@@ -904,10 +986,8 @@ impl<R: Read + Seek + Send> Filesystem for BtrfsFilesystem<R> {
 
         let mut entries = Vec::with_capacity(dir_entries.len());
         for de in &dir_entries {
-            match self.dir_entry_to_file_entry(de, &entry.path, tree_root) {
-                Ok(fe) => entries.push(fe),
-                Err(_) => continue,
-            }
+            // A child that can't be read is reported, not dropped from the listing.
+            entries.push(self.dir_entry_to_file_entry(de, &entry.path, tree_root)?);
         }
 
         // Sort: directories first, then alphabetically (case-insensitive)
@@ -1032,12 +1112,14 @@ impl<R: Read + Seek + Send> CompactBtrfsReader<R> {
             merged.push((start, end));
         }
 
-        // Also include the superblock region (0x10000..0x11000) as allocated —
-        // it must be preserved for the filesystem to be valid.
-        // Insert it into the merged ranges.
-        let sb_start = SUPERBLOCK_OFFSET;
-        let sb_end = SUPERBLOCK_OFFSET + 4096;
-        merged.push((sb_start, sb_end));
+        // Keep the boot area and the primary superblock (bootloaders such as GRUB live in the
+        // first 64 KiB), plus the 64 MiB and 256 GiB superblock mirrors that fit.
+        merged.push((0, SUPERBLOCK_OFFSET + 4096));
+        for mirror in [0x400_0000u64, 0x40_0000_0000] {
+            if mirror + 4096 <= total_bytes {
+                merged.push((mirror, mirror + 4096));
+            }
+        }
         merged.sort_by_key(|&(s, _)| s);
 
         // Re-merge after adding superblock
@@ -1074,11 +1156,11 @@ impl<R: Read + Seek + Send> CompactBtrfsReader<R> {
             let aligned_start = range_start / sector_size * sector_size;
             let aligned_end = (range_end.div_ceil(sector_size) * sector_size).min(total_bytes);
             let num_sectors = (aligned_end - aligned_start) / sector_size;
-            let old_blocks: Vec<u64> = (0..num_sectors)
-                .map(|i| aligned_start / sector_size + i)
-                .collect();
             total_allocated_sectors += num_sectors;
-            sections.push(CompactSection::MappedBlocks { old_blocks });
+            sections.push(CompactSection::MappedRun {
+                first: aligned_start / sector_size,
+                count: num_sectors,
+            });
 
             pos = aligned_end;
         }
@@ -1129,19 +1211,14 @@ pub fn resize_btrfs_in_place(
     log_cb: &mut impl FnMut(&str),
 ) -> anyhow::Result<()> {
     let sb_pos = partition_offset + SUPERBLOCK_OFFSET;
-    if file.seek(SeekFrom::Start(sb_pos)).is_err() {
-        // Volume too small to host a btrfs superblock — silent no-op so
-        // the blind `resize_filesystem_for` dispatcher can call us
-        // against any image without bailing on small partitions
-        // (e.g. QDOS QXL.WIN, ProDOS, sub-64-KiB FAT floppies).
-        return Ok(());
-    }
+    file.seek(SeekFrom::Start(sb_pos))?;
     let mut sb = [0u8; 4096];
-    if file.read_exact(&mut sb).is_err() {
-        // Same justification — partition is smaller than the btrfs
-        // primary-superblock offset + size, so it's definitely not
-        // btrfs. Skip silently.
-        return Ok(());
+    // A partition too small to hold a btrfs superblock is not btrfs: the blind
+    // `resize_filesystem_for` dispatcher calls us on anything. Other read errors are real.
+    match file.read_exact(&mut sb) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => return Err(e.into()),
     }
 
     // Validate magic — skip silently if not btrfs (matches ext/fat pattern)
@@ -1158,9 +1235,20 @@ pub fn resize_btrfs_in_place(
         return Ok(());
     }
 
+    // Every checksum below is written as crc32c; other checksum types would be corrupted.
+    let csum_type = u16::from_le_bytes([sb[0xC4], sb[0xC5]]);
+    if csum_type != 0 {
+        anyhow::bail!("btrfs resize: checksum type {csum_type} (only crc32c is supported)");
+    }
+
     log_cb(&format!(
         "btrfs resize: {current_total} -> {new_total_bytes} bytes"
     ));
+
+    // The chunk tree's DEV_ITEM must agree with the superblock's copy, or btrfs check fails.
+    if !patch_dev_item(&mut *file, partition_offset, &sb, new_total_bytes)? {
+        log_cb("btrfs resize: no DEV_ITEM in the chunk tree; only the superblocks were updated");
+    }
 
     // Patch total_bytes at 0x70
     sb[0x70..0x78].copy_from_slice(&new_total_bytes.to_le_bytes());
@@ -1176,8 +1264,77 @@ pub fn resize_btrfs_in_place(
     file.seek(SeekFrom::Start(sb_pos))?;
     file.write_all(&sb)?;
 
+    // The mirrors (64 MiB, 256 GiB) that already exist carry the same fields.
+    for mirror in [0x400_0000u64, 0x40_0000_0000] {
+        if mirror + 4096 > current_total {
+            continue;
+        }
+        let at = partition_offset + mirror;
+        let mut m = [0u8; 4096];
+        file.seek(SeekFrom::Start(at))?;
+        file.read_exact(&mut m)?;
+        if &m[0x40..0x48] != BTRFS_MAGIC {
+            continue;
+        }
+        m[0x70..0x78].copy_from_slice(&new_total_bytes.to_le_bytes());
+        m[0xD1..0xD9].copy_from_slice(&new_total_bytes.to_le_bytes());
+        let crc = crc32c::crc32c(&m[0x20..]);
+        m[0x00..0x04].copy_from_slice(&crc.to_le_bytes());
+        file.seek(SeekFrom::Start(at))?;
+        file.write_all(&m)?;
+    }
+
     log_cb("btrfs resize: superblock updated successfully");
     Ok(())
+}
+
+/// Set the chunk tree's DEV_ITEM total_bytes for the superblock's device and re-checksum its leaf.
+fn patch_dev_item(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    sb: &[u8; 4096],
+    new_total_bytes: u64,
+) -> anyhow::Result<bool> {
+    let devid = le64(sb, 0xC9);
+    let (loc, node_size) = {
+        let mut reader = &mut *file;
+        let info = parse_btrfs_superblock(&mut reader, partition_offset)?;
+        let mut fs = BtrfsFilesystem {
+            reader,
+            partition_offset,
+            node_size: info.node_size,
+            total_bytes: info.total_bytes,
+            bytes_used: info.bytes_used,
+            label: info.label,
+            chunk_map: info.chunk_map,
+            root_tree_root: info.root_tree_root,
+            fs_tree_root: 0,
+        };
+        fs.read_chunk_tree(info.chunk_root)?;
+        let key = BtrfsKey {
+            objectid: 1,   // BTRFS_DEV_ITEMS_OBJECTID
+            key_type: 216, // BTRFS_DEV_ITEM_KEY
+            offset: devid,
+        };
+        let Some(loc) = fs.locate_item(info.chunk_root, &key)? else {
+            return Ok(false);
+        };
+        (loc, info.node_size as usize)
+    };
+    let (phys, item) = loc;
+    let at = partition_offset + phys;
+    let mut node = vec![0u8; node_size];
+    file.seek(SeekFrom::Start(at))?;
+    file.read_exact(&mut node)?;
+    if item + 16 > node.len() {
+        anyhow::bail!("btrfs resize: DEV_ITEM runs off its leaf");
+    }
+    node[item + 8..item + 16].copy_from_slice(&new_total_bytes.to_le_bytes());
+    let crc = crc32c::crc32c(&node[0x20..]);
+    node[0x00..0x04].copy_from_slice(&crc.to_le_bytes());
+    file.seek(SeekFrom::Start(at))?;
+    file.write_all(&node)?;
+    Ok(true)
 }
 
 /// Validate btrfs superblock integrity. Returns a list of warnings (empty = OK).

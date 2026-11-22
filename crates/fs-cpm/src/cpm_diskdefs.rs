@@ -51,8 +51,7 @@ pub struct Dpb {
     /// images; some 3.0 disks have a non-128 phys sector layout that
     /// CP/M maps down to 128-B records via `psh`/`phm`).
     pub sector_size: u16,
-    /// Number of tracks on the disk. Some presets cap this at 80; the
-    /// FS uses it for sanity bounds-checking only.
+    /// Tracks on the disk, for display; 0 where a preset spans several. Nothing checks against it.
     pub tracks: u16,
 }
 

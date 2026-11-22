@@ -57,9 +57,9 @@
 //!
 //! ```text
 //!   0x00..0x04  file length (u32 BE)
-//!   0x04..0x06  access keys / lock flags (u16)
-//!   0x06..0x08  file type (0=data, 1=exec, 2=reloc, 3=device, ...)
-//!   0x08..0x0E  data area (6 bytes, file-type-specific)
+//!   0x04        access byte
+//!   0x05        file type (0=data, 1=exec, 2=reloc, 3=device, 0xFF=directory)
+//!   0x06..0x0E  dataspace and extra info (file-type-specific)
 //!   0x0E..0x10  name length (u16 BE)
 //!   0x10..0x34  name (36 bytes ASCII, truncated to name length)
 //!   0x34..0x38  date last modified (u32 — QDOS epoch 1961-01-01)
@@ -105,7 +105,6 @@ use disk_core::filesystem::{
 pub const QXLWIN_SIGNATURE: &[u8; 4] = b"QLWA";
 
 const HEADER_BYTES: usize = 64;
-const FAT_END_LO: u16 = 0xFFF8;
 const DIR_ENTRY_SIZE: usize = 64;
 /// Per-file QDOS header, 64 bytes, mirroring the directory entry layout.
 /// Sits at byte 0 of every regular file's cluster chain; user data starts
@@ -227,8 +226,9 @@ pub fn parse_dir_entry(buf: &[u8; DIR_ENTRY_SIZE]) -> Option<QdosDirEntry> {
         return None;
     }
     let file_length = BigEndian::read_u32(&buf[0x00..0x04]);
-    let access_keys = BigEndian::read_u16(&buf[0x04..0x06]);
-    let file_type = BigEndian::read_u16(&buf[0x06..0x08]);
+    // Access at 0x04 and type at 0x05, one byte each; 0x06..0x0A is the dataspace (B8-007).
+    let access_keys = u16::from(buf[0x04]);
+    let file_type = u16::from(buf[0x05]);
     // First cluster of file at offset 0x3A (sQLux QWDE_FNUM).
     let first_block = BigEndian::read_u16(&buf[0x3A..0x3C]);
     let update_date = BigEndian::read_u32(&buf[0x34..0x38]);
@@ -297,7 +297,8 @@ impl<R: Read + Seek + Send> QdosFilesystem<R> {
         let mut visited = std::collections::HashSet::new();
         let mut block = first;
         for _ in 0..MAX_CHAIN_HOPS {
-            if block == 0 || block >= FAT_END_LO {
+            // Chains end at 0; any cluster up to cc - 1 is a valid link.
+            if block == 0 || block >= self.header.cc {
                 break;
             }
             if !visited.insert(block) {
@@ -318,7 +319,7 @@ impl<R: Read + Seek + Send> QdosFilesystem<R> {
         first_cluster: u16,
         len: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let mut buf = Vec::with_capacity(len);
+        let mut buf = Vec::with_capacity(len.min(1 << 20));
         self.copy_chain_bytes(first_cluster, 0, len as u64, &mut buf)?;
         Ok(buf)
     }
@@ -398,6 +399,7 @@ impl<R: Read + Seek + Send> Filesystem for QdosFilesystem<R> {
                 1 => fe.special_type = Some("Exec".into()),
                 2 => fe.special_type = Some("Reloc".into()),
                 3 => fe.special_type = Some("Dev".into()),
+                0xFF => fe.special_type = Some("Dir".into()),
                 _ => {}
             }
             fe.modified_unix = disk_core::times::qdos_date_to_unix(de.update_date);
@@ -416,7 +418,7 @@ impl<R: Read + Seek + Send> Filesystem for QdosFilesystem<R> {
         // matching sQLux semantics. `entry.size` was already adjusted in
         // `list_directory` to the user-visible length.
         let want = (entry.size as usize).min(max_bytes);
-        let mut out = Vec::with_capacity(want);
+        let mut out = Vec::with_capacity(want.min(1 << 20));
         self.copy_chain_bytes(
             entry.location as u16,
             FILE_HEADER_BYTES as u64,
@@ -711,7 +713,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
     ) -> Result<FileEntry, FilesystemError> {
         if parent.path != "/" {
             return Err(FilesystemError::Unsupported(
-                "QDOS subdir writes deferred — only root supported".into(),
+                "QDOS subdir writes deferred - only root supported".into(),
             ));
         }
         validate_qdos_name(name)?;
@@ -777,7 +779,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
         let slot_off = self.dir_slot_byte_offset(slot_index)?;
         let mut entry = [0u8; DIR_ENTRY_SIZE];
         BigEndian::write_u32(&mut entry[0x00..0x04], on_disk_len as u32);
-        // access_keys (0x04..0x06), file_type (0x06..0x08): leave 0 (data).
+        // access (0x04), file type (0x05) and dataspace (0x06..): leave 0 (data).
         BigEndian::write_u16(&mut entry[0x0E..0x10], name.len() as u16);
         entry[0x10..0x10 + name.len()].copy_from_slice(name.as_bytes());
         BigEndian::write_u32(&mut entry[0x34..0x38], qdos_date);
@@ -806,7 +808,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "QDOS subdir creation deferred — needs subdir-cluster semantics".into(),
+            "QDOS subdir creation deferred - needs subdir-cluster semantics".into(),
         ))
     }
 
@@ -815,6 +817,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
+        if entry.special_type.as_deref() == Some("Dir") {
+            // Freeing a directory's chain would orphan everything inside it.
+            return Err(FilesystemError::Unsupported(
+                "deleting a QDOS level-2 directory is not supported".into(),
+            ));
+        }
         if parent.path != "/" {
             return Err(FilesystemError::Unsupported(
                 "QDOS subdir deletion deferred".into(),
@@ -844,7 +852,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
     ) -> Result<(), FilesystemError> {
         if parent.path != "/" {
             return Err(FilesystemError::Unsupported(
-                "QDOS subdir rename deferred — only root supported".into(),
+                "QDOS subdir rename deferred - only root supported".into(),
             ));
         }
         if new_name == entry.name {
@@ -1003,19 +1011,16 @@ pub fn resize_qdos_in_place(
     let mut cur = old_ffc;
     while cur != 0 && cur < old_cc {
         if !seen.insert(cur) {
-            log_cb("QDOS: refusing resize — cycle detected in free chain");
+            log_cb("QDOS: refusing resize - cycle detected in free chain");
             return Ok(false);
         }
         free_chain.push(cur);
         cur = fat_lookup(&fat, cur);
-        if cur >= FAT_END_LO {
-            break;
-        }
     }
 
     if (free_chain.len() as u16) != old_fc {
         log_cb(&format!(
-            "QDOS: warning — free-chain walk found {} clusters but header.fc = {}; using walked count",
+            "QDOS: warning - free-chain walk found {} clusters but header.fc = {}; using walked count",
             free_chain.len(),
             old_fc,
         ));
@@ -1033,7 +1038,7 @@ pub fn resize_qdos_in_place(
         for k in lo..hi {
             if !free_set.contains(&k) {
                 log_cb(&format!(
-                    "QDOS: refusing grow from {} to {} clusters — cluster {} would be \
+                    "QDOS: refusing grow from {} to {} clusters - cluster {} would be \
                      absorbed into the FAT region but is currently allocated",
                     old_cc, new_cc, k
                 ));
@@ -1074,7 +1079,7 @@ pub fn resize_qdos_in_place(
         for c in new_cc..old_cc {
             if !free_set.contains(&c) {
                 log_cb(&format!(
-                    "QDOS: refusing shrink from {} to {} clusters — cluster {} \
+                    "QDOS: refusing shrink from {} to {} clusters - cluster {} \
                      is allocated (not on the free chain) and would be discarded",
                     old_cc, new_cc, c
                 ));
@@ -1383,7 +1388,7 @@ mod tests {
 
         assert_eq!(
             fs.header.rlen, rlen_before,
-            "dir should not have grown — slot 1 was reused"
+            "dir should not have grown - slot 1 was reused"
         );
         let post = fs.list_directory(&root).unwrap();
         assert_eq!(post.len(), 1);

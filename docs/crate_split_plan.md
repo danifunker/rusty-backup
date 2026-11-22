@@ -33,7 +33,7 @@ All names were checked against crates.io on 2026-10-30 and are free. `fs-core` w
 | `fs-apple2` | `apple-dos`, `prodos`, `ucsd` | |
 | `fs-pc` | `fat`, `exfat`, `ntfs`, `hpfs`, `human68k` | |
 | `fs-unix` | `ext`, `ufs`, `efs`, `jfs`, `btrfs`, `reiserfs`, `vxfs`, `minix`, `bfs` (BeOS), `sun2tape` (+ `tar_section`) | |
-| `fs-xfs` | XFS read, fsck, repair (**GPL-2.0**, §6) | split out so `fs-unix` stays MIT |
+| `fs-xfs` | XFS read, edit, fsck, repair (**MIT** since 0.2.0; GPL-2.0-only through 0.1.x, §6) | split out so `fs-unix` stays MIT |
 | `fs-amiga` | `affs` (AFFS/OFS), `pfs3`, `sfs` | |
 | `fs-squashfs` | read / write / edit / verify; `appimage` (find the SquashFS in an AppImage), `iso` (find it inside a live-CD ISO) | |
 | `fs-cpm` | CP/M + disk-definition catalog | |
@@ -46,7 +46,14 @@ All names were checked against crates.io on 2026-10-30 and are free. `fs-core` w
 | Crate | Contents |
 |---|---|
 | `fs-tar` | export any `disk-core` filesystem (or a folder in it) to `.tar` / `.tar.gz` / `.tar.zst`, and import a tar into any editable filesystem. Handles permissions, symlinks, times and case-insensitive filesystems. Builds on the `tar` crate. |
+| `rb-fsimporter` | import a host folder into any editable `disk-core` filesystem (the mirror of `rb-fsexporter`): tar / zip expansion, progress and cancel through a `Host`, Mac archives and disk images through a caller's `Expander`; `mac` feature for forks (MIT, `fs-mac` `codecs` only, off by default). Moved from `src/fs/dir_import.rs` 2026-11-21 |
 | `rb-fsexporter` | export any `disk-core` filesystem (a file, a folder, a whole volume) to a host folder: Mac forks in every `fs-mac` mode, symlinks (a text file where the host refuses one), existing-file / error / case-collision policies, POSIX modes, progress and cancel through a `Host` trait. Depends on `disk-core` and `fs-mac` only. Added in Phase 2 slice 19 (docs/phase2_commander_plan.md). |
+
+### Disk builders (1)
+
+| Crate | Contents |
+|---|---|
+| `sgi-disk` | SGI / IRIX disks: build a volume header + EFS, XFS (feature `xfs`) or label-only root, data-only or root-plus-swap, 16 x 63 geometry by default; open an SGI partition as a `disk-core` filesystem over any reader. Moved from `src/partition/sgi_hdd_builder.rs` 2026-11-21 (the first HDD builder to leave the app: part-tables cannot depend on fs-unix, and IRIS needs it MIT) |
 
 ### Partition tables (1)
 
@@ -228,7 +235,7 @@ The crates already kept separately stay separate: `libchdman-rs` / `opticaldiscs
      - **`lif` moved (2026-10-31)** into `fs-8bit` (feature `lif`). The replace test moved to the app's shim and now checks through the public `parse_lif` plus a new `LifFilesystem::into_inner`. The 8-line header probe is duplicated with `part_tables::lif` on purpose, so neither crate depends on the other.
      - **`adfs` moved (2026-10-31)** into its own crate, `fs-adfs`, licensed GPL-2.0-only (D2: its new-map walk follows Linux's `fs/adfs/map.c`).
 3. **`fs-amiga`, `fs-unix`, `fs-xfs`, `fs-squashfs`, `fs-pc`, `fs-mac`, `fs-apfs`.** The big ones. The license-audit items get their handling here.
-   - **`fs-amiga` done (2026-10-30).** `affs` / `affs_fsck`, `pfs3` / `pfs3_fsck` / `pfs3_clone` and `sfs` / `sfs_fsck` moved as-is, one feature each (`affs_common` always builds). Licence `MIT AND BSD-4-Clause` (D3), with pfs3aio's licence and the SFS / ADFlib provenance in `THIRD_PARTY_NOTICES.md`. The audit's comment fixes for `affs_common`, `sfs.rs` (the misattribution) and `sfs_fsck`'s header went in with the move.
+   - **`fs-amiga` done (2026-10-30).** `affs` / `affs_fsck`, `pfs3` / `pfs3_fsck` / `pfs3_clone` and `sfs` / `sfs_fsck` moved as-is, one feature each (`affs_common` always builds). Licence `MIT AND BSD-4-Clause` (D3), with pfs3aio's licence and the SFS / ADFlib provenance in `THIRD_PARTY_NOTICES.md`. **0.2.0 (2026-11-21): MIT**; the pfs3aio notice is dropped after a side-by-side check found nothing translated (`docs/license_audit.md`). The audit's comment fixes for `affs_common`, `sfs.rs` (the misattribution) and `sfs_fsck`'s header went in with the move.
      - `disk-core` gained `name_legalize` and `stream_pipe` (both moved as-is). The one `name_legalize` test that runs real FAT / HFS / ProDOS / MFS validators stays in the app's shim file.
      - These additions are backwards compatible, so `disk-core` can go out as 0.1.1 if `fs-amiga` publishes before 0.2.
    - **`fs-unix` done (2026-10-30)**, MIT: `ext`, `ufs`, `efs` (incl. EFS v1 and both resizers), `jfs` (incl. AIX JFS1), `btrfs`, `reiserfs`, `vxfs`, `minix`, `bfs`, one feature each. The partimage comparison came back FACTS for `jfs` / `reiserfs` / `ufs` (license_audit.md), and their comments were corrected.
@@ -244,7 +251,7 @@ The crates already kept separately stay separate: `libchdman-rs` / `opticaldiscs
      - The `exfat_clone` test's dispatcher assertion (`detect_defrag_clone_shape`) became its own app-side test on the exFAT fixture.
    - **`fs-hpfs` done (2026-10-31)**, GPL-2.0-only (D2): `hpfs` moved whole, since the derived dnode editing and the read side share one file.
    - **`fs-apfs` done (2026-10-31)**, MIT: `apfs` and `apfs_crypto`. FileVault sits behind the crate's `crypto` feature, which the app's `crypto` forwards; the 1.73 manifests take the crate without it, as before. Two `VolumeInfo` / `NxSuperblock` fields that only the unlock path reads got a `cfg_attr(not(feature = "crypto"), allow(dead_code))`.
-   - **`fs-mac-unicode` done (2026-10-31)**, GPL-2.0-only (D2): `hfs_unicode` whole, plus `HFS_CHARORDER`, `compare_hfs_keys`, `fold_hfsplus_name_for_compare` and `compare_hfsplus_keys` (with their tests) carved out of `hfs_common` into `collate`; `hfs_common` re-exports the two comparisons.
+   - **`fs-mac-unicode` done (2026-10-31)**, GPL-2.0-only (D2): `hfs_unicode` whole, plus `HFS_CHARORDER`, `compare_hfs_keys`, `fold_hfsplus_name_for_compare` and `compare_hfsplus_keys` (with their tests) carved out of `hfs_common` into `collate`; `hfs_common` re-exports the two comparisons. **0.2.0 (2026-11-21): MIT**, tables regenerated from TN1150, Unicode 3.2 and Apple's `RelString` (see `docs/license_audit.md`).
    - **`fs-mac` done (2026-10-31)**, MIT, with features `hfs`, `mfs`, `hfsplus` and `forks`. It covers `mfs`, `hfs`, `hfs_fsck/`, `hfs_common`, `hfs_boot`, `hfs_clone`, `hfv`, `mac_alias`, all six `hfsplus*` modules, `resource_fork`, `binhex` and `fork_export`; `assets/hfs_file_types.json` moved into the crate (the GUI includes it from there).
      - C3: `hfs_clone::emit_apm_disk_with_hfs` (and its APM tests) and `hfs_boot::read_donor_boot_blocks_from_image` / `is_classic_hfs_partition` stay in the app's shim files.
      - `resolve_apple_hfs` moved from `fs/mod.rs` into `hfsplus` (re-exported). The four `can_defrag_clone_hfsplus` tests moved to the app shim, on `create_blank_hfsplus`, and `hfv`'s `PartitionTable` check became its own app test.

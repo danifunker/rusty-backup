@@ -30,8 +30,8 @@
 //! and leave it for a later slice.
 //!
 //! v4 only: a v5 inode core carries a CRC we don't recompute, so rewriting one
-//! would invalidate it (silent skip, not a failure). Porting reference:
-//! `xfs_repair` @ v3.1.11 `repair/dinode.c`.
+//! would invalidate it (silent skip, not a failure). Behavioural reference,
+//! validated against `xfs_repair -n` (its phase 4 inode checks).
 
 use std::io::{Read, Seek, SeekFrom, Write};
 

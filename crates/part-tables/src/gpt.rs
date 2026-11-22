@@ -156,7 +156,10 @@ impl GptPartitionEntry {
         if self.is_empty() {
             return 0;
         }
-        (self.last_lba - self.first_lba + 1) * SECTOR_SIZE
+        // A corrupt entry with last < first is empty, not a panic.
+        self.last_lba
+            .checked_sub(self.first_lba)
+            .map_or(0, |n| (n + 1).saturating_mul(SECTOR_SIZE))
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -246,12 +249,13 @@ impl Gpt {
     /// Build 33 sectors for the primary GPT (header at LBA 1, entries at LBAs 2-33).
     /// Returns 33 * 512 = 16896 bytes.
     pub fn build_primary_gpt(&self, target_disk_sectors: u64) -> Vec<u8> {
-        let last_lba = target_disk_sectors - 1;
+        let array_sectors = self.array_sectors();
+        let last_lba = target_disk_sectors.saturating_sub(1);
         let mut header = self.header.clone();
         header.my_lba = 1;
         header.alternate_lba = last_lba;
-        header.first_usable_lba = 34;
-        header.last_usable_lba = last_lba - 33;
+        header.first_usable_lba = 2 + array_sectors;
+        header.last_usable_lba = last_lba.saturating_sub(array_sectors + 1);
         header.partition_entry_lba = 2;
 
         // Compute partition array CRC32
@@ -264,25 +268,31 @@ impl Gpt {
         header.header_crc32 = Self::compute_header_crc32(&hdr_bytes);
         hdr_bytes = header.serialize_to_bytes();
 
-        let mut result = vec![0u8; 33 * 512];
-        // Header at sector 0 of this block (LBA 1 on disk)
+        let mut result = vec![0u8; (1 + array_sectors as usize) * 512];
+        // Header at sector 0 of this block (LBA 1 on disk), the whole array after it.
         result[..92].copy_from_slice(&hdr_bytes);
-        // Entries at sectors 1-32 of this block (LBAs 2-33 on disk)
-        let entries_len = array.len().min(32 * 512);
-        result[512..512 + entries_len].copy_from_slice(&array[..entries_len]);
+        result[512..512 + array.len()].copy_from_slice(&array);
         result
+    }
+
+    /// Sectors the entry array occupies on disk: at least the 32 the spec reserves.
+    pub fn array_sectors(&self) -> u64 {
+        let bytes =
+            self.header.num_partition_entries as u64 * self.header.partition_entry_size as u64;
+        bytes.div_ceil(SECTOR_SIZE).max(32)
     }
 
     /// Build 33 sectors for the backup GPT (entries followed by header at last LBA).
     /// Returns 33 * 512 = 16896 bytes.
     pub fn build_backup_gpt(&self, target_disk_sectors: u64) -> Vec<u8> {
-        let last_lba = target_disk_sectors - 1;
+        let array_sectors = self.array_sectors();
+        let last_lba = target_disk_sectors.saturating_sub(1);
         let mut header = self.header.clone();
         header.my_lba = last_lba;
         header.alternate_lba = 1;
-        header.first_usable_lba = 34;
-        header.last_usable_lba = last_lba - 33;
-        header.partition_entry_lba = last_lba - 32;
+        header.first_usable_lba = 2 + array_sectors;
+        header.last_usable_lba = last_lba.saturating_sub(array_sectors + 1);
+        header.partition_entry_lba = last_lba.saturating_sub(array_sectors);
 
         // Compute partition array CRC32
         let array = self.serialize_partition_array();
@@ -294,12 +304,11 @@ impl Gpt {
         header.header_crc32 = Self::compute_header_crc32(&hdr_bytes);
         hdr_bytes = header.serialize_to_bytes();
 
-        let mut result = vec![0u8; 33 * 512];
-        // Entries at sectors 0-31 (LBAs last-32 .. last-1)
-        let entries_len = array.len().min(32 * 512);
-        result[..entries_len].copy_from_slice(&array[..entries_len]);
-        // Header at sector 32 (last LBA)
-        result[32 * 512..32 * 512 + 92].copy_from_slice(&hdr_bytes);
+        // The array, then the header in the disk's last sector; write it so it ends there.
+        let header_at = array_sectors as usize * 512;
+        let mut result = vec![0u8; header_at + 512];
+        result[..array.len()].copy_from_slice(&array);
+        result[header_at..header_at + 92].copy_from_slice(&hdr_bytes);
         result
     }
 
@@ -336,10 +345,11 @@ impl Gpt {
         target_disk_sectors: u64,
     ) -> Gpt {
         let mut patched = self.clone();
-        let last_lba = target_disk_sectors - 1;
+        let last_lba = target_disk_sectors.saturating_sub(1);
+        let array_sectors = self.array_sectors();
 
-        patched.header.first_usable_lba = 34;
-        patched.header.last_usable_lba = last_lba - 33;
+        patched.header.first_usable_lba = 2 + array_sectors;
+        patched.header.last_usable_lba = last_lba.saturating_sub(array_sectors + 1);
         patched.header.alternate_lba = last_lba;
 
         for entry in &mut patched.entries {
@@ -348,7 +358,7 @@ impl Gpt {
                 let new_start = ov.effective_start_lba();
                 let new_sectors = ov.export_size / SECTOR_SIZE;
                 entry.first_lba = new_start;
-                entry.last_lba = new_start + new_sectors - 1;
+                entry.last_lba = new_start + new_sectors.max(1) - 1;
             }
         }
 
@@ -361,15 +371,54 @@ impl Gpt {
     /// **Note:** On macOS raw devices (`/dev/rdiskN`), reads must be
     /// sector-aligned. Wrap the reader in a `BufReader` before calling.
     pub fn parse(reader: &mut (impl Read + Seek)) -> Result<Self, PartitionError> {
-        // Seek to LBA 1 (byte offset 512)
+        let primary = Self::parse_at(reader, GPT_HEADER_LBA);
+        if let Ok((gpt, true)) = &primary {
+            return Ok(gpt.clone());
+        }
+        // A damaged primary: the backup at the disk's end is the copy the spec says to trust next.
+        let alternate = match &primary {
+            Ok((gpt, _)) if gpt.header.alternate_lba > GPT_HEADER_LBA => {
+                Some(gpt.header.alternate_lba)
+            }
+            _ => reader
+                .seek(SeekFrom::End(0))
+                .ok()
+                .and_then(|end| (end / SECTOR_SIZE).checked_sub(1)),
+        };
+        if let Some(lba) = alternate.filter(|&l| l > GPT_HEADER_LBA) {
+            if let Ok((gpt, true)) = Self::parse_at(reader, lba) {
+                return Ok(gpt);
+            }
+        }
+        // Neither copy checks out: keep the primary as read, as this always did.
+        primary.map(|(gpt, _)| gpt)
+    }
+
+    /// The GPT whose header is at `lba`, and whether both of its CRCs match.
+    fn parse_at(reader: &mut (impl Read + Seek), lba: u64) -> Result<(Self, bool), PartitionError> {
         reader
-            .seek(SeekFrom::Start(GPT_HEADER_LBA * SECTOR_SIZE))
+            .seek(SeekFrom::Start(lba * SECTOR_SIZE))
             .map_err(|e| PartitionError::InvalidGpt(format!("cannot seek to GPT header: {e}")))?;
+        let mut sector = [0u8; 512];
+        reader
+            .read_exact(&mut sector)
+            .map_err(|e| PartitionError::InvalidGpt(format!("cannot read GPT header: {e}")))?;
+        let header = Self::parse_header(&mut &sector[..])?;
+        let header_ok = Self::header_crc_matches(&sector, &header);
+        let (entries, array_crc) = Self::parse_entries(reader, &header)?;
+        let ok = header_ok && array_crc == header.partition_array_crc32;
+        Ok((Self { header, entries }, ok))
+    }
 
-        let header = Self::parse_header(reader)?;
-        let entries = Self::parse_entries(reader, &header)?;
-
-        Ok(Self { header, entries })
+    /// CRC32 over the first `header_size` bytes with the CRC field zeroed, as the spec defines it.
+    fn header_crc_matches(sector: &[u8; 512], header: &GptHeader) -> bool {
+        let size = header.header_size as usize;
+        if !(92..=512).contains(&size) {
+            return false;
+        }
+        let mut buf = sector[..size].to_vec();
+        buf[16..20].fill(0);
+        crc32fast::hash(&buf) == header.header_crc32
     }
 
     fn parse_header(reader: &mut impl Read) -> Result<GptHeader, PartitionError> {
@@ -420,7 +469,7 @@ impl Gpt {
     fn parse_entries(
         reader: &mut (impl Read + Seek),
         header: &GptHeader,
-    ) -> Result<Vec<GptPartitionEntry>, PartitionError> {
+    ) -> Result<(Vec<GptPartitionEntry>, u32), PartitionError> {
         reader
             .seek(SeekFrom::Start(header.partition_entry_lba * SECTOR_SIZE))
             .map_err(|e| {
@@ -435,14 +484,22 @@ impl Gpt {
                 header.num_partition_entries
             )));
         }
-        let mut entries = Vec::new();
+        // The spec allows 128 * 2^n; anything else (or a huge value from a corrupt header) is refused.
         let entry_size = header.partition_entry_size as usize;
+        if !(128..=4096).contains(&entry_size) || !entry_size.is_power_of_two() {
+            return Err(PartitionError::InvalidGpt(format!(
+                "implausible partition entry size {entry_size}"
+            )));
+        }
+        let mut entries = Vec::new();
         let mut entry_buf = vec![0u8; entry_size];
+        let mut crc = crc32fast::Hasher::new();
 
         for _ in 0..header.num_partition_entries {
             reader.read_exact(&mut entry_buf).map_err(|e| {
                 PartitionError::InvalidGpt(format!("cannot read partition entry: {e}"))
             })?;
+            crc.update(&entry_buf);
 
             let entry = Self::parse_one_entry(&entry_buf)?;
             if !entry.is_empty() {
@@ -450,7 +507,7 @@ impl Gpt {
             }
         }
 
-        Ok(entries)
+        Ok((entries, crc.finalize()))
     }
 
     fn parse_one_entry(data: &[u8]) -> Result<GptPartitionEntry, PartitionError> {
@@ -947,5 +1004,91 @@ mod tests {
         assert_eq!(parsed.entries[0].last_lba, disk_sectors - 34);
         assert_eq!(parsed.entries[0].name, "Test");
         assert_eq!(parsed.entries[0].type_guid, type_guid);
+    }
+
+    /// A whole disk image of `sectors` with `gpt` written as restore writes it.
+    fn disk_with(gpt: &Gpt, sectors: u64) -> Vec<u8> {
+        let mut disk = vec![0u8; (sectors * 512) as usize];
+        disk[..512].copy_from_slice(&Gpt::build_protective_mbr(sectors));
+        let primary = gpt.build_primary_gpt(sectors);
+        disk[512..512 + primary.len()].copy_from_slice(&primary);
+        let backup = gpt.build_backup_gpt(sectors);
+        let at = disk.len() - backup.len();
+        disk[at..].copy_from_slice(&backup);
+        disk
+    }
+
+    fn two_partitions() -> Gpt {
+        build_minimal_gpt(
+            &[
+                (linux_fs_guid(), 2048, 4095, "one".into()),
+                (ms_basic_data_guid(), 4096, 8191, "two".into()),
+            ],
+            16384 * 512,
+        )
+    }
+
+    /// PT-004: a primary GPT with a bad CRC gives way to an intact backup.
+    #[test]
+    fn a_corrupt_primary_falls_back_to_the_backup() {
+        let gpt = two_partitions();
+        let mut disk = disk_with(&gpt, 16384);
+        disk[512 + 40] ^= 0xFF; // first_usable_lba, inside the CRC'd header
+        let got = Gpt::parse(&mut std::io::Cursor::new(&disk)).unwrap();
+        assert_eq!(got.header.my_lba, 16383, "read from the backup header");
+        assert_eq!(got.entries.len(), 2);
+        assert_eq!(got.entries[1].first_lba, 4096);
+        // An entry-array CRC mismatch falls back the same way.
+        let mut disk = disk_with(&gpt, 16384);
+        disk[1024 + 32] ^= 0x01;
+        let got = Gpt::parse(&mut std::io::Cursor::new(&disk)).unwrap();
+        assert_eq!(got.entries[0].first_lba, 2048);
+    }
+
+    /// With no usable backup, a primary that fails its CRC is still read, as before.
+    #[test]
+    fn a_corrupt_primary_without_a_backup_is_still_read() {
+        let gpt = two_partitions();
+        let mut disk = disk_with(&gpt, 16384);
+        disk[512 + 40] ^= 0xFF;
+        let end = disk.len();
+        disk[end - 512..].fill(0);
+        let got = Gpt::parse(&mut std::io::Cursor::new(&disk)).unwrap();
+        assert_eq!(got.header.my_lba, 1);
+        assert_eq!(got.entries.len(), 2);
+    }
+
+    /// PT-002: an entry array past 32 sectors is written whole, and the GPT reads back clean.
+    #[test]
+    fn a_large_entry_array_is_written_whole() {
+        let mut gpt = two_partitions();
+        gpt.header.num_partition_entries = 256;
+        assert_eq!(gpt.array_sectors(), 64);
+        let primary = gpt.build_primary_gpt(16384);
+        assert_eq!(primary.len(), 65 * 512);
+        let disk = disk_with(&gpt, 16384);
+        let (back, ok) = Gpt::parse_at(&mut std::io::Cursor::new(&disk), 1).unwrap();
+        assert!(ok, "both CRCs match");
+        assert_eq!(back.header.first_usable_lba, 66);
+        let (_, ok) = Gpt::parse_at(&mut std::io::Cursor::new(&disk), 16383).unwrap();
+        assert!(ok, "the backup checks out too");
+    }
+
+    /// PT-003: a corrupt entry size is refused before it sizes a buffer.
+    #[test]
+    fn an_implausible_entry_size_is_refused() {
+        let mut gpt = two_partitions();
+        gpt.header.partition_entry_size = 0xFFFF_FF00;
+        let mut disk = vec![0u8; 4096];
+        disk[512..604].copy_from_slice(&gpt.header.serialize_to_bytes());
+        assert!(Gpt::parse(&mut std::io::Cursor::new(&disk)).is_err());
+    }
+
+    /// PT-008: a corrupt entry with last < first reports no size rather than panicking.
+    #[test]
+    fn an_inverted_entry_has_no_size() {
+        let mut e = two_partitions().entries[0].clone();
+        e.last_lba = e.first_lba - 1;
+        assert_eq!(e.size_bytes(), 0);
     }
 }

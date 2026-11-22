@@ -56,8 +56,12 @@ pub fn decompress(chunk: &[u8], max_out: usize) -> Result<Vec<u8>> {
     let litlen = read_tree(&mut br, LITLEN_SYMBOLS, 0)?;
     let dist = read_tree(&mut br, DIST_SYMBOLS, 0)?;
 
-    let mut out = Vec::with_capacity(want);
+    // The header's size is only a claim: don't reserve it, and stop if the input runs out.
+    let mut out = Vec::with_capacity(want.min(1 << 24));
     while out.len() < want {
+        if br.exhausted() {
+            bail!("ShrinkWrap: the stream ends before its {want} bytes");
+        }
         let sym = walk(&mut br, litlen.as_slice(), LITLEN_SYMBOLS)?;
         if sym < 256 {
             out.push(sym as u8);

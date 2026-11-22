@@ -3,6 +3,11 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.4.0
+
+### Changed
+- Built on `disk-core` 0.3 instead of 0.2.
+
 ## 0.3.4
 
 ### Fixed

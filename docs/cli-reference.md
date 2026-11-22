@@ -464,6 +464,7 @@ Usage: build [OPTIONS] <TARGET>
 - `--scsi` — `--preset x68k`: write the SCSI form (1024-byte sectors) rather than SASI
 - `--x68k-partitions` — `--preset x68k`: how many Human68k partitions, 1 to 8
 - `--system-disk` — `--preset x68k`: a Human68k system floppy cloned into partition 1
+- `--sgi-label-only` — `--preset sgi-efs`: write the SGI volume header and partition table only, no EFS
 - `--label` — With no `--table`: the volume label (a volume's, or a `--preset`'s)
 - `--geometry` — With no `--table`: the fixed geometry of a floppy format, e.g. `d71` for a 1571 disk (`cbm`), `80` tracks (`dfs`, `rsdos`), `80ds` (`dragondos`). The default is the format's first
 - `--ntfs-version` — The on-disk version of every NTFS volume or partition this builds: `1.2` (alias `nt4`) for Windows NT 3.5 / 3.51 / 4.0, `3.1` (alias `xp`, the default)
@@ -621,7 +622,7 @@ Usage: convert [OPTIONS] <IN> <OUT>
 
 **Options**
 
-- `--format` — Output format, for every kind that offers it: raw, vhd, vhd-dynamic, qcow2, vmdk-flat, vmdk-sparse, 2mg, chd (hard disks); raw, 2mg, woz, moof, dc42, xdf, hdm, dim, d88 (floppies); chd-cd, chd-dvd, bincue, iso (discs)
+- `--format` — Output format, for every kind that offers it: raw, vhd, vhd-dynamic, qcow2, vmdk-flat, vmdk-sparse, 2mg, chd (hard disks); raw, 2mg, woz, moof, dc42, xdf, hdm, dim, d88 (floppies); chd-cd, chd-dvd, bincue, iso (discs). Default chd. A single floppy-sized file named with a hard-disk format is converted as a hard disk
 - `--floppy-to` — The floppies' format, overriding --format for them
 - `--disc-to` — The discs' format, overriding --format for them
 - `--extension` — Output extension (no leading dot) for the kinds --format sets. Defaults to the format's
@@ -1310,7 +1311,7 @@ Usage: sgi-dklabel [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 ### `new hd sgi-efs`
 
-dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5. Pass `--from-dir` to fill the root filesystem from a host folder in the same step; otherwise it comes out blank for `import` / `put`
+dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a formatted root partition, EFS (mountable by IRIX 5.3-6.5) or, with `--fs xfs`, v5 XFS (which IRIX cannot mount). `--swap` adds a swap slot, `--label-only` writes the volume header alone. Pass `--from-dir` to fill the root from a host folder in the same step; otherwise it comes out blank for `import` / `put`
 
 ```
 Usage: sgi-efs [OPTIONS] <IMAGE>
@@ -1322,7 +1323,7 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 
 **Options**
 
-- `--size` — Disk size (plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes, e.g. `50M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Rounded up to a whole cylinder. Defaults to 50M
+- `--size` — Disk size (bytes or `K`/`M`/`G` suffixes, e.g. `50M`), or `auto` to fit `--from-dir` plus the volume header, `--swap` and filesystem overhead. Rounded up to a whole cylinder. Default 50M
 - `--from-dir` — Populate the root filesystem from this host directory after formatting. The directory's *contents* land at the volume root
 - `--expand-archives` — With `--from-dir`: unpack tar and ZIP archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content, so IRIX `.tardist` files count
 - `--expand-gunzip` — With `--from-dir`: strip the gzip layer off `.gz` files (a `.tgz` lands as `.tar`). With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files
@@ -1332,8 +1333,10 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 - `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too
 - `--exclude-appledouble` — Leave macOS `._*` sidecars out entirely: neither copied as files nor taken as a file's resource fork. For a folder that only has them because it came off a modern Mac
-- `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
-- `--fs` — Root filesystem to format. Only `efs` is supported today
+- `--name` — Volume label (EFS keeps up to 6 bytes, XFS 12; longer is truncated). Defaults to `rusty`
+- `--fs` — Root filesystem: it sets the root partition's type and, unless `--label-only`, is formatted. XFS is written as v5 (CRC), which IRIX itself cannot mount
+- `--label-only` — Write the SGI volume header and partition table only; leave the partitions as they are (unformatted on a new image)
+- `--swap` — Lay the disk out as an IRIX system disk: swap of this size in slot 1, the root after it
 - `--heads` — Heads (tracks per cylinder). Must match the geometry the target drive reports over SCSI: IRIX `fx` rejects the volume header if its geometry disagrees with the drive, which stops the disk from mounting. The IRIS emulator and typical SGI SCSI HDDs report 16 heads; change this only for a drive you know reports otherwise
 - `--sectors` — Sectors per track (512-byte sectors). Like `--heads`, must match the drive's reported geometry or IRIX `fx` rejects the label. Default 63 (the IRIS emulator's value; 16 × 63 = 1008-sector cylinders)
 - `--inodes` — Approximate total inode count for the EFS root. The formatter scales the cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`. When neither is given the density is ~1 inode/4 KiB

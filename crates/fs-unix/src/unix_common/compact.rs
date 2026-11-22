@@ -24,8 +24,72 @@ pub enum CompactSection {
         old_blocks: Vec<u64>,
     },
 
+    /// `count` consecutive source blocks from `first`: a run costs 16 bytes, not 8 per block,
+    /// and is read in large pieces.
+    MappedRun { first: u64, count: u64 },
+
     /// Zero-filled region of the given byte length.
     Zeros(u64),
+}
+
+/// Collects mapped source blocks into sections: runs of `MIN_RUN` or more consecutive blocks
+/// become [`CompactSection::MappedRun`], scattered ones a [`CompactSection::MappedBlocks`] list.
+pub struct MappedBuilder {
+    run: Option<(u64, u64)>,
+    loose: Vec<u64>,
+}
+
+impl MappedBuilder {
+    const MIN_RUN: u64 = 16;
+
+    pub fn new() -> Self {
+        Self {
+            run: None,
+            loose: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, block: u64, out: &mut Vec<CompactSection>) {
+        if let Some((first, count)) = &mut self.run {
+            if *first + *count == block {
+                *count += 1;
+                return;
+            }
+        }
+        self.close_run(out);
+        self.run = Some((block, 1));
+    }
+
+    fn close_run(&mut self, out: &mut Vec<CompactSection>) {
+        if let Some((first, count)) = self.run.take() {
+            if count >= Self::MIN_RUN {
+                if !self.loose.is_empty() {
+                    out.push(CompactSection::MappedBlocks {
+                        old_blocks: std::mem::take(&mut self.loose),
+                    });
+                }
+                out.push(CompactSection::MappedRun { first, count });
+            } else {
+                self.loose.extend(first..first + count);
+            }
+        }
+    }
+
+    /// Emit what is pending; call before a non-mapped section and at the end.
+    pub fn flush(&mut self, out: &mut Vec<CompactSection>) {
+        self.close_run(out);
+        if !self.loose.is_empty() {
+            out.push(CompactSection::MappedBlocks {
+                old_blocks: std::mem::take(&mut self.loose),
+            });
+        }
+    }
+}
+
+impl Default for MappedBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CompactSection {
@@ -36,6 +100,7 @@ impl CompactSection {
             CompactSection::MappedBlocks { old_blocks } => {
                 old_blocks.len() as u64 * block_size as u64
             }
+            CompactSection::MappedRun { count, .. } => count * block_size as u64,
             CompactSection::Zeros(len) => *len,
         }
     }
@@ -139,14 +204,9 @@ impl<R: Read + Seek> CompactStreamReader<R> {
     /// Find which section contains the given virtual position.
     /// Returns `(section_index, offset_within_section)`.
     fn find_section(&self, pos: u64) -> Option<(usize, u64)> {
-        // Linear scan is fine for typical layouts with < 10 sections.
-        // Could switch to binary search if layouts grow large.
-        for (i, span) in self.spans.iter().enumerate() {
-            if pos < span.end {
-                return Some((i, pos - span.start));
-            }
-        }
-        None
+        // Spans are in order; a fragmented layout has thousands, so search, don't scan.
+        let i = self.spans.partition_point(|s| s.end <= pos);
+        self.spans.get(i).map(|span| (i, pos - span.start))
     }
 }
 
@@ -210,6 +270,19 @@ impl<R: Read + Seek> Read for CompactStreamReader<R> {
                     filled += copy_len;
                 }
 
+                CompactSection::MappedRun { first, .. } => {
+                    // The run is contiguous at the source too: one seek and one read.
+                    let copy_len = (to_read - filled).min(remaining_in_section);
+                    let at = self.layout.source_partition_offset
+                        + self.layout.source_data_start
+                        + first * self.layout.block_size as u64
+                        + offset_in_section;
+                    self.source.seek(SeekFrom::Start(at))?;
+                    self.source
+                        .read_exact(&mut buf[filled..filled + copy_len])?;
+                    filled += copy_len;
+                }
+
                 CompactSection::Zeros(_) => {
                     let copy_len = (to_read - filled).min(remaining_in_section);
                     buf[filled..filled + copy_len].fill(0);
@@ -227,6 +300,43 @@ impl<R: Read + Seek> Read for CompactStreamReader<R> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn a_mapped_run_reads_the_same_bytes_as_a_block_list() {
+        // 64 source blocks of 512 bytes, each filled with its own number.
+        let src: Vec<u8> = (0..64u8).flat_map(|b| vec![b; 512]).collect();
+        let layout = |sections| CompactLayout {
+            sections,
+            block_size: 512,
+            source_data_start: 0,
+            source_partition_offset: 0,
+        };
+        let mut sections = Vec::new();
+        let mut b = MappedBuilder::new();
+        for blk in [3u64, 9, 10].into_iter().chain(20..40).chain([50, 51]) {
+            b.push(blk, &mut sections);
+        }
+        b.flush(&mut sections);
+        // 3, 9, 10 stay a list; 20..40 is a run; 50, 51 a list again.
+        assert!(matches!(
+            sections[1],
+            CompactSection::MappedRun {
+                first: 20,
+                count: 20
+            }
+        ));
+        let mut got = Vec::new();
+        CompactStreamReader::new(Cursor::new(src.clone()), layout(sections))
+            .read_to_end(&mut got)
+            .unwrap();
+        let want: Vec<u8> = [3u8, 9, 10]
+            .into_iter()
+            .chain(20..40)
+            .chain([50, 51])
+            .flat_map(|b| src[b as usize * 512..(b as usize + 1) * 512].to_vec())
+            .collect();
+        assert_eq!(got, want);
+    }
 
     #[test]
     fn test_prebuilt_section() {

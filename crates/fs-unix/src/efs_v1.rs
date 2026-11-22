@@ -808,6 +808,22 @@ impl<R: Read + Seek> EfsV1Filesystem<R> {
         &mut self,
         inode: &EfsV1Inode,
     ) -> Result<Vec<(u32, String)>, FilesystemError> {
+        self.read_dir_entries_with(inode, false)
+    }
+
+    /// Every entry, out-of-range inode numbers included, for fsck to report.
+    pub(crate) fn read_dir_entries_all(
+        &mut self,
+        inode: &EfsV1Inode,
+    ) -> Result<Vec<(u32, String)>, FilesystemError> {
+        self.read_dir_entries_with(inode, true)
+    }
+
+    fn read_dir_entries_with(
+        &mut self,
+        inode: &EfsV1Inode,
+        keep_bad: bool,
+    ) -> Result<Vec<(u32, String)>, FilesystemError> {
         let data = self.read_data(inode, EFS_V1_SANE_ALLOC)?;
         let total = self.sb.total_inodes();
         let mut out = Vec::new();
@@ -824,7 +840,7 @@ impl<R: Read + Seek> EfsV1Filesystem<R> {
             }
             // A dirent pointing past the inode table is damage, not a file;
             // the entry is dropped rather than failing the whole listing.
-            if inum >= total {
+            if inum >= total && !keep_bad {
                 log::warn!(
                     "EFS v1 directory inode {} references inode {inum}, past the {total}-inode table",
                     inode.inum
@@ -1143,7 +1159,8 @@ impl<R: Read + Write + Seek> EfsV1Filesystem<R> {
 
     /// Lowest free inode (`di_mode == 0`). Inums 0 and 1 are reserved.
     pub(crate) fn allocate_inode(&mut self) -> Result<u32, FilesystemError> {
-        let total = self.sb.total_inodes();
+        // Directory entries hold a 16-bit inode number: no inode past 65535 can be named (UNX-008).
+        let total = self.sb.total_inodes().min(0x1_0000);
         for inum in 2..total {
             if self.read_inode(inum)?.is_free() {
                 return Ok(inum);
@@ -1684,10 +1701,16 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem
         }
         self.write_inode(&parent_ino)?;
 
-        self.free_inode_extents(&ino, &mut bm)?;
-        self.write_inode(&EfsV1Inode::empty(inum))?;
-
-        self.sb.tinode = self.sb.tinode.saturating_add(1);
+        if !ino.is_dir() && ino.nlink > 1 {
+            // Another name still links the inode: keep it, one link fewer (UNX-001).
+            let mut kept = ino;
+            kept.nlink -= 1;
+            self.write_inode(&kept)?;
+        } else {
+            self.free_inode_extents(&ino, &mut bm)?;
+            self.write_inode(&EfsV1Inode::empty(inum))?;
+            self.sb.tinode = self.sb.tinode.saturating_add(1);
+        }
         self.refresh_tfree(&bm);
         self.write_bitmap(&bm)?;
         self.sync_superblock()?;
@@ -2107,7 +2130,22 @@ fn adopt_orphans<R: Read + Write + Seek + Send>(
 
     let mut adopted = 0usize;
     let mut lf = fs.read_inode(lf_inum)?;
+    // An orphan directory brings its contents back with it; adopt only the outermost.
+    let mut pairs = Vec::with_capacity(orphans.len());
     for &inum in orphans {
+        pairs.push((
+            inum,
+            fs.read_inode(inum).map(|i| i.is_dir()).unwrap_or(false),
+        ));
+    }
+    let roots = crate::unix_common::orphans::orphan_roots(&pairs, |d| match fs.read_inode(d) {
+        Ok(ino) if ino.is_dir() => fs
+            .read_dir_entries(&ino)
+            .map(|v| v.into_iter().map(|(i, _)| i).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    });
+    for inum in roots {
         let name = format!("inode_{inum}");
         if fs.dir_find(&lf, &name)?.is_some() {
             continue;

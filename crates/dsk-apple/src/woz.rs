@@ -14,6 +14,8 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::woz_write::CHUNK_62_524;
+
 use anyhow::{bail, Context, Result};
 
 // ─────────────────────────── WOZ container parsing ──────────────────────────
@@ -62,6 +64,17 @@ fn parse_woz(data: Vec<u8>) -> Result<WozFile> {
 
     if data[4..8] != HIGH_BIT_CHECK {
         bail!("WOZ high-bit verification failed (file may be corrupted or text-mode transferred)");
+    }
+    // A stored CRC of 0 means the writer did not compute one.
+    let stored_crc = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    if stored_crc != 0 {
+        let actual = crc32fast::hash(&data[12..]);
+        if actual != stored_crc {
+            log::warn!(
+                "WOZ CRC32 mismatch (file {stored_crc:08X}, computed {actual:08X}); \
+                 reading on, sector checksums will show what is damaged"
+            );
+        }
     }
 
     // Parse chunks starting at offset 12
@@ -222,9 +235,11 @@ struct BitStream<'a> {
 
 impl<'a> BitStream<'a> {
     fn new(data: &'a [u8], bit_count: u32) -> Self {
+        // A count past the stored bytes only spins over zeros.
+        let stored = (data.len() as u64 * 8).min(u32::MAX as u64) as u32;
         Self {
             data,
-            bit_count,
+            bit_count: bit_count.min(stored),
             pos: 0,
         }
     }
@@ -249,8 +264,8 @@ impl<'a> BitStream<'a> {
     /// Returns None if we can't find a sync byte within a reasonable scan.
     fn next_nibble(&mut self) -> Option<u8> {
         // Read bits until we get a 1 bit (sync), then read 7 more
-        let limit = self.bit_count * 2; // prevent infinite loop
-        let mut scanned = 0u32;
+        let limit = self.bit_count as u64 * 2; // prevent infinite loop
+        let mut scanned = 0u64;
         while scanned < limit {
             if self.next_bit() == 1 {
                 let mut byte = 0x80u8;
@@ -293,8 +308,8 @@ struct AddressField {
 /// Scan for an address field (D5 AA 96 prologue).
 /// Returns the parsed address field or None if not found within the track.
 fn find_address_field(stream: &mut BitStream) -> Option<AddressField> {
-    let limit = stream.bit_count * 2;
-    let mut scanned = 0u32;
+    let limit = stream.bit_count as u64 * 2;
+    let mut scanned = 0u64;
 
     loop {
         if scanned > limit {
@@ -359,7 +374,7 @@ fn find_data_prologue(stream: &mut BitStream) -> bool {
 /// Then 1 checksum nibble.
 ///
 /// Each nibble is XOR'd with the previous to form a running checksum.
-fn decode_data_field(stream: &mut BitStream) -> Option<[u8; 256]> {
+fn decode_data_field(stream: &mut BitStream) -> Option<([u8; 256], bool)> {
     // Read 342 + 1 nibbles (data + checksum)
     let mut raw = [0u8; 343];
     for byte in raw.iter_mut() {
@@ -378,10 +393,8 @@ fn decode_data_field(stream: &mut BitStream) -> Option<[u8; 256]> {
         prev = *byte;
     }
 
-    // Checksum validation: final value should be 0
-    if raw[342] != 0 {
-        // Bad checksum — still try to return data (some copy-protected disks)
-    }
+    // The final value is 0 when the XOR chain checks out.
+    let checksum_ok = raw[342] == 0;
 
     // Reconstruct 256 bytes from auxiliary (86) + primary (256) buffers
     let aux = &raw[..86];
@@ -400,13 +413,23 @@ fn decode_data_field(stream: &mut BitStream) -> Option<[u8; 256]> {
         result[i] = (hi6 << 2) | lo2;
     }
 
-    Some(result)
+    Some((result, checksum_ok))
 }
 
 /// Decode all sectors from a 5.25" track bitstream.
 /// Returns an array of 16 sectors, each 256 bytes. Missing sectors are zeroed.
+#[cfg(test)]
 pub(crate) fn decode_525_track(track_data: &[u8], bit_count: u32) -> [Option<[u8; 256]>; 16] {
+    decode_525_track_checked(track_data, bit_count).0
+}
+
+/// Like [`decode_525_track`], also listing sectors kept only with a bad checksum.
+pub(crate) fn decode_525_track_checked(
+    track_data: &[u8],
+    bit_count: u32,
+) -> ([Option<[u8; 256]>; 16], Vec<usize>) {
     let mut sectors: [Option<[u8; 256]>; 16] = [None; 16];
+    let mut bad = [false; 16];
     let mut stream = BitStream::new(track_data, bit_count);
     let mut found = 0u8;
 
@@ -426,21 +449,29 @@ pub(crate) fn decode_525_track(track_data: &[u8], bit_count: u32) -> [Option<[u8
             continue; // invalid sector number
         }
 
-        if sectors[addr.sector as usize].is_some() {
-            continue; // already decoded this sector
+        let si = addr.sector as usize;
+        if sectors[si].is_some() && !bad[si] {
+            continue; // already decoded this sector cleanly
         }
 
         if !find_data_prologue(&mut stream) {
             continue;
         }
 
-        if let Some(data) = decode_data_field(&mut stream) {
-            sectors[addr.sector as usize] = Some(data);
-            found += 1;
+        // A bad-checksum copy is kept only until a clean one turns up.
+        if let Some((data, ok)) = decode_data_field(&mut stream) {
+            if ok || sectors[si].is_none() {
+                sectors[si] = Some(data);
+                bad[si] = !ok;
+            }
+            if ok {
+                found += 1;
+            }
         }
     }
 
-    sectors
+    let bad_list = (0..16).filter(|&i| bad[i]).collect();
+    (sectors, bad_list)
 }
 
 /// Physical sector to ProDOS-order position mapping for 5.25" disks.
@@ -456,16 +487,20 @@ const PHYS_TO_PRODOS: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 
 /// Returns 35 tracks × 16 sectors × 256 bytes = 143,360 bytes.
 fn decode_525_woz(woz: &WozFile) -> Result<Vec<u8>> {
     let mut output = vec![0u8; 143_360];
+    let mut problems: Vec<String> = Vec::new();
 
     for track_num in 0u8..35 {
         // TMAP: whole tracks are at quarter-track indices 0, 4, 8, ...
         let tmap_idx = woz.tmap[track_num as usize * 4];
-        let sectors = if let Some((track_data, bit_count)) = get_track_bits(woz, tmap_idx) {
-            decode_525_track(track_data, bit_count)
+        let (sectors, bad) = if let Some((track_data, bit_count)) = get_track_bits(woz, tmap_idx) {
+            decode_525_track_checked(track_data, bit_count)
         } else {
-            // Empty track — leave as zeros
+            // An unrecorded track reads as zeros, as an emulator would see it.
             continue;
         };
+        for s in bad {
+            problems.push(format!("T{track_num} S{s} (bad checksum)"));
+        }
 
         // Arrange sectors in ProDOS order
         for phys_sector in 0..16u8 {
@@ -473,11 +508,33 @@ fn decode_525_woz(woz: &WozFile) -> Result<Vec<u8>> {
                 let prodos_pos = PHYS_TO_PRODOS[phys_sector as usize];
                 let out_offset = (track_num as usize * 16 + prodos_pos) * 256;
                 output[out_offset..out_offset + 256].copy_from_slice(data);
+            } else {
+                problems.push(format!("T{track_num} S{phys_sector} (missing, zeroed)"));
             }
         }
     }
 
+    if !problems.is_empty() {
+        log::warn!(
+            "WOZ 5.25\": {} damaged sector(s): {}",
+            problems.len(),
+            summarize(&problems)
+        );
+    }
     Ok(output)
+}
+
+/// The first 20 items of a problem list, then a count of the rest.
+fn summarize(items: &[String]) -> String {
+    if items.len() <= 20 {
+        items.join(", ")
+    } else {
+        format!(
+            "{}... (and {} more)",
+            items[..20].join(", "),
+            items.len() - 20
+        )
+    }
 }
 
 // ──────────────────────── 3.5" GCR decoding ─────────────────────────────────
@@ -515,8 +572,8 @@ struct AddressField35 {
 }
 
 fn find_address_field_35(stream: &mut BitStream) -> Option<AddressField35> {
-    let limit = stream.bit_count * 2;
-    let mut scanned = 0u32;
+    let limit = stream.bit_count as u64 * 2;
+    let mut scanned = 0u64;
 
     loop {
         if scanned > limit {
@@ -571,87 +628,96 @@ fn find_address_field_35(stream: &mut BitStream) -> Option<AddressField35> {
 /// decoding — there is no simple XOR chain like 5.25" disks.
 ///
 /// Returns the 512 data bytes (12-byte tag prefix is discarded).
-fn decode_data_field_35(stream: &mut BitStream) -> Option<[u8; 512]> {
-    // After D5 AA AD prologue, the first nibble is the sector number — skip it.
-    let _sector_nib = stream.next_nibble()?;
-    let _sector = DECODE_62[_sector_nib as usize];
-    if _sector == 0xFF {
+fn decode_data_field_35(stream: &mut BitStream) -> Option<([u8; 512], bool)> {
+    // After D5 AA AD prologue, the first nibble is the sector number.
+    if DECODE_62[stream.next_nibble()? as usize] == 0xFF {
         return None;
     }
+    let mut nib = || -> Option<u32> {
+        let v = DECODE_62[stream.next_nibble()? as usize];
+        (v != 0xFF).then_some(v as u32)
+    };
 
-    // Read 700 nibbles as 175 groups of 4 (aux, primary0, primary1, primary2).
-    let mut nibble_groups = Vec::with_capacity(175);
-    for _ in 0..175 {
-        let n0 = DECODE_62[stream.next_nibble()? as usize];
-        let n1 = DECODE_62[stream.next_nibble()? as usize];
-        let n2 = DECODE_62[stream.next_nibble()? as usize];
-        let n3 = DECODE_62[stream.next_nibble()? as usize];
-        if n0 == 0xFF || n1 == 0xFF || n2 == 0xFF || n3 == 0xFF {
-            return None;
+    // 174 four-nibble groups plus a final three-nibble group: 699 nibbles, 524 bytes.
+    let mut parts = [[0u32; 3]; CHUNK_62_524];
+    for (i, part) in parts.iter_mut().enumerate() {
+        let twos = nib()?;
+        part[0] = nib()? | ((twos << 2) & 0xC0);
+        part[1] = nib()? | ((twos << 4) & 0xC0);
+        if i != CHUNK_62_524 - 1 {
+            part[2] = nib()? | ((twos << 6) & 0xC0);
         }
-        nibble_groups.push((n0, n1, n2, n3));
     }
 
-    // Reconstruct bytes: each group of 4 nibbles → 3 data bytes.
-    // aux bits [5:4] → high 2 of byte 0, [3:2] → byte 1, [1:0] → byte 2.
-    // Three-register rotating checksum decodes each byte.
-    let mut c1: u32 = 0;
-    let mut c2: u32 = 0;
-    let mut c3: u32 = 0;
-    let mut sector_data = Vec::with_capacity(525);
-
-    for &(aux, p0, p1, p2) in &nibble_groups {
-        let d0 = (p0 & 0x3F) | ((aux << 2) & 0xC0);
-        let d1 = (p1 & 0x3F) | ((aux << 4) & 0xC0);
-        let d2 = (p2 & 0x3F) | ((aux << 6) & 0xC0);
-
-        // Byte 0: XOR with c1
-        c1 = (c1 & 0xFF) << 1;
-        if c1 > 0xFF {
-            c1 -= 0xFF;
-            c3 += 1;
+    // Undo the three-register rotating checksum; inverse of `encode_data_field_35`.
+    let (mut chk0, mut chk1, mut chk2) = (0u32, 0u32, 0u32);
+    let mut out = [0u8; 524];
+    let mut offset = 0usize;
+    for part in &parts {
+        chk0 = (chk0 & 0xFF) << 1;
+        if chk0 & 0x100 != 0 {
+            chk0 += 1;
+            chk2 += 1;
+            chk0 &= 0xFF;
         }
-        let b0 = (d0 as u32) ^ c1;
-        c3 += b0;
-        sector_data.push(b0 as u8);
+        let val = (part[0] ^ chk0) & 0xFF;
+        chk2 += val;
+        out[offset] = val as u8;
+        offset += 1;
 
-        // Byte 1: XOR with c3
-        if c3 > 0xFF {
-            c3 &= 0xFF;
-            c2 += 1;
+        if chk2 > 0xFF {
+            chk1 += 1;
+            chk2 &= 0xFF;
         }
-        let b1 = (d1 as u32) ^ c3;
-        c2 += b1;
-        sector_data.push(b1 as u8);
+        let val = (part[1] ^ chk2) & 0xFF;
+        chk1 += val;
+        out[offset] = val as u8;
+        offset += 1;
+        if offset == 524 {
+            break;
+        }
 
-        // Byte 2: XOR with c2
-        if c2 > 0xFF {
-            c2 &= 0xFF;
-            c1 += 1;
+        if chk1 > 0xFF {
+            chk0 += 1;
+            chk1 &= 0xFF;
         }
-        let b2 = (d2 as u32) ^ c2;
-        c1 += b2;
-        sector_data.push(b2 as u8);
+        let val = (part[2] ^ chk1) & 0xFF;
+        chk0 += val;
+        out[offset] = val as u8;
+        offset += 1;
     }
 
-    // 175 groups × 3 bytes = 525; we need 524 (12 tag + 512 data).
-    if sector_data.len() < 524 {
-        return None;
-    }
+    // Four checksum nibbles: shared high bits, then chk2, chk1, chk0.
+    let twos = nib()?;
+    let got2 = nib()? | ((twos << 2) & 0xC0);
+    let got1 = nib()? | ((twos << 4) & 0xC0);
+    let got0 = nib()? | ((twos << 6) & 0xC0);
+    let ok = got0 == chk0 & 0xFF && got1 == chk1 & 0xFF && got2 == chk2 & 0xFF;
 
-    // Return just the 512 data bytes (skip 12-byte tag prefix)
+    // Return just the 512 data bytes (skip the 12-byte tag prefix).
     let mut result = [0u8; 512];
-    result.copy_from_slice(&sector_data[12..524]);
-    Some(result)
+    result.copy_from_slice(&out[12..]);
+    Some((result, ok))
 }
 
 /// Decode all sectors from a 3.5" track bitstream.
+#[cfg(test)]
 pub(crate) fn decode_35_track(
     track_data: &[u8],
     bit_count: u32,
     expected_sectors: usize,
 ) -> Vec<Option<[u8; 512]>> {
+    decode_35_track_checked(track_data, bit_count, expected_sectors).0
+}
+
+/// Like [`decode_35_track`], also listing sectors kept only with a bad checksum.
+pub(crate) fn decode_35_track_checked(
+    track_data: &[u8],
+    bit_count: u32,
+    expected_sectors: usize,
+) -> (Vec<Option<[u8; 512]>>, Vec<usize>) {
     let mut sectors: Vec<Option<[u8; 512]>> = vec![None; expected_sectors];
+    let mut bad = vec![false; expected_sectors];
     let mut stream = BitStream::new(track_data, bit_count);
     let mut found = 0usize;
 
@@ -670,7 +736,7 @@ pub(crate) fn decode_35_track(
             continue;
         }
 
-        if sectors[sector].is_some() {
+        if sectors[sector].is_some() && !bad[sector] {
             continue;
         }
 
@@ -678,13 +744,20 @@ pub(crate) fn decode_35_track(
             continue;
         }
 
-        if let Some(data) = decode_data_field_35(&mut stream) {
-            sectors[sector] = Some(data);
-            found += 1;
+        // A bad-checksum copy is kept only until a clean one turns up.
+        if let Some((data, ok)) = decode_data_field_35(&mut stream) {
+            if ok || sectors[sector].is_none() {
+                sectors[sector] = Some(data);
+                bad[sector] = !ok;
+            }
+            if ok {
+                found += 1;
+            }
         }
     }
 
-    sectors
+    let bad_list = (0..expected_sectors).filter(|&i| bad[i]).collect();
+    (sectors, bad_list)
 }
 
 /// Decode a complete 3.5" WOZ image into flat sector data.
@@ -710,7 +783,10 @@ fn decode_35_woz(woz: &WozFile) -> Result<Vec<u8>> {
         total_expected += num_sectors;
         let tmap_idx_s0 = woz.tmap[track_num * 2];
         if let Some((track_data, bit_count)) = get_track_bits(woz, tmap_idx_s0) {
-            let sectors = decode_35_track(track_data, bit_count, num_sectors);
+            let (sectors, bad) = decode_35_track_checked(track_data, bit_count, num_sectors);
+            for s in bad {
+                missing_sectors.push(format!("S0 T{track_num} S{s} (bad checksum)"));
+            }
             for (sec_idx, sector) in sectors.iter().enumerate() {
                 if let Some(ref data) = sector {
                     if out_pos + 512 <= output.len() {
@@ -735,7 +811,11 @@ fn decode_35_woz(woz: &WozFile) -> Result<Vec<u8>> {
             let tmap_idx_s1 = woz.tmap[track_num * 2 + 1];
             if tmap_idx_s1 != 0xFF {
                 if let Some((track_data, bit_count)) = get_track_bits(woz, tmap_idx_s1) {
-                    let sectors = decode_35_track(track_data, bit_count, num_sectors);
+                    let (sectors, bad) =
+                        decode_35_track_checked(track_data, bit_count, num_sectors);
+                    for s in bad {
+                        missing_sectors.push(format!("S1 T{track_num} S{s} (bad checksum)"));
+                    }
                     for (sec_idx, sector) in sectors.iter().enumerate() {
                         if let Some(ref data) = sector {
                             if out_pos + 512 <= output.len() {
@@ -761,19 +841,11 @@ fn decode_35_woz(woz: &WozFile) -> Result<Vec<u8>> {
 
     if !missing_sectors.is_empty() {
         log::warn!(
-            "WOZ 3.5\": decoded {}/{} sectors, {} missing: {}",
+            "WOZ 3.5\": decoded {}/{} sectors, {} damaged: {}",
             total_decoded,
             total_expected,
             missing_sectors.len(),
-            if missing_sectors.len() <= 20 {
-                missing_sectors.join(", ")
-            } else {
-                format!(
-                    "{}... (and {} more)",
-                    missing_sectors[..20].join(", "),
-                    missing_sectors.len() - 20
-                )
-            }
+            summarize(&missing_sectors)
         );
     }
 

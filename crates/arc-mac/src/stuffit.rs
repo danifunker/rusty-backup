@@ -387,7 +387,11 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
             rsrc,
         });
 
-        pos += ENTRY_HEADER_LEN + rsrc_clen as usize + data_clen as usize;
+        pos = pos
+            .checked_add(ENTRY_HEADER_LEN)
+            .and_then(|p| p.checked_add(rsrc_clen as usize))
+            .and_then(|p| p.checked_add(data_clen as usize))
+            .ok_or_else(|| anyhow::anyhow!("StuffIt: fork sizes overflow"))?;
     }
 
     Ok(StuffItArchive {
@@ -472,7 +476,7 @@ pub fn decompress_fork(archive: &[u8], fork: &ForkInfo) -> Result<Vec<u8>> {
         bail!("StuffIt: encrypted forks are not supported");
     }
     let start = fork.offset as usize;
-    let end = start + fork.compressed_len as usize;
+    let end = start.saturating_add(fork.compressed_len as usize);
     if end > archive.len() {
         // Not a bounds-check bug: `compressed_len` is the on-disk length, so
         // this fires only when those bytes genuinely aren't in the container
@@ -621,13 +625,16 @@ pub fn build_archive(files: &[StuffItInput], method: WriteMethod) -> Result<Vec<
 pub fn build_archive_tree(tree: &[StuffItInputNode], method: WriteMethod) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     for node in tree {
-        emit_node(&mut body, node, method);
+        emit_node(&mut body, node, method)?;
     }
 
-    let total = (ARCHIVE_HEADER_LEN + body.len()) as u32;
+    let total = u32::try_from(ARCHIVE_HEADER_LEN + body.len())
+        .map_err(|_| anyhow::anyhow!("StuffIt: archive would pass the format's 4 GiB limit"))?;
+    let top = u16::try_from(tree.len())
+        .map_err(|_| anyhow::anyhow!("StuffIt: more than 65535 top-level entries"))?;
     let mut out = Vec::with_capacity(total as usize);
     out.extend_from_slice(b"SIT!");
-    out.extend_from_slice(&(tree.len() as u16).to_be_bytes());
+    out.extend_from_slice(&top.to_be_bytes());
     out.extend_from_slice(&total.to_be_bytes());
     out.extend_from_slice(b"rLau");
     out.push(1); // version
@@ -642,9 +649,9 @@ pub fn build_archive_tree(tree: &[StuffItInputNode], method: WriteMethod) -> Res
 /// Serialize a single node (file or folder) into `body`. For folders this
 /// emits the START marker, recurses into each child, and emits the END
 /// marker; for files it writes the standard 112-byte header + forks.
-fn emit_node(body: &mut Vec<u8>, node: &StuffItInputNode, method: WriteMethod) {
+fn emit_node(body: &mut Vec<u8>, node: &StuffItInputNode, method: WriteMethod) -> Result<()> {
     match node {
-        StuffItInputNode::File(f) => emit_file_entry(body, f, method),
+        StuffItInputNode::File(f) => emit_file_entry(body, f, method)?,
         StuffItInputNode::Folder {
             name,
             finder_flags,
@@ -659,17 +666,18 @@ fn emit_node(body: &mut Vec<u8>, node: &StuffItInputNode, method: WriteMethod) {
                 *create_date,
                 *mod_date,
                 START_FOLDER,
-            );
+            )?;
             for child in children {
-                emit_node(body, child, method);
+                emit_node(body, child, method)?;
             }
-            emit_folder_marker(body, "", 0, 0, 0, END_FOLDER);
+            emit_folder_marker(body, "", 0, 0, 0, END_FOLDER)?;
         }
     }
+    Ok(())
 }
 
-fn emit_file_entry(body: &mut Vec<u8>, f: &StuffItInput, method: WriteMethod) {
-    let name_bytes = mac_name_bytes(&f.name);
+fn emit_file_entry(body: &mut Vec<u8>, f: &StuffItInput, method: WriteMethod) -> Result<()> {
+    let name_bytes = mac_name_bytes(&f.name)?;
     let namelen = name_bytes.len();
 
     let (rmethod, rcomp) = if f.resource_fork.is_empty() {
@@ -678,6 +686,10 @@ fn emit_file_entry(body: &mut Vec<u8>, f: &StuffItInput, method: WriteMethod) {
         compress_fork(&f.resource_fork, method)
     };
     let (dmethod, dcomp) = compress_fork(&f.data_fork, method);
+    let len32 = |n: usize| {
+        u32::try_from(n)
+            .map_err(|_| anyhow::anyhow!("StuffIt: a fork of '{}' passes the 4 GiB limit", f.name))
+    };
 
     let mut h = [0u8; ENTRY_HEADER_LEN];
     h[0] = rmethod;
@@ -692,10 +704,10 @@ fn emit_file_entry(body: &mut Vec<u8>, f: &StuffItInput, method: WriteMethod) {
     BigEndian::write_u16(&mut h[74..76], f.finder_flags);
     BigEndian::write_u32(&mut h[76..80], f.create_date);
     BigEndian::write_u32(&mut h[80..84], f.mod_date);
-    BigEndian::write_u32(&mut h[84..88], f.resource_fork.len() as u32);
-    BigEndian::write_u32(&mut h[88..92], f.data_fork.len() as u32);
-    BigEndian::write_u32(&mut h[92..96], rcomp.len() as u32);
-    BigEndian::write_u32(&mut h[96..100], dcomp.len() as u32);
+    BigEndian::write_u32(&mut h[84..88], len32(f.resource_fork.len())?);
+    BigEndian::write_u32(&mut h[88..92], len32(f.data_fork.len())?);
+    BigEndian::write_u32(&mut h[92..96], len32(rcomp.len())?);
+    BigEndian::write_u32(&mut h[96..100], len32(dcomp.len())?);
     BigEndian::write_u16(&mut h[100..102], crc16_arc(&f.resource_fork));
     BigEndian::write_u16(&mut h[102..104], crc16_arc(&f.data_fork));
     // [62..66] child offset: -1 marks a file entry (as real archives do).
@@ -707,6 +719,7 @@ fn emit_file_entry(body: &mut Vec<u8>, f: &StuffItInput, method: WriteMethod) {
     body.extend_from_slice(&h);
     body.extend_from_slice(&rcomp);
     body.extend_from_slice(&dcomp);
+    Ok(())
 }
 
 /// Emit a folder-start or folder-end marker. The parser keys off the
@@ -720,9 +733,9 @@ fn emit_folder_marker(
     create_date: u32,
     mod_date: u32,
     marker: u8,
-) {
+) -> Result<()> {
     let name_bytes = if marker == START_FOLDER {
-        mac_name_bytes(name)
+        mac_name_bytes(name)?
     } else {
         Vec::new()
     };
@@ -749,17 +762,23 @@ fn emit_folder_marker(
     BigEndian::write_u16(&mut h[110..112], hdr_crc);
 
     body.extend_from_slice(&h);
+    Ok(())
 }
 
-/// Encode a name to at most 31 Mac Roman bytes (lossy ASCII fallback).
-fn mac_name_bytes(name: &str) -> Vec<u8> {
-    let mut bytes = fs_mac::mac_roman::utf8_to_mac_roman(name).unwrap_or_else(|_| {
+/// Encode a name as Mac Roman (lossy ASCII fallback), cut to StuffIt's 31 bytes.
+fn mac_name_bytes(name: &str) -> Result<Vec<u8>> {
+    let bytes = fs_mac::mac_roman::utf8_to_mac_roman(name).unwrap_or_else(|_| {
         name.chars()
             .map(|c| if c.is_ascii() { c as u8 } else { b'_' })
             .collect()
     });
-    bytes.truncate(31);
-    bytes
+    // StuffIt holds 31 bytes, as the Finder does; cut the name, but say so.
+    let mut bytes = bytes;
+    if bytes.len() > 31 {
+        log::warn!("StuffIt: name '{name}' cut to 31 Mac characters");
+        bytes.truncate(31);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

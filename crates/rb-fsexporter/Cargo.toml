@@ -1,6 +1,6 @@
 [package]
 name = "rb-fsexporter"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -16,9 +16,9 @@ categories = ["filesystem", "emulators"]
 rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.2", features = ["fs"] }
-# The fork writers (AppleDouble, MacBinary, BinHex); fs-mac pulls in the GPL-2.0-only fs-mac-unicode.
-fs-mac = { path = "../fs-mac", version = "0.1.1", default-features = false, features = ["forks"] }
+disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
+# The fork writers (AppleDouble, MacBinary, BinHex), without HFS: no GPL-2.0-only fs-mac-unicode.
+fs-mac = { path = "../fs-mac", version = "0.2", default-features = false, features = ["fork-export"] }
 anyhow = "1"
 
 [dev-dependencies]

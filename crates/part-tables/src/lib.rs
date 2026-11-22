@@ -77,4 +77,7 @@ pub enum PartitionError {
 
     #[error("Invalid AHDI: {0}")]
     InvalidAhdi(String),
+
+    #[error("Invalid X68k partition table: {0}")]
+    InvalidX68k(String),
 }

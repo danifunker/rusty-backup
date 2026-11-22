@@ -248,14 +248,8 @@ pub fn run_with_budget(
 
     // Duplicate check so we can honor --force consistently, matched the way
     // the filesystem matches (FAT and friends ignore case).
-    let fold_case = fs.case_insensitive_lookup();
-    let existing = disk_core::entry::select_child(
-        &fs.list_directory(&parent)
-            .map_err(|e| anyhow!("list_directory: {e}"))?,
-        fold_case,
-        &name,
-    )
-    .cloned();
+    let existing = disk_core::filesystem::lookup_child(fs.as_filesystem_mut(), &parent, &name)
+        .map_err(|e| anyhow!("list_directory: {e}"))?;
     // Capture before the delete: afterwards there is nothing left to ask.
     // Everything the replaced file carried, not just its xattrs. A replace
     // writes new *contents*; it is not a request to reset permissions, owner,

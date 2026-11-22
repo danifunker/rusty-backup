@@ -163,6 +163,8 @@ pub enum BuildRequest {
         target_path: PathBuf,
         size: u64,
         preset: Preset,
+        /// The target is a device (or stands in for one): build within `size`, write it in full.
+        on_device: bool,
     },
     /// A CD-ROM image, mastered by `model::cd_build`; always a raw file.
     Cd {
@@ -181,8 +183,26 @@ pub enum Preset {
         /// A Human68k system floppy cloned into partition 1.
         system_disk: Option<PathBuf>,
     },
-    /// SGI IRIX: a volume header and an EFS root.
-    SgiEfs { label: String },
+    /// SGI IRIX: a volume header and an EFS root; `label_only` writes the header alone.
+    SgiEfs { label: String, label_only: bool },
+}
+
+/// The SGI preset's disk: rounded down within a device's size, up to whole cylinders for a file.
+pub fn sgi_preset_options(
+    size: u64,
+    label: &str,
+    label_only: bool,
+    on_device: bool,
+) -> crate::partition::sgi_hdd_builder::SgiHddOptions {
+    use crate::partition::sgi_hdd_builder::{SgiFit, SgiHddOptions};
+    let mut opts = SgiHddOptions::new(size, label);
+    opts.format_root = !label_only;
+    opts.fit = if on_device {
+        SgiFit::WithinSize
+    } else {
+        SgiFit::RoundUp
+    };
+    opts
 }
 
 impl Preset {
@@ -194,11 +214,12 @@ impl Preset {
     }
 }
 
-/// Build `preset` into a new file at `out` of `size` bytes.
+/// Build `preset` into a new file at `out` of `size` bytes; `on_device` keeps it within `size`.
 fn run_preset(
     out: &std::path::Path,
     size: u64,
     preset: &Preset,
+    on_device: bool,
     log: &mut dyn FnMut(&str),
 ) -> Result<()> {
     match preset {
@@ -231,15 +252,19 @@ fn run_preset(
                 disk_core::display::format_size(s.partition_bytes),
             ));
         }
-        Preset::SgiEfs { label } => {
-            use crate::partition::sgi_hdd_builder::{write_sgi_efs_hdd, SgiHddOptions};
-            let opts = SgiHddOptions::new(size, label.as_str());
+        Preset::SgiEfs { label, label_only } => {
+            let opts = sgi_preset_options(size, label.as_str(), *label_only, on_device);
             let mut file = std::fs::File::create(out)
                 .with_context(|| format!("creating {}", out.display()))?;
-            let layout = write_sgi_efs_hdd(&mut file, &opts)?;
+            let layout = crate::partition::sgi_hdd_builder::write_sgi_disk(&mut file, &opts)?;
             file.set_len(layout.disk_bytes)?;
             log(&format!(
-                "Wrote an SGI volume header and an EFS root ({} cylinders)",
+                "Wrote an SGI volume header{} ({} cylinders)",
+                if *label_only {
+                    " only; the EFS root is unformatted"
+                } else {
+                    " and an EFS root"
+                },
                 layout.cylinders
             ));
         }
@@ -351,9 +376,12 @@ impl BuildRequest {
                 }
             }
             BuildRequest::Preset {
-                target_path, size, ..
+                target_path,
+                size,
+                on_device,
+                ..
             } => {
-                if crate::os::is_device_path(target_path.as_path()) {
+                if writes_in_full(target_path.as_path(), *on_device) {
                     *size
                 } else {
                     0
@@ -410,7 +438,14 @@ pub fn run_build(
             target_path,
             size,
             preset,
-        } => run_preset_on(target_path.as_path(), *size, preset, status),
+            on_device,
+        } => run_preset_on(
+            target_path.as_path(),
+            *size,
+            preset,
+            writes_in_full(target_path.as_path(), *on_device),
+            status,
+        ),
         BuildRequest::Cd {
             target_path,
             request,
@@ -451,7 +486,8 @@ fn run_cd(
         }
     };
     let mut log = |m: &str| push(m);
-    let built = crate::model::cd_build::build_cd(target, request, &mut log, &|_| {});
+    let cancel = || status.lock().map(|s| s.cancel_requested).unwrap_or(false);
+    let built = crate::model::cd_build::build_cd(target, request, &mut log, &|_| {}, &cancel);
     if built.is_err() {
         // A disc cut short is not a disc; leave no file behind.
         let _ = std::fs::remove_file(target);
@@ -466,6 +502,7 @@ fn run_preset_on(
     target: &std::path::Path,
     size: u64,
     preset: &Preset,
+    on_device: bool,
     status: Arc<Mutex<PhysicalWriteStatus>>,
 ) -> Result<()> {
     let push = |m: &str| {
@@ -474,14 +511,14 @@ fn run_preset_on(
         }
     };
     let mut log = |m: &str| push(m);
-    if !crate::os::is_device_path(target) {
-        run_preset(target, size, preset, &mut log)?;
+    if !on_device {
+        run_preset(target, size, preset, false, &mut log)?;
         push("Disk build complete");
         return Ok(());
     }
     let dir = tempfile::tempdir().context("creating a temporary folder")?;
     let tmp = dir.path().join("preset.img");
-    run_preset(tmp.as_path(), size, preset, &mut log)?;
+    run_preset(tmp.as_path(), size, preset, true, &mut log)?;
     let handle = open_target_preserving(target)
         .with_context(|| format!("opening target {} for writing", target.display()))?;
     let mut dev = SectorAlignedWriter::new(handle.file);
@@ -682,20 +719,20 @@ fn format_through_temp<W: Write + std::io::Seek>(
         f.kind.display_name(),
         done.summary
     ));
+    let cancel = || status.lock().map(|s| s.cancel_requested).unwrap_or(false);
     if let Some(folder) = folder {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&tmp)
             .context("reopening the temporary volume")?;
-        push(&import_folder(file, 0, size, folder)?);
+        push(&import_folder(file, 0, size, folder, &cancel)?);
     }
     let mut progress = |n: u64| {
         if let Ok(mut s) = status.lock() {
             s.current_bytes = n;
         }
     };
-    let cancel = || status.lock().map(|s| s.cancel_requested).unwrap_or(false);
     let mut log = |m: &str| push(m);
     physical_write_runner::write_image_into(
         target,
@@ -708,8 +745,15 @@ fn format_through_temp<W: Write + std::io::Seek>(
     )
 }
 
-/// Copy the host folder `dir` into the volume just formatted at `offset` of `file`.
-fn import_folder(file: std::fs::File, offset: u64, size: u64, dir: &Path) -> Result<String> {
+/// Copy the host folder `dir` into the volume just formatted at `offset` of `file`, stopping
+/// between entries once `cancel` says so.
+fn import_folder(
+    file: std::fs::File,
+    offset: u64,
+    size: u64,
+    dir: &Path,
+    cancel: &dyn Fn() -> bool,
+) -> Result<String> {
     let ctx = crate::fs::EditContext {
         partition_len: Some(size),
         ..Default::default()
@@ -721,8 +765,15 @@ fn import_folder(file: std::fs::File, offset: u64, size: u64, dir: &Path) -> Res
         .root()
         .map_err(|e| anyhow::anyhow!("reading the new volume's root: {e}"))?;
     let opts = crate::fs::dir_import::DirImportOptions::default();
-    let stats = crate::fs::dir_import::import_dir(&mut *efs, &root, dir, &opts, &|_| {})
-        .with_context(|| format!("copying {} in", dir.display()))?;
+    let stats = crate::fs::dir_import::import_dir_cancellable(
+        &mut *efs,
+        &root,
+        dir,
+        &opts,
+        &|_| {},
+        cancel,
+    )
+    .with_context(|| format!("copying {} in", dir.display()))?;
     efs.sync_metadata()
         .map_err(|e| anyhow::anyhow!("saving the copied files: {e}"))?;
     Ok(format!(
@@ -962,8 +1013,14 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
                 let handle = file
                     .try_clone()
                     .context("opening the target for the copy")?;
-                let msg = import_folder(handle, placed.start_byte(), placed.size_bytes, folder)
-                    .with_context(|| format!("filling partition {}", i + 1))?;
+                let msg = import_folder(
+                    handle,
+                    placed.start_byte(),
+                    placed.size_bytes,
+                    folder,
+                    &cancel_check,
+                )
+                .with_context(|| format!("filling partition {}", i + 1))?;
                 log_cb(&format!("Partition {}: {}", i + 1, msg));
             }
         }

@@ -378,6 +378,20 @@ impl<R: Read + Seek + Send> Human68kFilesystem<R> {
         let fat_byte_len = bpb.fat_sectors as u64 * bpb.bytes_per_sector as u64;
         let fat_off =
             partition_offset + bpb.fat_start_sector() as u64 * bpb.bytes_per_sector as u64;
+        // The FAT must sit inside the volume and the image before a buffer is sized from the BPB.
+        if bpb.fat_start_sector() as u64 + bpb.fat_sectors as u64 > bpb.total_sectors as u64 {
+            return Err(FilesystemError::Parse(format!(
+                "Human68k FAT ({} sectors) runs past the {}-sector volume",
+                bpb.fat_sectors, bpb.total_sectors
+            )));
+        }
+        if let Ok(end) = reader.seek(SeekFrom::End(0)) {
+            if end > fat_off && fat_byte_len > end - fat_off {
+                return Err(FilesystemError::Parse(
+                    "Human68k FAT runs past the end of the image".into(),
+                ));
+            }
+        }
         reader.seek(SeekFrom::Start(fat_off))?;
         let mut fat_bytes = vec![0u8; fat_byte_len as usize];
         reader.read_exact(&mut fat_bytes)?;
@@ -396,8 +410,9 @@ impl<R: Read + Seek + Send> Human68kFilesystem<R> {
         let mut out = Vec::new();
         let mut cluster = first;
         let mut visited = std::collections::HashSet::new();
-        let cap = self.bpb.total_sectors as usize / self.bpb.sectors_per_cluster as usize + 16;
-        while cluster >= 2 && (cluster as usize) < cap {
+        // Only data clusters exist; a link past the last one is corrupt and would leave the volume.
+        let cap = self.cluster_limit();
+        while cluster >= 2 && cluster < cap {
             if !visited.insert(cluster) {
                 return Err(FilesystemError::InvalidData(format!(
                     "Human68k FAT cycle at cluster {cluster}"
@@ -3053,5 +3068,23 @@ mod tests {
         let rep = fs.repair().unwrap();
         assert!(rep.fixes_applied.is_empty());
         assert!(rep.unrepairable_count >= 1);
+    }
+
+    /// FP-010: a BPB whose FAT runs past the volume is refused before the FAT is read.
+    #[test]
+    fn a_fat_past_the_volume_is_refused() {
+        let mut disk = build_fat12_synthetic();
+        LittleEndian::write_u16(&mut disk[22..24], 0xFFFF);
+        assert!(Human68kFilesystem::open(Cursor::new(disk), 0).is_err());
+    }
+
+    /// FP-011: a chain link past the last data cluster ends the chain.
+    #[test]
+    fn a_link_past_the_last_cluster_ends_the_chain() {
+        let disk = build_fat12_synthetic();
+        let fs = Human68kFilesystem::open(Cursor::new(disk), 0).unwrap();
+        let limit = fs.cluster_limit();
+        assert!(fs.cluster_chain(limit).unwrap().is_empty());
+        assert!(fs.cluster_chain(limit + 8).unwrap().is_empty());
     }
 }

@@ -130,6 +130,18 @@ pub fn read_header(bytes: &[u8]) -> Result<PdiHeader, FilesystemError> {
     if geometry.label_bytes == 0 || geometry.data_bytes == 0 || geometry.total_sectors() == 0 {
         return Err(FilesystemError::Parse("PDI: degenerate geometry".into()));
     }
+    // Each family has one label and data size; the label codecs index by them.
+    let (label, data) = match family {
+        FsFamily::Diablo => (16, 512),
+        FsFamily::Trident => (20, 2048),
+        FsFamily::Pilot => (20, 512),
+    };
+    if geometry.label_bytes != label || geometry.data_bytes != data {
+        return Err(FilesystemError::Parse(format!(
+            "PDI: {family:?} sectors are {label}+{data} bytes, the header says {}+{}",
+            geometry.label_bytes, geometry.data_bytes
+        )));
+    }
 
     Ok(PdiHeader {
         geometry,
@@ -145,7 +157,10 @@ pub fn read(bytes: &[u8]) -> Result<Disk, FilesystemError> {
     let g = header.geometry.clone();
     let total = g.total_sectors();
     let record = header.record_bytes();
-    let expected = HEADER_SIZE + total * record;
+    let expected = total
+        .checked_mul(record)
+        .and_then(|b| b.checked_add(HEADER_SIZE))
+        .ok_or_else(|| FilesystemError::Parse("PDI: geometry overflows".into()))?;
     if bytes.len() != expected {
         return Err(FilesystemError::Parse(format!(
             "PDI: file is {} bytes, expected {expected} (512 + {total} * {record})",

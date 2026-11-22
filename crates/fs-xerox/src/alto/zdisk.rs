@@ -66,11 +66,20 @@ fn swap_words(buf: &mut [u8]) {
 }
 
 /// Inflate a raw-zlib stream fully into memory.
+/// Largest inflated image: a Pilot pack of 65536 2 KiB pages with labels, with room to spare.
+const MAX_ZDISK_BYTES: u64 = 256 << 20;
+
 fn inflate(bytes: &[u8]) -> Result<Vec<u8>, FilesystemError> {
     let mut out = Vec::new();
     ZlibDecoder::new(bytes)
+        .take(MAX_ZDISK_BYTES + 1)
         .read_to_end(&mut out)
         .map_err(|e| FilesystemError::Parse(format!("zdisk: inflate failed: {e}")))?;
+    if out.len() as u64 > MAX_ZDISK_BYTES {
+        return Err(FilesystemError::Parse(format!(
+            "zdisk: inflates past {MAX_ZDISK_BYTES} bytes (a zlib bomb?)"
+        )));
+    }
     Ok(out)
 }
 

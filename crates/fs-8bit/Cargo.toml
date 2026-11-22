@@ -1,6 +1,6 @@
 [package]
 name = "fs-8bit"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -29,7 +29,7 @@ trdos = []
 rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.2", features = ["fs"] }
+disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
 anyhow = { version = "1", optional = true }
 byteorder = { version = "1", optional = true }
 

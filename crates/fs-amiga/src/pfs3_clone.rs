@@ -281,6 +281,13 @@ where
             continue;
         }
         if k.is_directory() {
+            if anode_map.contains_key(&k.location) {
+                // A directory reached twice points back at an ancestor: the tree loops (AMI-012).
+                return Err(FilesystemError::Parse(format!(
+                    "PFS3 directory {} is its own ancestor",
+                    k.path
+                )));
+            }
             let dopts = CreateDirectoryOptions {
                 amiga_protection: k.amiga_protection,
                 amiga_comment: k.amiga_comment.clone(),
@@ -311,6 +318,11 @@ where
             anode_map.insert(k.location, new_file);
             report.files_copied += 1;
             report.bytes_copied += size;
+            // Flush every 16 MiB so staged data never grows with the volume (AMI-013).
+            const FLUSH_EVERY: u64 = 16 << 20;
+            if (report.bytes_copied - size) / FLUSH_EVERY != report.bytes_copied / FLUSH_EVERY {
+                EditableFilesystem::sync_metadata(target)?;
+            }
             progress.tick(report, false);
         } else {
             report.warnings.push(format!(

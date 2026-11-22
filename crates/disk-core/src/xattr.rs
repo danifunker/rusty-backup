@@ -30,12 +30,20 @@ impl Xattr {
     /// `user.mime_type = text/plain` but `security.capability = 0x0100...`.
     pub fn value_display(&self) -> String {
         if let Ok(s) = std::str::from_utf8(&self.value) {
-            if !s.is_empty() && s.chars().all(|c| !c.is_control() || c == '\n' || c == '\t') {
+            let printable = s.chars().all(|c| !c.is_control() || c == '\n' || c == '\t');
+            // Text that itself starts "0x" would parse back as hex, so it is shown as hex instead.
+            if !s.is_empty() && printable && !looks_like_hex(s) {
                 return s.to_string();
             }
         }
         format!("0x{}", hex_encode(&self.value))
     }
+}
+
+/// Whether [`parse_value`] would read `s` as a hex value.
+fn looks_like_hex(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with("0x") || t.starts_with("0X")
 }
 
 /// Lowercase hex, no separators.
@@ -114,6 +122,28 @@ mod tests {
         assert_eq!(parse_value("text/plain").unwrap(), b"text/plain".to_vec());
         assert!(parse_value("0x123").is_err(), "odd hex length rejected");
         assert!(parse_value("0xzz").is_err(), "bad hex digit rejected");
+    }
+
+    /// DC-002: whatever `value_display` shows, `parse_value` reads back unchanged.
+    #[test]
+    fn display_then_parse_is_the_identity() {
+        let values: [&[u8]; 7] = [
+            b"text/plain",
+            b"0x41",
+            b"  0Xff",
+            b"",
+            &[0, 1, 0xff],
+            b"a\tb",
+            "\u{e9}t\u{e9}".as_bytes(),
+        ];
+        for v in values {
+            let x = Xattr {
+                name: "user.v".into(),
+                value: v.to_vec(),
+            };
+            let shown = x.value_display();
+            assert_eq!(parse_value(&shown).unwrap(), v, "{shown:?}");
+        }
     }
 
     #[test]

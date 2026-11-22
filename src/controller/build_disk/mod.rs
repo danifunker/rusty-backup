@@ -180,6 +180,7 @@ pub mod ids {
     pub const SYSTEM_DISK: &str = "build_disk.system_disk";
     pub const SYSTEM_DISK_CLEAR: &str = "build_disk.system_disk_clear";
     pub const SGI_LABEL: &str = "build_disk.sgi_label";
+    pub const SGI_FORMAT: &str = "build_disk.sgi_format";
     pub const ROW_SIZE: &str = "build_disk.row_size";
     pub const ROW_TYPE: &str = "build_disk.row_type";
     pub const ROW_PICK_TYPE: &str = "build_disk.row_pick_type";
@@ -226,6 +227,14 @@ pub mod labels {
     pub const CD_AUTO_SIZE: &str = "Size to the folder";
     pub const CD_FOLDER: &str = "Choose Folder...";
     pub const DONE: &str = "Disk build complete.";
+    pub const SGI_FORMAT: &str = "Format";
+    /// The SGI preset's Format choices, indexed by `sgi_label_only as usize`.
+    pub const SGI_FORMATS: [&str; 2] = ["Volume header and EFS", "Volume header only"];
+
+    /// The SGI Format choice `label_only` selects.
+    pub fn sgi_format(label_only: bool) -> &'static str {
+        SGI_FORMATS[usize::from(label_only)]
+    }
     /// Id to label, with `<task>.done` naming the outcome message, for drivers that find by label.
     pub const TABLE: &[(&str, &str)] = &[
         (ids::KIND, KIND),
@@ -456,6 +465,8 @@ pub struct PresetView {
     pub x68k_system_disk: Option<PathBuf>,
     /// SGI: the EFS volume label (6 bytes).
     pub sgi_label: String,
+    /// SGI: write the volume header and partition table only, leaving the root unformatted.
+    pub sgi_label_only: bool,
     /// An easy target's volume name; `None` keeps the target's own ("Macintosh HD").
     pub label: Option<String>,
 }
@@ -754,6 +765,7 @@ impl BuildDiskController {
                 x68k_partitions: 1,
                 x68k_system_disk: None,
                 sgi_label: "irix".to_string(),
+                sgi_label_only: false,
                 label: None,
             },
             cd: CdView {
@@ -1303,9 +1315,11 @@ impl BuildDiskController {
                     .then(|| "An X68000 disk needs at least 4 MiB.".to_string())
             }
             PresetKind::SgiEfs => {
-                let opts = crate::partition::sgi_hdd_builder::SgiHddOptions::new(
+                let opts = crate::model::provision_runner::sgi_preset_options(
                     size,
                     p.sgi_label.as_str(),
+                    p.sgi_label_only,
+                    self.output_is_device,
                 );
                 crate::partition::sgi_hdd_builder::compute_sgi_layout(&opts)
                     .err()
@@ -1403,6 +1417,9 @@ impl BuildDiskController {
                             v.push(format!("System disk cloned in: {}", d.display()));
                         }
                     }
+                    PresetKind::SgiEfs if p.sgi_label_only => v.push(
+                        "SGI volume header only; the EFS root is left unformatted".to_string(),
+                    ),
                     PresetKind::SgiEfs => v.push(format!("EFS label {:?}", p.sgi_label)),
                     _ => {}
                 }
@@ -1841,9 +1858,11 @@ impl BuildDiskController {
                         },
                         PresetKind::SgiEfs => crate::model::provision_runner::Preset::SgiEfs {
                             label: p.sgi_label.clone(),
+                            label_only: p.sgi_label_only,
                         },
                         _ => return,
                     },
+                    on_device: self.output_is_device,
                 }
             }
             DiskKind::Volume => crate::model::provision_runner::BuildRequest::Volume {

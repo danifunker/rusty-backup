@@ -91,6 +91,9 @@ struct DmgBlock {
 /// Parse a mish blob (base64-decoded from the XML plist).
 ///
 /// Returns the list of blocks with absolute virtual and file positions.
+/// Largest chunk a UDIF image uses (hdiutil writes 1 MiB; 64 MiB leaves room for anything real).
+const MAX_CHUNK_BYTES: u64 = 64 << 20;
+
 fn parse_mish(data: &[u8], data_fork_offset: u64) -> Result<Vec<DmgBlock>> {
     if data.len() < 0xCC {
         bail!("mish block too short ({} bytes)", data.len());
@@ -106,7 +109,10 @@ fn parse_mish(data: &[u8], data_fork_offset: u64) -> Result<Vec<DmgBlock>> {
     let num_blocks = u32::from_be_bytes(data[0xC8..0xCC].try_into()?);
 
     let entries_start = 0xCC;
-    let expected_len = entries_start + (num_blocks as usize) * 40;
+    let expected_len = (num_blocks as usize)
+        .checked_mul(40)
+        .and_then(|n| n.checked_add(entries_start))
+        .ok_or_else(|| anyhow::anyhow!("mish block count {num_blocks} overflows"))?;
     if data.len() < expected_len {
         bail!(
             "mish data too short for {} blocks (need {} bytes, have {})",
@@ -131,11 +137,28 @@ fn parse_mish(data: &[u8], data_fork_offset: u64) -> Result<Vec<DmgBlock>> {
         let pack_offset = u64::from_be_bytes(data[off + 24..off + 32].try_into()?);
         let pack_size = u64::from_be_bytes(data[off + 32..off + 40].try_into()?);
 
+        // A chunk is a few MiB at most; header values past that are corruption, and every
+        // product and sum here must not wrap.
+        let unpack_size = unpack_sectors
+            .checked_mul(SECTOR_SIZE)
+            .filter(|&n| n <= MAX_CHUNK_BYTES)
+            .ok_or_else(|| anyhow::anyhow!("mish chunk of {unpack_sectors} sectors"))?;
+        if pack_size > MAX_CHUNK_BYTES {
+            bail!("mish chunk packed to {pack_size} bytes");
+        }
+        let unpack_pos = start_sector
+            .checked_add(unpack_sector)
+            .and_then(|s| s.checked_mul(SECTOR_SIZE))
+            .ok_or_else(|| anyhow::anyhow!("mish chunk position overflows"))?;
+        let pack_pos = data_fork_offset
+            .checked_add(start_pack_pos)
+            .and_then(|p| p.checked_add(pack_offset))
+            .ok_or_else(|| anyhow::anyhow!("mish chunk offset overflows"))?;
         blocks.push(DmgBlock {
             block_type,
-            unpack_pos: (start_sector + unpack_sector) * SECTOR_SIZE,
-            unpack_size: unpack_sectors * SECTOR_SIZE,
-            pack_pos: data_fork_offset + start_pack_pos + pack_offset,
+            unpack_pos,
+            unpack_size,
+            pack_pos,
             pack_size,
         });
     }
@@ -241,7 +264,7 @@ pub(crate) fn decompress_adc(input: &[u8], output_size: usize) -> Result<Vec<u8>
             }
             let distance = (((input[pos] as usize) << 8) | (input[pos + 1] as usize)) + 1;
             pos += 2;
-            copy_match(&mut out, distance, len, output_size);
+            copy_match(&mut out, distance, len, output_size)?;
         } else {
             // Short match: length = (b >> 2) + 3. The 10-bit offset stores
             // distance-1, so the back-distance is offset + 1.
@@ -251,7 +274,7 @@ pub(crate) fn decompress_adc(input: &[u8], output_size: usize) -> Result<Vec<u8>
             }
             let distance = ((((b & 3) as usize) << 8) | (input[pos] as usize)) + 1;
             pos += 1;
-            copy_match(&mut out, distance, len, output_size);
+            copy_match(&mut out, distance, len, output_size)?;
         }
     }
 
@@ -259,12 +282,13 @@ pub(crate) fn decompress_adc(input: &[u8], output_size: usize) -> Result<Vec<u8>
 }
 
 /// Copy `len` bytes from `distance` bytes back in the output buffer.
-fn copy_match(out: &mut Vec<u8>, distance: usize, len: usize, max_size: usize) {
+fn copy_match(out: &mut Vec<u8>, distance: usize, len: usize, max_size: usize) -> Result<()> {
+    // A match reaching before the start is corrupt data; zeros in its place would be silent.
     if distance == 0 || distance > out.len() {
-        // Invalid distance — fill with zeros rather than crashing
-        let fill = len.min(max_size - out.len());
-        out.extend(disk_core::repeat_n(0u8, fill));
-        return;
+        bail!(
+            "ADC: match distance {distance} with only {} bytes out",
+            out.len()
+        );
     }
     let start = out.len() - distance;
     for i in 0..len {
@@ -274,6 +298,7 @@ fn copy_match(out: &mut Vec<u8>, distance: usize, len: usize, max_size: usize) {
         let byte = out[start + (i % distance)];
         out.push(byte);
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -349,9 +374,12 @@ impl DmgReader {
                 self.source
                     .read_exact(&mut compressed)
                     .map_err(disk_core::io_other)?;
-                let mut decoder = flate2::read::ZlibDecoder::new(Cursor::new(compressed));
+                let decoder = flate2::read::ZlibDecoder::new(Cursor::new(compressed));
                 let mut out = Vec::with_capacity(block.unpack_size as usize);
-                decoder.read_to_end(&mut out).map_err(disk_core::io_other)?;
+                decoder
+                    .take(block.unpack_size + 1)
+                    .read_to_end(&mut out)
+                    .map_err(disk_core::io_other)?;
                 out
             }
             METHOD_BZIP2 => {
@@ -362,9 +390,12 @@ impl DmgReader {
                 self.source
                     .read_exact(&mut compressed)
                     .map_err(disk_core::io_other)?;
-                let mut decoder = bzip2::read::BzDecoder::new(Cursor::new(compressed));
+                let decoder = bzip2::read::BzDecoder::new(Cursor::new(compressed));
                 let mut out = Vec::with_capacity(block.unpack_size as usize);
-                decoder.read_to_end(&mut out).map_err(disk_core::io_other)?;
+                decoder
+                    .take(block.unpack_size + 1)
+                    .read_to_end(&mut out)
+                    .map_err(disk_core::io_other)?;
                 out
             }
             METHOD_ADC => {
@@ -419,6 +450,18 @@ impl DmgReader {
             }
         };
 
+        // A chunk that decodes to anything but its stated size would end the disk early or
+        // shift what follows: corruption, not a short read.
+        if data.len() as u64 != block.unpack_size && block.block_type != METHOD_COPY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "DMG chunk {idx} decoded to {} bytes, not its {}",
+                    data.len(),
+                    block.unpack_size
+                ),
+            ));
+        }
         self.cache_block_idx = Some(idx);
         self.cache_data = data;
         Ok(())
@@ -515,7 +558,14 @@ pub fn detect_dmg(file: std::fs::File) -> Result<Option<DmgReader>> {
         return Ok(None);
     }
 
-    // Read XML plist
+    // Read XML plist (it lives in the file, and is never more than a few MiB).
+    if koly.xml_length > 256 << 20 || koly.xml_offset.saturating_add(koly.xml_length) > file_size {
+        bail!(
+            "DMG plist of {} bytes at {} doesn't fit the {file_size}-byte file",
+            koly.xml_length,
+            koly.xml_offset
+        );
+    }
     reader.seek(SeekFrom::Start(koly.xml_offset))?;
     let mut xml_buf = vec![0u8; koly.xml_length as usize];
     reader
@@ -541,6 +591,16 @@ pub fn detect_dmg(file: std::fs::File) -> Result<Option<DmgReader>> {
 
     if all_blocks.is_empty() {
         return Ok(None);
+    }
+    if let Some(b) = all_blocks
+        .iter()
+        .find(|b| b.pack_pos.saturating_add(b.pack_size) > file_size)
+    {
+        bail!(
+            "DMG chunk at {} ({} bytes) runs past the {file_size}-byte file",
+            b.pack_pos,
+            b.pack_size
+        );
     }
 
     // Sort by unpack position for binary search

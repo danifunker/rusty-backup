@@ -286,12 +286,16 @@ pub fn decompress(comp: &[u8], want: usize) -> Result<Vec<u8>> {
     let mut tree = AdaptiveTree::new();
     let mut window = preset_window();
 
-    let mut out = Vec::with_capacity(want);
+    // The header's size is only a claim: don't reserve it, and stop if the input runs out.
+    let mut out = Vec::with_capacity(want.min(1 << 24));
     let mut pos: usize = 0;
     let mut match_len: usize = 0;
     let mut match_off: usize = 0;
 
     while out.len() < want {
+        if br.exhausted() {
+            bail!("StuffIt LZAH: the stream ends before its {want} bytes");
+        }
         if match_len == 0 {
             let lit = tree.next_value(&mut br)?;
             if lit < 0x100 {

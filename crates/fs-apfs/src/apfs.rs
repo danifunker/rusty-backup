@@ -130,7 +130,8 @@ const FINDER_INFO_XATTR_NAME: &[u8] = b"com.apple.FinderInfo";
 /// Cap a single file read/extract so a corrupt extent list can't make us
 /// allocate or stream absurd amounts. 64 GiB is far above any real vintage-Mac
 /// APFS file yet bounds the damage.
-const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Upper bound on a keybag's PBKDF2 iteration count.
+const MAX_PBKDF2_ITERATIONS: u32 = 10_000_000;
 
 // --- FileVault encryption ---
 /// `apfs_fs_flags` bit 0: the volume is **not** encrypted. When clear, the
@@ -490,6 +491,8 @@ pub struct ApfsFilesystem<R: Read + Seek + Send> {
     /// unencrypted volumes and for encrypted volumes opened without a
     /// passphrase (which then browse as "locked").
     vek: Option<[u8; 32]>,
+    /// Volumes the container lists that could not be read, with the reason.
+    skipped_volumes: Vec<String>,
 }
 
 /// The active volume's decoded catalog, cached after the first browse.
@@ -621,6 +624,7 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             active_vol: 0,
             catalog: None,
             vek: None,
+            skipped_volumes: Vec::new(),
         };
 
         // Prefer the newest valid superblock from the checkpoint descriptor
@@ -638,8 +642,10 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             };
             match fs.parse_volume(apsb_paddr) {
                 Ok(v) => fs.volumes.push(v),
-                // A single unreadable volume shouldn't sink the whole container.
-                Err(_) => continue,
+                // A single unreadable volume shouldn't sink the whole container, but say so.
+                Err(e) => fs
+                    .skipped_volumes
+                    .push(format!("volume oid {vol_oid}: {e}")),
             }
         }
 
@@ -694,18 +700,30 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
 
         // Volume keybag → the crypto user's KEK blob (tag 3).
         let vol_kb = self.read_keybag(vol_kb_paddr, &vol_uuid)?;
-        let kek_blob = vol_kb
+        // One KEK per user who can unlock the volume, plus the recovery key: try each.
+        let kek_blobs: Vec<Vec<u8>> = vol_kb
             .iter()
-            .find(|e| e.tag == KB_TAG_VOLUME_UNLOCK_RECORDS)
+            .filter(|e| e.tag == KB_TAG_VOLUME_UNLOCK_RECORDS)
             .map(|e| e.data.clone())
-            .ok_or_else(|| FilesystemError::Parse("no KEK blob in volume keybag".into()))?;
-
-        // Unwrap KEK from the passphrase, then unwrap the VEK from the KEK.
-        let (wrapped_kek, salt, iters) = parse_kek_blob(&kek_blob)
-            .ok_or_else(|| FilesystemError::Parse("malformed KEK blob".into()))?;
-        let derived = apfs_crypto::pbkdf2_hmac_sha256(passphrase.as_bytes(), &salt, iters, 32);
-        let derived: [u8; 32] = derived.try_into().unwrap();
-        let kek = apfs_crypto::aes256_key_unwrap(&derived, &wrapped_kek).ok_or_else(|| {
+            .collect();
+        if kek_blobs.is_empty() {
+            return Err(FilesystemError::Parse(
+                "no KEK blob in volume keybag".into(),
+            ));
+        }
+        let mut kek = None;
+        for blob in &kek_blobs {
+            let Some((wrapped_kek, salt, iters)) = parse_kek_blob(blob) else {
+                continue;
+            };
+            let derived = apfs_crypto::pbkdf2_hmac_sha256(passphrase.as_bytes(), &salt, iters, 32);
+            let derived: [u8; 32] = derived.try_into().unwrap();
+            if let Some(k) = apfs_crypto::aes256_key_unwrap(&derived, &wrapped_kek) {
+                kek = Some(k);
+                break;
+            }
+        }
+        let kek = kek.ok_or_else(|| {
             FilesystemError::InvalidData("wrong APFS passphrase (KEK unwrap failed)".into())
         })?;
         let kek: [u8; 32] = kek
@@ -748,10 +766,13 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
         let mut map = std::collections::HashMap::new();
         let mut best_xid: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         let mut stack = vec![tree_root];
-        let mut visited = 0usize;
+        let mut seen = std::collections::HashSet::new();
         while let Some(paddr) = stack.pop() {
-            visited += 1;
-            if visited > MAX_BTREE_NODES {
+            // A node pointing back at itself or an ancestor is visited once.
+            if !seen.insert(paddr) {
+                continue;
+            }
+            if seen.len() > MAX_BTREE_NODES {
                 return Err(FilesystemError::Parse("omap B-tree too large".into()));
             }
             let node = BtreeNode::parse(self.read_block(paddr)?)?;
@@ -816,6 +837,11 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
         })
     }
 
+    /// Volumes the container lists that could not be opened, each with the reason.
+    pub fn skipped_volumes(&self) -> &[String] {
+        &self.skipped_volumes
+    }
+
     /// The volume currently selected for browsing, if the container has one.
     fn active_volume(&self) -> Option<&VolumeInfo> {
         self.volumes.get(self.active_vol)
@@ -863,10 +889,12 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
 
         let mut cat = Catalog::default();
         let mut stack = vec![root_paddr];
-        let mut visited = 0usize;
+        let mut seen = std::collections::HashSet::new();
         while let Some(paddr) = stack.pop() {
-            visited += 1;
-            if visited > MAX_BTREE_NODES {
+            if !seen.insert(paddr) {
+                continue;
+            }
+            if seen.len() > MAX_BTREE_NODES {
                 return Err(FilesystemError::Parse("FS B-tree too large".into()));
             }
             // FS-tree nodes are VEK-encrypted on FileVault volumes (the omap,
@@ -986,7 +1014,7 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
         limit: u64,
         writer: &mut dyn Write,
     ) -> Result<u64, FilesystemError> {
-        let limit = limit.min(size).min(MAX_FILE_BYTES);
+        let limit = limit.min(size);
         let mut written: u64 = 0;
         let mut logical_pos: u64 = 0;
         for ext in extents {
@@ -1034,6 +1062,7 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
         let mut buf = vec![0u8; (chunk_blocks * bs) as usize];
         let mut remaining = byte_len;
         let mut blk = phys_block;
+        self.check_blocks(phys_block, byte_len.div_ceil(bs))?;
         while remaining > 0 {
             let need_blocks = remaining.div_ceil(bs).min(chunk_blocks);
             let read_bytes = (need_blocks * bs) as usize;
@@ -1046,6 +1075,8 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             #[cfg(feature = "crypto")]
             if let Some(vek) = self.vek {
                 let units = bs / XTS_UNIT as u64;
+                // FileVault's tweak is the physical sector (checked against the encrypted fixture),
+                // not the extent's crypto_id.
                 for j in 0..need_blocks {
                     let start = (j * bs) as usize;
                     let first_sector = (blk + j) * units;
@@ -1068,11 +1099,24 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
     /// Read a single object block by physical block address (plaintext — used
     /// for container/omap/APSB metadata, which stays unencrypted).
     fn read_block(&mut self, paddr: u64) -> Result<Vec<u8>, FilesystemError> {
+        self.check_blocks(paddr, 1)?;
         let mut buf = vec![0u8; self.block_size as usize];
         let pos = self.partition_offset + paddr * self.block_size as u64;
         self.reader.seek(SeekFrom::Start(pos))?;
         self.reader.read_exact(&mut buf)?;
         Ok(buf)
+    }
+
+    /// Refuse block addresses outside the container, so no product overflows or reads elsewhere.
+    fn check_blocks(&self, paddr: u64, count: u64) -> Result<(), FilesystemError> {
+        let inside = matches!(paddr.checked_add(count), Some(end) if end <= self.block_count);
+        if !inside {
+            return Err(FilesystemError::InvalidData(format!(
+                "APFS: block {paddr}+{count} is outside the {}-block container",
+                self.block_count
+            )));
+        }
+        Ok(())
     }
 
     /// Read an object block, decrypting it with the VEK when the active volume
@@ -1274,7 +1318,7 @@ fn der_children(b: &[u8]) -> Vec<(u8, &[u8])> {
             }
             hdr = 2 + n;
         }
-        let end = (p + hdr + len).min(b.len());
+        let end = (p + hdr).saturating_add(len).min(b.len());
         out.push((tag, &b[p + hdr..end]));
         p = end;
     }
@@ -1326,9 +1370,16 @@ fn parse_kek_blob(blob: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u32)> {
     let wrapped = get(DER_TAG_WRAPPED_KEY)?;
     let salt = get(DER_TAG_SALT)?;
     let iters_bytes = get(DER_TAG_ITERATIONS)?;
+    if iters_bytes.len() > 4 {
+        return None;
+    }
     let mut iters = 0u32;
     for b in &iters_bytes {
         iters = (iters << 8) | *b as u32;
+    }
+    // macOS uses well under a million; a huge count from a corrupt keybag would hang for hours.
+    if iters == 0 || iters > MAX_PBKDF2_ITERATIONS {
+        return None;
     }
     Some((wrapped, salt, iters))
 }

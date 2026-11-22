@@ -8,4 +8,4 @@ Classic Amiga filesystems, one Cargo feature each:
 
 Each implements the `disk-core` filesystem traits and can format a blank volume. Builds on Rust 1.73 and later. Part of [rusty-backup](https://github.com/danifunker/rusty-backup).
 
-Licensed `MIT AND BSD-4-Clause`. The PFS3 driver carries pfs3aio's 4-clause BSD notice; see `THIRD_PARTY_NOTICES.md`.
+MIT licensed. The drivers follow the on-disk formats; no code was taken from the reference drivers (see `THIRD_PARTY_NOTICES.md`).

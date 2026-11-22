@@ -326,7 +326,7 @@ pub fn produce(
     let mut outcomes = Vec::new();
     let have: Vec<&Recipe> = recipes
         .iter()
-        .filter(|r| filter.map(|f| r.id.contains(f)).unwrap_or(true))
+        .filter(|r| filter.map(|f| crate::id_matches_filter(f, &r.id)).unwrap_or(true))
         .collect();
 
     // Pass A. Each artifact lands in its final home immediately, so pass B can

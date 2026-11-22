@@ -101,11 +101,11 @@ path = "../frontends-vintage/cocoa/rust/src/ppc_main.rs"
 
 [features]
 default = []
-native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd", "fs-squashfs/native-zstd", "fs-tar/native-zstd"]
+native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd", "fs-squashfs/native-zstd", "fs-tar/native-zstd", "rb-fsimporter/native-zstd"]
 remote = []
 tui = ["dep:ratatui", "ratatui-legacy"]
 ratatui-legacy = []
-rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "fs-mac/rust173-polyfill", "part-tables/rust173-polyfill", "dsk-flux/rust173-polyfill", "dsk-apple/rust173-polyfill", "dsk-dmg/rust173-polyfill", "dsk-floppy/rust173-polyfill", "dsk-vm/rust173-polyfill", "dsk-ghost/rust173-polyfill", "fs-adfs/rust173-polyfill", "fs-tar/rust173-polyfill", "rb-fsexporter/rust173-polyfill", "arc-mac/rust173-polyfill", "dsk-imz/rust173-polyfill", "dsk-tape/rust173-polyfill", "qnx2fs/rust173-polyfill"]
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "fs-mac/rust173-polyfill", "part-tables/rust173-polyfill", "dsk-flux/rust173-polyfill", "dsk-apple/rust173-polyfill", "dsk-dmg/rust173-polyfill", "dsk-floppy/rust173-polyfill", "dsk-vm/rust173-polyfill", "dsk-ghost/rust173-polyfill", "fs-adfs/rust173-polyfill", "fs-tar/rust173-polyfill", "rb-fsexporter/rust173-polyfill", "arc-mac/rust173-polyfill", "dsk-imz/rust173-polyfill", "dsk-tape/rust173-polyfill", "qnx2fs/rust173-polyfill", "sgi-disk/rust173-polyfill", "rb-fsimporter/rust173-polyfill"]
 windows-legacy = []
 # Declared so the shared source's `#[cfg(feature = "yaml")]` resolves, but
 # deliberately NOT in this build's feature list — see the serde_yml note below.
@@ -132,6 +132,7 @@ dsk-imz = { path = "../crates/dsk-imz", default-features = false }
 arc-mac = { path = "../crates/arc-mac" }
 fs-tar = { path = "../crates/fs-tar", default-features = false, features = ["appledouble", "zip"] }
 rb-fsexporter = { path = "../crates/rb-fsexporter" }
+rb-fsimporter = { path = "../crates/rb-fsimporter", default-features = false, features = ["mac"] }
 fs-adfs = { path = "../crates/fs-adfs" }
 dsk-ghost = { path = "../crates/dsk-ghost" }
 dsk-vm = { path = "../crates/dsk-vm" }
@@ -147,6 +148,7 @@ fs-hpfs = { path = "../crates/fs-hpfs" }
 fs-pc = { path = "../crates/fs-pc" }
 fs-squashfs = { path = "../crates/fs-squashfs", default-features = false }
 fs-xfs = { path = "../crates/fs-xfs" }
+sgi-disk = { path = "../crates/sgi-disk" }
 fs-unix = { path = "../crates/fs-unix", features = ["ofs"] }
 fs-amiga = { path = "../crates/fs-amiga" }
 dsk-clonezilla = { path = "../crates/dsk-clonezilla", default-features = false }

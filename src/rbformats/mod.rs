@@ -395,7 +395,8 @@ pub fn reconstruct_disk_from_backup(
         }
         let mut block = table.to_bytes();
         if !partition_sizes.is_empty() {
-            patch_x68k_entries(&mut block, partition_sizes, x68k_sector_size);
+            patch_x68k_entries(&mut block, partition_sizes, x68k_sector_size)
+                .context("patching the X68k table")?;
             log_cb("Patched X68k partition table with export sizes");
         }
         // Zero-fill the IPL region before the table and write the 144-byte
@@ -436,7 +437,9 @@ pub fn reconstruct_disk_from_backup(
     } else if let Some(apm_data) = apm {
         // APM restore: write patched DDR + partition map entries
         let target_blocks = (target_size / apm_data.ddr.block_size as u64) as u32;
-        let patched_apm = apm_data.patch_for_restore(partition_sizes, target_blocks);
+        let patched_apm = apm_data
+            .patch_for_restore(partition_sizes, target_blocks)
+            .context("patching the APM")?;
         let apm_blocks = patched_apm.build_apm_blocks(Some(target_blocks));
 
         writer
@@ -465,7 +468,7 @@ pub fn reconstruct_disk_from_backup(
             }
         };
         if !partition_sizes.is_empty() {
-            patch_mbr_entries(&mut mbr_buf, partition_sizes);
+            patch_mbr_entries(&mut mbr_buf, partition_sizes).context("patching the MBR")?;
             log_cb("Patched MBR partition table with export sizes");
             for index in
                 part_tables::mbr::clear_orphan_entries_overlapping(&mut mbr_buf, partition_sizes)
@@ -520,7 +523,7 @@ pub fn reconstruct_disk_from_backup(
         // Build EBR chain here so we can pass the actual MBR bytes as a
         // fallback for old backups that lack the `extended_container` field.
         ebr_result =
-            crate::restore::build_restore_ebr_chain(metadata, partition_sizes, Some(&mbr_buf));
+            crate::restore::build_restore_ebr_chain(metadata, partition_sizes, Some(&mbr_buf))?;
 
         // Patch the MBR extended container entry's total_sectors to match the
         // repacked EBR chain layout, then rewrite the MBR.
@@ -806,14 +809,14 @@ pub fn reconstruct_disk_from_backup(
     if let Some(gpt_data) = gpt {
         let patched_gpt = gpt_data.patch_for_restore(partition_sizes, target_sectors);
         let backup_gpt = patched_gpt.build_backup_gpt(target_sectors);
-        let backup_offset = (target_sectors - 33) * 512;
+        let backup_offset = target_sectors * 512 - backup_gpt.len() as u64;
         writer.seek(SeekFrom::Start(backup_offset))?;
         writer
             .write_all(&backup_gpt)
             .context("failed to write backup GPT")?;
         log_cb(&format!(
             "Wrote backup GPT at LBA {} ({} bytes)",
-            target_sectors - 33,
+            backup_offset / 512,
             backup_gpt.len()
         ));
     }
@@ -897,7 +900,9 @@ pub fn reconstruct_raw_apm_disk(
         .try_into()
         .context("APM target block count exceeds u32")?;
 
-    let patched = apm.patch_for_restore(partition_sizes, target_block_count);
+    let patched = apm
+        .patch_for_restore(partition_sizes, target_block_count)
+        .context("patching the APM")?;
     let apm_blocks = patched.build_apm_blocks(Some(target_block_count));
 
     writer.seek(SeekFrom::Start(0))?;

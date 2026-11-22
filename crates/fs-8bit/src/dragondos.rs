@@ -117,6 +117,9 @@ impl DragonDosGeometry {
     }
 }
 
+/// LSNs the bitmap can address: 512 bytes less the 76-byte geometry gap.
+const MAX_BITMAP_LSNS: u64 = (512 - 76) * 8;
+
 /// Map an LSN to its `(byte, bit)` position inside the 512-byte bitmap that
 /// occupies the directory track's first two sectors.
 fn bitmap_addr(lsn: u64) -> (usize, u8) {
@@ -198,6 +201,10 @@ fn parse_geometry(dir_track: &[u8]) -> Option<(u64, u64)> {
     };
     // The directory track must physically exist on the disk.
     if (tod as u64) <= DIR_TRACK {
+        return None;
+    }
+    // The two-sector bitmap maps LSNs below 3488; more would flip directory bits.
+    if tod as u64 * spt as u64 > MAX_BITMAP_LSNS {
         return None;
     }
     Some((tod as u64, sides))
@@ -859,7 +866,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for DragonDosFilesystem<R
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "DragonDOS is a flat filesystem — no subdirectories".into(),
+            "DragonDOS is a flat filesystem - no subdirectories".into(),
         ))
     }
 

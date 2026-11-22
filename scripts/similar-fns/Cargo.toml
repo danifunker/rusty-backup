@@ -1,0 +1,16 @@
+[package]
+name = "similar-fns"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Find Rust functions that do the same job under different names (a review aid, not shipped)"
+license = "AGPL-3.0-only"
+
+# Its own workspace root, like regression-tests/runner: a dev tool, not engine code.
+[workspace]
+
+[dependencies]
+syn = { version = "2", default-features = false, features = ["full", "visit", "parsing", "printing"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+walkdir = "2"

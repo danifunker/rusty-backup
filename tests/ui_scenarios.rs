@@ -1091,11 +1091,13 @@ impl Target for RestoreTarget {
 /// for a device, pre-filled with 0xA5), `SetSize`, `SetTable` (a table label such as `MBR`),
 /// `RowSize` (`row:size`), `AddRow`, `RowFs` (`row:fs-id` or `row:empty`), `VolumeFs` (an fs id),
 /// `Label` (the first formatted target's label), `TypeDevicePath` (types the path asked for),
-/// `SetMacDriver` (`bundled` or `none`).
+/// `SetMacDriver` (`bundled` or `none`), `SgiFormat` (`efs` or `label-only`).
 /// Probes: `step`, `steps` (comma list), `blocked` (why Next is refused, empty when it is not),
 /// `rows`, `layout` (`ok` or why), `row_type` (row 0's type), `result` (`ok`, the failure, or
 /// empty), `opens` (how many volumes of the output open: the bare volume or each partition),
-/// `tail_zero` (the output's last 64 KiB were written as zeros, so no old data shows), `mac_driver`.
+/// `tail_zero` (the output's last 64 KiB were written as zeros, so no old data shows), `mac_driver`,
+/// `summary` (every Review line), `sgi_label_only`, `sgi_header` (the output starts with an SGI
+/// label), `root_efs` (the first partition opens as EFS).
 struct BuildDiskTarget {
     ctl: rusty_backup::controller::build_disk::BuildDiskController,
     dir: tempfile::TempDir,
@@ -1133,6 +1135,22 @@ impl BuildDiskTarget {
 }
 
 impl BuildDiskTarget {
+    /// The first partition opens as EFS (an unformatted one only opens as a raw carve).
+    fn root_efs(&self) -> bool {
+        let Some(path) = &self.out else { return false };
+        let parts = std::fs::File::open(path).ok().and_then(|f| {
+            let mut r = std::io::BufReader::new(f);
+            rusty_backup::partition::PartitionTable::detect(&mut r).ok()
+        });
+        let Some(first) = parts.and_then(|t| t.partitions().into_iter().next()) else {
+            return false;
+        };
+        std::fs::File::open(path)
+            .ok()
+            .and_then(|f| rusty_backup::fs::open_filesystem(f, first.start_lba * 512, 0, None).ok())
+            .is_some_and(|fs| fs.fs_type().contains("EFS"))
+    }
+
     fn copied(&self) -> i64 {
         let Some(path) = &self.out else { return 0 };
         let parts = std::fs::File::open(path).ok().and_then(|f| {
@@ -1235,6 +1253,15 @@ impl Target for BuildDiskTarget {
                 }
             }
             "SetSize" => A::SetSize(arg_str(arg)?.to_string()),
+            "SgiFormat" => {
+                let mut p = self.ctl.preset().clone();
+                p.sgi_label_only = match arg_str(arg)? {
+                    "label-only" => true,
+                    "efs" => false,
+                    other => return Err(format!("unknown SGI format {other:?}")),
+                };
+                A::SetPreset(p)
+            }
             "SetMacDriver" => A::SetMacDriver(match arg_str(arg)? {
                 "none" => rusty_backup::controller::build_disk::MacDriver::Off,
                 _ => rusty_backup::controller::build_disk::MacDriver::Bundled,
@@ -1363,6 +1390,15 @@ impl Target for BuildDiskTarget {
                 None => String::new(),
             }),
             "opens" => Value::Integer(self.opens()),
+            "summary" => Value::String(self.ctl.review_lines().join("\n")),
+            "sgi_label_only" => Value::Boolean(self.ctl.preset().sgi_label_only),
+            "root_efs" => Value::Boolean(self.root_efs()),
+            "sgi_header" => Value::Boolean(
+                self.out
+                    .as_ref()
+                    .and_then(|p| std::fs::read(p).ok())
+                    .is_some_and(|d| d.len() >= 4 && d[..4] == 0x0BE5_A941u32.to_be_bytes()),
+            ),
             // Partitions whose root holds the README a `RowFolder` copied in.
             "copied" => Value::Integer(self.copied()),
             "row_folder" => Value::Boolean(

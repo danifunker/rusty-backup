@@ -733,6 +733,13 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             ));
         }
         let catalog_header = BTreeHeaderRecord::parse(&catalog_data[14..14 + 106]);
+        let ns = catalog_header.node_size as usize;
+        if !ns.is_power_of_two() || !(512..=32768).contains(&ns) {
+            // TN1150: node sizes are powers of two from 512 to 32768 (MAC-008).
+            return Err(FilesystemError::Parse(format!(
+                "HFS+ catalog node size {ns} is not a power of two in 512..=32768"
+            )));
+        }
         log::debug!(
             "[HFS+ open] catalog btree: depth={}, root_node={}, first_leaf={}, last_leaf={}, \
              node_size={}, total_nodes={}, free_nodes={}",
@@ -1451,7 +1458,9 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
             for i in 0..desc.num_records as usize {
                 // Record offsets are stored at end of node, growing backward
-                let offset_pos = node_size - 2 * (i + 1);
+                let Some(offset_pos) = node_size.checked_sub(2 * (i + 1)) else {
+                    break; // numRecords larger than the node (MAC-008)
+                };
                 if offset_pos + 2 > node.len() {
                     break;
                 }
@@ -1815,7 +1824,14 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
     /// Build HFS+ catalog key bytes: key_len(2) + parent_id(4) + name_length(2) + name(UTF-16BE NFD).
     pub(crate) fn build_catalog_key(parent_cnid: u32, name: &str) -> Vec<u8> {
-        let utf16: Vec<u16> = fs_mac_unicode::hfs_unicode::decompose_str(name);
+        Self::catalog_key_from_units(
+            parent_cnid,
+            &fs_mac_unicode::hfs_unicode::decompose_str(name),
+        )
+    }
+
+    /// Catalog key bytes for a name given as the UTF-16 units to store.
+    fn catalog_key_from_units(parent_cnid: u32, utf16: &[u16]) -> Vec<u8> {
         let key_len = 4 + 2 + utf16.len() * 2;
         let mut key = Vec::with_capacity(2 + key_len);
         let mut buf = [0u8; 2];
@@ -1826,7 +1842,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         key.extend_from_slice(&buf4);
         BigEndian::write_u16(&mut buf, utf16.len() as u16);
         key.extend_from_slice(&buf);
-        for &ch in &utf16 {
+        for &ch in utf16 {
             BigEndian::write_u16(&mut buf, ch);
             key.extend_from_slice(&buf);
         }
@@ -1867,7 +1883,21 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     /// Returns Some((node_idx, rec_idx, absolute_offset_in_catalog_data)) if found.
     /// Scans leaf nodes linearly (correct for all catalog sizes we encounter).
     fn find_catalog_record(&self, parent_cnid: u32, name: &str) -> Option<(u32, usize, usize)> {
-        let search_key = Self::build_catalog_key(parent_cnid, name);
+        let canonical = fs_mac_unicode::hfs_unicode::decompose_str(name);
+        let as_given: Vec<u16> = name.encode_utf16().collect();
+        self.find_catalog_key(&Self::catalog_key_from_units(parent_cnid, &canonical))
+            .or_else(|| {
+                // A name an older writer stored in another form, as listed back to us (MU-001).
+                (as_given != canonical)
+                    .then(|| {
+                        self.find_catalog_key(&Self::catalog_key_from_units(parent_cnid, &as_given))
+                    })
+                    .flatten()
+            })
+    }
+
+    /// The leaf record whose key equals `search_key`, scanning leaves in order.
+    fn find_catalog_key(&self, search_key: &[u8]) -> Option<(u32, usize, usize)> {
         let node_size = self.catalog_header.node_size as usize;
         let first_leaf = self.catalog_header.first_leaf_node;
         let cs = self.case_sensitive();
@@ -1882,7 +1912,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                 }
                 let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
                 let key_portion = &rec[..2 + key_len.min(rec.len() - 2)];
-                if Self::catalog_compare(key_portion, &search_key, cs) == Ordering::Equal {
+                if Self::catalog_compare(key_portion, search_key, cs) == Ordering::Equal {
                     Some((node_idx, rec_idx, abs_off))
                 } else {
                     None
@@ -2494,6 +2524,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             &mut self.reader,
             self.partition_offset,
             self.vh.block_size,
+            self.vh.total_blocks,
             &self.vh.extents_file,
             data,
         )
@@ -2513,6 +2544,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             &mut self.reader,
             self.partition_offset,
             self.vh.block_size,
+            self.vh.total_blocks,
             &self.vh.attributes_file,
             HFSPLUS_ATTRIBUTES_FILE_ID,
             0,
@@ -2529,6 +2561,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             &mut self.reader,
             self.partition_offset,
             self.vh.block_size,
+            self.vh.total_blocks,
             &self.vh.catalog_file,
             HFSPLUS_CATALOG_FILE_ID,
             0,
@@ -2544,6 +2577,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                 &mut self.reader,
                 self.partition_offset,
                 self.vh.block_size,
+                self.vh.total_blocks,
                 &self.vh.allocation_file,
                 bm,
             )?;
@@ -3943,10 +3977,24 @@ pub fn probe_hfsplus_volume_label<R: Read + Seek>(
 }
 
 /// Write data through a fork's extent descriptors.
+/// An extent read from disk must lie inside the volume before anything is written through it.
+fn check_extent(start: u32, count: u32, total_blocks: u32) -> Result<(), FilesystemError> {
+    if start
+        .checked_add(count)
+        .map_or(true, |end| end > total_blocks)
+    {
+        return Err(FilesystemError::InvalidData(format!(
+            "extent at block {start} for {count} blocks runs past the {total_blocks}-block volume"
+        )));
+    }
+    Ok(())
+}
+
 fn write_fork_data<R: Write + Seek>(
     writer: &mut R,
     partition_offset: u64,
     block_size: u32,
+    total_blocks: u32,
     fork: &ForkData,
     data: &[u8],
 ) -> Result<(), FilesystemError> {
@@ -3955,6 +4003,7 @@ fn write_fork_data<R: Write + Seek>(
         if ext.is_empty() || written >= data.len() {
             break;
         }
+        check_extent(ext.start_block, ext.block_count, total_blocks)?;
         let offset = partition_offset + ext.start_block as u64 * block_size as u64;
         let extent_len = ext.block_count as u64 * block_size as u64;
         let to_write = extent_len.min((data.len() - written) as u64) as usize;
@@ -3976,6 +4025,7 @@ fn write_fork_data_with_overflow<R: Write + Seek>(
     writer: &mut R,
     partition_offset: u64,
     block_size: u32,
+    total_blocks: u32,
     fork: &ForkData,
     file_id: u32,
     fork_type: u8,
@@ -3987,6 +4037,7 @@ fn write_fork_data_with_overflow<R: Write + Seek>(
         if ext.block_count == 0 || *written >= data.len() {
             return Ok(false);
         }
+        check_extent(ext.start_block, ext.block_count, total_blocks)?;
         let offset = partition_offset + ext.start_block as u64 * block_size as u64;
         let extent_len = ext.block_count as u64 * block_size as u64;
         let to_write = extent_len.min((data.len() - *written) as u64) as usize;
@@ -6496,6 +6547,77 @@ pub fn resolve_apple_hfs<R: Read + Seek>(
 #[allow(clippy::identity_op)] // `1usize * block_size` keeps offset rows aligned
 mod tests {
     use super::*;
+
+    /// Replace every UTF-16BE occurrence of `from` with `to` (same length) in a raw image.
+    fn patch_units(img: &mut [u8], from: &[u16], to: &[u16]) -> usize {
+        let enc = |u: &[u16]| u.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>();
+        let (pat, rep) = (enc(from), enc(to));
+        let mut n = 0;
+        for i in (0..img.len().saturating_sub(pat.len())).step_by(2) {
+            if img[i..i + pat.len()] == pat[..] {
+                img[i..i + pat.len()].copy_from_slice(&rep);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// A name stored with its marks out of canonical order (as fs-mac 0.1.10 wrote it) is still
+    /// found by its listed name: delete works and a second create is refused (MU-001).
+    #[test]
+    fn a_non_canonical_stored_name_is_found_by_its_listed_name() {
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let mut img = create_blank_hfsplus(8 << 20, 4096, "T", false);
+        {
+            let mut fs = HfsPlusFilesystem::open(std::io::Cursor::new(&mut img), 0).unwrap();
+            let root = fs.root().unwrap();
+            let opts = CreateFileOptions::default();
+            fs.create_file(&root, "x\u{323}\u{301}", &mut &b"hi"[..], 2, &opts)
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        assert!(patch_units(&mut img, &[0x78, 0x323, 0x301], &[0x78, 0x301, 0x323]) >= 2);
+        let mut fs = HfsPlusFilesystem::open(std::io::Cursor::new(&mut img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let kids = fs.list_directory(&root).unwrap();
+        let e = kids.into_iter().find(|e| e.name.starts_with('x')).unwrap();
+        let opts = CreateFileOptions::default();
+        let again = fs.create_file(&root, &e.name, &mut &b"yo"[..], 2, &opts);
+        assert!(
+            again.is_err(),
+            "the existing entry is seen, so no second child is made"
+        );
+        fs.delete_entry(&root, &e)
+            .expect("delete by the listed name");
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+    }
+
+    /// A unit an older writer stored precomposed (U+0218, decomposed only since Unicode 3.0)
+    /// sorts by its own value, so the volume stays in order and the file is found (MU-002).
+    #[test]
+    fn a_precomposed_stored_name_keeps_the_tree_in_order() {
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let mut img = create_blank_hfsplus(8 << 20, 4096, "T", false);
+        {
+            let mut fs = HfsPlusFilesystem::open(std::io::Cursor::new(&mut img), 0).unwrap();
+            let root = fs.root().unwrap();
+            let opts = CreateFileOptions::default();
+            fs.create_file(&root, "t", &mut &b"1"[..], 1, &opts)
+                .unwrap();
+            fs.create_file(&root, "zq", &mut &b"2"[..], 1, &opts)
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        assert!(patch_units(&mut img, &[0x7A, 0x71], &[0x0218, 0x71]) >= 2);
+        let mut fs = HfsPlusFilesystem::open(std::io::Cursor::new(&mut img), 0).unwrap();
+        let report = fs.fsck().expect("hfs+ has fsck").unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let root = fs.root().unwrap();
+        let kids = fs.list_directory(&root).unwrap();
+        let e = kids.into_iter().find(|e| e.name.ends_with('q')).unwrap();
+        fs.delete_entry(&root, &e)
+            .expect("delete by the listed name");
+    }
 
     /// A thousand files in, one more in and out, the thousand out, one in:
     /// the catalog must stay clean through every split, merge and retire.
@@ -10098,5 +10220,38 @@ mod tests {
             return;
         }
         panic!("the clock ticked during every attempt");
+    }
+}
+
+#[cfg(test)]
+mod extent_bound_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// FM-002: a B-tree fork extent past the volume is refused, and nothing is written.
+    #[test]
+    fn writing_a_fork_past_the_volume_is_refused() {
+        let total = 1000u32;
+        let mut fork = ForkData {
+            logical_size: 8192,
+            clump_size: 0,
+            total_blocks: 2,
+            extents: [ExtentDescriptor {
+                start_block: 0,
+                block_count: 0,
+            }; 8],
+        };
+        fork.extents[0] = ExtentDescriptor {
+            start_block: total - 1,
+            block_count: 2,
+        };
+        let mut out = Cursor::new(vec![0u8; 4096]);
+        assert!(write_fork_data(&mut out, 0, 4096, total, &fork, &[0xAA; 8192]).is_err());
+        assert!(out.get_ref().iter().all(|&b| b == 0));
+        fork.extents[0].start_block = u32::MAX;
+        assert!(
+            write_fork_data(&mut out, 0, 4096, total, &fork, &[0xAA; 16]).is_err(),
+            "overflow"
+        );
     }
 }

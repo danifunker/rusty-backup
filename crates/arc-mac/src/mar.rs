@@ -170,6 +170,10 @@ fn parse_record(
     parent_path: &[String],
     entries: &mut Vec<StuffItEntry>,
 ) -> Result<()> {
+    // Folders recurse: cap the nesting so a crafted archive can't overflow the stack.
+    if parent_path.len() > 256 {
+        bail!("MAR folders nested more than 256 deep");
+    }
     if *pos + HEADER_LEN > data.len() {
         bail!("truncated MAR record header");
     }
@@ -319,8 +323,13 @@ fn emit_node(out: &mut Vec<u8>, node: &StuffItInputNode) -> Result<()> {
             put_u32(&mut hdr, 0, MAR_MAGIC);
             put_u32(&mut hdr, 4, MAR_FILE);
             write_name(&mut hdr, &f.name)?;
-            put_u32(&mut hdr, 72, f.data_fork.len() as u32);
-            put_u32(&mut hdr, 76, f.resource_fork.len() as u32);
+            let len32 = |n: usize| {
+                u32::try_from(n).map_err(|_| {
+                    anyhow::anyhow!("MAR: a fork of '{}' passes the 4 GiB limit", f.name)
+                })
+            };
+            put_u32(&mut hdr, 72, len32(f.data_fork.len())?);
+            put_u32(&mut hdr, 76, len32(f.resource_fork.len())?);
             // comment_size (80) and file_flags (84) stay 0.
             put_u32(&mut hdr, 88, f.create_date);
             put_u32(&mut hdr, 92, f.mod_date);
@@ -396,12 +405,16 @@ fn write_block(out: &mut Vec<u8>, payload: &[u8]) {
 /// Write a Mac filename as a Pascal string into a header's name field
 /// (offset 8, length byte + up to 63 Mac-Roman bytes).
 fn write_name(hdr: &mut [u8; HEADER_LEN], name: &str) -> Result<()> {
-    let mut bytes = utf8_to_mac_roman(name).unwrap_or_else(|_| {
+    let bytes = utf8_to_mac_roman(name).unwrap_or_else(|_| {
         name.chars()
             .map(|c| if c.is_ascii() { c as u8 } else { b'_' })
             .collect()
     });
-    bytes.truncate(NAME_MAX);
+    let mut bytes = bytes;
+    if bytes.len() > NAME_MAX {
+        log::warn!("MAR: name '{name}' cut to {NAME_MAX} Mac characters");
+        bytes.truncate(NAME_MAX);
+    }
     hdr[NAME_OFF] = bytes.len() as u8;
     hdr[NAME_OFF + 1..NAME_OFF + 1 + bytes.len()].copy_from_slice(&bytes);
     Ok(())

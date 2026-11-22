@@ -1,423 +1,119 @@
-//! Import a host directory tree INTO a disk image's filesystem — the
-//! `mkisofs -graft-points`-shaped counterpart to [`fs_tar::tar_import`],
-//! without needing to stage a tarball first.
-//!
-//! Only the source differs: this walks the host with `std::fs` and hands each
-//! entry to the shared [`fs_tar::import_sink`], which owns path-traversal
-//! guarding, mkdir -p, the conflict policy, and attribute inheritance. So a
-//! directory import and a tar import behave identically once an entry has been
-//! classified — including which failures are "skip and count" rather than
-//! "abort" (a tree with symlinks imports fine onto FAT, dropping them).
-//!
-//! Entries are visited in sorted order at every level, so an import is
-//! reproducible: the same tree produces the same on-disk layout rather than
-//! whatever order the host filesystem happened to hand back.
-//!
-//! The caller owns the sync/commit lifecycle: like every other
-//! [`EditableFilesystem`] mutation, callers MUST call `sync_metadata()` (and,
-//! for a container, `commit`) after import returns.
+//! Copy a host folder into an editable filesystem. The walker, the archive and
+//! gunzip expansion and the conflict policy live in the MIT `rb-fsimporter` crate;
+//! this shim keeps the app's signatures and plugs in what only the app has: Mac
+//! archives (through `arc-mac`) and disk images (through the app's dispatcher).
 
-use std::fs::File;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use crate::partition::PartitionInfo;
+use anyhow::Result;
+use rb_fsimporter::{EditableFilesystem, FileEntry, ImportOptions, ImportStats, Importer};
 
-use disk_core::attrs::AttrOverrides;
-use disk_core::entry::FileEntry;
-use disk_core::filesystem::EditableFilesystem;
-use fs_tar::import_sink::{
-    is_appledouble, ImportItem, ImportOptions, ImportPreflight, ImportStats, Importer,
+pub use rb_fsimporter::{
+    projected_volume_bytes, Cancelled, DirImportOptions, DirImportPreflight, DirImportStats,
+    Expander, Host, ImportConflict, NoHost,
 };
-
-pub use fs_tar::import_sink::{
-    ImportConflict, ImportPreflight as DirImportPreflight, ImportStats as DirImportStats,
-};
-
-/// Knobs for [`import_dir`].
-#[derive(Default)]
-pub struct DirImportOptions {
-    pub shared: ImportOptions,
-    /// Unpack archives found in the tree into a directory named after each,
-    /// instead of copying them in as opaque files. Two families:
-    ///
-    /// - **tar** (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.zst`, and anything else
-    ///   carrying the `ustar` magic — IRIX `.tardist` files included),
-    /// - **classic Mac** (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`), which land
-    ///   with both forks and Finder type/creator intact.
-    ///
-    /// **Off by default.** Which one you want is a genuine judgement call: a
-    /// software-distribution disc usually wants the archives left intact so
-    /// the target system's own installer can consume them, while a "just give
-    /// me the files" disc wants them unpacked. Tar detection is a pure content
-    /// sniff (an oddly-named archive is still found, a `.gz` disk image is
-    /// not); the Mac family gates on extension first so a tree walk never
-    /// reads a multi-GB image just to classify it, then confirms by content.
-    pub expand_archives: bool,
-
-    /// With [`Self::expand_archives`]: unpack each archive's contents into the
-    /// directory that held the archive, rather than into a per-archive
-    /// subdirectory. Every archive alongside each other then shares one root.
-    ///
-    /// This is what an IRIX `inst` distribution wants: `.tardist` files carry
-    /// flat product images (`tgc_bash`, `tgc_bash.idb`, `tgc_bash.sw`, ...),
-    /// and `inst` is pointed at ONE directory holding all of them. A
-    /// subdirectory per archive would mean re-pointing `inst` 55 times.
-    ///
-    /// Overlapping entries are expected here rather than exceptional —
-    /// SGI freeware tardists all ship the same shared `fw_common*` product —
-    /// so callers generally want a non-fatal conflict policy alongside this.
-    pub flatten_archives: bool,
-
-    /// Strip one gzip layer, keeping any tar inside: `x.tgz` lands as `x.tar`, `foo.gz` as `foo`.
-    /// [`Self::expand_archives`] runs first, so with both only non-tar gzip files reach this.
-    pub expand_gunzip: bool,
-
-    /// Copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a
-    /// folder named after each, instead of copying the image in; see [`super::image_import`].
-    pub expand_disk_images: bool,
-
-    /// Leave out macOS `._` sidecars entirely: not copied, and no resource fork taken from them.
-    pub ignore_appledouble: bool,
-}
-
-/// `host` has a `._name` sidecar beside it.
-fn has_appledouble_sibling(host: &Path) -> bool {
-    match (host.parent(), host.file_name().and_then(|n| n.to_str())) {
-        (Some(dir), Some(name)) => dir.join(format!("._{name}")).is_file(),
-        _ => false,
-    }
-}
-
-/// The name `--expand-gunzip` gives a gzip file: `.tgz` becomes `.tar`, `.gz` is dropped.
-/// `None` when there is no such suffix or the name would strip to nothing.
-fn gunzipped_name(file_name: &str) -> Option<String> {
-    let lower = file_name.to_ascii_lowercase();
-    let (cut, add) = if lower.ends_with(".tgz") {
-        (4, ".tar")
-    } else if lower.ends_with(".gz") {
-        (3, "")
-    } else {
-        return None;
-    };
-    let stem = &file_name[..file_name.len() - cut];
-    (!stem.is_empty()).then(|| format!("{stem}{add}"))
-}
-
-/// True when `path` starts with the gzip magic.
-fn is_gzip_file(path: &Path) -> bool {
-    use std::io::Read;
-    let mut magic = [0u8; 2];
-    File::open(path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .map(|_| magic == [0x1f, 0x8b])
-        .unwrap_or(false)
-}
-
-/// The name to import `host` under with `--expand-gunzip`, when it applies.
-fn gunzip_target(host: &Path, file_name: &str) -> Option<String> {
-    gunzipped_name(file_name).filter(|_| is_gzip_file(host))
-}
-
-/// Decompressed length of a (possibly multi-member) gzip file. The trailer's
-/// ISIZE is only the length mod 4 GiB, so the stream is counted instead.
-fn gunzipped_len(path: &Path) -> Result<u64> {
-    Ok(gunzip_scan(path)?.0)
-}
-
-/// Decompressed length plus the original file's mtime from the gzip header (0 means unset).
-fn gunzip_scan(path: &Path) -> Result<(u64, Option<u64>)> {
-    let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut dec = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(f));
-    let len = std::io::copy(&mut dec, &mut std::io::sink())
-        .with_context(|| format!("decompressing {}", path.display()))?;
-    let mtime = dec
-        .header()
-        .map(|h| u64::from(h.mtime()))
-        .filter(|t| *t != 0);
-    Ok((len, mtime))
-}
-
-/// Which expander handles a host file under `expand_archives`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArchiveFlavor {
-    Tar,
-    Mac,
-    Zip,
-    DiskImage,
-}
-
-/// Classify a host file for expansion. Tar first: its `ustar` sniff reads a
-/// fixed header, while the Mac gate may read the whole (small) archive.
-fn archive_flavor(path: &Path) -> Option<ArchiveFlavor> {
-    if fs_tar::tar_import::looks_like_tar_archive(path) {
-        Some(ArchiveFlavor::Tar)
-    } else if is_zip(path) {
-        // Info-ZIP's MacZip carries forks in `Mac3` fields, which only arc-mac reads.
-        Some(match is_maczip(path) {
-            true => ArchiveFlavor::Mac,
-            false => ArchiveFlavor::Zip,
-        })
-    } else if crate::fs::mac_archive_import::looks_like_mac_archive(path) {
-        Some(ArchiveFlavor::Mac)
-    } else {
-        None
-    }
-}
-
-/// A `.zip` by name and by signature; a zip-wrapped disk image is still a zip here.
-fn is_zip(path: &Path) -> bool {
-    let named = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
-    named && fs_tar::zip_import::looks_like_zip(path)
-}
 
 /// Largest zip read whole to look for MacZip fields; MacZip archives are floppy-era small.
 const MACZIP_PROBE_MAX: u64 = 256 * 1024 * 1024;
 
-fn is_maczip(path: &Path) -> bool {
-    let small = std::fs::metadata(path).is_ok_and(|m| m.len() <= MACZIP_PROBE_MAX);
-    small
-        && std::fs::read(path)
-            .map(|b| arc_mac::maczip::is_maczip(b.as_slice()))
-            .unwrap_or(false)
+/// An image's browsable volumes, each with the subfolder it lands in.
+type Volumes = Vec<(Option<String>, PartitionInfo)>;
+
+/// Mac archives and disk images, expanded the way the rest of the app opens them.
+#[derive(Default)]
+pub struct AppExpander {
+    /// The last image `image_has_volumes` probed, kept for the `import_image` that follows.
+    probed: RefCell<Option<(PathBuf, Volumes)>>,
 }
 
-/// What a host file expands as under `opts`, if anything.
-fn expansion(path: &Path, opts: &DirImportOptions) -> Option<ArchiveFlavor> {
-    if opts.expand_archives {
-        if let Some(f) = archive_flavor(path) {
-            return Some(f);
+impl AppExpander {
+    /// The image's volumes: the ones `image_has_volumes` just probed, else a fresh probe.
+    fn volumes(&self, path: &Path) -> Volumes {
+        match self.probed.borrow_mut().take() {
+            Some((p, vols)) if p == path => vols,
+            _ => super::image_import::volumes(path),
         }
     }
-    (opts.expand_disk_images && super::image_import::looks_like_disk_image(path))
-        .then_some(ArchiveFlavor::DiskImage)
 }
 
-/// `(files, dirs, bytes)` the archive expands to, per flavor; `None` for an image with no
-/// browsable volume, which is copied in as a file.
-fn measure_expanded(flavor: ArchiveFlavor, path: &Path) -> Result<Option<(u64, u64, u64)>> {
-    match flavor {
-        ArchiveFlavor::Tar => fs_tar::tar_import::measure_tar_expanded(path).map(Some),
-        ArchiveFlavor::Mac => {
-            crate::fs::mac_archive_import::measure_mac_archive_expanded(path).map(Some)
-        }
-        ArchiveFlavor::Zip => fs_tar::zip_import::measure_zip_expanded(path).map(Some),
-        ArchiveFlavor::DiskImage => super::image_import::measure_image_expanded(path),
+impl Expander for AppExpander {
+    fn is_mac_archive(&self, path: &Path) -> bool {
+        super::mac_archive_import::looks_like_mac_archive(path)
+    }
+
+    fn is_maczip(&self, path: &Path) -> bool {
+        let small = std::fs::metadata(path).is_ok_and(|m| m.len() <= MACZIP_PROBE_MAX);
+        small
+            && std::fs::read(path)
+                .map(|b| arc_mac::maczip::is_maczip(b.as_slice()))
+                .unwrap_or(false)
+    }
+
+    fn measure_mac_archive(&self, path: &Path) -> Result<(u64, u64, u64)> {
+        super::mac_archive_import::measure_mac_archive_expanded(path)
+    }
+
+    fn import_mac_archive(
+        &self,
+        efs: &mut dyn EditableFilesystem,
+        dest: &FileEntry,
+        path: &Path,
+        opts: &ImportOptions,
+        progress: &dyn Fn(&ImportStats),
+    ) -> Result<ImportStats> {
+        super::mac_archive_import::import_mac_archive_from_path_into(
+            efs, dest, path, opts, progress,
+        )
+    }
+
+    fn is_disk_image(&self, path: &Path) -> bool {
+        super::image_import::looks_like_disk_image(path)
+    }
+
+    fn image_has_volumes(&self, path: &Path) -> bool {
+        let vols = super::image_import::volumes(path);
+        let any = !vols.is_empty();
+        *self.probed.borrow_mut() = Some((path.to_path_buf(), vols));
+        any
+    }
+
+    fn measure_image(&self, path: &Path) -> Result<Option<(u64, u64, u64)>> {
+        super::image_import::measure_image_expanded(path)
+    }
+
+    fn import_image(
+        &self,
+        efs: &mut dyn EditableFilesystem,
+        sink: &mut Importer,
+        comps: &[String],
+        path: &Path,
+        opts: &ImportOptions,
+        progress: &dyn Fn(&ImportStats),
+    ) -> Result<ImportStats> {
+        let vols = self.volumes(path);
+        super::image_import::import_image_into(efs, sink, comps, path, &vols, opts, progress)
     }
 }
 
-/// Directory name for an expanded archive: the file name with its archive
-/// extension(s) stripped. `foo-1.2.tar.gz` -> `foo-1.2`, `bar.tardist` ->
-/// `bar`, `Tool.sit.hqx` -> `Tool`. A name that strips to nothing keeps the
-/// original.
-fn expanded_dir_name(file_name: &str) -> String {
-    let lower = file_name.to_ascii_lowercase();
-    for suffix in [
-        ".gnutar.gz",
-        ".gtar.gz",
-        ".tar.gz",
-        ".tar.zst",
-        ".tar.zstd",
-        ".tar.bz2",
-        ".tar.xz",
-        ".tgz",
-        ".tzst",
-        ".tbz2",
-        ".tbz",
-        ".txz",
-        ".tardist",
-        ".gnutar",
-        ".gtar",
-        ".tar",
-        ".sit.hqx",
-        ".sea.hqx",
-        ".cpt.hqx",
-        ".sit",
-        ".sea",
-        ".cpt",
-        ".hqx",
-        ".mar",
-        ".zip",
-    ] {
-        if lower.ends_with(suffix) {
-            let stem = &file_name[..file_name.len() - suffix.len()];
-            if !stem.is_empty() {
-                return stem.to_string();
-            }
-        }
-    }
-    file_name.to_string()
+/// A progress callback and a cancel check as a [`Host`].
+struct ProgressHost<'a> {
+    progress: &'a dyn Fn(&ImportStats),
+    cancel: &'a dyn Fn() -> bool,
 }
 
-/// Folder name for an expanded disk image: the name without its last extension.
-fn image_dir_name(file_name: &str) -> String {
-    match file_name.rsplit_once('.') {
-        Some((stem, _)) if !stem.is_empty() => stem.to_string(),
-        _ => file_name.to_string(),
+impl Host for ProgressHost<'_> {
+    fn cancelled(&self) -> bool {
+        (self.cancel)()
+    }
+
+    fn progress(&self, stats: &ImportStats) {
+        (self.progress)(stats)
     }
 }
 
-/// One host entry, flattened out of the recursive walk.
-struct HostEntry {
-    /// Path components relative to the import root.
-    comps: Vec<String>,
-    host: PathBuf,
-    kind: HostKind,
-}
-
-enum HostKind {
-    Dir,
-    File { size: u64 },
-    Symlink { target: String },
-    Other,
-}
-
-/// Walk `root` depth-first, yielding directories before their contents so the
-/// sink can create parents first. Symlinks are reported as symlinks and never
-/// followed — following them risks importing the same subtree repeatedly, or
-/// escaping `root` entirely.
-fn walk(root: &Path) -> Result<Vec<HostEntry>> {
-    let mut out = Vec::new();
-    walk_into(root, &mut Vec::new(), &mut out)?;
-    Ok(out)
-}
-
-fn walk_into(dir: &Path, prefix: &mut Vec<String>, out: &mut Vec<HostEntry>) -> Result<()> {
-    let mut children: Vec<_> = std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("reading {}", dir.display()))?;
-    // Deterministic order, so the same tree always lays out the same way.
-    children.sort_by_key(|d| d.file_name());
-
-    for dent in children {
-        let name = dent.file_name().to_string_lossy().into_owned();
-        let host = dent.path();
-        // `symlink_metadata` so a symlink is classified as one rather than as
-        // whatever it points at.
-        let meta = match host.symlink_metadata() {
-            Ok(m) => m,
-            // A file that vanished mid-walk is not worth aborting a
-            // multi-gigabyte import over.
-            Err(_) => continue,
-        };
-        let ft = meta.file_type();
-        prefix.push(name);
-        if ft.is_symlink() {
-            let target = std::fs::read_link(&host)
-                .map(|t| t.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            out.push(HostEntry {
-                comps: prefix.clone(),
-                host: host.clone(),
-                kind: HostKind::Symlink { target },
-            });
-        } else if ft.is_dir() {
-            out.push(HostEntry {
-                comps: prefix.clone(),
-                host: host.clone(),
-                kind: HostKind::Dir,
-            });
-            walk_into(&host, prefix, out)?;
-        } else if ft.is_file() {
-            out.push(HostEntry {
-                comps: prefix.clone(),
-                host: host.clone(),
-                kind: HostKind::File { size: meta.len() },
-            });
-        } else {
-            // Devices, fifos, sockets.
-            out.push(HostEntry {
-                comps: prefix.clone(),
-                host: host.clone(),
-                kind: HostKind::Other,
-            });
-        }
-        prefix.pop();
-    }
-    Ok(())
-}
-
-/// The mode / ownership a host entry asks for, or nothing when the caller
-/// turned that off (`--no-permissions`), in which case the shared resolver
-/// falls back to the replaced entry then the parent directory.
-///
-/// Unix-only: on Windows there is no mode to read, so every entry takes the
-/// resolver's inherit-from-parent default. `unix_times` is always populated
-/// (independent of `apply_permissions`) so the imported file carries its
-/// source's mtime end-to-end — that's independent of whether we honour its
-/// mode bits, and is available on every host OS via `SystemTime`.
-#[cfg(unix)]
-fn host_overrides(meta: &std::fs::Metadata, apply: bool) -> AttrOverrides {
-    use std::os::unix::fs::MetadataExt;
-    let unix_times = Some(disk_core::times::UnixTimes {
-        mtime: Some(meta.mtime().max(0) as u64),
-        atime: Some(meta.atime().max(0) as u64),
-        ctime: Some(meta.ctime().max(0) as u64),
-    });
-    if !apply {
-        return AttrOverrides {
-            unix_times,
-            ..Default::default()
-        };
-    }
-    AttrOverrides {
-        mode: Some(meta.mode() & 0o7777),
-        uid: Some(meta.uid()),
-        gid: Some(meta.gid()),
-        unix_times,
-    }
-}
-
-#[cfg(not(unix))]
-fn host_overrides(meta: &std::fs::Metadata, _apply: bool) -> AttrOverrides {
-    // Windows has no mode/uid/gid to read, but `SystemTime::modified` /
-    // `accessed` / `created` all work — carry the host's mtime so an
-    // rb-cli import from a Windows dir still preserves file dates. On
-    // failure fall through to None (driver stamps now).
-    fn to_secs(t: std::io::Result<std::time::SystemTime>) -> Option<u64> {
-        t.ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs())
-    }
-    AttrOverrides {
-        unix_times: Some(disk_core::times::UnixTimes {
-            mtime: to_secs(meta.modified()),
-            atime: to_secs(meta.accessed()),
-            ctime: to_secs(meta.created()),
-        }),
-        ..Default::default()
-    }
-}
-
-/// `comps` with its last element replaced — the Mac name a whole-file container
-/// records, in place of the host's `Foo.bin` / `Foo.hqx` wrapper name.
-fn rename_leaf(comps: &[String], leaf: &str) -> Vec<String> {
-    let mut out = comps.to_vec();
-    if let Some(last) = out.last_mut() {
-        *last = leaf.to_string();
-    }
-    out
-}
-
-fn overrides_for(host: &Path, apply: bool) -> AttrOverrides {
-    match host.symlink_metadata() {
-        Ok(m) => host_overrides(&m, apply),
-        Err(_) => AttrOverrides::default(),
-    }
-}
-
-/// Import everything under `root` into `dest`.
-///
-/// Brackets the work in [`EditableFilesystem::begin_bulk`] /
-/// [`end_bulk`](EditableFilesystem::end_bulk). The importer aborts on the first
-/// hard error (every create is `?`-propagated) and callers discard the volume
-/// on `Err`, so per-operation rollback is redundant here; bulk mode lets HFS
-/// skip cloning its whole catalog on every entry. `end_bulk` runs even on
-/// error so the filesystem is never left stuck in bulk mode.
+/// Import everything under `root` into `dest`; see [`rb_fsimporter::import_dir_with`].
 pub fn import_dir(
     efs: &mut dyn EditableFilesystem,
     dest: &FileEntry,
@@ -425,673 +121,55 @@ pub fn import_dir(
     opts: &DirImportOptions,
     progress: &dyn Fn(&ImportStats),
 ) -> Result<ImportStats> {
-    if !root.is_dir() {
-        return Err(anyhow!("{} is not a directory", root.display()));
-    }
-    efs.begin_bulk();
-    let result = import_dir_inner(efs, dest, root, opts, progress);
-    efs.end_bulk();
-    result
+    import_dir_cancellable(efs, dest, root, opts, progress, &|| false)
 }
 
-fn import_dir_inner(
+/// [`import_dir`] that stops between entries once `cancel` says so, with a [`Cancelled`] error.
+pub fn import_dir_cancellable(
     efs: &mut dyn EditableFilesystem,
     dest: &FileEntry,
     root: &Path,
     opts: &DirImportOptions,
     progress: &dyn Fn(&ImportStats),
+    cancel: &dyn Fn() -> bool,
 ) -> Result<ImportStats> {
-    let entries = walk(root)?;
-    let mut sink = Importer::new(dest);
-    // Rejoining forks is only meaningful where the target can store one; on FAT
-    // a `._name` sidecar stays the cruft `skip_appledouble` already drops.
-    let mac_forks_wanted = crate::fs::copy::Capabilities::infer(efs.fs_type()).resource_forks;
-
-    for e in entries {
-        let display = e.host.display().to_string();
-        let overrides = overrides_for(&e.host, opts.shared.apply_permissions);
-        match e.kind {
-            HostKind::Dir => {
-                sink.push(
-                    efs,
-                    &e.comps,
-                    ImportItem::Dir,
-                    &overrides,
-                    &opts.shared,
-                    &display,
-                )?;
-            }
-            HostKind::Symlink { target } => {
-                sink.push(
-                    efs,
-                    &e.comps,
-                    ImportItem::Symlink { target },
-                    &overrides,
-                    &opts.shared,
-                    &display,
-                )?;
-            }
-            HostKind::File { size } => {
-                if let Some(flavor) = expansion(&e.host, opts) {
-                    if expand_archive(efs, &mut sink, &e, flavor, opts, progress)? {
-                        progress(&sink.stats);
-                        continue;
-                    }
-                }
-                if let Some(name) = opts
-                    .expand_gunzip
-                    .then(|| e.comps.last().and_then(|n| gunzip_target(&e.host, n)))
-                    .flatten()
-                {
-                    let (len, header_mtime) = gunzip_scan(&e.host)?;
-                    // The gzip header records the original file's date; fall back to the .gz's own.
-                    let mut overrides = overrides;
-                    if let Some(t) = header_mtime {
-                        overrides.unix_times = Some(disk_core::times::UnixTimes::mtime_only(t));
-                    }
-                    let f = File::open(&e.host).with_context(|| format!("opening {display}"))?;
-                    let mut dec = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(f));
-                    sink.push(
-                        efs,
-                        &rename_leaf(&e.comps, &name),
-                        ImportItem::File {
-                            size: len,
-                            data: &mut dec,
-                            mac_fork: None,
-                        },
-                        &overrides,
-                        &opts.shared,
-                        &display,
-                    )?;
-                    sink.stats.gunzipped += 1;
-                    progress(&sink.stats);
-                    continue;
-                }
-                // Sidecars a modern Mac left behind, dropped with whatever they carry.
-                let sidecar = e.host.file_name().and_then(|n| n.to_str());
-                if opts.ignore_appledouble && sidecar.is_some_and(is_appledouble) {
-                    sink.stats.appledouble_skipped += 1;
-                    progress(&sink.stats);
-                    continue;
-                }
-                // A Mac file in a host folder is one file in up to two pieces:
-                // a data fork plus a `._name` / `.rsrc` sidecar, or a single
-                // `.bin` / `.hqx` wrapper holding both. Rejoin them here, where
-                // the host paths are, so the volume gets one forked file
-                // instead of a fork-less file and a stray sidecar (R-040).
-                // `--include-appledouble` asks for the sidecars as files as
-                // well, so it keeps them; the fork still reaches the primary.
-                if mac_forks_wanted
-                    && opts.shared.skip_appledouble
-                    && fs_mac::resource_fork::is_resource_fork_sidecar(&e.host)
-                {
-                    sink.stats.appledouble_skipped += 1;
-                    progress(&sink.stats);
-                    continue;
-                }
-                let from_sidecar = opts.ignore_appledouble && has_appledouble_sibling(&e.host);
-                let fork = (mac_forks_wanted && !from_sidecar)
-                    .then(|| fs_mac::resource_fork::detect_resource_fork(&e.host))
-                    .flatten();
-                // A wrapper's own bytes are not the file: use the data fork it
-                // carries, under the Mac name it records.
-                let unwrapped = fork.as_ref().and_then(|i| i.data_fork.clone());
-                let comps = match (&unwrapped, fork.as_ref().and_then(|i| i.name.as_deref())) {
-                    (Some(_), Some(mac_name)) => rename_leaf(&e.comps, mac_name),
-                    _ => e.comps.clone(),
-                };
-                match unwrapped {
-                    Some(df) => {
-                        let len = df.len() as u64;
-                        let mut cursor = std::io::Cursor::new(df);
-                        sink.push(
-                            efs,
-                            &comps,
-                            ImportItem::File {
-                                size: len,
-                                data: &mut cursor,
-                                mac_fork: fork.as_ref(),
-                            },
-                            &overrides,
-                            &opts.shared,
-                            &display,
-                        )?;
-                    }
-                    None => {
-                        let mut f =
-                            File::open(&e.host).with_context(|| format!("opening {display}"))?;
-                        sink.push(
-                            efs,
-                            &comps,
-                            ImportItem::File {
-                                size,
-                                data: &mut f,
-                                mac_fork: fork.as_ref(),
-                            },
-                            &overrides,
-                            &opts.shared,
-                            &display,
-                        )?;
-                    }
-                }
-            }
-            HostKind::Other => {
-                sink.push(
-                    efs,
-                    &e.comps,
-                    ImportItem::Unsupported,
-                    &overrides,
-                    &opts.shared,
-                    &display,
-                )?;
-            }
-        }
-        progress(&sink.stats);
-    }
-    Ok(sink.stats)
+    rb_fsimporter::import_dir_with(
+        efs,
+        dest,
+        root,
+        opts,
+        Some(&AppExpander::default()),
+        &ProgressHost { progress, cancel },
+    )
 }
 
-/// Unpack one archive: into a directory named after it, or — with
-/// `flatten_archives` — straight into the directory that held it, so sibling
-/// archives share one root. Returns `false` when the archive should be copied
-/// in verbatim after all (its directory name is unusable on this filesystem),
-/// so the caller falls back to a plain copy rather than silently dropping the
-/// file.
-///
-/// Bulk mode stays with the enclosing [`import_dir`] — see
-/// [`fs_tar::tar_import::import_tar_into`] for why this can't just call
-/// `import_tar`.
-fn expand_archive(
-    efs: &mut dyn EditableFilesystem,
-    sink: &mut Importer,
-    e: &HostEntry,
-    flavor: ArchiveFlavor,
-    opts: &DirImportOptions,
-    progress: &dyn Fn(&ImportStats),
-) -> Result<bool> {
-    let file_name = match e.comps.last() {
-        Some(n) => n.clone(),
-        None => return Ok(false),
-    };
-    // Flattened: drop the archive's own name, landing its contents in the
-    // directory that held it (the destination root for a top-level archive).
-    // Otherwise: replace the archive's name with the stripped-extension form
-    // and unpack under that.
-    let mut comps = e.comps.clone();
-    let last = comps.len() - 1;
-    // A disk image with nothing browsable is copied in as it is.
-    let vols = match flavor {
-        ArchiveFlavor::DiskImage => {
-            let v = super::image_import::volumes(&e.host);
-            if v.is_empty() {
-                return Ok(false);
-            }
-            v
-        }
-        _ => Vec::new(),
-    };
-    if opts.flatten_archives {
-        comps.truncate(last);
-    } else if flavor == ArchiveFlavor::DiskImage {
-        comps[last] = image_dir_name(file_name.as_str());
-    } else {
-        comps[last] = expanded_dir_name(&file_name);
-    }
-
-    let dir = match sink.ensure_dir_at(efs, &comps, fs_tar::tar_import::archive_times(&e.host))? {
-        Some(d) => d,
-        None => return Ok(false),
-    };
-    // The nested import's tally is reported against the parent's totals, so
-    // the caller's progress callback keeps counting up rather than restarting.
-    let base = sink.stats.clone();
-    let report = &|s: &ImportStats| {
-        let mut merged = base.clone();
-        merged.merge(s);
-        progress(&merged);
-    };
-    let nested = match flavor {
-        ArchiveFlavor::Tar => {
-            fs_tar::tar_import::import_tar_from_path_into(efs, &dir, &e.host, &opts.shared, report)
-        }
-        ArchiveFlavor::Mac => crate::fs::mac_archive_import::import_mac_archive_from_path_into(
-            efs,
-            &dir,
-            &e.host,
-            &opts.shared,
-            report,
-        ),
-        ArchiveFlavor::Zip => fs_tar::zip_import::import_zip_from_path_into(
-            efs,
-            &dir,
-            e.host.as_path(),
-            &opts.shared,
-            report,
-        ),
-        ArchiveFlavor::DiskImage => super::image_import::import_image_into(
-            efs,
-            sink,
-            comps.as_slice(),
-            e.host.as_path(),
-            vols.as_slice(),
-            &opts.shared,
-            report,
-        ),
-    }
-    // `{e:#}` not `{e}`: the CLI flattens this error into a message with
-    // `{e}` further up, which keeps only the outermost layer. Without the
-    // alternate form the real cause — which file, which filesystem limit —
-    // is silently dropped and the user gets a bare archive name.
-    .map_err(|err| anyhow!("expanding {}: {err:#}", e.host.display()))?;
-    sink.stats.merge(&nested);
-    sink.stats.archives_expanded += 1;
-    Ok(true)
-}
-
-/// Read-only scan of a host tree against a target filesystem: what would be
-/// skipped or dropped, and how many content bytes the import would write.
-/// Mirrors [`import_dir`]'s classification but performs no mutations.
-///
-/// `total_bytes` is what sizing a fresh volume to fit the tree keys off — see
-/// [`projected_volume_bytes`].
+/// What an import would skip and write, without writing; see [`rb_fsimporter::preflight_dir_with`].
 pub fn preflight_dir(
     efs: &dyn EditableFilesystem,
     root: &Path,
     opts: &DirImportOptions,
-) -> Result<ImportPreflight> {
-    let supports_symlinks = efs.supports_symlinks();
-    let mut pf = ImportPreflight::default();
-    for e in walk(root)? {
-        let name_invalid = e.comps.iter().any(|c| efs.validate_name(c).is_err());
-        let appledouble = (opts.shared.skip_appledouble || opts.ignore_appledouble)
-            && e.comps.last().map(|c| is_appledouble(c)).unwrap_or(false);
-        if appledouble {
-            pf.appledouble += 1;
-            continue;
-        }
-        match e.kind {
-            HostKind::Dir => {
-                pf.dirs += 1;
-                if name_invalid {
-                    pf.invalid_names += 1;
-                }
-            }
-            _ if name_invalid => pf.invalid_names += 1,
-            HostKind::Symlink { .. } => {
-                pf.symlinks += 1;
-                if !supports_symlinks {
-                    pf.symlinks_dropped += 1;
-                }
-            }
-            HostKind::File { size } => {
-                let expanded = match expansion(&e.host, opts) {
-                    Some(flavor) => measure_expanded(flavor, &e.host)?,
-                    None => None,
-                };
-                if let Some((f, d, b)) = expanded {
-                    // Count what the archive becomes, not the archive.
-                    pf.files += f;
-                    // Plus the directory it unpacks into, unless flattened —
-                    // then it shares the one that already exists.
-                    pf.dirs += d + u64::from(!opts.flatten_archives);
-                    pf.total_bytes += b;
-                } else if opts.expand_gunzip
-                    && e.comps
-                        .last()
-                        .and_then(|n| gunzip_target(&e.host, n))
-                        .is_some()
-                {
-                    pf.files += 1;
-                    pf.total_bytes += gunzipped_len(&e.host)?;
-                } else {
-                    pf.files += 1;
-                    pf.total_bytes += size;
-                }
-            }
-            HostKind::Other => pf.other_unsupported += 1,
-        }
-    }
-    Ok(pf)
+) -> Result<DirImportPreflight> {
+    rb_fsimporter::preflight_dir_with(efs, root, opts, Some(&AppExpander::default()))
 }
 
-/// Scan a host tree with no target filesystem in hand — used to size a volume
-/// *before* formatting it, where there is nothing to validate names against
-/// yet. Returns (file count, directory count, total content bytes).
-///
-/// With `expand_archives` on, archives are measured by what they unpack to.
-/// That distinction is the whole point for sizing: a tree of `.tar.gz` can
-/// easily triple on the way in, and a disc sized off the compressed total
-/// would run out partway through the copy.
-/// `flatten` matches [`DirImportOptions::flatten_archives`]: it drops the
-/// per-archive directory from the count. It does not try to predict how many
-/// entries several archives share once merged, so a flattened estimate errs
-/// high — the safe direction for sizing.
+/// `(files, dirs, bytes)` under `root`, archives measured as they unpack when `expand_archives`.
 pub fn measure_dir(root: &Path, expand_archives: bool, flatten: bool) -> Result<(u64, u64, u64)> {
-    measure_dir_for(
+    rb_fsimporter::measure_dir(
         root,
-        &DirImportOptions {
-            expand_archives,
-            flatten_archives: flatten,
-            ..Default::default()
-        },
+        expand_archives,
+        flatten,
+        Some(&AppExpander::default()),
     )
 }
 
-/// [`measure_dir`] driven by the import options themselves, so `--expand-gunzip`
-/// files are measured decompressed too.
+/// [`measure_dir`] driven by the import options themselves.
 pub fn measure_dir_for(root: &Path, opts: &DirImportOptions) -> Result<(u64, u64, u64)> {
-    let flatten = opts.flatten_archives;
-    let mut files = 0u64;
-    let mut dirs = 0u64;
-    let mut bytes = 0u64;
-    for e in walk(root)? {
-        match e.kind {
-            HostKind::Dir => dirs += 1,
-            HostKind::File { size } => {
-                let expanded = match expansion(&e.host, opts) {
-                    Some(flavor) => measure_expanded(flavor, &e.host)?,
-                    None => None,
-                };
-                if let Some((f, d, b)) = expanded {
-                    files += f;
-                    dirs += d + u64::from(!flatten);
-                    bytes += b;
-                } else if opts.expand_gunzip
-                    && e.comps
-                        .last()
-                        .and_then(|n| gunzip_target(&e.host, n))
-                        .is_some()
-                {
-                    files += 1;
-                    bytes += gunzipped_len(&e.host)?;
-                } else {
-                    files += 1;
-                    bytes += size;
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok((files, dirs, bytes))
-}
-
-/// Project the volume size needed to hold a tree of `content_bytes` across
-/// `files` files and `dirs` directories, for `--size auto`.
-///
-/// Every filesystem rounds each file up to a block and spends further blocks on
-/// its own metadata, so the raw content total always undershoots. This adds a
-/// per-entry block allowance plus a proportional slack margin and rounds up to
-/// a whole mebibyte. Deliberately generous: overshooting costs a few MB of
-/// empty space, undershooting costs the user a failed import most of the way
-/// through a long copy.
-pub fn projected_volume_bytes(files: u64, dirs: u64, content_bytes: u64, block_size: u64) -> u64 {
-    let block = block_size.max(512);
-    // Per-entry: one block of internal fragmentation on average, plus a block
-    // of directory/inode overhead.
-    let per_entry = (files + dirs).saturating_mul(block.saturating_mul(2));
-    let base = content_bytes
-        .saturating_add(per_entry)
-        // Filesystem-level metadata (bitmaps, inode tables, superblocks) plus
-        // headroom, as a fraction of the content.
-        .saturating_add(content_bytes / 8);
-    // Never propose something uselessly tiny.
-    let floor = 4 * 1024 * 1024;
-    let mib = 1024 * 1024;
-    base.max(floor).div_ceil(mib).saturating_mul(mib)
+    rb_fsimporter::measure_dir_with(root, opts, Some(&AppExpander::default()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disk_core::filesystem::Filesystem;
-
-    fn blank_fat() -> Vec<u8> {
-        fs_pc::fat::create_blank_fat(16 * 1024 * 1024, Some("DIRIMP")).expect("format")
-    }
-
-    fn tree(root: &Path) {
-        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
-        std::fs::write(root.join("a.txt"), b"alpha").unwrap();
-        std::fs::write(root.join("sub/b.txt"), b"bravo").unwrap();
-        std::fs::write(root.join("sub/deeper/c.bin"), vec![7u8; 5000]).unwrap();
-    }
-
-    #[test]
-    fn imports_a_host_tree_preserving_structure_and_content() {
-        let tmp = tempfile::tempdir().unwrap();
-        tree(tmp.path());
-
-        let img = blank_fat();
-        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
-        let root = Filesystem::root(&mut fs).expect("root");
-        let stats = import_dir(
-            &mut fs,
-            &root,
-            tmp.path(),
-            &DirImportOptions::default(),
-            &|_| {},
-        )
-        .expect("import");
-
-        assert_eq!(stats.files, 3);
-        assert_eq!(stats.dirs_created, 2);
-        assert_eq!(stats.total_bytes, 5 + 5 + 5000);
-
-        // Content survives the trip, including the nested one.
-        let entries = fs.list_directory(&root).expect("list");
-        let a = entries.iter().find(|e| e.name == "a.txt").expect("a.txt");
-        assert_eq!(fs.read_file(a, usize::MAX).unwrap(), b"alpha");
-
-        let sub = entries.iter().find(|e| e.name == "sub").expect("sub");
-        let sub_kids = fs.list_directory(sub).expect("list sub");
-        let b = sub_kids.iter().find(|e| e.name == "b.txt").expect("b.txt");
-        assert_eq!(fs.read_file(b, usize::MAX).unwrap(), b"bravo");
-    }
-
-    /// The walk must not follow symlinks — following them can import a
-    /// subtree repeatedly or escape the import root entirely.
-    #[cfg(unix)]
-    #[test]
-    fn symlinks_are_recorded_not_followed() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("real")).unwrap();
-        std::fs::write(tmp.path().join("real/file.txt"), b"data").unwrap();
-        std::os::unix::fs::symlink("real", tmp.path().join("link")).unwrap();
-
-        let entries = walk(tmp.path()).unwrap();
-        let link = entries
-            .iter()
-            .find(|e| e.comps == vec!["link".to_string()])
-            .expect("link present");
-        assert!(matches!(link.kind, HostKind::Symlink { .. }));
-        // "real/file.txt" appears exactly once — not again under "link/".
-        let count = entries
-            .iter()
-            .filter(|e| e.comps.last().map(|s| s.as_str()) == Some("file.txt"))
-            .count();
-        assert_eq!(count, 1, "symlink was followed");
-    }
-
-    /// A tree with symlinks must still import onto a filesystem that can't
-    /// store them — dropped and counted, not fatal.
-    #[cfg(unix)]
-    #[test]
-    fn symlinks_are_dropped_not_fatal_on_fat() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("real.txt"), b"data").unwrap();
-        std::os::unix::fs::symlink("real.txt", tmp.path().join("link.txt")).unwrap();
-
-        let img = blank_fat();
-        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
-        let root = Filesystem::root(&mut fs).expect("root");
-        let stats = import_dir(
-            &mut fs,
-            &root,
-            tmp.path(),
-            &DirImportOptions::default(),
-            &|_| {},
-        )
-        .expect("import must not abort on an unsupported symlink");
-        assert_eq!(stats.files, 1);
-        assert_eq!(stats.symlinks_skipped, 1);
-
-        let pf = preflight_dir(&fs, tmp.path(), &DirImportOptions::default()).expect("preflight");
-        assert_eq!(pf.symlinks_dropped, 1);
-        assert!(pf.has_warnings());
-    }
-
-    #[test]
-    fn walk_order_is_deterministic() {
-        let tmp = tempfile::tempdir().unwrap();
-        for n in ["zebra", "alpha", "middle"] {
-            std::fs::write(tmp.path().join(n), b"x").unwrap();
-        }
-        let names: Vec<String> = walk(tmp.path())
-            .unwrap()
-            .into_iter()
-            .map(|e| e.comps.join("/"))
-            .collect();
-        assert_eq!(names, vec!["alpha", "middle", "zebra"]);
-    }
-
-    fn write_tgz(path: &Path, entries: &[(&str, &[u8])]) {
-        let f = std::fs::File::create(path).unwrap();
-        let enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-        let mut b = tar::Builder::new(enc);
-        for (name, data) in entries {
-            let mut h = tar::Header::new_gnu();
-            h.set_size(data.len() as u64);
-            h.set_mode(0o644);
-            h.set_cksum();
-            b.append_data(&mut h, name, *data).unwrap();
-        }
-        b.into_inner().unwrap().finish().unwrap();
-    }
-
-    /// pbzip2 writes one bzip2 stream per block, so the reader must not stop after the first.
-    #[test]
-    fn a_multi_stream_tar_bz2_expands_into_its_own_folder() {
-        use std::io::Write;
-        let tmp = tempfile::tempdir().unwrap();
-        let mut b = tar::Builder::new(Vec::new());
-        let big = vec![b'x'; 300_000];
-        for (name, data) in [("src/a.c", &b"int a;"[..]), ("src/big.dat", &big[..])] {
-            let mut h = tar::Header::new_gnu();
-            h.set_size(data.len() as u64);
-            h.set_mode(0o644);
-            h.set_cksum();
-            b.append_data(&mut h, name, data).unwrap();
-        }
-        let tar_bytes = b.into_inner().unwrap();
-        let mut f = std::fs::File::create(tmp.path().join("egcs-1.1.2.tar.bz2")).unwrap();
-        let (head, tail) = tar_bytes.split_at(1024);
-        for part in [head, tail] {
-            let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
-            enc.write_all(part).unwrap();
-            f.write_all(&enc.finish().unwrap()).unwrap();
-        }
-        drop(f);
-
-        let (files, _, bytes) = measure_dir(tmp.path(), true, false).unwrap();
-        assert_eq!((files, bytes), (2, 300_006));
-
-        let img = blank_fat();
-        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
-        let root = Filesystem::root(&mut fs).expect("root");
-        let opts = DirImportOptions {
-            expand_archives: true,
-            ..Default::default()
-        };
-        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {}).expect("import");
-        assert_eq!((stats.archives_expanded, stats.files), (1, 2));
-        let find = |fs: &mut fs_pc::fat::FatFilesystem<_>, dir: &FileEntry, name: &str| {
-            fs.list_directory(dir)
-                .unwrap()
-                .into_iter()
-                .find(|e| e.name.eq_ignore_ascii_case(name))
-                .unwrap_or_else(|| panic!("{name} missing"))
-        };
-        let top = find(&mut fs, &root, "egcs-1.1.2");
-        let src = find(&mut fs, &top, "src");
-        let dat = find(&mut fs, &src, "big.dat");
-        assert_eq!(fs.read_file(&dat, usize::MAX).unwrap(), big);
-    }
-
-    /// Default is to copy an archive in verbatim; `--expand-archives` unpacks
-    /// it into a directory named after it. Both must be reachable, because
-    /// which one is right depends on what the disc is for.
-    #[test]
-    fn archives_are_copied_verbatim_unless_expansion_is_requested() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_tgz(
-            &tmp.path().join("pkg-1.0.tar.gz"),
-            &[("inner/one.txt", b"one"), ("inner/two.txt", b"two")],
-        );
-
-        // Default: one opaque file, no expansion.
-        let img = blank_fat();
-        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
-        let root = Filesystem::root(&mut fs).expect("root");
-        let stats = import_dir(
-            &mut fs,
-            &root,
-            tmp.path(),
-            &DirImportOptions::default(),
-            &|_| {},
-        )
-        .expect("import");
-        assert_eq!(stats.files, 1);
-        assert_eq!(stats.archives_expanded, 0);
-        let names: Vec<String> = fs
-            .list_directory(&root)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
-        assert!(names.iter().any(|n| n == "pkg-1.0.tar.gz"));
-
-        // Opt in: the archive becomes a directory of its contents.
-        let img = blank_fat();
-        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
-        let root = Filesystem::root(&mut fs).expect("root");
-        let opts = DirImportOptions {
-            expand_archives: true,
-            ..Default::default()
-        };
-        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {}).expect("import");
-        assert_eq!(stats.archives_expanded, 1);
-        assert_eq!(stats.files, 2, "both archive members should land");
-
-        let names: Vec<String> = fs
-            .list_directory(&root)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
-        assert!(
-            !names.iter().any(|n| n.contains("tar.gz")),
-            "the archive itself should not be copied: {names:?}"
-        );
-        // pkg-1.0/inner/one.txt
-        let dir = fs
-            .list_directory(&root)
-            .unwrap()
-            .into_iter()
-            .find(|e| e.name.eq_ignore_ascii_case("pkg-1.0"))
-            .expect("expanded directory");
-        let inner = fs
-            .list_directory(&dir)
-            .unwrap()
-            .into_iter()
-            .find(|e| e.name.eq_ignore_ascii_case("inner"))
-            .expect("inner dir");
-        let kids = fs.list_directory(&inner).unwrap();
-        let one = kids
-            .iter()
-            .find(|e| e.name.eq_ignore_ascii_case("one.txt"))
-            .expect("one.txt");
-        assert_eq!(fs.read_file(one, usize::MAX).unwrap(), b"one");
-    }
 
     fn write_gz(path: &Path, data: &[u8]) {
         use std::io::Write as _;
@@ -1099,15 +177,6 @@ mod tests {
         let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
         enc.write_all(data).unwrap();
         enc.finish().unwrap();
-    }
-
-    fn root_names(fs: &mut fs_pc::fat::FatFilesystem<std::io::Cursor<Vec<u8>>>) -> Vec<String> {
-        let root = Filesystem::root(fs).unwrap();
-        fs.list_directory(&root)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.name)
-            .collect()
     }
 
     /// Archive dates for the test fixtures: 1994-01-04 and 1998-07-14.
@@ -1228,257 +297,6 @@ mod tests {
             entry_at(&mut *efs, &["plain.bin"]).modified_unix,
             Some(ARCHIVE_DATE)
         );
-    }
-
-    #[test]
-    fn gunzipped_names_drop_only_the_gzip_suffix() {
-        assert_eq!(gunzipped_name("pkg.tar.gz").as_deref(), Some("pkg.tar"));
-        assert_eq!(gunzipped_name("pkg.TGZ").as_deref(), Some("pkg.tar"));
-        assert_eq!(gunzipped_name("disk.iso.gz").as_deref(), Some("disk.iso"));
-        assert_eq!(gunzipped_name(".gz"), None);
-        assert_eq!(gunzipped_name("disk.adz"), None);
-        assert_eq!(gunzipped_name("notes.txt"), None);
-    }
-
-    /// `--expand-gunzip` strips one gzip layer and leaves the tar inside intact.
-    #[test]
-    fn expand_gunzip_strips_the_gzip_layer_and_keeps_the_tar() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_tgz(&tmp.path().join("pkg.tar.gz"), &[("inner/one.txt", b"one")]);
-        write_gz(&tmp.path().join("disk.iso.gz"), &vec![0x5A; 70_000]);
-        // Named .gz but not gzip: copied through untouched.
-        std::fs::write(tmp.path().join("fake.gz"), b"plain text").unwrap();
-
-        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(blank_fat()), 0).unwrap();
-        let root = Filesystem::root(&mut fs).unwrap();
-        let opts = DirImportOptions {
-            expand_gunzip: true,
-            ..Default::default()
-        };
-        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {}).expect("import");
-        assert_eq!(
-            (stats.gunzipped, stats.archives_expanded, stats.files),
-            (2, 0, 3)
-        );
-
-        let names = root_names(&mut fs);
-        for want in ["pkg.tar", "disk.iso", "fake.gz"] {
-            assert!(names.iter().any(|n| n == want), "{want} missing: {names:?}");
-        }
-        let entries = fs.list_directory(&root).unwrap();
-        let iso = entries.iter().find(|e| e.name == "disk.iso").unwrap();
-        assert_eq!(fs.read_file(iso, usize::MAX).unwrap(), vec![0x5A; 70_000]);
-        let tar = entries.iter().find(|e| e.name == "pkg.tar").unwrap();
-        let tar_bytes = fs.read_file(tar, usize::MAX).unwrap();
-        assert_eq!(&tar_bytes[257..262], b"ustar", "the tar survives as a tar");
-    }
-
-    /// With both flags a tarball is unpacked fully and a bare gzip is decompressed.
-    #[test]
-    fn expand_archives_wins_over_expand_gunzip_for_tarballs() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_tgz(&tmp.path().join("pkg.tar.gz"), &[("one.txt", b"one")]);
-        write_gz(&tmp.path().join("readme.txt.gz"), b"read me");
-
-        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(blank_fat()), 0).unwrap();
-        let root = Filesystem::root(&mut fs).unwrap();
-        let opts = DirImportOptions {
-            expand_archives: true,
-            expand_gunzip: true,
-            ..Default::default()
-        };
-        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {}).expect("import");
-        assert_eq!((stats.archives_expanded, stats.gunzipped), (1, 1));
-        let names = root_names(&mut fs);
-        assert!(names.iter().any(|n| n == "pkg"), "{names:?}");
-        assert!(names.iter().any(|n| n == "readme.txt"), "{names:?}");
-    }
-
-    #[test]
-    fn expand_gunzip_measures_the_decompressed_size() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_gz(&tmp.path().join("big.bin.gz"), &vec![0u8; 1 << 20]);
-        let (_, _, packed) = measure_dir(tmp.path(), false, false).unwrap();
-        let opts = DirImportOptions {
-            expand_gunzip: true,
-            ..Default::default()
-        };
-        let (files, _, unpacked) = measure_dir_for(tmp.path(), &opts).unwrap();
-        assert!(packed < 1 << 16, "zeros compress: {packed}");
-        assert_eq!((files, unpacked), (1, 1 << 20));
-    }
-
-    /// Flattening drops the per-archive wrapper directory so sibling archives
-    /// share one root — the shape IRIX `inst` wants from a `.tardist` set.
-    #[test]
-    fn flatten_merges_every_archive_into_one_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_tgz(
-            &tmp.path().join("pkg-a.tardist"),
-            &[("a_prod", b"A"), ("a_prod.sw", b"A")],
-        );
-        write_tgz(
-            &tmp.path().join("pkg-b.tardist"),
-            &[("b_prod", b"B"), ("b_prod.sw", b"B")],
-        );
-
-        let img = blank_fat();
-        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
-        let root = Filesystem::root(&mut fs).expect("root");
-        let opts = DirImportOptions {
-            expand_archives: true,
-            flatten_archives: true,
-            ..Default::default()
-        };
-        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {}).expect("import");
-        assert_eq!(stats.archives_expanded, 2);
-        assert_eq!(stats.files, 4);
-        // No wrapper directories at all — every product image sits at the root.
-        assert_eq!(
-            stats.dirs_created, 0,
-            "flatten should create no wrapper dirs"
-        );
-
-        let mut names: Vec<String> = fs
-            .list_directory(&root)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.name.to_ascii_lowercase())
-            .collect();
-        names.sort();
-        assert_eq!(names, vec!["a_prod", "a_prod.sw", "b_prod", "b_prod.sw"]);
-    }
-
-    /// The case a real IRIX freeware set hits: several tardists ship the same
-    /// shared `fw_common*` product. Flattening must merge them rather than
-    /// abort, or the flag is unusable on exactly the trees it exists for.
-    #[test]
-    fn flatten_tolerates_the_shared_product_archives_have_in_common() {
-        let tmp = tempfile::tempdir().unwrap();
-        for pkg in ["fw_one", "fw_two", "fw_three"] {
-            write_tgz(
-                &tmp.path().join(format!("{pkg}.tardist")),
-                &[
-                    (pkg, b"unique"),
-                    // Every freeware tardist carries this same product.
-                    ("fw_common", b"shared"),
-                    ("fw_common.idb", b"shared"),
-                ],
-            );
-        }
-
-        let img = blank_fat();
-        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
-        let root = Filesystem::root(&mut fs).expect("root");
-        let opts = DirImportOptions {
-            // What the CLI builds for --flatten-folders: Skip, not Error.
-            shared: ImportOptions {
-                conflict: ImportConflict::Skip,
-                ..Default::default()
-            },
-            expand_archives: true,
-            flatten_archives: true,
-            ..Default::default()
-        };
-        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {})
-            .expect("a shared product across archives must not abort the import");
-
-        // 3 unique products + fw_common + fw_common.idb written once each.
-        assert_eq!(stats.files, 5);
-        assert_eq!(stats.skipped_existing, 4, "the 2nd/3rd copies are skipped");
-
-        let mut names: Vec<String> = fs
-            .list_directory(&root)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.name.to_ascii_lowercase())
-            .collect();
-        names.sort();
-        assert_eq!(
-            names,
-            vec!["fw_common", "fw_common.idb", "fw_one", "fw_three", "fw_two"]
-        );
-    }
-
-    /// Without flattening the same set stays segregated per archive, so the
-    /// shared product is duplicated rather than merged and nothing collides.
-    #[test]
-    fn without_flatten_each_archive_keeps_its_own_folder() {
-        let tmp = tempfile::tempdir().unwrap();
-        for pkg in ["fw_one", "fw_two"] {
-            write_tgz(
-                &tmp.path().join(format!("{pkg}.tardist")),
-                &[(pkg, b"unique"), ("fw_common", b"shared")],
-            );
-        }
-        let img = blank_fat();
-        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
-        let root = Filesystem::root(&mut fs).expect("root");
-        let opts = DirImportOptions {
-            expand_archives: true,
-            ..Default::default()
-        };
-        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {}).expect("import");
-        assert_eq!(stats.dirs_created, 2, "one wrapper dir per archive");
-        assert_eq!(stats.files, 4, "fw_common lands once per archive");
-        assert_eq!(stats.skipped_existing, 0);
-    }
-
-    /// Sizing has to key off what an archive *becomes*, not its compressed
-    /// size, or `--size auto` under-provisions and the copy dies partway in.
-    #[test]
-    fn expansion_changes_the_measured_size() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Highly compressible payload: on disk it is tiny, expanded it is not.
-        write_tgz(
-            &tmp.path().join("big.tar.gz"),
-            &[("blob", &vec![0u8; 200_000])],
-        );
-
-        let (_, _, packed) = measure_dir(tmp.path(), false, false).unwrap();
-        let (_, _, expanded) = measure_dir(tmp.path(), true, false).unwrap();
-        assert!(
-            expanded > packed * 4,
-            "expanded ({expanded}) should dwarf the compressed size ({packed})"
-        );
-        assert!(expanded >= 200_000);
-    }
-
-    #[test]
-    fn expanded_dir_name_strips_archive_suffixes() {
-        assert_eq!(expanded_dir_name("foo-1.2.tar.gz"), "foo-1.2");
-        assert_eq!(expanded_dir_name("bar.tardist"), "bar");
-        assert_eq!(expanded_dir_name("baz.tgz"), "baz");
-        assert_eq!(
-            expanded_dir_name("egcs-1.1.2-2.s.tar.bz2"),
-            "egcs-1.1.2-2.s"
-        );
-        assert_eq!(expanded_dir_name("qux.TAR.GZ"), "qux");
-        // GNU tar's own names, common on NeXT archives.
-        assert_eq!(
-            expanded_dir_name("MiscKit.2.0.5.s.gnutar.gz"),
-            "MiscKit.2.0.5.s"
-        );
-        assert_eq!(expanded_dir_name("fly.NIHS.bs.gnutar"), "fly.NIHS.bs");
-        assert_eq!(expanded_dir_name("HKGnats-1.0.gtar.gz"), "HKGnats-1.0");
-        // Not an archive suffix -> untouched.
-        assert_eq!(expanded_dir_name("plain.txt"), "plain.txt");
-        // Stripping to nothing keeps the original.
-        assert_eq!(expanded_dir_name(".tar"), ".tar");
-    }
-
-    #[test]
-    fn measure_and_projection_leave_room_for_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
-        tree(tmp.path());
-        let (files, dirs, bytes) = measure_dir(tmp.path(), false, false).unwrap();
-        assert_eq!(files, 3);
-        assert_eq!(dirs, 2);
-        assert_eq!(bytes, 5010);
-        // The projection must exceed raw content, and land on a whole MiB.
-        let projected = projected_volume_bytes(files, dirs, bytes, 512);
-        assert!(projected > bytes);
-        assert_eq!(projected % (1024 * 1024), 0);
     }
 
     fn blank_hfs() -> Box<dyn EditableFilesystem> {
@@ -1613,5 +431,25 @@ mod tests {
         assert_eq!(out, b"from the floppy");
         let (files, _, _) = measure_dir_for(tmp.path(), &opts(false, true)).unwrap();
         assert_eq!(files, 2, "the floppy's file plus junk.img");
+    }
+
+    /// The cancel-aware entry stops before the first entry and says it was cancelled.
+    #[test]
+    fn a_cancelled_import_stops_with_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"a").unwrap();
+        let mut efs = blank_next_ufs();
+        let root = efs.root().unwrap();
+        let err = import_dir_cancellable(
+            &mut *efs,
+            &root,
+            tmp.path(),
+            &opts(false, false),
+            &|_| {},
+            &|| true,
+        )
+        .unwrap_err();
+        assert!(err.downcast_ref::<Cancelled>().is_some(), "{err:#}");
+        assert_eq!(names(&mut *efs, &[]), Vec::<String>::new());
     }
 }

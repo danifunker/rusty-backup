@@ -1,6 +1,6 @@
 //! SFS (Smart File System) filesystem check (fsck) + repair.
 //!
-//! An independent checker covering the block-allocation phases `SFScheck` checks,
+//! An independent checker for SFS block allocation,
 //! shaped like the AFFS Disk Validator (`affs_fsck.rs`). Unlike PFS3, every
 //! SFS metadata block carries a checksum (`sum(all longs) + 1 == 0`), so
 //! `SfsBadChecksum` is a real structural check here.

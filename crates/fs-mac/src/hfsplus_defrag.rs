@@ -541,7 +541,7 @@ fn emit_fragmentation_report(snapshot: &SourceCatalogSnapshot) {
 }
 
 fn emit_progress(msg: &str) {
-    eprintln!("{msg}");
+    log::info!("{msg}"); // a library logs; it does not write to stderr (MAC-017)
     PROGRESS_SINK.with(|cell| {
         if let Some(cb) = cell.borrow_mut().as_mut() {
             cb(msg);

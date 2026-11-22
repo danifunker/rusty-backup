@@ -55,11 +55,14 @@ pub enum HdCommand {
     /// blank or donor-cloned Human68k partition.
     X68k(super::new_x68k_hdd::NewX68kHddArgs),
 
-    /// dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a
-    /// formatted EFS root partition, mountable by IRIX 5.3-6.5. Pass
-    /// `--from-dir` to fill the root filesystem from a host folder in the
-    /// same step; otherwise it comes out blank for `import` / `put`.
-    #[command(name = "sgi-efs")]
+    #[command(
+        name = "sgi-efs",
+        about = "dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a \
+                 formatted root partition, EFS (mountable by IRIX 5.3-6.5) or, with `--fs xfs`, \
+                 v5 XFS (which IRIX cannot mount). `--swap` adds a swap slot, `--label-only` \
+                 writes the volume header alone. Pass `--from-dir` to fill the root from a host \
+                 folder in the same step; otherwise it comes out blank for `import` / `put`"
+    )]
     SgiEfs(super::new_sgi_hdd::NewSgiHddArgs),
 
     /// MBR (DOS / PC) disk with partitions you size and type yourself. The

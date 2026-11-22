@@ -301,8 +301,11 @@ fn check_connectivity<R: Read + Seek>(
         if !dir.is_dir() {
             continue;
         }
-        for i in 0..(dir.numextents as usize).min(EFS_DIRECTEXTENTS_MAX) {
-            let ext = dir.extents[i];
+        // Indirect-mode directories keep their dirblocks behind index blocks (UNX-007).
+        let Ok(extents) = fs.dir_extents(&dir) else {
+            continue;
+        };
+        for ext in extents {
             if ext.length == 0 {
                 continue;
             }

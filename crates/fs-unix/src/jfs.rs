@@ -217,18 +217,10 @@ const DTROOT_OFF_FREELIST: usize = 19; // s8
 const DTROOT_OFF_IDOTDOT: usize = 20; // u32 — parent inode #
 const DTROOT_OFF_STBL: usize = 24; // s8[8] — sorted entry index table
 
-/// Maximum directory size we accept inline (i.e. inside the dinode's
-/// dtroot). When `di_size > DT_INLINE_CAP`, the dtree has spilled to
-/// off-disk leaf/internal pages — not supported in this J.3 first
-/// slice. Empirically the kernel keeps a directory inline while its
-/// total entry count fits in the 8 free slots (~7 short-name entries),
-/// so the cap below is generous.
-pub(crate) const DT_INLINE_CAP: u64 = 4096;
-
 /// `IDATASIZE` — the inode inline-data size mkfs / fsck stamp as the
 /// `di_size` of an empty inline directory (`jfs_filsys.h`). fsck does not
 /// validate directory size, but a freshly created `/lost+found` uses this
-/// so the value is kernel-faithful and stays under [`DT_INLINE_CAP`].
+/// so the value is kernel-faithful.
 const IDATASIZE: u64 = 256;
 
 // ---- External dtpage layout (4 KiB) ----
@@ -590,7 +582,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         self.ensure_bmap_cache()?;
         self.bmap_walk_cache.as_ref().ok_or_else(|| {
             FilesystemError::Unsupported(
-                "JFS: aggregate exceeds the in-tree BMAP walker (≥ 2^23 blocks; \
+                "JFS: aggregate exceeds the in-tree BMAP walker (>= 2^23 blocks; \
                  dmapctl multi-level walker is a follow-up)"
                     .into(),
             )
@@ -622,7 +614,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         if logical_pages < 2 {
             return Err(FilesystemError::Parse(format!(
                 "jfs: FILESYSTEM_I di_size {} bytes is too small to hold any IAG \
-                 (need ≥ 2 logical pages)",
+                 (need >= 2 logical pages)",
                 fs_ino.size
             )));
         }
@@ -630,7 +622,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         if iag_no >= max_iag {
             return Err(FilesystemError::Unsupported(format!(
                 "jfs: requested IAG {iag_no} is past the fileset's last IAG \
-                 (di_size = {} bytes ⇒ max iag_no = {})",
+                 (di_size = {} bytes => max iag_no = {})",
                 fs_ino.size,
                 max_iag.saturating_sub(1)
             )));
@@ -743,13 +735,12 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
                  (extent not allocated)"
             )));
         }
-        // Verify the pmap bit is set — bit (31 - local_extent%32) of
-        // word local_extent/32, MSB-first.
-        let pmap_word = iag.pmap[local_extent / 32];
-        let pmap_bit_pos = 31 - (local_extent % 32);
+        // pmap[e] holds one bit per inode of extent e, MSB first: check this inode's own bit.
+        let pmap_word = iag.pmap[local_extent];
+        let pmap_bit_pos = 31 - in_extent as u32;
         if (pmap_word >> pmap_bit_pos) & 1 != 1 {
             return Err(FilesystemError::Parse(format!(
-                "jfs: fileset inode {fino}: pmap says extent {local_extent} is free"
+                "jfs: fileset inode {fino} is free in the pmap"
             )));
         }
 
@@ -1073,7 +1064,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         file_inode: &JfsDinode,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let mut out = Vec::with_capacity((file_inode.size as usize).min(max_bytes));
+        let mut out = Vec::with_capacity((file_inode.size as usize).min(max_bytes).min(1 << 20));
         self.copy_file_data(file_inode, max_bytes as u64, &mut out)?;
         Ok(out)
     }
@@ -1292,7 +1283,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
     ) -> Result<XtreeRoot, FilesystemError> {
         if buf.len() < XTHEADER_SIZE {
             return Err(FilesystemError::Parse(format!(
-                "jfs: xtpage buffer too small ({} < {XTHEADER_SIZE}) — {context}",
+                "jfs: xtpage buffer too small ({} < {XTHEADER_SIZE}) - {context}",
                 buf.len()
             )));
         }
@@ -1300,7 +1291,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         let nextindex = u16::from_le_bytes([buf[XTH_OFF_NEXTINDEX], buf[XTH_OFF_NEXTINDEX + 1]]);
         if nextindex < 2 {
             return Err(FilesystemError::Parse(format!(
-                "jfs: xtpage nextindex {nextindex} < 2 (header takes 2 slots) — {context}"
+                "jfs: xtpage nextindex {nextindex} < 2 (header takes 2 slots) - {context}"
             )));
         }
         let xad_count = (nextindex as usize) - 2;
@@ -1308,7 +1299,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         if xad_count > max_xad_slots {
             return Err(FilesystemError::Parse(format!(
                 "jfs: xtpage has {xad_count} XADs but the buffer only holds {max_xad_slots} slots \
-                 — {context}"
+                 - {context}"
             )));
         }
         let mut xads = Vec::with_capacity(xad_count);
@@ -1416,7 +1407,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
             iter_budget += 1;
             if iter_budget > 1_000_000 {
                 return Err(FilesystemError::Parse(
-                    "jfs: walk_xtree_leaves exceeded 1M node visits — likely cyclic xtree".into(),
+                    "jfs: walk_xtree_leaves exceeded 1M node visits - likely cyclic xtree".into(),
                 ));
             }
             if node.flag & BT_LEAF_FLAG != 0 {
@@ -1645,7 +1636,18 @@ impl<R: Read + Write + Seek + Send> JfsFilesystem<R> {
                 "jfs: fileset inode {fino}: inoext[{local_extent}] not allocated"
             )));
         }
-        Ok(pxd.address * self.bsize + in_extent * DISIZE)
+        // The extent address comes from disk: the inode must lie inside the aggregate (UNX-005).
+        let byte = pxd
+            .address
+            .checked_mul(self.bsize)
+            .and_then(|b| b.checked_add(in_extent * DISIZE))
+            .filter(|&b| b + DISIZE <= self.total_byte_extent)
+            .ok_or_else(|| {
+                FilesystemError::InvalidData(format!(
+                    "jfs: fileset inode {fino} lies past the aggregate"
+                ))
+            })?;
+        Ok(byte)
     }
 
     /// Re-write fileset inode `fino`'s 512-byte dinode from `raw`. Callers
@@ -1826,6 +1828,37 @@ impl<R: Read + Write + Seek + Send> JfsFilesystem<R> {
     /// `rebuild_dir_index` writes), so no inline dir-table upkeep is needed
     /// and `di_next_index` stays valid for every existing entry. fsck does
     /// not validate directory `di_size`, so the parent's size is left as-is.
+    /// Whether `name` fits in `dir_fino`'s inline dtroot, checked before anything is allocated
+    /// for it (a repair that allocates first leaks on every refusal).
+    pub(crate) fn dtree_has_room(
+        &mut self,
+        dir_fino: u32,
+        name: &str,
+    ) -> Result<(), FilesystemError> {
+        let dir = self.read_fileset_inode_global(dir_fino)?;
+        let base = DI_OFF_TYPE_AREA;
+        if dir.raw.len() < base + DTROOT_SIZE {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: directory inode {dir_fino} buffer too small for dtroot"
+            )));
+        }
+        if dir.raw[base + DTROOT_OFF_FLAG] & BT_INTERNAL_FLAG != 0 {
+            return Err(FilesystemError::Unsupported(format!(
+                "jfs: directory inode {dir_fino} has an external dtree"
+            )));
+        }
+        let namlen = name.encode_utf16().count();
+        let slots_needed = (4 + namlen).div_ceil(15);
+        let nextindex = dir.raw[base + DTROOT_OFF_NEXTINDEX] as usize;
+        let freecnt = dir.raw[base + DTROOT_OFF_FREECNT] as i8 as i32;
+        if namlen == 0 || namlen > 255 || nextindex >= 8 || (freecnt as usize) < slots_needed {
+            return Err(FilesystemError::Unsupported(format!(
+                "jfs: no room for {name:?} in directory inode {dir_fino}'s inline dtroot"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn dtree_insert(
         &mut self,
         dir_fino: u32,
@@ -2594,12 +2627,10 @@ impl<R: Read + Seek + Send> CompactJfsReader<R> {
                 sections.push(CompactSection::Zeros(start_byte - covered));
             }
             if run.allocated {
-                let n_blocks_per_section = run.length as usize;
-                let mut old_blocks = Vec::with_capacity(n_blocks_per_section);
-                for b in run.start_block..run.start_block + run.length {
-                    old_blocks.push(b);
-                }
-                sections.push(CompactSection::MappedBlocks { old_blocks });
+                sections.push(CompactSection::MappedRun {
+                    first: run.start_block,
+                    count: run.length,
+                });
             } else {
                 sections.push(CompactSection::Zeros(len_bytes));
             }
@@ -2636,8 +2667,10 @@ impl<R: Read + Seek + Send> CompactJfsReader<R> {
                 let blocks_start = trimmed_start.div_ceil(bsize);
                 let blocks_end = end / bsize;
                 if blocks_end > blocks_start {
-                    let old_blocks: Vec<u64> = (blocks_start..blocks_end).collect();
-                    sections.push(CompactSection::MappedBlocks { old_blocks });
+                    sections.push(CompactSection::MappedRun {
+                        first: blocks_start,
+                        count: blocks_end - blocks_start,
+                    });
                     covered = blocks_end * bsize;
                 }
                 continue;
@@ -2649,8 +2682,10 @@ impl<R: Read + Seek + Send> CompactJfsReader<R> {
             let blocks_start = start / bsize;
             let blocks_end = end / bsize;
             if blocks_end > blocks_start {
-                let old_blocks: Vec<u64> = (blocks_start..blocks_end).collect();
-                sections.push(CompactSection::MappedBlocks { old_blocks });
+                sections.push(CompactSection::MappedRun {
+                    first: blocks_start,
+                    count: blocks_end - blocks_start,
+                });
                 covered = end;
             }
         }
@@ -3659,7 +3694,7 @@ mod tests {
         // — connectivity pass should walk root + subdir.
         assert!(
             result.stats.directories_checked >= 2,
-            "expected ≥2 dirs walked (/ + /subdir), got {}",
+            "expected >=2 dirs walked (/ + /subdir), got {}",
             result.stats.directories_checked
         );
         // Should report at least the BMAP stats + IAG count + allocated

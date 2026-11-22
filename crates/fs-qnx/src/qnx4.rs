@@ -100,12 +100,23 @@ impl<R: Read + Seek + Send> Qnx4Filesystem<R> {
         reader.seek(SeekFrom::Start(offset + BLOCK))?;
         reader.read_exact(&mut sb)?;
         let end = reader.seek(SeekFrom::End(0))?;
-        Ok(Self {
+        let mut fs = Self {
             reader,
             offset,
             root: Inode::parse(&sb[..ENTRY]),
             total_blocks: end.saturating_sub(offset) / BLOCK,
-        })
+        };
+        // The reader may run on past the partition; `/.bitmap` (one bit per block) sizes the volume.
+        let root = fs.root.clone();
+        if let Ok(entries) = fs.read_dir(&root) {
+            if let Some((_, bm, _)) = entries.iter().find(|(n, _, _)| n == ".bitmap") {
+                let blocks = bm.size * 8;
+                if blocks > 0 {
+                    fs.total_blocks = fs.total_blocks.min(blocks);
+                }
+            }
+        }
+        Ok(fs)
     }
 
     fn read_block(&mut self, physical: u64) -> Result<Vec<u8>, FilesystemError> {
@@ -123,7 +134,14 @@ impl<R: Read + Seek + Send> Qnx4Filesystem<R> {
             out.push((inode.first.0 as u64 - 1, inode.first.1 as u64));
         }
         let mut next = inode.xblk;
+        let mut seen = std::collections::HashSet::new();
         while next != 0 && out.len() < MAX_XBLKS {
+            // A self-linked or looping extent block that adds nothing would spin forever.
+            if !seen.insert(next) || seen.len() > MAX_XBLKS {
+                return Err(FilesystemError::InvalidData(format!(
+                    "qnx4: extent block chain loops at {next}"
+                )));
+            }
             let x = self.read_block(next as u64 - 1)?;
             if &x[496..504] != XBLK_SIG {
                 return Err(FilesystemError::InvalidData(format!(
@@ -142,7 +160,7 @@ impl<R: Read + Seek + Send> Qnx4Filesystem<R> {
     }
 
     fn read_data(&mut self, inode: &Inode, max: usize) -> Result<Vec<u8>, FilesystemError> {
-        let mut out = Vec::with_capacity((inode.size as usize).min(max));
+        let mut out = Vec::with_capacity((inode.size as usize).min(max).min(1 << 20));
         self.copy_data(inode, max as u64, &mut out)?;
         Ok(out)
     }

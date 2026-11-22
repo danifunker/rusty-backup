@@ -45,7 +45,8 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn need(&self, n: usize) -> Result<()> {
-        if self.pos + n > self.data.len() {
+        // Sizes come from the archive; on a 32-bit target pos + n can wrap.
+        if !matches!(self.pos.checked_add(n), Some(end) if end <= self.data.len()) {
             bail!("StuffIt 5: unexpected end of archive at {}", self.pos);
         }
         Ok(())
@@ -128,13 +129,16 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
     // Safety bound: never iterate more times than there are possible entries.
     let max_iters = data.len() / 48 + numfiles + 16;
     let mut iters = 0usize;
+    // The furthest byte the entries need, to report an archive cut short.
+    let mut needed = 0u64;
 
     while done < total {
         iters += 1;
         if iters > max_iters {
             bail!("StuffIt 5: entry walk did not terminate");
         }
-        if cur.pos + 48 > data.len() {
+        if cur.pos.saturating_add(48) > data.len() {
+            needed = needed.max(cur.pos as u64 + 48);
             break;
         }
         let offs = cur.pos as u32;
@@ -149,7 +153,9 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
         let entry_version = cur.u8()?;
         cur.skip(1)?;
         let headersize = cur.u16()? as usize;
-        let headerend = offs as usize + headersize;
+        let headerend = (offs as usize)
+            .checked_add(headersize)
+            .ok_or_else(|| anyhow::anyhow!("StuffIt 5: header size overflows"))?;
         cur.skip(1)?;
         let flags = cur.u8()?;
         let creation_date = cur.u32()?;
@@ -287,14 +293,23 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
                 data: data_fork,
                 rsrc,
             });
-            cur.seek(datastart as usize + resourcecomplen as usize + datacomplen as usize);
+            let next = (datastart as usize)
+                .checked_add(resourcecomplen as usize)
+                .and_then(|p| p.checked_add(datacomplen as usize))
+                .ok_or_else(|| anyhow::anyhow!("StuffIt 5: fork sizes overflow"))?;
+            needed = needed.max(next as u64);
+            cur.seek(next);
         }
         done += 1;
     }
 
+    let truncated = (needed > data.len() as u64).then_some(crate::stuffit::SitTruncation {
+        declared: needed,
+        available: data.len() as u64,
+    });
     Ok(StuffItArchive {
         entries,
-        truncated: None,
+        truncated,
         damage: Vec::new(),
     })
 }

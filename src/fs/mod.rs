@@ -2514,9 +2514,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                         reader,
                         partition_offset,
                     )?)),
-                    "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                    "xfs" => Ok(Box::new(open_xfs_editable(
                         reader,
                         partition_offset,
+                        partition_len,
                     )?)),
                     "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
                         reader,
@@ -2556,16 +2557,16 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 )?));
             }
             s if is_amiga_pfs3_type(s) => {
-                return Ok(Box::new(pfs3::Pfs3Filesystem::open(
-                    reader,
-                    partition_offset,
-                )?));
+                return Ok(Box::new(match partition_len {
+                    Some(len) => pfs3::Pfs3Filesystem::open_within(reader, partition_offset, len)?,
+                    None => pfs3::Pfs3Filesystem::open(reader, partition_offset)?,
+                }));
             }
             s if is_amiga_sfs_type(s) => {
-                return Ok(Box::new(sfs::SfsFilesystem::open(
-                    reader,
-                    partition_offset,
-                )?));
+                return Ok(Box::new(match partition_len {
+                    Some(len) => sfs::SfsFilesystem::open_within(reader, partition_offset, len)?,
+                    None => sfs::SfsFilesystem::open(reader, partition_offset)?,
+                }));
             }
             s if s.starts_with("cpm:") => {
                 let preset_name = &s[4..];
@@ -2765,9 +2766,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                     partition_len,
                 )?)),
-                "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                "xfs" => Ok(Box::new(open_xfs_editable(
                     reader,
                     partition_offset,
+                    partition_len,
                 )?)),
                 "qdos" => Ok(Box::new(qdos::QdosFilesystem::open(
                     reader,
@@ -2883,9 +2885,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                         .unwrap_or(squashfs_edit::SizeBudget::Fit),
                     None,
                 )?)),
-                "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                "xfs" => Ok(Box::new(open_xfs_editable(
                     reader,
                     partition_offset,
+                    partition_len,
                 )?)),
                 "ufs" => Ok(Box::new(open_ufs_editable(reader, partition_offset)?)),
                 "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
@@ -2920,9 +2923,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
             partition_offset,
         )?)),
         // SGI XFS — synthetic type byte emitted by PartitionTable::Sgi.
-        0xA0 => Ok(Box::new(xfs::XfsFilesystem::open(
+        0xA0 => Ok(Box::new(open_xfs_editable(
             reader,
             partition_offset,
+            partition_len,
         )?)),
         // Minix (MBR type 0x81) and old Minix (0x80).
         0x80 | 0x81 => Ok(Box::new(minix::MinixFilesystem::open(
@@ -2969,6 +2973,18 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
 }
 
 /// Open a filesystem by APM partition type string.
+/// Open XFS for editing, refused when it declares more than its partition (XFS-008).
+fn open_xfs_editable<R: Read + Write + Seek + Send>(
+    reader: R,
+    offset: u64,
+    partition_len: Option<u64>,
+) -> Result<xfs::XfsFilesystem<R>, FilesystemError> {
+    match partition_len {
+        Some(len) => xfs::XfsFilesystem::open_within(reader, offset, len),
+        None => xfs::XfsFilesystem::open(reader, offset),
+    }
+}
+
 /// Open UFS for editing; HP-UX HFS stays read-only until its write path is verified.
 fn open_ufs_editable<R: Read + Write + Seek + Send>(
     reader: R,

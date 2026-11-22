@@ -5,6 +5,7 @@
 //!   Rust 1.73 (the last toolchain whose std targets macOS 10.7).
 //! - [`display`]: small neutral formatters (sizes, Mac `OSType`, Unix modes).
 //! - [`bits`]: big-endian allocation-bitmap helpers (HFS, HFS+, ProDOS).
+//! - [`bytes`]: bounds-checked little / big-endian integers at a byte offset.
 //! - [`sgi`]: the 16-bit word order of SGI disk images.
 //! - `rust173` (feature `rust173-polyfill` only): extension traits standing in
 //!   for std methods missing on 1.73. Never enable it on a modern toolchain.
@@ -14,6 +15,7 @@
 //! - [`filesystem`]: `Filesystem` (read) and `EditableFilesystem` (write),
 //!   `FilesystemError`, create/repair options.
 //! - [`attrs`]: resolve the attributes a copied or imported entry should get.
+//! - [`caps`]: what a filesystem can store (forks, modes, DOS / Amiga metadata), by `fs_type`.
 //! - [`entry`]: `FileEntry`, `EntryType` and directory display ordering.
 //! - [`id_names`]: uid / gid names from an image's own `/etc/passwd` and `/etc/group`.
 //! - [`fsck`]: integrity-check results shared by every checker.
@@ -31,13 +33,17 @@
 #![allow(clippy::incompatible_msrv)]
 
 pub mod bits;
+pub mod bytes;
 pub mod display;
+pub mod mac_roman;
 #[cfg(feature = "rust173-polyfill")]
 pub mod rust173;
 pub mod sgi;
 
 #[cfg(feature = "fs")]
 pub mod attrs;
+#[cfg(feature = "fs")]
+pub mod caps;
 #[cfg(feature = "fs")]
 pub mod entry;
 #[cfg(feature = "fs")]

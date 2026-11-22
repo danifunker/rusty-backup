@@ -330,21 +330,38 @@ impl<R: Read + Write + Seek + Send> BfsFilesystem<R> {
 
     /// Write `data` over a stream's blocks, zero-padding the last block.
     fn write_stream_bytes(&mut self, ds: &DataStream, data: &[u8]) -> Result<(), FilesystemError> {
-        let bs = self.sb.block_size as usize;
+        self.write_stream_from(ds, &mut std::io::Cursor::new(data), data.len() as u64)
+    }
+
+    /// Copy `len` bytes from `src` into the stream's extents, at most 1 MiB at a time.
+    fn write_stream_from(
+        &mut self,
+        ds: &DataStream,
+        src: &mut dyn Read,
+        len: u64,
+    ) -> Result<(), FilesystemError> {
+        let bs = self.sb.block_size as u64;
+        let chunk_blocks = ((1u64 << 20) / bs).max(1);
         let extents = self.stream_extents(ds)?;
-        let mut pos = 0usize;
+        let mut pos = 0u64;
+        let mut buf = Vec::new();
         for (block, count) in extents {
-            if pos >= data.len() {
+            let mut done = 0u64;
+            while done < count && pos < len {
+                let blocks = (count - done).min(chunk_blocks);
+                let take = (blocks * bs).min(len - pos) as usize;
+                buf.clear();
+                buf.resize(take.div_ceil(bs as usize) * bs as usize, 0);
+                src.read_exact(&mut buf[..take])?;
+                self.write_blocks(block + done, &buf)?;
+                pos += take as u64;
+                done += blocks;
+            }
+            if pos >= len {
                 break;
             }
-            let span = count as usize * bs;
-            let take = span.min(data.len() - pos);
-            let mut buf = vec![0u8; take.div_ceil(bs) * bs];
-            buf[..take].copy_from_slice(&data[pos..pos + take]);
-            self.write_blocks(block, &buf)?;
-            pos += take;
         }
-        if pos < data.len() {
+        if pos < len {
             return Err(FilesystemError::InvalidData(
                 "bfs: stream is shorter than the data written into it".into(),
             ));
@@ -534,16 +551,18 @@ impl<R: Read + Write + Seek + Send> BfsFilesystem<R> {
         // leaks blocks that no directory references.
         let built = (|| -> Result<u64, FilesystemError> {
             match payload {
-                Payload::Bytes(data) => {
-                    if data.is_empty() {
+                Payload::Stream(src, len) => {
+                    if len == 0 {
                         return Ok(0);
                     }
                     let bs = self.sb.block_size as u64;
-                    let need = (data.len() as u64).div_ceil(bs);
-                    let runs = self.alloc_runs(need, inode_block)?;
-                    inode.data = self.build_stream(&runs, data.len() as u64, inode_block)?;
-                    self.write_stream_bytes(&inode.data, data)?;
-                    Ok(data.len() as u64)
+                    let runs = self.alloc_runs(len.div_ceil(bs), inode_block)?;
+                    inode.data = self.build_stream(&runs, len, inode_block)?;
+                    if let Err(e) = self.write_stream_from(&inode.data, src, len) {
+                        let _ = self.free_stream(&inode.data);
+                        return Err(e);
+                    }
+                    Ok(len)
                 }
                 Payload::ShortSymlink(target) => {
                     let mut raw = vec![0u8; DATA_STREAM_SIZE];
@@ -617,7 +636,8 @@ struct NewEntryAttrs {
 
 /// What a freshly created inode is filled with.
 enum Payload<'a> {
-    Bytes(&'a [u8]),
+    /// A file's content, read from the source as it is written.
+    Stream(&'a mut dyn Read, u64),
     ShortSymlink(&'a [u8]),
     Directory,
 }
@@ -638,14 +658,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for BfsFilesystem<R> {
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        let mut bytes = Vec::with_capacity(data_len.min(64 << 20) as usize);
-        data.take(data_len).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 != data_len {
-            return Err(FilesystemError::InvalidData(format!(
-                "bfs create_file: source gave {} bytes, expected {data_len}",
-                bytes.len()
-            )));
-        }
         let mtime = disk_core::times::resolve_or_now(options.unix_times).mtime_or_now() as i64;
         self.create_entry(
             parent,
@@ -656,7 +668,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for BfsFilesystem<R> {
                 gid: options.gid.unwrap_or(0),
                 mtime: mtime << INODE_TIME_SHIFT,
             },
-            Payload::Bytes(&bytes),
+            Payload::Stream(data, data_len),
         )
     }
 
@@ -729,15 +741,36 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for BfsFilesystem<R> {
             }
         }
 
+        // Everything to free, gathered and checked before the directory changes: the file,
+        // its attribute directory and each attribute's inode.
+        let mut doomed = vec![target.clone()];
+        if target.attributes.len > 0 {
+            let attr_dir = self.read_inode(target.attributes.to_block(self.sb.ag_shift))?;
+            for (_, loc) in self.read_directory(&attr_dir)? {
+                doomed.push(self.read_inode(loc)?);
+            }
+            doomed.push(attr_dir);
+        }
+        // A corrupt attribute entry pointing back at the file must not free it twice.
+        let mut seen = std::collections::HashSet::new();
+        doomed.retain(|i| seen.insert(i.block));
+        if doomed.iter().any(|i| i.data.double_indirect.len > 0) {
+            return Err(FilesystemError::Unsupported(
+                "bfs: freeing a double-indirect stream is not implemented".into(),
+            ));
+        }
+
         let mut tree = self.load_tree(&parent_inode)?;
         if !tree.remove(&entry.name)? {
             return Err(FilesystemError::NotFound(entry.path.clone()));
         }
         self.store_tree(&mut parent_inode, &tree)?;
 
-        self.free_stream(&target.data)?;
-        let inode_run = self.block_to_run(target.block, self.inode_blocks() as u16);
-        self.free_run(inode_run)?;
+        for inode in &doomed {
+            self.free_stream(&inode.data)?;
+            let inode_run = self.block_to_run(inode.block, self.inode_blocks() as u16);
+            self.free_run(inode_run)?;
+        }
         self.sync_superblock()
     }
 
@@ -1083,11 +1116,12 @@ impl BTree {
             } else {
                 node.overflow
             };
+            // An internal split moves its last key's child to the left half's overflow; that key,
+            // the largest the left half now covers, is the separator to promote (UNX-011).
+            let mut promoted = None;
             if !is_leaf {
-                // The left half's new overflow is the child of its last key,
-                // which stops being a separator when it becomes the boundary.
                 node.overflow = node.values.pop().unwrap_or(BPLUSTREE_NULL);
-                node.keys.pop();
+                promoted = node.keys.pop();
             }
             right.left = node.offset;
             right.right = node.right;
@@ -1099,10 +1133,9 @@ impl BTree {
                 sibling.left = new_off;
                 self.store(&sibling)?;
             }
-            let separator =
-                node.keys.last().cloned().ok_or_else(|| {
-                    FilesystemError::Parse("bfs: split left half has no keys".into())
-                })?;
+            let separator = promoted
+                .or_else(|| node.keys.last().cloned())
+                .ok_or_else(|| FilesystemError::Parse("bfs: split left half has no keys".into()))?;
             self.store(&node)?;
             self.store(&right)?;
 
@@ -1375,6 +1408,31 @@ mod tests {
         }
     }
 
+    /// Enough keys to split internal nodes too: every key stays reachable, so each one can be
+    /// removed and none twice (UNX-011).
+    #[test]
+    fn internal_splits_keep_every_key_reachable() {
+        let mut t = tree();
+        let n = 6000;
+        for i in 0..n {
+            t.insert(&format!("name-{i:05}"), i as i64 + 1).unwrap();
+        }
+        for i in 0..n {
+            assert_eq!(
+                t.find(&format!("name-{i:05}")),
+                Some(i as i64 + 1),
+                "name-{i:05}"
+            );
+        }
+        for i in (0..n).rev() {
+            assert!(
+                t.remove(&format!("name-{i:05}")).unwrap(),
+                "name-{i:05} not removable"
+            );
+        }
+        assert!(!t.remove("name-00000").unwrap());
+    }
+
     #[test]
     fn leaf_chain_visits_every_key_once_after_splits() {
         let mut t = tree();
@@ -1514,6 +1572,12 @@ pub fn write_blank_bfs_into<W: Write + Seek>(
         .max(log_start_block + log_blocks)
         .max(indices_block + 1 + root_tree_blocks)
         .max(root_block + 1 + root_tree_blocks);
+    if last_marked > num_blocks {
+        // The AG count rounds up, so a volume just past 8 AGs would put the root past its end (UNX-012).
+        return Err(FilesystemError::InvalidData(format!(
+            "bfs: {num_blocks} blocks is too small: the root directory needs {last_marked}"
+        )));
+    }
     let mut img = vec![0u8; (bs + last_marked.div_ceil(32) * 4) as usize];
     let ag_mask = ag_blocks - 1;
     let run = |block: u64, len: u16| BlockRun {

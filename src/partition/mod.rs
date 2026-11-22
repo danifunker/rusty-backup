@@ -1747,21 +1747,16 @@ impl PartitionTable {
                         if ptype.is_skipped_from_browse() {
                             return None;
                         }
-                        let partition_type_byte = if ptype.is_efs() {
-                            SGI_TYPE_BYTE_EFS
-                        } else if ptype == sgi::SgiPartitionType::Xfs {
-                            SGI_TYPE_BYTE_XFS
-                        } else {
-                            0
-                        };
-                        // SYSV-typed partitions are EFS CD-ROM filesystems; show
-                        // them as EFS rather than their raw "SYSV" type name.
-                        let type_name = if ptype.is_efs() {
-                            "SGI EFS".to_string()
-                        } else if ptype == sgi::SgiPartitionType::Xfs {
-                            "SGI XFS".to_string()
-                        } else {
-                            format!("SGI {}", ptype.display_name())
+                        // The type -> filesystem rule is sgi-disk's; SYSV (EFS CD-ROMs) shows as EFS.
+                        let (partition_type_byte, type_name) = match sgi_disk::SgiFsKind::of(ptype)
+                        {
+                            Some(sgi_disk::SgiFsKind::Efs) => {
+                                (SGI_TYPE_BYTE_EFS, "SGI EFS".to_string())
+                            }
+                            Some(sgi_disk::SgiFsKind::Xfs) => {
+                                (SGI_TYPE_BYTE_XFS, "SGI XFS".to_string())
+                            }
+                            None => (0, format!("SGI {}", ptype.display_name())),
                         };
                         Some(PartitionInfo {
                             index: i,

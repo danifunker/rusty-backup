@@ -105,6 +105,14 @@ impl VmdkSparseHeader {
                 num_gtes_per_gt
             );
         }
+        // VMware writes 128-sector grains and 512-entry tables; far larger values would make
+        // each grain or grain-table buffer gigabytes.
+        if grain_size_sectors > 2048 || num_gtes_per_gt > 4096 {
+            bail!(
+                "VMDK sparse: grain size {grain_size_sectors} sectors / {num_gtes_per_gt} \
+                 entries per table is past what any VMDK writer produces"
+            );
+        }
         if flags & (FLAG_COMPRESSED | FLAG_MARKERS) != 0 {
             bail!(
                 "VMDK sparse: compressed/marker grains (streamOptimized) are \
@@ -622,6 +630,10 @@ pub fn export_vmdk_sparse(
 
     // Pre-fill GD with sequential GT host sectors; pre-allocate GT buffers (all
     // zero = no grains yet). GT[gt][gte] = host sector of the grain (or 0).
+    // Sparse extents hold 32-bit host sector numbers: a file past 2 TiB can't be addressed.
+    if overhead_sectors > u32::MAX as u64 {
+        bail!("VMDK sparse export: {disk_size_bytes} bytes need more metadata than a sparse extent can address");
+    }
     let mut gd: Vec<u32> = Vec::with_capacity(num_gts);
     for i in 0..num_gts {
         let gt_host_sector = gt_first_sector + (i as u64) * gt_sectors_per_gt;
@@ -661,6 +673,12 @@ pub fn export_vmdk_sparse(
         let gte_index = (grain_idx % num_gtes_per_gt as u64) as usize;
         if !is_zero_unit(&buf[..]) {
             let host_byte = allocator.alloc();
+            if host_byte / VMDK_SECTOR + grain_size_sectors > u32::MAX as u64 + 1 {
+                bail!(
+                    "VMDK sparse export: the data passes 2 TiB, past what a sparse extent \
+                     can address; use a flat VMDK or another format"
+                );
+            }
             assert!(
                 host_byte.is_multiple_of(VMDK_SECTOR),
                 "grain offset {host_byte} not sector-aligned"

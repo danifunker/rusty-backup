@@ -715,6 +715,20 @@ impl<R: Read + Write + Seek + Send> AtariDosFilesystem<R> {
     }
 }
 
+impl<R: Read + Write + Seek + Send> AtariDosFilesystem<R> {
+    /// Enhanced density keeps sectors 720+ in the DOS 2.5 VTOC2, which these edits do not
+    /// update: refuse rather than leave the two VTOCs disagreeing (B8-006).
+    fn refuse_enhanced_density(&self) -> Result<(), FilesystemError> {
+        if self.geom.total_sectors >= self.vtoc_covered_sectors() {
+            return Err(FilesystemError::Unsupported(
+                "Atari DOS 2.5 enhanced-density disks are read-only here (VTOC2 is not maintained)"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl<R: Read + Write + Seek + Send> EditableFilesystem for AtariDosFilesystem<R> {
     fn as_filesystem(&self) -> &dyn disk_core::filesystem::Filesystem {
         self
@@ -730,6 +744,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AtariDosFilesystem<R>
         data_len: u64,
         _options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        self.refuse_enhanced_density()?;
         if parent.path != "/" {
             return Err(FilesystemError::Unsupported(
                 "Atari DOS is flat; only the root accepts files".into(),
@@ -855,7 +870,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AtariDosFilesystem<R>
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "Atari DOS 2 is a flat filesystem — no subdirectories".into(),
+            "Atari DOS 2 is a flat filesystem - no subdirectories".into(),
         ))
     }
 
@@ -864,6 +879,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AtariDosFilesystem<R>
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
+        self.refuse_enhanced_density()?;
         if parent.path != "/" {
             return Err(FilesystemError::Unsupported(
                 "Atari DOS is flat; only root files are deletable".into(),

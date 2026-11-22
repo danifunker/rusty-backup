@@ -433,6 +433,9 @@ impl<R: Read + Seek + Send> AppleDosFilesystem<R> {
         let mut tslist_track = e.first_ts_track;
         let mut tslist_sector = e.first_ts_sector;
         let mut seen = std::collections::HashSet::new();
+        // Zero pairs are holes when data follows them (random-access text files) and the end
+        // of file when nothing does, so they are written out only once more data turns up.
+        let mut pending_holes = 0usize;
         for _ in 0..MAX_TS_LISTS {
             if tslist_track == 0 {
                 break;
@@ -454,17 +457,16 @@ impl<R: Read + Seek + Send> AppleDosFilesystem<R> {
                 let off = 0x0C + pair * 2;
                 let dt = list_buf[off];
                 let ds = list_buf[off + 1];
-                if dt == 0 && ds == 0 {
-                    // Trailing zero pairs mark end-of-file within this
-                    // list. Continue scanning to keep things simple
-                    // (DOS 3.3 typically packs from the front).
-                    continue;
-                }
+                // Track 0 holds DOS itself, never file data: a pair there is a hole.
                 if dt == 0 {
-                    // Sparse hole — 256 zeros.
-                    data.extend(disk_core::repeat_n(0u8, APPLE_II_SECTOR_BYTES));
+                    pending_holes += 1;
                     continue;
                 }
+                data.extend(disk_core::repeat_n(
+                    0u8,
+                    pending_holes * APPLE_II_SECTOR_BYTES,
+                ));
+                pending_holes = 0;
                 let sec = read_sector(&mut self.reader, self.partition_offset, dt, ds)?;
                 data.extend_from_slice(&sec);
             }
@@ -572,14 +574,9 @@ impl<R: Read + Seek + Send> Filesystem for AppleDosFilesystem<R> {
             .get(idx)
             .ok_or_else(|| FilesystemError::NotFound(format!("entry idx {idx} out of range")))?
             .clone();
+        // `read_file_bytes` already strips a binary file's 4-byte header; stripping again
+        // would cut payloads that start with plausible header bytes (AP2-001).
         let mut data = self.read_file_bytes(&de)?;
-        // For binary files, strip the 4-byte header so the bytes the
-        // user gets back are the actual payload (matching what
-        // CiderPress2's "Extract Raw" does on binary files).
-        if de.type_code == TYPE_B {
-            let payload = Self::strip_binary_header(&data).to_vec();
-            data = payload;
-        }
         data.truncate(max_bytes);
         Ok(data)
     }
@@ -759,7 +756,7 @@ impl<R: Read + Seek + Send> AppleDosFilesystem<R> {
             warnings.push(FsckIssue {
                 code: "AppleDosBootReserved".into(),
                 message: format!(
-                    "{leaked_boot} sector(s) on tracks 0-2 are allocated but unreferenced — \
+                    "{leaked_boot} sector(s) on tracks 0-2 are allocated but unreferenced - \
                      the DOS 3.3 boot image; left as-is"
                 ),
                 repairable: false,
@@ -815,6 +812,13 @@ fn encode_apple_name(name: &str) -> Result<[u8; 30], FilesystemError> {
             "DOS 3.3 filename '{name}' exceeds 30 chars"
         )));
     }
+    // Names are space-padded on disk, so a trailing space can't be told from padding: the file
+    // would read back under another name.
+    if name.ends_with(' ') {
+        return Err(FilesystemError::InvalidData(format!(
+            "DOS 3.3 filename '{name}' ends in a space; DOS pads names with spaces"
+        )));
+    }
     let mut buf = [0xA0u8; 30];
     for (i, c) in name.chars().enumerate() {
         if !c.is_ascii() {
@@ -846,6 +850,10 @@ impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
 
     /// Mark a sector FREE (bit set in the bitmap).
     fn bitmap_mark_free(&mut self, track: u8, sector: u8) {
+        // A T/S pair from a damaged list can name a track or sector that doesn't exist.
+        if track as usize >= APPLE_II_TRACKS || sector as usize >= APPLE_II_SECTORS_PER_TRACK {
+            return;
+        }
         let row = 0x38 + (track as usize) * 4;
         if sector >= 8 {
             self.vtoc.bitmap[row - 0x38] |= 1 << (sector - 8);
@@ -861,13 +869,14 @@ impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
     fn alloc_one_sector(&mut self) -> Result<(u8, u8), FilesystemError> {
         // Walk outward from track 17 in alternating direction so the
         // catalog stays clustered near the head's typical resting place.
+        // Tracks 1..=34: track 34 is data space too (it is counted free), and track 0 is DOS.
         let order: Vec<u8> = std::iter::once(17u8)
-            .chain((1..=16).flat_map(|d: u8| {
+            .chain((1..=17).flat_map(|d: u8| {
                 let inc = 17u8.checked_add(d);
                 let dec = 17u8.checked_sub(d);
                 inc.into_iter().chain(dec)
             }))
-            .filter(|&t| (t as usize) < APPLE_II_TRACKS)
+            .filter(|&t| t != 0 && (t as usize) < APPLE_II_TRACKS)
             .collect();
         for t in order {
             // Skip the entire VTOC+catalog track for data allocation
@@ -884,7 +893,7 @@ impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
             }
         }
         Err(FilesystemError::InvalidData(
-            "DOS 3.3 volume full — no free sectors outside track 17".into(),
+            "DOS 3.3 volume full - no free sectors outside track 17".into(),
         ))
     }
 
@@ -915,7 +924,7 @@ impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
             sector = cat[0x02];
         }
         Err(FilesystemError::InvalidData(
-            "DOS 3.3 catalog full — no free entry slot in the 15-sector catalog chain".into(),
+            "DOS 3.3 catalog full - no free entry slot in the 15-sector catalog chain".into(),
         ))
     }
 
@@ -1047,6 +1056,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AppleDosFilesystem<R>
         // for arbitrary bytes, so the length is recoverable by anything that
         // reads the disk, not just by us.
         let type_code = TYPE_B;
+        if payload.len() > 0xFFFF {
+            // The B header's length is 16 bits: a longer file would read back truncated (AP2-002).
+            return Err(FilesystemError::InvalidData(format!(
+                "DOS 3.3 binary files hold at most 65535 bytes; this one is {}",
+                payload.len()
+            )));
+        }
         let mut stored = Vec::with_capacity(payload.len() + BINARY_HEADER_LEN);
         stored.extend_from_slice(&0u16.to_le_bytes()); // load address
         stored.extend_from_slice(&(payload.len() as u16).to_le_bytes());
@@ -1160,7 +1176,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AppleDosFilesystem<R>
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "DOS 3.3 is flat — no subdirectories".into(),
+            "DOS 3.3 is flat - no subdirectories".into(),
         ))
     }
 

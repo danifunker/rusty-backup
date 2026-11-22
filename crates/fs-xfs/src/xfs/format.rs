@@ -479,8 +479,8 @@ pub fn write_blank_xfs<W: Write + Seek>(
     Ok(l.dblocks * bs)
 }
 
-/// Format a blank XFS volume into memory. Used by the multi-partition builder
-/// and tests; `new` streams straight to a file instead.
+/// Format a blank XFS volume into memory, for tests; real callers stream with `write_blank_xfs`.
+#[cfg(test)]
 pub fn create_blank_xfs(size_bytes: u64, label: &str) -> Result<Vec<u8>, FilesystemError> {
     let plan = plan(size_bytes)?;
     let mut img = vec![0u8; (plan.dblocks * BLOCKSIZE as u64) as usize];
@@ -527,7 +527,7 @@ mod tests {
         assert_eq!(l.free_start(1), 8);
     }
 
-    /// `create_blank_xfs` is what the `batch` builder calls, so it needs its
+    /// `create_blank_xfs` is what the tests build on, so it needs its
     /// own check — at the smallest size, since it does materialize the volume.
     #[test]
     fn create_blank_xfs_returns_a_readable_image() {

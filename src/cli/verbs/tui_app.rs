@@ -2013,6 +2013,8 @@ impl App {
                         size,
                         name,
                         fs: crate::cli::verbs::new_sgi_hdd::SgiFs::Efs,
+                        label_only: false,
+                        swap: None,
                         heads: crate::controller::new_disk::DEFAULT_HEADS,
                         sectors: crate::controller::new_disk::DEFAULT_SECTORS_PER_TRACK,
                         inodes: None,

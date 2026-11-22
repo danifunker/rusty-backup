@@ -68,7 +68,15 @@ pub fn verify_squashfs<R: Read + Seek + Send>(
     // hostile or damaged image could nest deeply enough to blow a recursive
     // one, and the verifier of all things must not itself crash on bad input.
     let mut stack = vec![root];
+    // A directory listed inside its own subtree would loop forever: visit each once.
+    let mut seen_dirs = std::collections::HashSet::new();
     while let Some(entry) = stack.pop() {
+        if entry.entry_type == EntryType::Directory && !seen_dirs.insert(entry.location) {
+            return Err(FilesystemError::InvalidData(format!(
+                "squashfs verify: directory '{}' is listed inside itself",
+                entry.path
+            )));
+        }
         verify_entry(fs, &entry, &mut stack, &mut report)?;
     }
     Ok(report)
@@ -129,6 +137,7 @@ mod tests {
             gid: 0,
             mtime: 0,
             xattrs: Vec::new(),
+            link_group: None,
             kind: BuildKind::Dir(vec![
                 BuildNode::file("readme", 0o644, b"hello\n".to_vec()),
                 BuildNode::symlink("link", "readme"),
@@ -145,6 +154,7 @@ mod tests {
                             name: "security.capability".into(),
                             value: vec![1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0],
                         }],
+                        link_group: None,
                         // Compressible, so its data blocks are gzip-compressed
                         // — a corrupt-block test needs a block that *decompresses*,
                         // and an incompressible file is stored raw (no checksum,

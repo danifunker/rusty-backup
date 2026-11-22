@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use disk_core::bits::{bitmap_clear_bit_be, bitmap_find_set_bit_be, bitmap_set_bit_be};
+use disk_core::bits::{bitmap_clear_bit_be, bitmap_set_bit_be};
 use disk_core::entry::{EntryType, FileEntry};
 use disk_core::filesystem::CompactResult;
 use disk_core::filesystem::{
@@ -35,6 +35,14 @@ impl<R: Read + Seek + Send> ProDosFilesystem<R> {
     /// Open a ProDOS filesystem at the given partition offset.
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
         let header = read_volume_header(&mut reader, partition_offset)?;
+        // A volume claiming more blocks than the image holds would allocate past its end.
+        let end = reader.seek(SeekFrom::End(0))?;
+        if partition_offset + header.total_blocks as u64 * BLOCK_SIZE > end {
+            return Err(FilesystemError::InvalidData(format!(
+                "ProDOS: the volume claims {} blocks, more than the image holds",
+                header.total_blocks
+            )));
+        }
         Ok(Self {
             reader,
             partition_offset,
@@ -94,6 +102,8 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
         // storage_type is stored in entry.mode (set by list_directory).
         // Fall back to inference from eof if mode is absent.
         let storage_type = entry.mode.unwrap_or_else(|| infer_storage_type(eof)) as u8;
+        // A forked file's entry points at its extended key block; read the data fork.
+        let (storage_type, key_ptr, eof) = self.data_fork(storage_type, key_ptr, eof)?;
 
         let data = match storage_type {
             1 => read_seedling(&mut self.reader, self.partition_offset, key_ptr, eof)?,
@@ -123,6 +133,7 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
         let key_ptr = entry.location as u16;
         let eof = entry.size as usize;
         let storage_type = entry.mode.unwrap_or_else(|| infer_storage_type(eof)) as u8;
+        let (storage_type, key_ptr, eof) = self.data_fork(storage_type, key_ptr, eof)?;
         match storage_type {
             1 => write_seedling_to(
                 &mut self.reader,
@@ -216,6 +227,29 @@ fn mark_block(used: &mut [bool], broken: &mut Vec<String>, total: usize, block: 
 
 impl<R: Read + Seek + Send> ProDosFilesystem<R> {
     /// Read a 512-byte block through the read-only path (fsck needs no write).
+    /// For an extended (forked, storage type 5) file, the data fork's storage type, key block
+    /// and EOF from the extended key block; other files pass through unchanged.
+    fn data_fork(
+        &mut self,
+        storage_type: u8,
+        key: u16,
+        eof: usize,
+    ) -> Result<(u8, u16, usize), FilesystemError> {
+        if storage_type != 5 {
+            return Ok((storage_type, key, eof));
+        }
+        let ek = self.read_block_ro(key)?;
+        let st = ek[0];
+        if !matches!(st, 1..=3) {
+            return Err(FilesystemError::Parse(format!(
+                "ProDOS: extended file at block {key} has a data fork of storage type {st}"
+            )));
+        }
+        let kp = u16::from_le_bytes([ek[1], ek[2]]);
+        let fork_eof = u32::from_le_bytes([ek[5], ek[6], ek[7], 0]) as usize;
+        Ok((st, kp, fork_eof))
+    }
+
     fn read_block_ro(&mut self, block: u16) -> Result<[u8; 512], FilesystemError> {
         let offset = self.partition_offset + block as u64 * BLOCK_SIZE;
         self.reader
@@ -521,9 +555,18 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
     /// Allocate a free block: find SET bit (free), CLEAR it (mark used).
     fn allocate_block(&mut self) -> Result<u16, FilesystemError> {
         self.ensure_bitmap()?;
-        let bm = self.bitmap.as_mut().unwrap();
         let total = self.header.total_blocks as u32;
-        let bit = bitmap_find_set_bit_be(bm, total)
+        let bitmap = self.header.bitmap_pointer as u32;
+        let bitmap_end = bitmap + total.div_ceil(4096);
+        let bm = self.bitmap.as_mut().unwrap();
+        // Boot blocks, the volume directory and the bitmap are never data, whatever a corrupt
+        // bitmap says (and block 0 would read as "no block").
+        let bit = (6..total)
+            .filter(|&b| b < bitmap || b >= bitmap_end)
+            .find(|&b| {
+                bm.get((b / 8) as usize)
+                    .is_some_and(|byte| byte & (0x80 >> (b % 8)) != 0)
+            })
             .ok_or_else(|| FilesystemError::DiskFull("no free blocks available".into()))?;
         bitmap_clear_bit_be(bm, bit); // mark used
         self.header.free_blocks = self.header.free_blocks.saturating_sub(1);
@@ -532,6 +575,12 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
 
     /// Free a block: SET the bit (mark free).
     fn free_block(&mut self, block: u16) -> Result<(), FilesystemError> {
+        if block >= self.header.total_blocks {
+            return Err(FilesystemError::InvalidData(format!(
+                "ProDOS: block {block} is past the {}-block volume",
+                self.header.total_blocks
+            )));
+        }
         self.ensure_bitmap()?;
         let bm = self.bitmap.as_mut().unwrap();
         bitmap_set_bit_be(bm, block as u32); // mark free
@@ -623,7 +672,14 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
         let upper = name.to_ascii_uppercase();
         let mut block_num = dir_key_block;
 
+        // A directory block linking back into its own chain would loop forever.
+        let mut chain_seen: HashSet<u16> = HashSet::new();
         while block_num != 0 {
+            if !chain_seen.insert(block_num) {
+                return Err(FilesystemError::Parse(format!(
+                    "ProDOS: directory chain loops at block {block_num}"
+                )));
+            }
             let block = self.read_block(block_num)?;
             let next_block = u16::from_le_bytes([block[2], block[3]]);
 
@@ -660,7 +716,14 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
         let mut block_num = dir_key_block;
         let mut last_block = dir_key_block;
 
+        // A directory block linking back into its own chain would loop forever.
+        let mut chain_seen: HashSet<u16> = HashSet::new();
         while block_num != 0 {
+            if !chain_seen.insert(block_num) {
+                return Err(FilesystemError::Parse(format!(
+                    "ProDOS: directory chain loops at block {block_num}"
+                )));
+            }
             let block = self.read_block(block_num)?;
             let next_block = u16::from_le_bytes([block[2], block[3]]);
 
@@ -683,6 +746,12 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
             block_num = next_block;
         }
 
+        // The volume directory is a fixed four blocks; only subdirectories grow.
+        if dir_key_block == 2 {
+            return Err(FilesystemError::DiskFull(
+                "ProDOS: the volume directory is full (51 entries)".into(),
+            ));
+        }
         // No free slot — allocate a new block and link it to the chain.
         let new_block = self.allocate_block()?;
         let mut new_data = [0u8; 512];
@@ -698,6 +767,22 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
         last_data[2] = nb[0];
         last_data[3] = nb[1];
         self.write_block(last_block, &last_data)?;
+
+        // The subdirectory's entry in its parent records its size: one more block.
+        let key = self.read_block(dir_key_block)?;
+        let parent_block = u16::from_le_bytes([key[4 + 35], key[4 + 36]]);
+        let parent_slot = key[4 + 37] as usize;
+        if parent_block != 0 && (1..=13).contains(&parent_slot) {
+            let mut pb = self.read_block(parent_block)?;
+            let eo = 4 + (parent_slot - 1) * 39;
+            if u16::from_le_bytes([pb[eo + 17], pb[eo + 18]]) == dir_key_block {
+                let used = u16::from_le_bytes([pb[eo + 19], pb[eo + 20]]).saturating_add(1);
+                pb[eo + 19..eo + 21].copy_from_slice(&used.to_le_bytes());
+                let eof = used as u32 * 512;
+                pb[eo + 21..eo + 24].copy_from_slice(&eof.to_le_bytes()[..3]);
+                self.write_block(parent_block, &pb)?;
+            }
+        }
 
         // Slot 0 of the new block is available (it's not a header).
         Ok((new_block, 0))
@@ -840,50 +925,79 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
         if key_pointer == 0 {
             return Ok(());
         }
-        match storage_type {
-            1 => {
-                // Seedling: just one data block.
-                self.free_block(key_pointer)?;
-            }
-            2 => {
-                // Sapling: index block + data blocks.
-                let index = read_index_block(&mut self.reader, self.partition_offset, key_pointer)?;
-                for &db in &index {
-                    if db != 0 {
-                        self.free_block(db)?;
-                    }
+        // Gather every block first and check it: a wild index pointer must not free the volume
+        // directory, the bitmap, or something past the end.
+        let mut blocks = Vec::new();
+        if storage_type == 5 {
+            // Extended file: the key block lists a data fork (offset 0) and a resource fork (256).
+            let ek = self.read_block_ro(key_pointer)?;
+            for base in [0usize, 256] {
+                let st = ek[base];
+                let kp = u16::from_le_bytes([ek[base + 1], ek[base + 2]]);
+                if matches!(st, 1..=3) && kp != 0 {
+                    self.collect_fork_blocks(kp, st, &mut blocks)?;
                 }
-                self.free_block(key_pointer)?;
+            }
+            blocks.push(key_pointer);
+        } else {
+            self.collect_fork_blocks(key_pointer, storage_type, &mut blocks)?;
+        }
+        let total = self.header.total_blocks;
+        let bitmap = self.header.bitmap_pointer;
+        let bitmap_end = bitmap as u32 + (total as u32).div_ceil(4096);
+        for &b in &blocks {
+            let reserved = b < 6 || (b as u32 >= bitmap as u32 && (b as u32) < bitmap_end);
+            if reserved || b >= total {
+                return Err(FilesystemError::InvalidData(format!(
+                    "ProDOS: file at block {key_pointer} points at block {b}, which it can't own"
+                )));
+            }
+        }
+        for b in blocks {
+            self.free_block(b)?;
+        }
+        Ok(())
+    }
+
+    /// The blocks of one seedling / sapling / tree fork, index blocks included.
+    fn collect_fork_blocks(
+        &mut self,
+        key: u16,
+        storage_type: u8,
+        out: &mut Vec<u16>,
+    ) -> Result<(), FilesystemError> {
+        match storage_type {
+            2 => {
+                let index = read_index_block(&mut self.reader, self.partition_offset, key)?;
+                out.extend(index.iter().copied().filter(|&b| b != 0));
             }
             3 => {
-                // Tree: master index + index blocks + data blocks.
-                let master =
-                    read_index_block(&mut self.reader, self.partition_offset, key_pointer)?;
+                let master = read_index_block(&mut self.reader, self.partition_offset, key)?;
                 for &ib in &master[..128] {
                     if ib != 0 {
                         let index = read_index_block(&mut self.reader, self.partition_offset, ib)?;
-                        for &db in &index {
-                            if db != 0 {
-                                self.free_block(db)?;
-                            }
-                        }
-                        self.free_block(ib)?;
+                        out.extend(index.iter().copied().filter(|&b| b != 0));
+                        out.push(ib);
                     }
                 }
-                self.free_block(key_pointer)?;
             }
-            _ => {
-                // Unknown storage type — just free the key block.
-                self.free_block(key_pointer)?;
-            }
+            _ => {}
         }
+        out.push(key);
         Ok(())
     }
 
     /// Free all blocks in a directory chain (but NOT the files within it).
     fn free_dir_blocks(&mut self, dir_key_block: u16) -> Result<(), FilesystemError> {
         let mut block_num = dir_key_block;
+        // A directory block linking back into its own chain would loop forever.
+        let mut chain_seen: HashSet<u16> = HashSet::new();
         while block_num != 0 {
+            if !chain_seen.insert(block_num) {
+                return Err(FilesystemError::Parse(format!(
+                    "ProDOS: directory chain loops at block {block_num}"
+                )));
+            }
             let block = self.read_block(block_num)?;
             let next = u16::from_le_bytes([block[2], block[3]]);
             self.free_block(block_num)?;
@@ -895,7 +1009,14 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
     /// Check if a directory is empty (has no file or subdir entries).
     fn is_directory_empty(&mut self, dir_key_block: u16) -> Result<bool, FilesystemError> {
         let mut block_num = dir_key_block;
+        // A directory block linking back into its own chain would loop forever.
+        let mut chain_seen: HashSet<u16> = HashSet::new();
         while block_num != 0 {
+            if !chain_seen.insert(block_num) {
+                return Err(FilesystemError::Parse(format!(
+                    "ProDOS: directory chain loops at block {block_num}"
+                )));
+            }
             let block = self.read_block(block_num)?;
             let next = u16::from_le_bytes([block[2], block[3]]);
             for i in 0..13usize {
@@ -1046,9 +1167,10 @@ fn build_subdir_entry_bytes(name: &str, key_ptr: u16, mtime_secs: Option<u64>) -
     let kp = key_ptr.to_le_bytes();
     e[17] = kp[0];
     e[18] = kp[1];
-    // blocks_used = 1 (the key block itself)
+    // blocks_used = 1 (the key block itself), EOF = one 512-byte block
     e[19] = 1;
     e[20] = 0;
+    e[21..24].copy_from_slice(&[0x00, 0x02, 0x00]);
     let (date, time) = match mtime_secs {
         Some(s) => disk_core::times::unix_to_prodos_local(s),
         None => make_prodos_datetime_now(),
@@ -1139,20 +1261,20 @@ fn make_prodos_datetime_now() -> (u16, u16) {
 fn validate_prodos_name(name: &str, what: &str) -> Result<String, FilesystemError> {
     if name.is_empty() {
         return Err(FilesystemError::InvalidData(format!(
-            "{what} is empty — pick a non-blank name"
+            "{what} is empty - pick a non-blank name"
         )));
     }
     let upper = name.to_ascii_uppercase();
     let bytes = upper.as_bytes();
     if bytes.len() > 15 {
         return Err(FilesystemError::InvalidData(format!(
-            "{what} is too long ({} chars); ProDOS allows up to 15 — shorten it",
+            "{what} is too long ({} chars); ProDOS allows up to 15 - shorten it",
             bytes.len()
         )));
     }
     if !bytes[0].is_ascii_alphabetic() {
         return Err(FilesystemError::InvalidData(format!(
-            "{what} starts with '{}' — ProDOS requires the first character to be a letter \
+            "{what} starts with '{}' - ProDOS requires the first character to be a letter \
              (A-Z); change it to begin with a letter",
             upper.chars().next().unwrap_or('?')
         )));
@@ -1161,7 +1283,7 @@ fn validate_prodos_name(name: &str, what: &str) -> Result<String, FilesystemErro
         if !b.is_ascii_alphanumeric() && b != b'.' {
             let c = upper.chars().nth(i).unwrap_or('?');
             return Err(FilesystemError::InvalidData(format!(
-                "{what} contains '{c}' — ProDOS allows only letters (A-Z), digits (0-9), \
+                "{what} contains '{c}' - ProDOS allows only letters (A-Z), digits (0-9), \
                  and '.' (spaces and most punctuation are not allowed)"
             )));
         }
@@ -1225,7 +1347,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         }
 
         // Max ProDOS file size: 16MB
-        if data_len > 16 * 1024 * 1024 {
+        if data_len > 0xFF_FFFF {
+            // EOF is a 3-byte field: 16 MiB itself would be stored as 0 (AP2-003).
             return Err(FilesystemError::InvalidData(
                 "ProDOS file size cannot exceed 16MB".into(),
             ));
@@ -1310,8 +1433,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
 
         // Build subdirectory key block with header at slot 0
         let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        // parent_entry_number counts from 1 within the entry's block.
         let header =
-            build_subdir_header_bytes(&validated_name, parent_key_block, entry_slot as u8, mtime);
+            build_subdir_header_bytes(&validated_name, entry_block, entry_slot as u8 + 1, mtime);
         let mut new_block_data = [0u8; 512];
         // prev_block = 0, next_block = 0 (bytes 0-3)
         // Header at slot 0 (offset 4)
@@ -1598,20 +1722,24 @@ pub fn resize_prodos_in_place(
     let bitmap_blocks_needed = (old_total as u32).div_ceil(4096) as usize;
     let mut bitmap: Vec<u8> = Vec::with_capacity(bitmap_blocks_needed * 512);
     {
-        let mut bm_block = [0u8; 512];
         for i in 0..bitmap_blocks_needed {
             let offset = partition_offset + (bitmap_pointer as u64 + i as u64) * BLOCK_SIZE;
             device.seek(SeekFrom::Start(offset))?;
-            // Ignore read errors; unreadable blocks are treated as fully-used.
-            let _ = device.read_exact(&mut bm_block);
+            // An unreadable bitmap block counts as fully used, never as the previous block's
+            // leftover bytes.
+            let mut bm_block = [0u8; 512];
+            if device.read_exact(&mut bm_block).is_err() {
+                bm_block = [0u8; 512];
+            }
             bitmap.extend_from_slice(&bm_block);
         }
     }
 
+    // Files sit anywhere, so a shrink must stay above the highest used block, not the count.
     let mut used_blocks = 0u32;
     for block in 0..old_total as u32 {
         if is_block_used(&bitmap, block) {
-            used_blocks += 1;
+            used_blocks = block + 1;
         }
     }
 
@@ -1624,7 +1752,7 @@ pub fn resize_prodos_in_place(
 
     if (new_total as u32) < used_blocks {
         log(&format!(
-            "ProDOS: cannot resize to {} blocks; {} blocks are in use — skipping",
+            "ProDOS: cannot resize to {} blocks; blocks up to {} are in use - skipping",
             new_total, used_blocks
         ));
         return Ok(());
@@ -1920,7 +2048,14 @@ fn list_prodos_directory<R: Read + Seek>(
     let mut result = Vec::new();
     let mut block_num = entry.location as u16;
 
+    // A directory block linking back into its own chain would loop forever.
+    let mut chain_seen: HashSet<u16> = HashSet::new();
     while block_num != 0 {
+        if !chain_seen.insert(block_num) {
+            return Err(FilesystemError::Parse(format!(
+                "ProDOS: directory chain loops at block {block_num}"
+            )));
+        }
         let block_offset = partition_offset + block_num as u64 * BLOCK_SIZE;
         reader
             .seek(SeekFrom::Start(block_offset))
@@ -1979,7 +2114,20 @@ fn list_prodos_directory<R: Read + Seek>(
                 fe.modified_unix = modified_unix;
                 result.push(fe);
             } else {
-                // Regular file: seedling (1), sapling (2), or tree (3).
+                // A forked file's directory EOF is its 512-byte key block; report the data fork.
+                let eof = if type_nibble == 5 {
+                    let mut ek = [0u8; 8];
+                    reader
+                        .seek(SeekFrom::Start(
+                            partition_offset + key_pointer as u64 * BLOCK_SIZE,
+                        ))
+                        .map_err(FilesystemError::Io)?;
+                    reader.read_exact(&mut ek).map_err(FilesystemError::Io)?;
+                    u32::from_le_bytes([ek[5], ek[6], ek[7], 0])
+                } else {
+                    eof
+                };
+                // Regular file: seedling (1), sapling (2), tree (3), or forked (5).
                 let mut fe = FileEntry::new_file(name, path, eof as u64, key_pointer as u64);
                 fe.modified = modified;
                 fe.modified_unix = modified_unix;

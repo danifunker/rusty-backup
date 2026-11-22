@@ -726,7 +726,9 @@ impl<D: Read + Seek> Volume<D> {
                 .iter()
                 .find(|e| e.in_use() && e.name == "bitmap" && !e.is_dir())
             {
-                if let Ok(map) = vol.read_chain(bm.first, usize::MAX) {
+                // One bit per block: nothing past the device's own size is a bitmap byte.
+                let cap = (vol.total_blocks / 8 + 1) as usize;
+                if let Ok(map) = vol.read_chain(bm.first, cap) {
                     vol.total_blocks = (map.len() as u64 * 8).min(vol.total_blocks.max(1));
                     vol.free_blocks = map
                         .iter()
@@ -855,6 +857,13 @@ impl<D: Read + Seek> Volume<D> {
             let w =
                 |o: usize| u32::from_le_bytes([hdr[o], hdr[o + 1], hdr[o + 2], hdr[o + 3]]) as u64;
             let (prev, next, size, bound) = (w(0), w(4), w(8), w(12));
+            // The extent's blocks must lie inside the volume, or an edit would touch whatever follows.
+            if at + bound > self.total_blocks.max(1) {
+                return Err(Error::InvalidData(format!(
+                    "qnx2: extent at block {at} spans {} blocks past the volume",
+                    bound + 1
+                )));
+            }
             out.push(Extent {
                 block: at,
                 span: bound + 1,
@@ -1013,6 +1022,7 @@ impl<D: Read + Seek> Volume<D> {
         };
         let mut prev = 0;
         let mut held = 0u64;
+        let mut crossed = 0u64;
         for x in &xs {
             if x.prev != prev {
                 report.warnings.push(issue(
@@ -1034,15 +1044,24 @@ impl<D: Read + Seek> Volume<D> {
                     continue;
                 }
                 if let Some(other) = owners.insert(b, path.to_string()) {
-                    report.errors.push(issue(
-                        "CrossLinked",
-                        format!("block {b} is held by both {other} and {path}"),
-                    ));
+                    crossed += 1;
+                    if crossed <= 20 {
+                        report.errors.push(issue(
+                            "CrossLinked",
+                            format!("block {b} is held by both {other} and {path}"),
+                        ));
+                    }
                 }
                 if self.marked(b) == Some(false) {
                     report.unmarked.push(b);
                 }
             }
+        }
+        if crossed > 20 {
+            report.errors.push(issue(
+                "CrossLinked",
+                format!("{path}: {crossed} blocks held by other files in all"),
+            ));
         }
         if let Some(n) = blocks_less_one {
             if u64::from(n) + 1 != held {
@@ -1277,10 +1296,17 @@ impl<D: Read + Write + Seek> Volume<D> {
                 "qnx2: the volume has no bitmap file".into(),
             ));
         }
-        let (lo, hi) = (
-            ((start - 1) / 8) as usize,
-            ((start + count - 2) / 8) as usize,
-        );
+        let end = start.saturating_add(count);
+        if start == 0
+            || count == 0
+            || end - 1 > self.total_blocks
+            || end - 1 > self.bitmap.len() as u64 * 8
+        {
+            return Err(Error::InvalidData(format!(
+                "qnx2: blocks {start}+{count} are outside the bitmap"
+            )));
+        }
+        let (lo, hi) = (((start - 1) / 8) as usize, ((end - 2) / 8) as usize);
         for b in start..start + count {
             let (i, bit) = (((b - 1) / 8) as usize, (b - 1) % 8);
             let was = self.bitmap[i] >> bit & 1 != 0;
@@ -1302,54 +1328,34 @@ impl<D: Read + Write + Seek> Volume<D> {
     /// Extents for `len` data bytes, at most [`MAX_EXTENT_BLOCKS`] each as QNX writes them: from
     /// one contiguous run when one is big enough, else from the largest free runs first.
     fn allocate(&mut self, len: u64) -> Result<Vec<(u64, u64)>> {
-        let mut runs: Vec<(u64, u64)> = Vec::new();
-        let mut b = 2;
-        while b <= self.total_blocks {
-            if self.marked(b) == Some(false) {
-                let start = b;
-                while b <= self.total_blocks && self.marked(b) == Some(false) {
-                    b += 1;
-                }
-                runs.push((start, b - start));
-            } else {
-                b += 1;
-            }
-        }
-        let need = blocks_for(len);
-        if let Some(&(start, _)) = runs.iter().find(|r| r.1 >= need) {
-            runs = vec![(start, need)];
-        } else {
-            runs.sort_by_key(|r| std::cmp::Reverse(r.1));
-        }
-        // Carve the runs into extents until the data fits.
-        let mut out = Vec::new();
-        let mut left = len;
-        'runs: for (start, n) in runs {
-            let mut at = start;
-            while at < start + n {
-                let take = (start + n - at).min(MAX_EXTENT_BLOCKS);
-                let cap = take * BLOCK - XTNT_HDR;
-                if cap >= left {
-                    out.push((at, (left + XTNT_HDR).div_ceil(BLOCK).max(1)));
-                    left = 0;
-                    break 'runs;
-                }
-                out.push((at, take));
-                left -= cap;
-                at += take;
-            }
-        }
-        if left > 0 || out.is_empty() {
-            return Err(Error::DiskFull(format!(
+        let out = plan_allocation(&self.bitmap, self.total_blocks, len).ok_or_else(|| {
+            Error::DiskFull(format!(
                 "{len} bytes do not fit in {} free blocks",
                 self.free_blocks
-            )));
-        }
-        out.sort_unstable();
+            ))
+        })?;
         for &(start, n) in &out {
             self.mark(start, n, true)?;
         }
         Ok(out)
+    }
+
+    /// Refuse a replace of `old` by `len` bytes unless the new extents fit once the old ones go.
+    fn check_replace_fits(&mut self, old: &Entry, len: u64) -> Result<()> {
+        let mut map = self.bitmap.clone();
+        for x in self.extents(old.first)? {
+            for b in x.block..x.block + x.span {
+                if let Some(byte) = map.get_mut(((b - 1) / 8) as usize) {
+                    *byte &= !(1 << ((b - 1) % 8));
+                }
+            }
+        }
+        if plan_allocation(&map, self.total_blocks, len).is_none() {
+            return Err(Error::DiskFull(format!(
+                "{len} bytes do not fit in the space the old file would free"
+            )));
+        }
+        Ok(())
     }
 
     /// Write `len` bytes from `data` as an extent chain over `runs`; returns (last extent, blocks).
@@ -1534,6 +1540,8 @@ impl<D: Read + Write + Seek> Volume<D> {
         if self.name_taken(dir, name)? {
             return Err(Error::AlreadyExists(name.to_string()));
         }
+        // The slot first: a full directory then fails before any data blocks are taken.
+        let slot = self.free_slot(dir)?;
         let runs = self.allocate(len)?;
         let (last, blocks) = self.write_chain(&runs, data, len)?;
         let bits = Self::bits_of(opts, false);
@@ -1548,7 +1556,6 @@ impl<D: Read + Write + Seek> Volume<D> {
             bits,
             date,
         );
-        let slot = self.free_slot(dir)?;
         self.write_entry(EntryLoc { dir, slot }, &e)?;
         self.touch_dir(dir)?;
         Ok(self.entry_for(&parent.path, &Dirent::decode(&e)))
@@ -1593,18 +1600,19 @@ impl<D: Read + Write + Seek> Volume<D> {
             )));
         }
         let xs = self.extents(d.first)?;
-        for x in &xs {
-            self.mark(x.block, x.span, false)?;
-        }
         // As `frel`: the slot is released and the first extent emptied; names and pointers stay.
-        if let Some(x) = xs.first() {
-            self.write_block_bytes(x.block, 8, &0u32.to_le_bytes())?;
-        }
+        // The slot goes first, so a failure part-way never leaves an entry on freed blocks.
         e[0] = 0;
         let [w0, w1] = encode_date(self.now());
         e[27..29].copy_from_slice(&w0.to_le_bytes());
         e[29..31].copy_from_slice(&w1.to_le_bytes());
         self.write_entry(loc, &e)?;
+        if let Some(x) = xs.first() {
+            self.write_block_bytes(x.block, 8, &0u32.to_le_bytes())?;
+        }
+        for x in &xs {
+            self.mark(x.block, x.span, false)?;
+        }
         self.touch_dir(dir)
     }
 
@@ -1713,14 +1721,7 @@ impl<D: Read + Write + Seek> Volume<D> {
             Err(Error::NotFound(_)) => return self.put(path, data, opts),
             Err(e) => return Err(e),
         };
-        let need = blocks_for(data.len() as u64);
-        if need > self.free_blocks + u64::from(old.blocks) {
-            return Err(Error::DiskFull(format!(
-                "{} bytes do not fit in {} free blocks",
-                data.len(),
-                self.free_blocks + u64::from(old.blocks)
-            )));
-        }
+        self.check_replace_fits(&old, data.len() as u64)?;
         let mut o = *opts;
         if o.attributes.is_none() {
             o.attributes = Some(old.attributes());
@@ -1754,11 +1755,11 @@ impl<D: Read + Write + Seek> Volume<D> {
         if src_path.trim_matches('/').is_empty() {
             for child in src.list("/")? {
                 if child.name != "bitmap" {
-                    self.copy_entry(src, &child, &dir.path, replace, &mut report)?;
+                    self.copy_entry(src, &child, &dir.path, replace, &mut report, 0)?;
                 }
             }
         } else {
-            self.copy_entry(src, &e, &dir.path, replace, &mut report)?;
+            self.copy_entry(src, &e, &dir.path, replace, &mut report, 0)?;
         }
         Ok(report)
     }
@@ -1770,7 +1771,15 @@ impl<D: Read + Write + Seek> Volume<D> {
         dst_dir: &str,
         replace: bool,
         report: &mut CopyReport,
+        depth: usize,
     ) -> Result<()> {
+        // A directory that loops back to an ancestor would recurse until the disk filled.
+        if depth > 64 {
+            return Err(Error::InvalidData(format!(
+                "qnx2: {} is nested more than 64 deep (a directory loop?)",
+                e.path
+            )));
+        }
         let target = join(dst_dir, &e.name);
         let existing = match self.lookup(&target) {
             Ok(t) => Some(t),
@@ -1788,7 +1797,7 @@ impl<D: Read + Write + Seek> Volume<D> {
                 }
             };
             for child in src.list(&e.path)? {
-                self.copy_entry(src, &child, &target, replace, report)?;
+                self.copy_entry(src, &child, &target, replace, report, depth + 1)?;
             }
             // Adding entries re-dated the folder; give a copied folder its own date back.
             if created {
@@ -1801,10 +1810,13 @@ impl<D: Read + Write + Seek> Volume<D> {
                     return Err(Error::AlreadyExists(format!("{target} is a directory")))
                 }
                 Some(_) if !replace => return Err(Error::AlreadyExists(target)),
-                Some(_) => self.remove(&target)?,
-                None => {}
+                _ => {}
             }
             let data = src.read_file(e, usize::MAX)?;
+            if let Some(old) = existing {
+                self.check_replace_fits(&old, data.len() as u64)?;
+                self.remove(&target)?;
+            }
             self.put(&target, &data, &NewEntry::like(e))?;
             report.files += 1;
         }
@@ -1853,6 +1865,57 @@ struct Walk {
     dirs: u32,
     deleted: u32,
     recoverable: u32,
+}
+
+/// Extents for `len` data bytes over the free blocks of `bitmap`, without marking them.
+fn plan_allocation(bitmap: &[u8], total_blocks: u64, len: u64) -> Option<Vec<(u64, u64)>> {
+    let free = |n: u64| {
+        bitmap
+            .get(((n - 1) / 8) as usize)
+            .is_some_and(|b| b >> ((n - 1) % 8) & 1 == 0)
+    };
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut b = 2;
+    while b <= total_blocks {
+        if free(b) {
+            let start = b;
+            while b <= total_blocks && free(b) {
+                b += 1;
+            }
+            runs.push((start, b - start));
+        } else {
+            b += 1;
+        }
+    }
+    let need = blocks_for(len);
+    if let Some(&(start, _)) = runs.iter().find(|r| r.1 >= need) {
+        runs = vec![(start, need)];
+    } else {
+        runs.sort_by_key(|r| std::cmp::Reverse(r.1));
+    }
+    // Carve the runs into extents until the data fits.
+    let mut out = Vec::new();
+    let mut left = len;
+    'runs: for (start, n) in runs {
+        let mut at = start;
+        while at < start + n {
+            let take = (start + n - at).min(MAX_EXTENT_BLOCKS);
+            let cap = take * BLOCK - XTNT_HDR;
+            if cap >= left {
+                out.push((at, (left + XTNT_HDR).div_ceil(BLOCK).max(1)));
+                left = 0;
+                break 'runs;
+            }
+            out.push((at, take));
+            left -= cap;
+            at += take;
+        }
+    }
+    if left > 0 || out.is_empty() {
+        return None;
+    }
+    out.sort_unstable();
+    Some(out)
 }
 
 fn issue(code: &str, message: String) -> Issue {

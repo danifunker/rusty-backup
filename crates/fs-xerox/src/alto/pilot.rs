@@ -474,6 +474,20 @@ pub fn read_volume(disk: &Disk, generation: Generation) -> Result<PilotVolume, F
     };
 
     let physical_root = PhysicalRoot::parse(page(0)?)?;
+    // Every loop and page index below is driven by these counts: they must fit the pack.
+    let total = disk.geometry.total_sectors() as u64;
+    for sv in &physical_root.sub_volumes {
+        let fits = sv.pv_page as u64 + sv.n_pages as u64 <= total
+            && sv.lv_page as u64 + sv.n_pages as u64 <= sv.lv_size as u64
+            && sv.lv_size as u64 <= total;
+        if !fits {
+            return Err(FilesystemError::Parse(format!(
+                "Pilot: subvolume at page {} ({} pages of a {}-page volume) does not fit the \
+                 {total}-page pack",
+                sv.pv_page, sv.n_pages, sv.lv_size
+            )));
+        }
+    }
 
     // Find the subvolume that holds the LV root (lv_page == rootPageNumber).
     let root_sv = physical_root
@@ -714,6 +728,10 @@ fn install_vam(disk: &mut Disk, sv: &SubVolumeDesc, generation: Generation) {
 fn rebuild_vam(disk: &mut Disk, sv: &SubVolumeDesc) {
     let pv = sv.pv_page as usize;
     let vsize = sv.lv_size as usize;
+    // The bitmap covers the whole logical volume, which is indexed here as this one subvolume.
+    if vsize > sv.n_pages as usize || pv + sv.n_pages as usize > disk.sectors.len() {
+        return;
+    }
 
     // Locate the VAM header page and its data pages (run table).
     let mut header_lp = None;
@@ -884,7 +902,14 @@ fn leader_name(data: &[u8]) -> Option<String> {
     if data.len() < 80 {
         return None;
     }
-    let w = |wi: usize| be16(data, wi * 2);
+    // Words and strings past the page read as absent: a crafted length must not index past it.
+    let w = |wi: usize| {
+        if wi * 2 + 2 <= data.len() {
+            be16(data, wi * 2)
+        } else {
+            0
+        }
+    };
     let validate = |s: String| -> Option<String> {
         let t = s.trim().to_string();
         (1..=72).contains(&t.len()).then_some(t)
@@ -899,10 +924,10 @@ fn leader_name(data: &[u8]) -> Option<String> {
     if w(0) == 0x1061 || w(0) == 0x1062 {
         let n = (w(1) as usize).min(72);
         let s: String = if w(0) == 0x1061 {
-            ascii_clean(&data[4..4 + n])
+            ascii_clean(data.get(4..4 + n)?)
         } else {
             (0..n)
-                .map(|i| data[(2 + i) * 2 + 1] as char)
+                .map(|i| data.get((2 + i) * 2 + 1).copied().unwrap_or(0) as char)
                 .take_while(|&c| c != '\0')
                 .filter(|&c| (' '..='~').contains(&c))
                 .collect()
@@ -926,7 +951,7 @@ fn leader_name(data: &[u8]) -> Option<String> {
     // name (packed chars) @word11.
     if w(0) == 0o1240 {
         let n = (w(10) as usize).min(40);
-        return validate(ascii_clean(&data[22..22 + n]));
+        return validate(ascii_clean(data.get(22..22 + n)?));
     }
     // Cedar directory leader (fullLP): magic 25280 @word64, property list from
     // word65 (LPEntry{type,len,value}); file name = tFileName(6) StringBody.
@@ -940,9 +965,9 @@ fn leader_name(data: &[u8]) -> Option<String> {
             let plen = w(wi + 1) as usize;
             if ptype == 6 {
                 let slen = (w(wi + 2) as usize).min(40);
-                return validate(ascii_clean(&data[(wi + 4) * 2..(wi + 4) * 2 + slen]));
+                return validate(ascii_clean(data.get((wi + 4) * 2..(wi + 4) * 2 + slen)?));
             }
-            wi += plen + 2;
+            wi = wi.saturating_add(plen + 2);
         }
     }
     None
@@ -1260,7 +1285,8 @@ pub fn add_file(
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for lp in allocated_lps {
         match runs.last_mut() {
-            Some((first, len)) if *first + *len == lp => *len += 1,
+            // A run's size is a 16-bit word in the run table: split at 0xFFFF (XRX-011).
+            Some((first, len)) if *first + *len == lp && *len < 0xFFFF => *len += 1,
             _ => runs.push((lp, 1)),
         }
     }
@@ -1531,7 +1557,8 @@ fn parse_client_directory(client_data: &[u8]) -> Vec<ClientDirEntry> {
             if size == 0 || entry_w + size > page_words {
                 break; // corrupt; abandon this page
             }
-            if rdw(page, entry_w + 3) == FS_ENTRY_LOCAL && size > FS_LOCAL_TEXT_WORD {
+            // The type word (+3) and the local entry's fields (to +8) must lie in the entry.
+            if size > FS_LOCAL_TEXT_WORD.max(8) && rdw(page, entry_w + 3) == FS_ENTRY_LOCAL {
                 let version = rdw(page, entry_w + 1);
                 let name_rp = rdw(page, entry_w + 2) as usize; // word-relative ptr
                 let fid = rdlong(page, entry_w + 5); // fp.id (FileID, 2 words)

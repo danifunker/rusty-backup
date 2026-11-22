@@ -89,14 +89,7 @@ pub struct EdskGeometry {
     pub track_sizes_edsk: Vec<u8>,
 }
 
-/// One decoded sector, after the on-disk re-ordering.
-#[derive(Debug, Clone)]
-struct DecodedSector {
-    cyl: u8,
-    head: u8,
-    sector_id: u8,
-    data: Vec<u8>,
-}
+use crate::flat_layout::{flatten, RawSector};
 
 /// Decode an EDSK / DSK byte stream into a flat sector image.
 ///
@@ -116,8 +109,8 @@ pub fn decode_edsk_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
 
     // Walk every track block.
     let mut cursor = HEADER_SIZE;
-    let mut all_sectors: Vec<DecodedSector> = Vec::new();
     let total_tracks = geom.num_tracks as usize * geom.num_sides as usize;
+    let mut tracks: Vec<Option<Vec<RawSector>>> = Vec::with_capacity(total_tracks);
     for ti in 0..total_tracks {
         let track_size = if geom.is_extended {
             *geom
@@ -130,8 +123,8 @@ pub fn decode_edsk_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
             geom.track_size_dsk as usize
         };
         if track_size == 0 {
-            // Unformatted track — skip past nothing; the EDSK layout
-            // simply omits it.
+            // Unformatted track: the file omits it, the flat image keeps its slot.
+            tracks.push(None);
             continue;
         }
         if cursor + track_size > bytes.len() {
@@ -141,17 +134,19 @@ pub fn decode_edsk_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
             );
         }
         let block = &bytes[cursor..cursor + track_size];
-        decode_one_track(block, geom.is_extended, &mut all_sectors)?;
+        let mut secs = Vec::new();
+        decode_one_track(block, geom.is_extended, &mut secs)?;
+        tracks.push(Some(secs));
         cursor += track_size;
     }
 
-    // Re-order: ascending (cyl, head, sector_id).
-    all_sectors.sort_by_key(|s| (s.cyl, s.head, s.sector_id));
-
-    // Pack flat output.
-    let mut out = Vec::with_capacity(all_sectors.iter().map(|s| s.data.len()).sum());
-    for s in &all_sectors {
-        out.extend_from_slice(&s.data);
+    let (out, gaps) = flatten(&tracks);
+    if gaps.missing + gaps.dropped > 0 {
+        log::warn!(
+            "EDSK: {} sector(s) missing (zero-filled), {} duplicate or out-of-run sector(s) dropped",
+            gaps.missing,
+            gaps.dropped
+        );
     }
     Ok(out)
 }
@@ -181,7 +176,7 @@ fn parse_header(buf: &[u8]) -> Result<EdskGeometry> {
     })
 }
 
-fn decode_one_track(block: &[u8], is_extended: bool, out: &mut Vec<DecodedSector>) -> Result<()> {
+fn decode_one_track(block: &[u8], is_extended: bool, out: &mut Vec<RawSector>) -> Result<()> {
     if block.len() < TRACK_INFO_SIZE {
         bail!("EDSK track block too small: {}", block.len());
     }
@@ -204,8 +199,6 @@ fn decode_one_track(block: &[u8], is_extended: bool, out: &mut Vec<DecodedSector
     let mut data_off = TRACK_INFO_SIZE;
     for i in 0..num_sectors {
         let entry_off = 0x18 + i * 8;
-        let cyl_id = hdr[entry_off];
-        let head_id = hdr[entry_off + 1];
         let sector_id = hdr[entry_off + 2];
         let size_code = hdr[entry_off + 3];
         let logical_size = size_code_to_bytes(size_code);
@@ -228,22 +221,11 @@ fn decode_one_track(block: &[u8], is_extended: bool, out: &mut Vec<DecodedSector
                 block.len()
             );
         }
-        let data = block[data_off..data_off + actual_size].to_vec();
-        // If the sector is oversized (weird-disk / copy-protection), we
-        // keep only the logical-size prefix when emitting flat output —
-        // the downstream filesystem driver expects logical-size sectors.
-        let mut emit = data;
-        if emit.len() > logical_size {
-            emit.truncate(logical_size);
-        } else if emit.len() < logical_size {
-            // Short sector: zero-pad to logical size.
-            emit.resize(logical_size, 0);
-        }
-        out.push(DecodedSector {
-            cyl: cyl_id,
-            head: head_id,
-            sector_id,
-            data: emit,
+        // `flatten` cuts or pads each sector to its logical size.
+        out.push(RawSector {
+            id: sector_id,
+            size: logical_size,
+            data: block[data_off..data_off + actual_size].to_vec(),
         });
         data_off += actual_size;
     }

@@ -10,8 +10,8 @@
 //! 1. Recognize an ANDOS volume (boot-block signature probe).
 //! 2. Surface "ANDOS" through `fs_type()` so `inspect` reports the
 //!    filesystem instead of "Unknown".
-//! 3. Return an empty root directory (extract path returns
-//!    `Unsupported`).
+//! 3. Refuse listing and extraction with `Unsupported`, so the volume is
+//!    never shown as empty.
 //!
 //! Real read + write support is parked behind both better spec coverage
 //! and a real test fixture from the BK-emulator community.
@@ -76,9 +76,7 @@ impl<R: Read + Seek + Send> Filesystem for AndosFilesystem<R> {
         // Real directory walk is parked; surface a clear error so callers
         // don't silently treat the volume as empty.
         Err(FilesystemError::Unsupported(
-            "ANDOS directory walk not implemented — \
-             see src/fs/andos.rs for the scope note"
-                .into(),
+            "ANDOS images can be detected but not yet browsed".into(),
         ))
     }
 

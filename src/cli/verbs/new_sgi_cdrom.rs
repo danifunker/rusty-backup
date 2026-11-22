@@ -144,15 +144,15 @@ pub fn run(args: NewSgiCdromArgs) -> Result<()> {
     ));
     log_stderr(format!(
         "  slot 7 EFS (type SYSV): sectors {}..{} ({} MiB)",
-        layout.efs_first_sector,
-        layout.efs_first_sector + layout.efs_sectors,
-        (layout.efs_sectors * 512) / (1024 * 1024),
+        layout.root_first_sector,
+        layout.root_first_sector + layout.root_sectors,
+        (layout.root_sectors * 512) / (1024 * 1024),
     ));
     if let Some(dir) = &args.from_dir {
         // Drop the handle before reopening the image through the normal
         // partition-resolution path.
         drop(file);
-        populate(&args, dir, layout.efs_first_sector * 512)?;
+        populate(&args, dir, layout.root_first_sector * 512)?;
     } else {
         log_stderr(format!(
             "  populate it with: rb-cli import {} <dir>   (or put ...@1 host/file /file)",

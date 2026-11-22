@@ -139,6 +139,8 @@ pub struct Qcow2Reader<R: Read + Seek> {
     /// do. UTM stores its suspend state as a snapshot, so this is the common
     /// case for classic-Mac VM disks.
     snapshot_count: u32,
+    /// Set when the header marks the image dirty or corrupt: its refcounts can't be trusted to allocate.
+    unclean: bool,
 }
 
 impl<R: Read + Seek> Qcow2Reader<R> {
@@ -190,6 +192,7 @@ impl<R: Read + Seek> Qcow2Reader<R> {
         // separate structure we never follow. Remember the count so the editor
         // can refuse to write (shared clusters need copy-on-write) and open.
         let snapshot_count = u32::from_be_bytes(head[60..64].try_into().unwrap());
+        let mut unclean = false;
 
         if version == 3 {
             if total_len < 104 {
@@ -202,6 +205,7 @@ impl<R: Read + Seek> Qcow2Reader<R> {
                      refusing to open"
                 );
             }
+            unclean = incompat & 0b11 != 0;
             if incompat & 0b0_0100 != 0 {
                 bail!("QCOW2 with an external data file is not supported");
             }
@@ -286,8 +290,10 @@ impl<R: Read + Seek> Qcow2Reader<R> {
             refcount_table_offset,
             refcount_table_capacity,
             free_clusters: None,
-            host_end: total_len,
+            // New clusters must start on a cluster boundary, whatever the file length.
+            host_end: total_len.div_ceil(cluster_size) * cluster_size,
             snapshot_count,
+            unclean,
         })
     }
 
@@ -312,10 +318,14 @@ impl<R: Read + Seek> Qcow2Reader<R> {
         self.snapshot_count
     }
 
-    /// True when in-place edits are refused because the image carries internal
-    /// snapshots (their clusters are shared and we have no copy-on-write path).
+    /// True when the header marks the image dirty or corrupt.
+    pub fn is_unclean(&self) -> bool {
+        self.unclean
+    }
+
+    /// True when in-place edits are refused: internal snapshots, or a dirty / corrupt header.
     pub fn is_read_only(&self) -> bool {
-        self.snapshot_count != 0
+        self.snapshot_count != 0 || self.unclean
     }
 
     /// Load (and cache) the L2 table at `host_offset`.
@@ -447,6 +457,13 @@ impl<R: Read + Write + Seek> Write for Qcow2Reader<R> {
                      qemu-img convert -O qcow2 in.qcow2 out.qcow2)",
                     self.snapshot_count
                 ),
+            ));
+        }
+        if self.unclean {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "QCOW2 image is marked dirty or corrupt and opens read-only; \
+                 repair it first (qemu-img check -r all)",
             ));
         }
         if self.pos >= self.header.size {
@@ -741,7 +758,22 @@ pub fn export_qcow2(
     let refcount_table_offset = l1_offset + l1_bytes_padded;
     // refcount_order = 4 → 2 bytes per entry → cluster_size/2 entries per block.
     let refcounts_per_block = cluster_size / 2;
-    let data_start = refcount_table_offset + cluster_size;
+    // Size the refcount table for the worst case (every guest cluster written), or at small
+    // cluster sizes it would run into the first L2 table.
+    let prefix = refcount_table_offset / cluster_size;
+    let mut rt_clusters = 1u64;
+    loop {
+        let worst = prefix + rt_clusters + l1_size + num_guest_clusters;
+        let blocks = worst.div_ceil(refcounts_per_block) + 1;
+        let need = (blocks * 8).div_ceil(cluster_size).max(1);
+        if need <= rt_clusters {
+            break;
+        }
+        rt_clusters = need;
+    }
+    let rt_clusters_u32 = u32::try_from(rt_clusters)
+        .map_err(|_| anyhow::anyhow!("QCOW2 export: disk too large for the refcount table"))?;
+    let data_start = refcount_table_offset + rt_clusters * cluster_size;
 
     // Zero-fill the reserved prefix so unused L1 slots / refcount-table entries
     // read as 0 (= "no allocation") rather than uninitialised tempfile garbage.
@@ -875,7 +907,7 @@ pub fn export_qcow2(
         l1_size as u32,
         l1_offset,
         refcount_table_offset,
-        1,
+        rt_clusters_u32,
     );
     out.write_all(&header)
         .context("failed to write QCOW2 header")?;
@@ -1148,6 +1180,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_dirty_image_reads_but_refuses_writes() {
+        let cluster_bits = 9;
+        let cluster_size = 1u64 << cluster_bits;
+        let payload = make_pattern(cluster_size as usize);
+        let mut img = build_minimal_qcow2(3, cluster_bits, cluster_size, &[], &[(0, payload)]);
+        img[79] |= 1; // incompatible_features: dirty
+        let mut r = Qcow2Reader::open(Cursor::new(img)).unwrap();
+        assert!(r.is_unclean() && r.is_read_only());
+        let err = r.write(&[0xAB; 16]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
     /// UTM parks the VM's suspend state in an internal snapshot, so nearly every
     /// classic-Mac `.qcow2` in the wild has `nb_snapshots > 0`. Snapshots leave
     /// the active L1 table alone, so reads must work; only the in-place editor
@@ -1245,6 +1290,28 @@ mod tests {
             &|| false,
         )
         .unwrap();
+        assert_qcow2_round_trips(out, &src);
+    }
+
+    #[test]
+    fn a_dense_disk_past_one_refcount_table_cluster_round_trips() {
+        // 512-byte clusters: one refcount-table cluster covers only 8 MiB of host file.
+        let disk_size = 12u64 << 20;
+        let src = make_pattern(disk_size as usize);
+        let mut out = Cursor::new(Vec::new());
+        export_qcow2(
+            &mut Cursor::new(&src),
+            &mut out,
+            disk_size,
+            9,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.qcow2");
+        std::fs::write(&path, out.get_ref()).unwrap();
+        crate::qemu_img_test::qemu_img_check(&path).unwrap();
         assert_qcow2_round_trips(out, &src);
     }
 

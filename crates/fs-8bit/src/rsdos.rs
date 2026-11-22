@@ -793,7 +793,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for RsdosFilesystem<R> {
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "RS-DOS / Disk BASIC is a flat filesystem — no subdirectories".into(),
+            "RS-DOS / Disk BASIC is a flat filesystem - no subdirectories".into(),
         ))
     }
 

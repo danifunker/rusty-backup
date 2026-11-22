@@ -3,17 +3,10 @@
 //! reconnection. Writes straight through to the device (no in-memory
 //! staging), like the repair path.
 //!
-//! **Format coverage**: v4 (no CRC) is the original target. v5 (CRC) is
-//! being landed structure-by-structure under §2.1 hole (E):
-//!   - **E.2 (this commit)** wires v3 inode core stamping
-//!     ([`v5_crc::stamp_inode_v3`]) into [`write_inode_region`] and into the
-//!     fresh-chunk initializer ([`init_free_inode_chunk`]). Upstream callers
-//!     still gate on v5 — `alloc_inode_slot` and `alloc_new_inode_chunk`
-//!     because the inobt leaf splice / AGI / AGFL / superblock writes don't
-//!     yet stamp CRCs (E.4 / E.5).
-//!   - The dir3 / bmbt / sblock-CRC / AGF / AGI / SB stamp work lives in
-//!     later slices; until then the v5 gate at each alloc entry point keeps
-//!     the volume internally consistent (no write paths active).
+//! **Format coverage**: v4 and v5 (every write stamps the v5 CRCs). The editable surface first
+//! refuses a volume whose features these primitives do not maintain
+//! ([`super::sb::XfsSuperblock::edit_blocker`]: finobt, rmapbt, reflink, inobtcnt, sparse
+//! inodes, bigtime, dir1), so on what remains (IRIX-era v4, our own v5) they keep it whole.
 //!
 //! Primitives, smallest first:
 //!
@@ -36,9 +29,9 @@
 //!   * **Directory insert** ([`dir_insert_entry`]) / remove ([`dir_remove_entry`]):
 //!     short-form inline add/remove with automatic conversion to a single
 //!     block on overflow. Leaf and node-form directories are edited in
-//!     place by [`dir2_tree`] (the kernel's leaf/node algorithms: data-block
-//!     free space, stale leaf slots, leaf and node splits, root push-down,
-//!     freeindex blocks, root join). The full rebuild — [`plan_dir_layout`]
+//!     place by [`dir2_tree`] (written from XFS Algorithms & Data Structures:
+//!     data-block free space, stale leaf slots, leaf and node splits, root
+//!     push-down, freeindex blocks, root join). The full rebuild — [`plan_dir_layout`]
 //!     picks the smallest form that fits and [`write_dir_layout`] lays it
 //!     down — remains the path for block form, for a full leaf1 index
 //!     (which converts to node form) and for shrinking a directory back
@@ -46,8 +39,8 @@
 //!
 //! On top of these: `create_directory`, `create_file` (single contiguous
 //! extent), and `delete_entry` (empty short-form dirs / single-or-no-extent
-//! files). Behavioural reference: `xfs_repair` @ v3.1.11 + `libxfs/xfs_dir2_sf.c`,
-//! `libxfs/xfs_dir2_block.c`, `libxfs/xfs_ialloc.c`.
+//! files). On-disk layouts per XFS Algorithms & Data Structures; behavioural
+//! reference, validated against `xfs_repair -n`.
 
 use std::io::{Read, Seek, Write};
 
@@ -64,6 +57,8 @@ use disk_core::filesystem::{Filesystem, FilesystemError};
 use disk_core::fsck::RepairReport;
 
 mod dir2_tree;
+#[cfg(test)]
+mod hash_from_disk_tests;
 
 /// Largest single-extent file we write: the on-disk blockcount field is 21 bits.
 const MAX_SINGLE_EXTENT_BLOCKS: u64 = (1 << 21) - 1;
@@ -131,7 +126,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Allocate one inode. Tries existing chunks first; when every chunk in
     /// every AG is full, allocates a fresh 64-inode chunk via
     /// [`alloc_new_inode_chunk`] and re-runs the slot search against it.
-    /// Returns the new inode number. v4 only.
+    /// Returns the new inode number.
     pub(crate) fn alloc_inode_slot(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -207,6 +202,11 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     }
                     let slot = free.trailing_zeros() as u64; // lowest free slot
                     let ino = (agno << ino_shift) | (start_agino + slot);
+                    if matches!(self.read_inode_buf(ino), Ok((core, _)) if core.mode != 0) {
+                        return Err(FilesystemError::InvalidData(format!(
+                            "inode {ino} is marked free but is in use; check the volume first"
+                        )));
+                    }
 
                     // Mark allocated: clear the bit, decrement record freecount.
                     let new_free = free & !(1u64 << slot);
@@ -251,8 +251,6 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     ///     blocks (and reclaim the old tree blocks in the same freespace
     ///     rebuild), then rebuild a balanced tree via [`build_sblock_btree`]
     ///     and relocate the AGI root + level.
-    ///
-    /// v4 only.
     pub(crate) fn alloc_new_inode_chunk(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -649,14 +647,13 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// starting fsblock. Each dinode carries `XFS_DINODE_MAGIC`, the volume's
     /// `di_version` (matching every other inode), `di_mode = 0` (the on-disk
     /// "free slot" marker), and `di_next_unlinked = NULLAGINO`. All other
-    /// fields are zero — matching what `xfs_ialloc_inode_init` writes.
+    /// fields are zero, as a freshly allocated inode chunk must be for `xfs_repair -n`.
     ///
     /// **v5 (CRC) volumes**: each slot's v3 core also needs its CRC-header
     /// tuple stamped (`di_uuid` / `di_ino` / `di_lsn` / `di_crc`) so the
     /// inobt-walk readers and `xfs_repair` accept the chunk as a fresh
-    /// 64-slot extension. The kernel's `xfs_ialloc_inode_init` does the
-    /// equivalent stamp via `xfs_dinode_calc_crc` after writing the body;
-    /// we do it inline. v4 callers skip the stamp (no `di_crc` field).
+    /// 64-slot extension; the CRC is stamped inline once the body is written.
+    /// v4 callers skip the stamp (no `di_crc` field).
     fn init_free_inode_chunk(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -817,11 +814,6 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 "parent is not a short-form directory".into(),
             ));
         }
-        if child_ino > u64::from(u32::MAX) {
-            return Err(FilesystemError::Unsupported(
-                "XFS short-form dir with 8-byte inode numbers not supported".into(),
-            ));
-        }
         let namelen = name.len();
         if namelen == 0 || namelen > 255 {
             return Err(FilesystemError::InvalidData("bad entry name length".into()));
@@ -844,8 +836,14 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         }
         let new_off = self.sf_next_offset(&buf[fs..fork_end], has_ftype, sb.is_v5())?;
 
-        // Build the new entry: namelen(1) offset(2) name[namelen] [ftype] ino(4).
-        let ino_width = 4usize; // i8count == 0 path only
+        // Entries take the width the header's i8count gives them all (XFS-010).
+        let wide = fork_len >= 2 && buf[fs + 1] > 0;
+        if !wide && child_ino > u64::from(u32::MAX) {
+            return Err(FilesystemError::Unsupported(
+                "an 8-byte inode number in a 4-byte short-form directory needs a conversion".into(),
+            ));
+        }
+        let ino_width = if wide { 8 } else { 4 };
         let entry_len = 1 + 2 + namelen + usize::from(has_ftype) + ino_width;
         let new_fork_len = fork_len + entry_len;
 
@@ -876,7 +874,14 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             };
             p += 1;
         }
-        BigEndian::write_u32(&mut buf[p..p + ino_width], child_ino as u32);
+        if wide {
+            BigEndian::write_u64(&mut buf[p..p + 8], child_ino);
+            if child_ino > u64::from(u32::MAX) {
+                buf[fs + 1] = buf[fs + 1].saturating_add(1);
+            }
+        } else {
+            BigEndian::write_u32(&mut buf[p..p + 4], child_ino as u32);
+        }
 
         // Header count++ and di_size.
         buf[fs] = buf[fs]
@@ -1060,7 +1065,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Carves the run off the tail of an AG's largest free extent and rebuilds
     /// that AG's free-space btrees over the remainder (reusing the R2 rebuild),
     /// then resyncs `sb_fdblocks`. Errors `DiskFull` when no AG has a single
-    /// free extent large enough (no multi-extent split yet). v4 only.
+    /// free extent large enough (no multi-extent split yet).
     pub(crate) fn alloc_blocks(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -1218,6 +1223,19 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 startblock: agbno,
                 blockcount: 1,
             });
+        }
+        // Allocate only from records that lie inside the AG and do not overlap (XFS-007).
+        all.sort_by_key(|e| e.startblock);
+        let mut end = 0u64;
+        for e in &all {
+            let (start, len) = (u64::from(e.startblock), u64::from(e.blockcount));
+            if len == 0 || start + len > expected_len || start < end {
+                return Err(FilesystemError::InvalidData(format!(
+                    "AG {agno}: free-space record [{start}, +{len}) is outside the AG or overlaps \
+                     another; check the volume first"
+                )));
+            }
+            end = start + len;
         }
         Ok(coalesce(all))
     }
@@ -1601,8 +1619,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             if next > fork_end {
                 return Err(FilesystemError::Parse("short-form entry overflow".into()));
             }
-            let ename = String::from_utf8_lossy(&buf[name_off..name_off + namelen]);
-            if !removed && ename == name {
+            if !removed && &buf[name_off..name_off + namelen] == name.as_bytes() {
                 removed = true; // drop this one
             } else {
                 survivors.push((start, next));
@@ -1731,6 +1748,16 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             }
             let agno = fsblock >> sb.agblklog;
             let agbno = (fsblock & agmask) as u32;
+            let ag_len = if agno + 1 == sb.agcount as u64 {
+                sb.dblocks.saturating_sub(agno * agblocks)
+            } else {
+                agblocks
+            };
+            if agno >= sb.agcount as u64 || u64::from(agbno) + u64::from(count) > ag_len {
+                return Err(FilesystemError::InvalidData(format!(
+                    "extent at fsblock {fsblock} (+{count}) is outside the volume; check it first"
+                )));
+            }
             by_ag.entry(agno).or_default().push(FreeExtent {
                 startblock: agbno,
                 blockcount: count,
@@ -1775,7 +1802,19 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 return Err(FilesystemError::InvalidData("directory not empty".into()));
             }
         }
-        let extents: Vec<(u64, u32)> = match cc.format {
+        if !child_is_dir && cc.nlink > 1 {
+            // Another name still links the file: drop this entry and one link only (XFS-005).
+            self.dir_remove_entry(&sb, parent_ino, name, false)?;
+            self.bump_dir_nlink(&sb, child_ino, -1)?;
+            self.reader.flush()?;
+            return Ok(());
+        }
+        let attr: Vec<(u64, u32)> = self
+            .attr_fork_blocks(&cc, &cbuf)?
+            .into_iter()
+            .map(|(start, count)| (start, count as u32))
+            .collect();
+        let mut extents: Vec<(u64, u32)> = match cc.format {
             super::types::DiFormat::Extents => self
                 .decode_data_extents(&cc, &cbuf)?
                 .iter()
@@ -1788,6 +1827,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             }
             _ => Vec::new(), // local / device: owns no blocks
         };
+        extents.extend(attr); // the attribute fork's blocks go with the inode (XFS-004)
 
         self.dir_remove_entry(&sb, parent_ino, name, child_is_dir)?;
         if !extents.is_empty() {
@@ -2574,7 +2614,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// `lost+found`; a detached *subtree* reconnects only at its top (children
     /// that are themselves reachable from an orphan are left in place). Link
     /// counts are not adjusted here — the R7 nlink pass runs afterwards and
-    /// recomputes them from the now-connected tree. v4 only.
+    /// recomputes them from the now-connected tree.
     pub(crate) fn run_orphan_reconnect(&mut self) -> Result<RepairReport, FilesystemError> {
         let mut report = RepairReport {
             fixes_applied: Vec::new(),
@@ -2856,28 +2896,24 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     }
 }
 
-/// XFS directory name hash (`xfs_da_hashname`) — used to build the leaf hash
-/// index of a single-block directory.
+/// Directory name hash, per XFS Algorithms & Data Structures, ch. Variable Length
+/// Record B+trees: four bytes per round into a 28-bit-rotated hash, then the 1-3 byte tail.
 fn dir_hashname(name: &[u8]) -> u32 {
     let mut hash: u32 = 0;
-    let mut chunks = name.chunks_exact(4);
-    for c in &mut chunks {
-        hash = ((c[0] as u32) << 21)
-            ^ ((c[1] as u32) << 14)
-            ^ ((c[2] as u32) << 7)
-            ^ (c[3] as u32)
-            ^ hash.rotate_left(7 * 4);
+    let mut quads = name.chunks_exact(4);
+    for q in &mut quads {
+        hash = (u32::from(q[0]) << 21)
+            ^ (u32::from(q[1]) << 14)
+            ^ (u32::from(q[2]) << 7)
+            ^ u32::from(q[3])
+            ^ hash.rotate_left(28);
     }
-    let rem = chunks.remainder();
-    match rem.len() {
-        3 => {
-            ((rem[0] as u32) << 14)
-                ^ ((rem[1] as u32) << 7)
-                ^ (rem[2] as u32)
-                ^ hash.rotate_left(7 * 3)
+    match *quads.remainder() {
+        [a, b, c] => {
+            (u32::from(a) << 14) ^ (u32::from(b) << 7) ^ u32::from(c) ^ hash.rotate_left(21)
         }
-        2 => ((rem[0] as u32) << 7) ^ (rem[1] as u32) ^ hash.rotate_left(7 * 2),
-        1 => (rem[0] as u32) ^ hash.rotate_left(7),
+        [a, b] => (u32::from(a) << 7) ^ u32::from(b) ^ hash.rotate_left(14),
+        [a] => u32::from(a) ^ hash.rotate_left(7),
         _ => hash,
     }
 }
@@ -3815,24 +3851,42 @@ fn sf_entries_with_ftype(
             BigEndian::read_u32(b) as u64
         }
     };
+    if fork.len() < 2 + ino_width {
+        return Err(FilesystemError::Parse("short-form fork too small".into()));
+    }
     let parent = read_ino(&fork[2..2 + ino_width]);
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(fork.len() / 4));
     let mut pos = 2 + ino_width;
     for _ in 0..count {
-        let namelen = fork[pos] as usize;
         let name_off = pos + 3;
-        let name_end = name_off + namelen;
-        let ft = if has_ftype { fork[name_end] } else { 0 };
+        let Some(&namelen) = fork.get(pos) else {
+            return Err(FilesystemError::Parse(
+                "short-form entry count runs past the fork".into(),
+            ));
+        };
+        let name_end = name_off + namelen as usize;
         let ino_off = name_end + usize::from(has_ftype);
+        if ino_off + ino_width > fork.len() {
+            return Err(FilesystemError::Parse(
+                "short-form entry runs past the fork".into(),
+            ));
+        }
+        let ft = if has_ftype { fork[name_end] } else { 0 };
         let ino = read_ino(&fork[ino_off..ino_off + ino_width]);
-        out.push((
-            String::from_utf8_lossy(&fork[name_off..name_end]).to_string(),
-            ino,
-            ft,
-        ));
+        out.push((strict_name(&fork[name_off..name_end])?, ino, ft));
         pos = ino_off + ino_width;
     }
     Ok((parent, out))
+}
+
+/// A directory name for a rebuild: refused unless UTF-8, as a lossy copy would be written back.
+fn strict_name(name: &[u8]) -> Result<String, FilesystemError> {
+    String::from_utf8(name.to_vec()).map_err(|_| {
+        FilesystemError::Unsupported(format!(
+            "the directory holds a name that is not UTF-8 ({}); editing it would rewrite that name",
+            String::from_utf8_lossy(name)
+        ))
+    })
 }
 
 /// Walk a single-block directory into `(dotdot_ino, [(name, ino, ftype)])`,
@@ -3842,9 +3896,12 @@ fn block_entries_with_ftype(
     has_ftype: bool,
 ) -> Result<(u64, DirEntries), FilesystemError> {
     let block_end = block.len();
+    if block_end < 64 {
+        return Err(FilesystemError::Parse("directory block too small".into()));
+    }
     let tail = block_end - 8;
     let leaf_count = BigEndian::read_u32(&block[tail..tail + 4]) as usize;
-    let data_end = block_end.saturating_sub(leaf_count * 8 + 8);
+    let data_end = block_end.saturating_sub(leaf_count.saturating_mul(8).saturating_add(8));
     walk_data_entries(block, data_end, has_ftype)
 }
 
@@ -3902,7 +3959,7 @@ fn walk_data_entries(
         if name == b".." {
             dotdot = ino;
         } else if name != b"." {
-            out.push((String::from_utf8_lossy(name).to_string(), ino, ft));
+            out.push((strict_name(name)?, ino, ft));
         }
         pos += dir2_data_entsize(namelen, has_ftype);
     }
@@ -3916,6 +3973,16 @@ mod tests {
     //! `dir3_block_builder_round_trips_through_dir2_reader` etc.).
     use super::*;
     use crate::xfs::dir2;
+
+    /// A name that is not UTF-8 makes a directory rebuild refuse rather than rewrite it (XFS-006).
+    #[test]
+    fn strict_name_refuses_non_utf8() {
+        assert_eq!(strict_name(b"caf\xc3\xa9").unwrap(), "caf\u{e9}");
+        assert!(matches!(
+            strict_name(b"caf\xe9"),
+            Err(FilesystemError::Unsupported(_))
+        ));
+    }
 
     /// Look up the `XfsSuperblock` constants we need to fabricate a
     /// stamper-ready superblock without an actual on-disk image.

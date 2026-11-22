@@ -114,7 +114,7 @@ native-xz = ["dep:liblzma"]
 # interchangeable. Slim build: `--no-default-features --features pure-zstd`.
 # The seekable-zstd cache (zeekstd) is C-only; the pure path full-decompresses
 # such caches to a tempfile instead of seeking. See docs/linux_486_build.md.
-native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd", "fs-squashfs/native-zstd", "fs-tar/native-zstd"]
+native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd", "fs-squashfs/native-zstd", "fs-tar/native-zstd", "rb-fsimporter/native-zstd"]
 # Seekable-zstd random-access cache (zeekstd). Splits out from native-zstd so the
 # vintage macOS 10.7 build (Rust 1.73) can take the C `zstd` backend WITHOUT
 # zeekstd — every zeekstd release is edition 2024 (needs rustc >= 1.85). Requires
@@ -122,7 +122,7 @@ native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd", "fs-squashfs/native-zst
 # `gui`; when off, browse_session full-decompresses a seekable cache instead of
 # random-accessing it. See src/model/browse_session.rs.
 seekable-zstd = ["dep:zeekstd", "native-zstd"]
-pure-zstd = ["dep:libzstd-bitexact-rs", "dsk-clonezilla/pure-zstd", "fs-squashfs/pure-zstd", "fs-tar/pure-zstd"]
+pure-zstd = ["dep:libzstd-bitexact-rs", "dsk-clonezilla/pure-zstd", "fs-squashfs/pure-zstd", "fs-tar/pure-zstd", "rb-fsimporter/pure-zstd"]
 # eframe + egui only (no rfd/reqwest), used by the throwaway Commander Mode
 # layout mock: `cargo run --example commander_mock --features mock_gui`.
 mock_gui = ["dep:eframe", "dep:egui"]
@@ -187,7 +187,7 @@ windows-legacy = []
 # Do NOT enable on a modern toolchain: std's inherent is_multiple_of would then
 # collide with the polyfill trait. See crates/disk-core. Forwarded to every
 # extracted crate under crates/ (docs/crate_split_plan.md).
-rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "fs-mac/rust173-polyfill", "part-tables/rust173-polyfill", "dsk-flux/rust173-polyfill", "dsk-apple/rust173-polyfill", "dsk-dmg/rust173-polyfill", "dsk-floppy/rust173-polyfill", "dsk-vm/rust173-polyfill", "dsk-ghost/rust173-polyfill", "fs-adfs/rust173-polyfill", "fs-tar/rust173-polyfill", "rb-fsexporter/rust173-polyfill", "arc-mac/rust173-polyfill", "dsk-imz/rust173-polyfill", "dsk-tape/rust173-polyfill", "qnx2fs/rust173-polyfill"]
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "fs-mac/rust173-polyfill", "part-tables/rust173-polyfill", "dsk-flux/rust173-polyfill", "dsk-apple/rust173-polyfill", "dsk-dmg/rust173-polyfill", "dsk-floppy/rust173-polyfill", "dsk-vm/rust173-polyfill", "dsk-ghost/rust173-polyfill", "fs-adfs/rust173-polyfill", "fs-tar/rust173-polyfill", "rb-fsexporter/rust173-polyfill", "arc-mac/rust173-polyfill", "dsk-imz/rust173-polyfill", "dsk-tape/rust173-polyfill", "qnx2fs/rust173-polyfill", "sgi-disk/rust173-polyfill", "rb-fsimporter/rust173-polyfill"]
 # In-app self-update for `rb-cli update` (CLI + TUI). Pulls the reqwest client
 # (rustls, no OpenSSL). In `default` (it replaced `gui` there, which used to bring
 # reqwest in); left OUT of the slim / appliance / MiSTer builds so they link no
@@ -207,6 +207,7 @@ dsk-imz = { path = "crates/dsk-imz", default-features = false }
 arc-mac = { path = "crates/arc-mac" }
 fs-tar = { path = "crates/fs-tar", default-features = false, features = ["appledouble", "zip"] }
 rb-fsexporter = { path = "crates/rb-fsexporter" }
+rb-fsimporter = { path = "crates/rb-fsimporter", default-features = false, features = ["mac"] }
 fs-adfs = { path = "crates/fs-adfs" }
 dsk-ghost = { path = "crates/dsk-ghost" }
 dsk-vm = { path = "crates/dsk-vm" }
@@ -222,6 +223,7 @@ fs-hpfs = { path = "crates/fs-hpfs" }
 fs-pc = { path = "crates/fs-pc" }
 fs-squashfs = { path = "crates/fs-squashfs", default-features = false }
 fs-xfs = { path = "crates/fs-xfs" }
+sgi-disk = { path = "crates/sgi-disk" }
 fs-unix = { path = "crates/fs-unix", features = ["ofs"] }
 fs-amiga = { path = "crates/fs-amiga" }
 dsk-clonezilla = { path = "crates/dsk-clonezilla", default-features = false }

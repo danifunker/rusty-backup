@@ -514,6 +514,15 @@ pub struct EfsFilesystem<R: Read + Seek> {
 }
 
 impl<R: Read + Seek> EfsFilesystem<R> {
+    /// A directory's dirblock extents in offset order, direct or indirect (more than 12
+    /// extents: the inode's slots then point at index blocks, UNX-007).
+    pub(crate) fn dir_extents(
+        &mut self,
+        inode: &EfsInode,
+    ) -> Result<Vec<EfsExtent>, FilesystemError> {
+        resolve_data_extents(&mut self.reader, self.partition_offset, inode)
+    }
+
     /// Open an EFS filesystem at the given byte offset within `reader`.
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
         // Superblock lives at sector 1 of the partition. Read a full
@@ -526,6 +535,19 @@ impl<R: Read + Seek> EfsFilesystem<R> {
             &mut sector,
         )?;
         let sb = EfsSuperblock::parse(&sector)?;
+        // Inode numbers divide by the per-group inode count and groups tile the volume:
+        // zero or overflowing geometry would panic later (UNX-021).
+        let groups_end = u64::from(sb.firstcg) + u64::from(sb.ncg) * u64::from(sb.cgfsize);
+        if sb.cgisize == 0
+            || sb.ncg == 0
+            || u32::from(sb.cgisize) >= sb.cgfsize
+            || groups_end > u64::from(sb.fs_size).max(1) + u64::from(sb.cgfsize)
+        {
+            return Err(FilesystemError::Parse(format!(
+                "EFS superblock geometry: {} groups of {} blocks ({} inode blocks) from {}, size {}",
+                sb.ncg, sb.cgfsize, sb.cgisize, sb.firstcg, sb.fs_size
+            )));
+        }
         // A volume whose superblock describes more blocks than the image holds
         // is a truncated capture, not a filesystem. Reads of anything in the
         // surviving prefix still work, so this warns rather than refuses — but
@@ -985,6 +1007,24 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         bn: u32,
         buf: &[u8; EFS_BLOCKSIZE as usize],
     ) -> Result<(), FilesystemError> {
+        // Edits go through here: an on-disk pointer past the volume is refused, not written
+        // into whatever follows the partition (UNX-005). Resize, which grows the volume
+        // before it records the new size, uses `write_block_resizing`.
+        if bn >= self.sb.fs_size {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS write to block {bn} is past the {}-block volume",
+                self.sb.fs_size
+            )));
+        }
+        self.write_block_resizing(bn, buf)
+    }
+
+    /// [`Self::write_block`] without the volume-end check, for the resize paths only.
+    pub(crate) fn write_block_resizing(
+        &mut self,
+        bn: u32,
+        buf: &[u8; EFS_BLOCKSIZE as usize],
+    ) -> Result<(), FilesystemError> {
         self.reader.seek(SeekFrom::Start(
             self.partition_offset + bn as u64 * EFS_BLOCKSIZE,
         ))?;
@@ -1027,13 +1067,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         };
 
         // Try to append to an existing dirblock that has room.
-        let mut extents: Vec<EfsExtent> = dir_inode
-            .extents
-            .iter()
-            .take(dir_inode.numextents as usize)
-            .copied()
-            .collect();
-        extents.sort_by_key(|e| e.offset);
+        let extents = self.dir_extents(dir_inode)?;
 
         for ext in &extents {
             for i in 0..ext.length as u32 {
@@ -1180,13 +1214,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
                 dir_inode.inum
             )));
         }
-        let mut extents: Vec<EfsExtent> = dir_inode
-            .extents
-            .iter()
-            .take(dir_inode.numextents as usize)
-            .copied()
-            .collect();
-        extents.sort_by_key(|e| e.offset);
+        let extents = self.dir_extents(dir_inode)?;
 
         for ext in &extents {
             for i in 0..ext.length as u32 {
@@ -1508,13 +1536,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         dir_inode: &EfsInode,
         name: &[u8],
     ) -> Result<Option<u32>, FilesystemError> {
-        let mut extents: Vec<EfsExtent> = dir_inode
-            .extents
-            .iter()
-            .take(dir_inode.numextents as usize)
-            .copied()
-            .collect();
-        extents.sort_by_key(|e| e.offset);
+        let extents = self.dir_extents(dir_inode)?;
         for ext in &extents {
             for i in 0..ext.length as u32 {
                 let bn = ext.bn + i;
@@ -1927,13 +1949,7 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
         // For directories, ensure empty (`.`/`..` only).
         if target.is_dir() {
             let mut found_other = false;
-            let mut extents: Vec<EfsExtent> = target
-                .extents
-                .iter()
-                .take(target.numextents as usize)
-                .copied()
-                .collect();
-            extents.sort_by_key(|e| e.offset);
+            let extents = self.dir_extents(&target)?;
             'scan: for ext in &extents {
                 for i in 0..ext.length as u32 {
                     let block = self.read_block(ext.bn + i)?;
@@ -1972,16 +1988,16 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
                 )));
             }
 
-            // Free the inode's data blocks.
-            self.free_inode_data(&mut bm, &mut target)?;
-
-            // If the target was a directory, free its own dirblocks
-            // too (free_inode_data already covered them via the
-            // extent list).
-
-            // Zero the inode slot so allocate_inode sees it as free.
-            let zero = EfsInode::empty(entry_inum);
-            self.write_inode(&zero)?;
+            if !target.is_dir() && target.nlink > 1 {
+                // Another name still links the inode: keep it, one link fewer (UNX-001).
+                target.nlink -= 1;
+                self.write_inode(&target)?;
+            } else {
+                // Free the inode's data blocks (a directory's dirblocks are in its extents).
+                self.free_inode_data(&mut bm, &mut target)?;
+                // Zero the inode slot so allocate_inode sees it as free.
+                self.write_inode(&EfsInode::empty(entry_inum))?;
+            }
 
             // Parent dir-contents changed → mtime + ctime bump. If the target
             // was a directory, its ".." back-link goes away too (parent nlink
@@ -2036,13 +2052,7 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
         // allocates nothing, so no bitmap / superblock bookkeeping is
         // needed. Walk the directory's extents to find the block holding
         // the old name.
-        let mut extents: Vec<EfsExtent> = parent_inode
-            .extents
-            .iter()
-            .take(parent_inode.numextents as usize)
-            .copied()
-            .collect();
-        extents.sort_by_key(|e| e.offset);
+        let extents = self.dir_extents(&parent_inode)?;
 
         for ext in &extents {
             for i in 0..ext.length as u32 {
@@ -2291,8 +2301,19 @@ fn adopt_orphans_into_lost_found<R: Read + Write + Seek + Send>(
     };
     let res = (|| -> Result<u32, FilesystemError> {
         let mut adopted: u32 = 0;
-        for orphan in orphans {
-            let inum = orphan.id as u32;
+        // An orphan directory brings its contents back with it; adopt only the outermost.
+        let pairs: Vec<(u32, bool)> = orphans
+            .iter()
+            .map(|o| (o.id as u32, o.is_directory))
+            .collect();
+        let roots = crate::unix_common::orphans::orphan_roots(&pairs, |d| {
+            let dir =
+                disk_core::entry::FileEntry::new_directory(String::new(), String::new(), d as u64);
+            disk_core::filesystem::Filesystem::list_directory(fs, &dir)
+                .map(|v| v.into_iter().map(|e| e.location as u32).collect())
+                .unwrap_or_default()
+        });
+        'orphans: for inum in roots {
             let mut lf_inode = fs.read_inode(lf_inum)?;
             // Avoid name collisions: append a numeric suffix on retry.
             let mut name = format!("ino_{inum}");
@@ -2304,11 +2325,15 @@ fn adopt_orphans_into_lost_found<R: Read + Write + Seek + Send>(
                     report.fixes_failed.push(format!(
                         "Orphan inum {inum}: could not generate unique lost+found name"
                     ));
-                    continue;
+                    continue 'orphans;
                 }
             }
             match fs.dir_insert(&mut lf_inode, &mut bm, name.as_bytes(), inum) {
                 Ok(()) => {
+                    // An adopted directory's `..` link counts against lost+found.
+                    if fs.read_inode(inum).map(|i| i.is_dir()).unwrap_or(false) {
+                        lf_inode.nlink = lf_inode.nlink.saturating_add(1);
+                    }
                     fs.write_inode(&lf_inode)?;
                     adopted += 1;
                 }
@@ -2500,14 +2525,8 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
         }
 
         // Walk the inline extents in logical-offset order. EFS has no indirect
-        // blocks; a directory's data lives entirely in the 12 inline extents.
-        let mut extents: Vec<EfsExtent> = dir_ino
-            .extents
-            .iter()
-            .take(dir_ino.numextents as usize)
-            .copied()
-            .collect();
-        extents.sort_by_key(|e| e.offset);
+        // blocks (indirect mode included: IRIX uses it for fragmented large directories).
+        let extents = self.dir_extents(&dir_ino)?;
 
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut block_buf = [0u8; EFS_BLOCKSIZE as usize];

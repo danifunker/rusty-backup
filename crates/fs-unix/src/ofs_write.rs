@@ -42,9 +42,20 @@ const MAX_RUN_SECTORS: u64 = 0x7F_FFFF;
 const MAX_DIR_BLOCKS: usize = 4096;
 
 impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
+    /// Directory and file writes: only the data area, after the bitmap and inside the volume.
     fn write_sectors(&mut self, sector: u64, data: &[u8]) -> Result<(), FilesystemError> {
+        let first = self.toc.bitmap_start as u64 + self.toc.bitmap_sectors as u64;
+        if sector < first {
+            return Err(FilesystemError::InvalidData(format!(
+                "ofs: refusing to write sector {sector}, which is before the data area"
+            )));
+        }
+        self.write_raw(sector, data)
+    }
+
+    fn write_raw(&mut self, sector: u64, data: &[u8]) -> Result<(), FilesystemError> {
         let count = (data.len() as u64).div_ceil(SECTOR);
-        if sector.saturating_add(count) > self.toc.total_sectors as u64 + 1 {
+        if sector.saturating_add(count) > self.toc.total_sectors as u64 {
             return Err(FilesystemError::InvalidData(format!(
                 "ofs: write of {count} sectors at {sector} runs past the volume"
             )));
@@ -64,7 +75,7 @@ impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
 
     fn write_bitmap(&mut self, bitmap: &[u8]) -> Result<(), FilesystemError> {
         let start = self.toc.bitmap_start as u64;
-        self.write_sectors(start, bitmap)
+        self.write_bitmap_at(start, bitmap)
     }
 
     /// Bitmap writer for `ofs_fsck`, which takes its own snapshot first.
@@ -73,7 +84,14 @@ impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
         start: u64,
         bitmap: &[u8],
     ) -> Result<(), FilesystemError> {
-        self.write_sectors(start, bitmap)
+        if start != self.toc.bitmap_start as u64
+            || (bitmap.len() as u64).div_ceil(SECTOR) > self.toc.bitmap_sectors as u64
+        {
+            return Err(FilesystemError::InvalidData(
+                "ofs: bitmap write outside the bitmap".into(),
+            ));
+        }
+        self.write_raw(start, bitmap)
     }
 
     fn bit_is_set(bitmap: &[u8], sector: u64) -> bool {
@@ -200,7 +218,7 @@ impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
         }
         let mut buf = self.read_sectors(0, 1)?;
         put_be32(&mut buf, 36, self.toc.used_sectors);
-        self.write_sectors(0, &buf)?;
+        self.write_raw(0, &buf)?;
         self.toc_dirty = false;
         Ok(())
     }
@@ -302,23 +320,51 @@ impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
             return Ok(runs);
         }
         let mut runs = self.file_extents(attrs)?;
-        if !attrs.is_contiguous() && attrs.first_alloc_list != 0 {
-            // The extent-list sector itself is allocated too.
-            runs.push((attrs.first_alloc_list as u64, 1));
-        }
+        // Every extent-list sector of the chain is allocated too, not only the first (UNX-010).
+        runs.extend(self.alloc_list_sectors(attrs)?.into_iter().map(|s| (s, 1)));
         Ok(runs)
     }
 
     /// Lay `data` down and return the attribute fields that describe it.
-    fn store_data(&mut self, data: &[u8]) -> Result<(u32, u32, u32), FilesystemError> {
-        if data.is_empty() {
+    /// Fill `count` sectors from `start` with up to `*left` bytes of `src`, zero-padded, 1 MiB at a time.
+    fn write_run_from(
+        &mut self,
+        start: u64,
+        count: u64,
+        src: &mut dyn Read,
+        left: &mut u64,
+    ) -> Result<(), FilesystemError> {
+        const CHUNK: u64 = (1 << 20) / SECTOR;
+        let mut done = 0u64;
+        let mut buf = Vec::new();
+        while done < count {
+            let n = (count - done).min(CHUNK);
+            buf.clear();
+            buf.resize((n * SECTOR) as usize, 0);
+            let take = (n * SECTOR).min(*left) as usize;
+            src.read_exact(&mut buf[..take])?;
+            self.write_sectors(start + done, &buf)?;
+            *left -= take as u64;
+            done += n;
+        }
+        Ok(())
+    }
+
+    fn store_data(
+        &mut self,
+        src: &mut dyn Read,
+        len: u64,
+    ) -> Result<(u32, u32, u32), FilesystemError> {
+        if len == 0 {
             return Ok((CONTIGUOUS_FLAG, 0, 0));
         }
-        let sectors = (data.len() as u64).div_ceil(SECTOR);
+        let sectors = len.div_ceil(SECTOR);
         if let Ok(start) = self.alloc_contiguous(sectors) {
-            let mut padded = vec![0u8; (sectors * SECTOR) as usize];
-            padded[..data.len()].copy_from_slice(data);
-            self.write_sectors(start, &padded)?;
+            let mut left = len;
+            if let Err(e) = self.write_run_from(start, sectors, src, &mut left) {
+                let _ = self.free_sectors(&[(start, sectors)]);
+                return Err(e);
+            }
             return Ok((
                 start as u32 | CONTIGUOUS_FLAG,
                 sectors as u32,
@@ -336,14 +382,13 @@ impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
                 return Err(e);
             }
         };
-        let mut cursor = 0usize;
-        for (start, count) in &runs {
-            let span = (*count * SECTOR) as usize;
-            let take = span.min(data.len() - cursor);
-            let mut padded = vec![0u8; span];
-            padded[..take].copy_from_slice(&data[cursor..cursor + take]);
-            self.write_sectors(*start, &padded)?;
-            cursor += take;
+        let mut left = len;
+        for &(start, count) in &runs {
+            if let Err(e) = self.write_run_from(start, count, src, &mut left) {
+                let _ = self.free_sectors(&runs);
+                let _ = self.free_sectors(&[(list, 1)]);
+                return Err(e);
+            }
         }
         let mut raw = vec![0u8; SECTOR as usize];
         for (i, (start, count)) in runs.iter().enumerate() {
@@ -411,16 +456,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for OfsFilesystem<R> {
         if self.find_in_dir(start, name)?.is_some() {
             return Err(FilesystemError::AlreadyExists(name.to_string()));
         }
-        let mut bytes = Vec::with_capacity(data_len.min(64 << 20) as usize);
-        data.take(data_len).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 != data_len {
-            return Err(FilesystemError::InvalidData(format!(
-                "ofs create_file: source gave {} bytes, expected {data_len}",
-                bytes.len()
-            )));
-        }
-
-        let (first, last, physical) = self.store_data(&bytes)?;
+        let (first, last, physical) = self.store_data(data, data_len)?;
         // Early BeOS used Mac-style type/creator codes, so the same resolution
         // the HFS drivers use gives an untyped copy a sensible pair.
         let (type_code, creator) = resolve_create_type_creator(
@@ -437,7 +473,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for OfsFilesystem<R> {
             file_type: u32::from_be_bytes(type_code),
             create_date: now,
             modify_date: now,
-            logical_size: bytes.len() as u32,
+            logical_size: data_len as u32,
             physical_size: physical,
             creator: u32::from_be_bytes(creator),
         };

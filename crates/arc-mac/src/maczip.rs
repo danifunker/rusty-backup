@@ -67,6 +67,7 @@ fn le32(b: &[u8], off: usize) -> Option<u32> {
 struct CentralEntry {
     name: String,
     method: u16,
+    crc32: u32,
     comp_size: u32,
     uncomp_size: u32,
     local_offset: u32,
@@ -108,6 +109,7 @@ fn read_central_directory(bytes: &[u8]) -> Result<Vec<CentralEntry>> {
     let mut p = cd_offset;
     while p + 46 <= bytes.len() && &bytes[p..p + 4] == CEN_SIG {
         let method = le16(bytes, p + 10).context("central header truncated")?;
+        let crc32 = le32(bytes, p + 16).context("central header truncated")?;
         let comp_size = le32(bytes, p + 20).context("central header truncated")?;
         let uncomp_size = le32(bytes, p + 24).context("central header truncated")?;
         let name_len = le16(bytes, p + 28).context("central header truncated")? as usize;
@@ -128,6 +130,7 @@ fn read_central_directory(bytes: &[u8]) -> Result<Vec<CentralEntry>> {
         entries.push(CentralEntry {
             name,
             method,
+            crc32,
             comp_size,
             uncomp_size,
             local_offset,
@@ -229,17 +232,24 @@ fn decode_mac3_blob(blob: &[u8], info_flags: u16) -> Option<Vec<u8>> {
     let stream = &blob[6..]; // skip method(2) + crc(4)
     match method {
         0 => Some(stream.to_vec()),
-        8 => inflate(stream).ok(),
+        // A Mac3 attribute blob is a few hundred bytes.
+        8 => inflate(stream, 1 << 16).ok(),
         _ => None,
     }
 }
 
 /// Raw-deflate inflate (ZIP method 8 — no zlib/gzip wrapper).
-fn inflate(stream: &[u8]) -> Result<Vec<u8>> {
+/// Inflate at most `limit` bytes: the stored size is read first, so a bomb stops there
+/// instead of being checked only after it has filled memory.
+fn inflate(stream: &[u8], limit: u64) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     flate2::read::DeflateDecoder::new(stream)
+        .take(limit.saturating_add(1))
         .read_to_end(&mut out)
         .context("inflating deflate stream")?;
+    if out.len() as u64 > limit {
+        bail!("deflate stream inflates past its stated {limit} bytes");
+    }
     Ok(out)
 }
 
@@ -316,7 +326,7 @@ fn read_entry_payload<'a>(bytes: &'a [u8], e: &CentralEntry) -> Result<(Vec<u8>,
     let raw = &bytes[data_start..data_end];
     let data = match e.method {
         0 => raw.to_vec(),
-        8 => inflate(raw).with_context(|| format!("inflating {}", e.name))?,
+        8 => inflate(raw, e.uncomp_size as u64).with_context(|| format!("inflating {}", e.name))?,
         m => bail!("unsupported ZIP compression method {m} for {}", e.name),
     };
     if data.len() as u32 != e.uncomp_size {
@@ -326,6 +336,11 @@ fn read_entry_payload<'a>(bytes: &'a [u8], e: &CentralEntry) -> Result<(Vec<u8>,
             data.len(),
             e.uncomp_size
         );
+    }
+    let mut crc = flate2::Crc::new();
+    crc.update(&data);
+    if crc.sum() != e.crc32 {
+        bail!("CRC mismatch for {} (the fork is damaged)", e.name);
     }
     Ok((data, local_extra))
 }
@@ -384,7 +399,11 @@ pub fn parse(bytes: &[u8]) -> Result<(Vec<u8>, StuffItArchive)> {
 
         let (payload, local_extra) = match read_entry_payload(bytes, e) {
             Ok(v) => v,
-            Err(_) => continue, // skip an unreadable fork; keep the rest
+            Err(err) => {
+                // Keep the rest of the archive, but say which fork was lost.
+                log::warn!("MacZip: skipping a fork of {}: {err:#}", e.name);
+                continue;
+            }
         };
         let mac3 = find_mac3(local_extra);
         let jlee = mac3.is_none().then(|| find_jlee(local_extra)).flatten();

@@ -116,10 +116,11 @@ pub fn read(bytes: &[u8]) -> Result<Disk, FilesystemError> {
     };
 
     let total = geometry.total_sectors();
-    if total == 0 {
-        return Err(FilesystemError::Parse(
-            "CopyDisk: degenerate geometry (zero sectors)".into(),
-        ));
+    // Diablo disk addresses are 16 bits; a larger geometry is corrupt, not a pack to allocate.
+    if total == 0 || total > 1 << 16 {
+        return Err(FilesystemError::Parse(format!(
+            "CopyDisk: implausible geometry ({total} sectors)"
+        )));
     }
     let label_bytes = geometry.label_bytes as usize;
     let data_bytes = geometry.data_bytes as usize;

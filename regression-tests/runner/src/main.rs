@@ -437,7 +437,7 @@ OPTIONS:
     --verifications <DIR>  Verdict tree root        [default: regression-tests/verifications]
                            verify writes <DIR>/<os>
     --tiers <SPEC>         e.g. 0-6, or 0,1,5       [default: all]
-    --filter <SUBSTR>      Only cases whose ID contains SUBSTR
+    --filter <S[,S]>       Only cases whose ID contains one of these substrings
     --level <smoke|full>   smoke: only cases tagged level = "smoke" [default: full]
     --area <A[,B]>         Only cases tagged with one of these areas (FLOWS.md)
     --fs <FS[,FS]>         Only matrix instances for these filesystems
@@ -1195,12 +1195,17 @@ fn cmd_list(args: &Args) -> i32 {
     0
 }
 
+/// `--filter a,b` keeps an ID containing any one of the comma-separated substrings.
+pub(crate) fn id_matches_filter(filter: &str, id: &str) -> bool {
+    filter.split(',').filter(|s| !s.is_empty()).any(|s| id.contains(s))
+}
+
 fn selected(args: &Args, case: &manifest::Case, tier: u8) -> bool {
     if !args.tiers.is_empty() && !args.tiers.contains(&tier) {
         return false;
     }
     if let Some(f) = &args.filter {
-        if !case.id.contains(f.as_str()) {
+        if !id_matches_filter(f, &case.id) {
             return false;
         }
     }
@@ -2211,4 +2216,17 @@ fn today_stamp() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::id_matches_filter;
+
+    #[test]
+    fn filter_is_an_any_of_substring_list() {
+        assert!(id_matches_filter("affs", "edit.real.affs"));
+        assert!(id_matches_filter("ntfs,affs", "edit.real.affs"));
+        assert!(!id_matches_filter("ntfs,hfs", "edit.real.affs"));
+        assert!(!id_matches_filter(",", "edit.real.affs"));
+    }
 }

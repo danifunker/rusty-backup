@@ -354,7 +354,9 @@ impl Rdb {
                     i, dest_lba, cyl_lbas
                 )));
             }
-            let new_low_cyl = (dest_lba / cyl_lbas) as u32;
+            let new_low_cyl = u32::try_from(dest_lba / cyl_lbas).map_err(|_| {
+                PartitionError::InvalidRdb(format!("partition {i} starts past cylinder 2^32"))
+            })?;
             // Round the requested export size UP to the next cylinder boundary.
             // RDB partition geometry is cylinder-granular (low_cyl/high_cyl are
             // u32 cylinder counts), so an MB-aligned size from the GUI almost
@@ -378,7 +380,9 @@ impl Rdb {
             })?;
             let aligned_export_lbas = new_cyls_u64 * cyl_lbas;
             let aligned_export_size = aligned_export_lbas * 512;
-            let new_high_cyl = new_low_cyl + new_cyls - 1;
+            let new_high_cyl = new_low_cyl.checked_add(new_cyls - 1).ok_or_else(|| {
+                PartitionError::InvalidRdb(format!("partition {i} ends past cylinder 2^32"))
+            })?;
 
             // Patch in place.
             let (_, buf) = &mut part_bufs[i];
@@ -418,8 +422,9 @@ impl Rdb {
         // whole number that covers all partitions.
         let cyl_lbas_disk = cyl_blks; // RDSK cyl_blks is already in 512-byte LBAs.
         let new_total_lbas = max_end_lba.div_ceil(cyl_lbas_disk) * cyl_lbas_disk;
-        let new_cylinders = (new_total_lbas / cyl_lbas_disk) as u32;
-        let new_hi_cyl = new_cylinders - 1;
+        let new_cylinders = u32::try_from(new_total_lbas / cyl_lbas_disk)
+            .map_err(|_| PartitionError::InvalidRdb("disk is past 2^32 cylinders".into()))?;
+        let new_hi_cyl = new_cylinders.saturating_sub(1);
         BigEndian::write_u32(&mut rdsk_buf[16 * 4..16 * 4 + 4], new_cylinders);
         BigEndian::write_u32(&mut rdsk_buf[35 * 4..35 * 4 + 4], new_hi_cyl);
         restamp_checksum(&mut rdsk_buf);

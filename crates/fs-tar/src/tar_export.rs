@@ -22,7 +22,7 @@
 use std::collections::HashSet;
 use std::io::{Seek, SeekFrom, Write};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use disk_core::entry::{EntryType, FileEntry};
 use disk_core::filesystem::Filesystem;
@@ -296,6 +296,13 @@ fn walk<W: Write>(
     stats: &mut TarExportStats,
     progress: &dyn Fn(&TarExportStats),
 ) -> Result<()> {
+    // A directory listed inside its own subtree would recurse until the stack overflowed.
+    if prefix.matches('/').count() > 256 {
+        bail!(
+            "{}: directories nested more than 256 deep (a loop?)",
+            dir.path
+        );
+    }
     let children = fs
         .list_directory(dir)
         .map_err(|e| anyhow!("list_directory {}: {e}", dir.path))?;

@@ -14,7 +14,7 @@ use dsk_ghost::gho::GhoReader;
 fn main() -> anyhow::Result<()> {
     let path = std::env::args().nth(1).expect("path to GHO");
     let mut r = GhoReader::open(std::path::Path::new(&path))?;
-    r.prepare_full_image();
+    r.prepare_full_image().expect("prepare GHO");
 
     let Some(ranges) = r.ntfs_mapped_ranges() else {
         println!("not an NTFS file-aware GHO");

@@ -311,6 +311,16 @@ pub(crate) fn parse_header(reader: &mut impl Read) -> Result<PartcloneHeader> {
     let mut _crc = [0u8; 4];
     reader.read_exact(&mut _crc)?;
 
+    // Every size below drives an allocation or a loop: a block of 0 would never advance, and
+    // a huge count sizes the bitmap. Filesystems use 512 B to 1 MiB blocks, and 2^34 blocks
+    // covers a 64 TiB volume at 4 KiB.
+    if !block_size.is_power_of_two() || !(512..=1 << 20).contains(&block_size) {
+        bail!("partclone: block size {block_size} is out of range");
+    }
+    if total_blocks > 1 << 34 || used_blocks > total_blocks {
+        bail!("partclone: {used_blocks} used of {total_blocks} blocks is implausible");
+    }
+
     Ok(PartcloneHeader {
         version,
         fs_type,

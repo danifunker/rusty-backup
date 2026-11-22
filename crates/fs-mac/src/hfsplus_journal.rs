@@ -688,7 +688,12 @@ impl<'a, R: Read + Seek> JournalWalker<'a, R> {
                 ));
             }
             if info.bnum != KILLED_BLOCK && info.bsize != 0 {
-                let target = info.bnum * self.jhdr_size;
+                let target = info.bnum.checked_mul(self.jhdr_size).ok_or_else(|| {
+                    JournalError::OutOfRange(format!(
+                        "journal block number {} overflows",
+                        info.bnum
+                    ))
+                })?;
                 blocks.push((target, data[data_pos..data_pos + bsize].to_vec()));
                 total_payload += bsize as u64;
             }
@@ -755,6 +760,25 @@ pub fn replay_journal<RW: Read + Write + Seek>(
     jh: &mut JournalHeader,
     partition_offset: u64,
 ) -> Result<ReplayReport> {
+    let image_end = disk.seek(SeekFrom::End(0))?;
+    replay_journal_within(
+        disk,
+        jib,
+        jh,
+        partition_offset,
+        image_end.saturating_sub(partition_offset),
+    )
+}
+
+/// [`replay_journal`] that refuses any block landing past `volume_len` bytes of the volume
+/// (block numbers sit outside the journal checksum, so a corrupt one could go anywhere: MAC-012).
+pub fn replay_journal_within<RW: Read + Write + Seek>(
+    disk: &mut RW,
+    jib: &JournalInfoBlock,
+    jh: &mut JournalHeader,
+    partition_offset: u64,
+    volume_len: u64,
+) -> Result<ReplayReport> {
     if jib.is_external() {
         return Err(JournalError::ExternalJournal);
     }
@@ -792,6 +816,19 @@ pub fn replay_journal<RW: Read + Write + Seek>(
         let (view, next_start) = view;
 
         // Apply each block to its real on-disk location.
+        if let Some((target, payload)) =
+            view.blocks
+                .iter()
+                .find(|(t, p)| match t.checked_add(p.len() as u64) {
+                    Some(end) => end > volume_len,
+                    None => true,
+                })
+        {
+            return Err(JournalError::OutOfRange(format!(
+                "journal block at byte {target} (+{}) lands past the {volume_len}-byte volume",
+                payload.len()
+            )));
+        }
         for (target, payload) in &view.blocks {
             disk.seek(SeekFrom::Start(partition_offset + *target))?;
             disk.write_all(payload)?;

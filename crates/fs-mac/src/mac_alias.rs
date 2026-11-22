@@ -23,23 +23,14 @@ pub const SLNK_TYPE: &str = "slnk";
 pub const RHAP_CREATOR: &str = "rhap";
 
 /// Read a Pascal string padded to `field_len` bytes. The first byte is the
-/// length; `field_len - 1` bytes of data follow. Non-ASCII bytes are passed
-/// through (MacRoman ≈ ASCII for the low 128), with high bytes mapped to `?`.
+/// length; `field_len - 1` bytes of Mac Roman follow.
 fn read_pascal_string(field: &[u8]) -> String {
     if field.is_empty() {
         return String::new();
     }
     let len = field[0] as usize;
     let max = field.len().saturating_sub(1).min(len);
-    let mut out = String::with_capacity(max);
-    for &b in &field[1..1 + max] {
-        if b < 0x80 {
-            out.push(b as char);
-        } else {
-            out.push('?');
-        }
-    }
-    out
+    crate::mac_roman::mac_roman_to_utf8(&field[1..1 + max])
 }
 
 /// Parse an `alis` resource record and return a human-readable target string
@@ -103,16 +94,9 @@ fn scan_tagged_path(tags: &[u8]) -> Option<String> {
             // Tag 2 — absolute path (Pascal-ish, MacRoman). Not length-prefixed
             // here; the record length IS the string length.
             2 => {
-                let mut out = String::with_capacity(len);
-                for &b in &tags[data_start..data_end] {
-                    if b == 0 {
-                        break;
-                    } else if b < 0x80 {
-                        out.push(b as char);
-                    } else {
-                        out.push('?');
-                    }
-                }
+                let raw = &tags[data_start..data_end];
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                let out = crate::mac_roman::mac_roman_to_utf8(&raw[..end]);
                 if !out.is_empty() {
                     return Some(out);
                 }
@@ -149,7 +133,7 @@ pub fn find_alis_in_resource_fork(rsrc: &[u8]) -> Option<Vec<u8>> {
     let _data_len = BigEndian::read_u32(&rsrc[8..12]) as usize;
     let map_len = BigEndian::read_u32(&rsrc[12..16]) as usize;
 
-    if map_off + map_len > rsrc.len() || map_off + 30 > rsrc.len() {
+    if map_off.saturating_add(map_len) > rsrc.len() || map_off.saturating_add(30) > rsrc.len() {
         return None;
     }
     let map = &rsrc[map_off..map_off + map_len.min(rsrc.len() - map_off)];

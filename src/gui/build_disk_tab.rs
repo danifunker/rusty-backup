@@ -464,6 +464,14 @@ impl BuildDiskTab {
                                 egui::TextEdit::singleline(&mut p.sgi_label).desired_width(80.0),
                             );
                         });
+                        ui.push_id(ids::SGI_FORMAT, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{}:", labels::SGI_FORMAT));
+                                for (i, text) in labels::SGI_FORMATS.iter().enumerate() {
+                                    ui.radio_value(&mut p.sgi_label_only, i == 1, *text);
+                                }
+                            });
+                        });
                     }
                     // An easy target asks only for a size.
                     _ => {}

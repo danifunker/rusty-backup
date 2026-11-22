@@ -59,6 +59,7 @@ pub(super) enum Row {
     X68kParts,
     SystemDisk,
     SgiLabel,
+    SgiFormat,
     CdLayout,
     CdName,
     CdAutoSize,
@@ -227,7 +228,7 @@ impl BuildDiskState {
                             PresetKind::X68k => {
                                 r.extend([Row::X68kScsi, Row::X68kParts, Row::SystemDisk])
                             }
-                            PresetKind::SgiEfs => r.push(Row::SgiLabel),
+                            PresetKind::SgiEfs => r.extend([Row::SgiLabel, Row::SgiFormat]),
                             // An easy target asks only for a size.
                             _ => {}
                         }
@@ -475,6 +476,11 @@ impl BuildDiskState {
             Row::X68kScsi => {
                 let mut p = c.preset().clone();
                 p.x68k_scsi = !p.x68k_scsi;
+                self.act(BuildDiskAction::SetPreset(p));
+            }
+            Row::SgiFormat => {
+                let mut p = c.preset().clone();
+                p.sgi_label_only = !p.sgi_label_only;
                 self.act(BuildDiskAction::SetPreset(p));
             }
             Row::CdLayout => {
@@ -999,6 +1005,10 @@ impl App {
                         .unwrap_or_else(|| "(none: seed files; Enter to choose)".into()),
                 ),
                 Row::SgiLabel => ("EFS label".into(), c.preset().sgi_label.clone()),
+                Row::SgiFormat => (
+                    labels::SGI_FORMAT.into(),
+                    format!("< {} >", labels::sgi_format(c.preset().sgi_label_only)),
+                ),
                 Row::CdLayout => (
                     labels::CD_LAYOUT.into(),
                     format!("< {} >", c.cd().layout.label()),

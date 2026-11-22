@@ -301,8 +301,9 @@ fn parse_decoded(raw: &[u8]) -> Result<BinHexFile> {
 
     // data fork + its CRC
     let data_start = header_len + 2;
-    let data_end = data_start + data_len;
-    if raw.len() < data_end + 2 {
+    // Checked so a 4 GiB length cannot wrap on 32-bit targets (MAC-014).
+    let data_end = data_start.saturating_add(data_len);
+    if raw.len().saturating_sub(2) < data_end {
         bail!("BinHex: truncated data fork");
     }
     let data_fork = raw[data_start..data_end].to_vec();
@@ -314,8 +315,8 @@ fn parse_decoded(raw: &[u8]) -> Result<BinHexFile> {
 
     // resource fork + its CRC
     let rsrc_start = data_end + 2;
-    let rsrc_end = rsrc_start + rsrc_len;
-    if raw.len() < rsrc_end + 2 {
+    let rsrc_end = rsrc_start.saturating_add(rsrc_len);
+    if raw.len().saturating_sub(2) < rsrc_end {
         bail!("BinHex: truncated resource fork");
     }
     let resource_fork = raw[rsrc_start..rsrc_end].to_vec();

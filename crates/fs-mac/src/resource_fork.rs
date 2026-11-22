@@ -88,6 +88,17 @@ pub fn build_appledouble(
     dates: MacFileDates,
     rsrc_data: &[u8],
 ) -> Vec<u8> {
+    build_appledouble_with_flags(type_code, creator_code, 0, dates, rsrc_data)
+}
+
+/// [`build_appledouble`] that also stores the Finder flags (`fdFlags`) (MAC-013).
+pub fn build_appledouble_with_flags(
+    type_code: &[u8; 4],
+    creator_code: &[u8; 4],
+    finder_flags: u16,
+    dates: MacFileDates,
+    rsrc_data: &[u8],
+) -> Vec<u8> {
     // Entries, in on-disk order: Finder Info (id 9, 32B), then — only when we
     // have real dates — File Dates Info (id 8, 16B), then Resource Fork
     // (id 2, variable). Omitting the dates entry when unknown keeps the output
@@ -136,7 +147,7 @@ pub fn build_appledouble(
     let fi_start = finder_offset as usize;
     buf[fi_start..fi_start + 4].copy_from_slice(type_code);
     buf[fi_start + 4..fi_start + 8].copy_from_slice(creator_code);
-    // Rest is zeros
+    BigEndian::write_u16(&mut buf[fi_start + 8..fi_start + 10], finder_flags);
 
     // File Dates Info (16 bytes): create/modify/backup/access, signed seconds
     // relative to 2000-01-01 GMT. We only know create/modify; the rest are the
@@ -170,6 +181,27 @@ pub fn build_macbinary(
     data_fork: &[u8],
     rsrc_data: &[u8],
 ) -> Vec<u8> {
+    build_macbinary_with_flags(
+        filename,
+        type_code,
+        creator_code,
+        0,
+        dates,
+        data_fork,
+        rsrc_data,
+    )
+}
+
+/// [`build_macbinary`] that also stores the Finder flags: high byte at 73, low at 101 (MAC-013).
+pub fn build_macbinary_with_flags(
+    filename: &str,
+    type_code: &[u8; 4],
+    creator_code: &[u8; 4],
+    finder_flags: u16,
+    dates: MacFileDates,
+    data_fork: &[u8],
+    rsrc_data: &[u8],
+) -> Vec<u8> {
     let data_padded = pad_to_128(data_fork.len());
     let rsrc_padded = pad_to_128(rsrc_data.len());
     let total = 128 + data_padded + rsrc_padded;
@@ -185,6 +217,8 @@ pub fn build_macbinary(
     // Type code at 65-68, creator at 69-72
     buf[65..69].copy_from_slice(type_code);
     buf[69..73].copy_from_slice(creator_code);
+    buf[73] = (finder_flags >> 8) as u8;
+    buf[101] = finder_flags as u8;
 
     // Data fork length at 83-86 (big-endian)
     BigEndian::write_u32(&mut buf[83..87], data_fork.len() as u32);
@@ -618,18 +652,21 @@ pub fn parse_macbinary(data: &[u8]) -> Option<ImportedResourceFork> {
     let type_code: [u8; 4] = data[65..69].try_into().unwrap();
     let creator_code: [u8; 4] = data[69..73].try_into().unwrap();
 
-    let data_len = BigEndian::read_u32(&data[83..87]) as usize;
-    let rsrc_len = BigEndian::read_u32(&data[87..91]) as usize;
+    let data_len = BigEndian::read_u32(&data[83..87]) as u64;
+    let rsrc_len = BigEndian::read_u32(&data[87..91]) as u64;
 
-    let data_start = 128;
-    let data_padded = pad_to_128(data_len);
-    let rsrc_start = data_start + data_padded;
+    // In u64, so 4 GiB lengths cannot wrap on 32-bit targets (MAC-014).
+    let data_start = 128u64;
+    let rsrc_start = data_start + data_len.div_ceil(128) * 128;
 
     // A data-fork-only file is still MacBinary: type, creator and the Mac
     // name ride in the header, and the 128 bytes are not file content.
-    if rsrc_start + rsrc_len > data.len() || data_start + data_len > data.len() {
+    let len = data.len() as u64;
+    if rsrc_start + rsrc_len > len || data_start + data_len > len {
         return None;
     }
+    let (data_start, data_len) = (data_start as usize, data_len as usize);
+    let (rsrc_start, rsrc_len) = (rsrc_start as usize, rsrc_len as usize);
 
     Some(ImportedResourceFork {
         data: data[rsrc_start..rsrc_start + rsrc_len].to_vec(),
@@ -715,6 +752,16 @@ pub fn mac_name_bytes(name: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finder flags survive a round trip through MacBinary and AppleDouble (MAC-013).
+    #[test]
+    fn finder_flags_round_trip_through_macbinary_and_appledouble() {
+        let dates = MacFileDates::default();
+        let mb = build_macbinary_with_flags("F", b"TEXT", b"ttxt", 0x4420, dates, b"hi", b"rs");
+        assert_eq!(parse_macbinary(&mb).unwrap().finder_flags, Some(0x4420));
+        let ad = build_appledouble_with_flags(b"TEXT", b"ttxt", 0x4420, dates, b"rs");
+        assert_eq!(parse_appledouble(&ad).unwrap().finder_flags, Some(0x4420));
+    }
 
     /// X13: names went out as UTF-8 and were cut at 63 bytes mid-character;
     /// a classic Mac reads the header as Mac Roman.

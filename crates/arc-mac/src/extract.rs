@@ -359,6 +359,9 @@ pub fn extract_filtered(
         HashSet::new()
     };
     let mut used_sidecars: HashSet<PathBuf> = HashSet::new();
+    // Output files already written by this extraction: a second entry (or a name the
+    // sanitizer folded onto another) must not overwrite one.
+    let mut written: HashSet<PathBuf> = HashSet::new();
 
     let mut stats = ExtractStats::default();
     let mut done = 0usize;
@@ -394,6 +397,18 @@ pub fn extract_filtered(
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let target = {
+            let free = free_target(&target, format, &written);
+            if free != target {
+                log(format!(
+                    "Note: '{}' written as '{}' so it doesn't overwrite another file",
+                    e.display_path(),
+                    free.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+            written.insert(output_path(&free, format));
+            free
+        };
 
         let data = match decompress_named(bytes, e.data.as_ref(), e, &mut log) {
             Ok(d) => d,
@@ -516,11 +531,12 @@ pub fn write_entry(
             )?;
         }
         ForkFormat::MacBinary => {
-            let mb = resource_fork::build_macbinary(
+            let mb = resource_fork::build_macbinary_with_flags(
                 &entry.name,
                 &entry.type_code,
                 &entry.creator_code,
-                resource_fork::MacFileDates::default(),
+                entry.finder_flags,
+                entry_dates(entry),
                 data,
                 rsrc,
             );
@@ -529,10 +545,11 @@ pub fn write_entry(
         ForkFormat::AppleDouble => {
             std::fs::write(target, data)?;
             if !rsrc.is_empty() || entry.type_code != [0; 4] || entry.creator_code != [0; 4] {
-                let ad = resource_fork::build_appledouble(
+                let ad = resource_fork::build_appledouble_with_flags(
                     &entry.type_code,
                     &entry.creator_code,
-                    resource_fork::MacFileDates::default(),
+                    entry.finder_flags,
+                    entry_dates(entry),
                     rsrc,
                 );
                 std::fs::write(sidecar_path(target, "._"), ad)?;
@@ -549,6 +566,51 @@ pub fn write_entry(
         }
     }
     Ok(())
+}
+
+/// The file a format writes for `target` (BinHex and MacBinary add their extension).
+fn output_path(target: &Path, format: ForkFormat) -> PathBuf {
+    match format {
+        ForkFormat::BinHex => with_added_extension(target, "hqx"),
+        ForkFormat::MacBinary => with_added_extension(target, "bin"),
+        ForkFormat::AppleDouble | ForkFormat::Raw => target.to_path_buf(),
+    }
+}
+
+/// `target`, or `name 2`, `name 3`, ... when its output was already written by this
+/// extraction or already exists on the host.
+fn free_target(target: &Path, format: ForkFormat, written: &HashSet<PathBuf>) -> PathBuf {
+    let taken = |t: &Path| {
+        let out = output_path(t, format);
+        written.contains(&out) || out.exists()
+    };
+    if !taken(target) {
+        return target.to_path_buf();
+    }
+    let stem = target
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let ext = target.extension().map(|e| e.to_string_lossy().into_owned());
+    (2u32..)
+        .map(|n| {
+            let name = match &ext {
+                Some(x) => format!("{stem} {n}.{x}"),
+                None => format!("{stem} {n}"),
+            };
+            target.with_file_name(name)
+        })
+        .find(|c| !taken(c))
+        .expect("some suffix is free")
+}
+
+/// The archive's Mac dates for an entry, carried into MacBinary / AppleDouble.
+fn entry_dates(entry: &StuffItEntry) -> resource_fork::MacFileDates {
+    resource_fork::MacFileDates {
+        created: entry.create_date,
+        modified: entry.mod_date,
+    }
 }
 
 /// Destination path for an entry's data fork: `dest` joined with the entry's

@@ -94,7 +94,12 @@ pub struct Qnx6Filesystem<R: Read + Seek + Send> {
     free_blocks: u64,
     inodes: Node,
     longnames: Node,
+    /// The last indirect block read at each level, so a sequential read fetches each once.
+    ind_cache: Vec<(u32, Vec<u8>)>,
 }
+
+/// QNX6 trees are at most three levels deep; more is corruption (and would overflow a shift).
+const MAX_LEVELS: u8 = 3;
 
 impl<R: Read + Seek + Send> Qnx6Filesystem<R> {
     pub fn open(mut reader: R, offset: u64) -> Result<Self, FilesystemError> {
@@ -126,6 +131,7 @@ impl<R: Read + Seek + Send> Qnx6Filesystem<R> {
                 ptrs: [0; 16],
                 levels: 0,
             },
+            ind_cache: Vec::new(),
         };
         fs.bsize = fs.u32(&first, 48) as u64;
         if !(512..=65536).contains(&fs.bsize) || !fs.bsize.is_power_of_two() {
@@ -209,6 +215,12 @@ impl<R: Read + Seek + Send> Qnx6Filesystem<R> {
 
     /// The relative block holding logical block `n` of `node`, or `None` for a hole.
     fn bmap(&mut self, node: &Node, n: u64) -> Result<Option<u32>, FilesystemError> {
+        if node.levels > MAX_LEVELS {
+            return Err(FilesystemError::InvalidData(format!(
+                "qnx6: a tree of {} levels (at most {MAX_LEVELS})",
+                node.levels
+            )));
+        }
         let bits = (self.bsize / 4).trailing_zeros() as u64;
         let mut shift = bits * node.levels as u64;
         let top = (n >> shift) as usize;
@@ -221,14 +233,24 @@ impl<R: Read + Seek + Send> Qnx6Filesystem<R> {
                 return Ok(None);
             }
             shift -= bits;
-            let blk = self.read_block(ptr)?;
-            ptr = self.u32(&blk, (((n >> shift) & ((1 << bits) - 1)) * 4) as usize);
+            let level = (shift / bits) as usize;
+            if self.ind_cache.len() <= level {
+                self.ind_cache.resize(level + 1, (NOPTR, Vec::new()));
+            }
+            if self.ind_cache[level].0 != ptr {
+                let blk = self.read_block(ptr)?;
+                self.ind_cache[level] = (ptr, blk);
+            }
+            let idx = (((n >> shift) & ((1 << bits) - 1)) * 4) as usize;
+            let blk = std::mem::take(&mut self.ind_cache[level].1);
+            ptr = self.u32(&blk, idx);
+            self.ind_cache[level].1 = blk;
         }
         Ok((ptr != NOPTR).then_some(ptr))
     }
 
     fn read_node(&mut self, node: &Node, max: usize) -> Result<Vec<u8>, FilesystemError> {
-        let mut out = Vec::with_capacity((node.size as usize).min(max));
+        let mut out = Vec::with_capacity((node.size as usize).min(max).min(1 << 20));
         self.copy_node(node, max as u64, &mut out)?;
         Ok(out)
     }
@@ -240,7 +262,10 @@ impl<R: Read + Seek + Send> Qnx6Filesystem<R> {
         max: u64,
         w: &mut dyn Write,
     ) -> Result<u64, FilesystemError> {
-        let want = node.size.min(max);
+        // Past what the 16 pointers can address there is no data, only a corrupt size.
+        let bits = (self.bsize / 4).trailing_zeros() as u64;
+        let addressable = (16u64 << (bits * node.levels.min(MAX_LEVELS) as u64)) * self.bsize;
+        let want = node.size.min(max).min(addressable);
         let mut buf = vec![0u8; self.bsize as usize];
         let mut done = 0u64;
         let mut n = 0u64;

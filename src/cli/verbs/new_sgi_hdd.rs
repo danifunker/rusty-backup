@@ -1,16 +1,20 @@
-//! `rb-cli new hd sgi-efs IMG --size 50M [--name LABEL] [--heads N --sectors N]`
-//! — Build a dvh-wrapped IRIX hard-disk image: an SGI volume header +
-//! partition table at sector 0 wrapping a formatted EFS root partition,
-//! mountable by IRIX 5.3–6.5 as a SCSI HDD.
+//! `rb-cli new hd sgi-efs IMG --size 50M [--fs efs|xfs] [--swap SIZE] [--label-only]
+//! [--name LABEL] [--heads N --sectors N]` — Build a dvh-wrapped IRIX hard-disk
+//! image: an SGI volume header + partition table at sector 0 and a root partition
+//! formatted EFS (mountable by IRIX 5.3–6.5 as a SCSI HDD) or XFS.
 //!
-//! Wraps [`crate::partition::sgi_hdd_builder::build_sgi_efs_hdd`]. Unlike
+//! Wraps [`crate::partition::sgi_hdd_builder::write_sgi_disk`]. Unlike
 //! `new volume efs` — which makes a *bare* EFS superfloppy — this produces a
 //! real hard disk that `fx` / `prtvtoc` and the IRIX disk driver recognize,
 //! populatable through the normal verbs (`import IMG <dir>`,
 //! `put IMG@1 host/file /file`, `ls`, `get`, `fsck`).
 //!
-//! `--from-dir` formats and populates in one step; `--size auto` then sizes
-//! the disk to the tree rather than to a fixed figure.
+//! `--fs xfs` writes a v5 (CRC) XFS root, which IRIX itself cannot mount (IRIX
+//! reads v1/v2 XFS only); it suits Linux and other modern readers. `--label-only`
+//! writes the volume header alone and leaves the partitions as they were.
+//! `--from-dir` formats and populates in one step; `--size auto` then sizes the
+//! disk to the tree, with the volume header, `--swap` and the root filesystem's
+//! own overhead on top (`sgi_disk::disk_bytes_for_root`).
 
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
@@ -19,15 +23,17 @@ use std::path::PathBuf;
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
 use crate::partition::sgi_hdd_builder::{
-    write_sgi_efs_hdd, SgiHddOptions, SgiMedia, DEFAULT_HEADS, DEFAULT_SECTORS_PER_TRACK,
+    disk_bytes_for_root, write_sgi_disk, SgiFit, SgiHddOptions, SgiMedia, SgiPartitionLayout,
+    SgiRootFs, DEFAULT_HEADS, DEFAULT_SECTORS_PER_TRACK,
 };
 use fs_unix::efs::resolve_bytes_per_inode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SgiFs {
-    /// IRIX EFS root partition (IRIX 5.3–6.5). The only root filesystem
-    /// supported today; XFS is a future addition.
+    /// IRIX EFS root partition (IRIX 5.3–6.5).
     Efs,
+    /// XFS root partition (type 10). Written as v5 / CRC XFS, which IRIX itself cannot mount.
+    Xfs,
 }
 
 #[derive(Debug, Args)]
@@ -35,9 +41,8 @@ pub struct NewSgiHddArgs {
     /// Image file to create. Overwritten if it already exists.
     pub image: PathBuf,
 
-    /// Disk size (plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes, e.g.
-    /// `50M`), or `auto` to size it to `--from-dir` plus filesystem overhead
-    /// and headroom. Rounded up to a whole cylinder. Defaults to 50M.
+    /// Disk size (bytes or `K`/`M`/`G` suffixes, e.g. `50M`), or `auto` to fit `--from-dir` plus the
+    /// volume header, `--swap` and filesystem overhead. Rounded up to a whole cylinder. Default 50M.
     #[arg(long, default_value = "50M")]
     pub size: String,
 
@@ -90,14 +95,24 @@ pub struct NewSgiHddArgs {
     )]
     pub exclude_appledouble: bool,
 
-    /// EFS volume label (up to 6 bytes; longer is truncated). Defaults to
+    /// Volume label (EFS keeps up to 6 bytes, XFS 12; longer is truncated). Defaults to
     /// `rusty`.
     #[arg(long, default_value = "rusty")]
     pub name: String,
 
-    /// Root filesystem to format. Only `efs` is supported today.
+    /// Root filesystem: it sets the root partition's type and, unless `--label-only`, is
+    /// formatted. XFS is written as v5 (CRC), which IRIX itself cannot mount.
     #[arg(long, value_enum, default_value = "efs")]
     pub fs: SgiFs,
+
+    /// Write the SGI volume header and partition table only; leave the partitions as they are
+    /// (unformatted on a new image).
+    #[arg(long = "label-only", conflicts_with = "from_dir")]
+    pub label_only: bool,
+
+    /// Lay the disk out as an IRIX system disk: swap of this size in slot 1, the root after it.
+    #[arg(long)]
+    pub swap: Option<String>,
 
     /// Heads (tracks per cylinder). Must match the geometry the target drive
     /// reports over SCSI: IRIX `fx` rejects the volume header if its geometry
@@ -126,18 +141,44 @@ pub struct NewSgiHddArgs {
 }
 
 pub fn run(args: NewSgiHddArgs) -> Result<()> {
-    match args.fs {
-        SgiFs::Efs => { /* the only supported root filesystem today */ }
-    }
+    let root_fs = match args.fs {
+        SgiFs::Efs => SgiRootFs::Efs,
+        SgiFs::Xfs => SgiRootFs::Xfs,
+    };
+    let layout_kind = match &args.swap {
+        None => SgiPartitionLayout::DataOnly,
+        Some(s) => SgiPartitionLayout::RootSwap {
+            swap_bytes: parse_size(s).context("parsing --swap")?,
+        },
+    };
 
-    let size_bytes = if args.size.eq_ignore_ascii_case("auto") {
+    let mut opts = SgiHddOptions {
+        size_bytes: 0,
+        name: args.name.clone(),
+        heads: args.heads,
+        sectors_per_track: args.sectors,
+        bytes_per_inode: 0,
+        media: SgiMedia::HardDisk,
+        root_fs,
+        layout: layout_kind,
+        format_root: !args.label_only,
+        fit: SgiFit::RoundUp,
+    };
+    // Resolve the inode density against the disk size (the root is most of the disk).
+    let bytes_per_inode =
+        |size: u64| resolve_bytes_per_inode(size, args.inodes, args.bytes_per_inode);
+    opts.size_bytes = if args.size.eq_ignore_ascii_case("auto") {
         let Some(dir) = &args.from_dir else {
             anyhow::bail!("--size auto needs --from-dir to measure; pass an explicit size instead");
         };
         let (files, dirs, bytes) =
             crate::fs::dir_import::measure_dir_for(dir, &import_options(&args))
                 .with_context(|| format!("measuring {}", dir.display()))?;
-        let projected = crate::fs::dir_import::projected_volume_bytes(files, dirs, bytes, 512);
+        // The density depends on the size and the size on the density: settle it in two passes.
+        opts.bytes_per_inode = bytes_per_inode(bytes);
+        let first = disk_bytes_for_root(files, dirs, bytes, &opts);
+        opts.bytes_per_inode = bytes_per_inode(first);
+        let projected = disk_bytes_for_root(files, dirs, bytes, &opts).max(first);
         log_stderr(format!(
             "size auto: {files} file(s), {dirs} dir(s), {} MiB of content{} -> {} MiB disk",
             bytes / (1024 * 1024),
@@ -152,31 +193,31 @@ pub fn run(args: NewSgiHddArgs) -> Result<()> {
     } else {
         parse_size(&args.size).context("parsing --size")?
     };
-    let opts = SgiHddOptions {
-        size_bytes,
-        name: args.name.clone(),
-        heads: args.heads,
-        sectors_per_track: args.sectors,
-        // Resolve the inode density against the EFS root size (the partition is
-        // most of the disk; this is the count the user cares about).
-        bytes_per_inode: resolve_bytes_per_inode(size_bytes, args.inodes, args.bytes_per_inode),
-        media: SgiMedia::HardDisk,
-    };
+    opts.bytes_per_inode = bytes_per_inode(opts.size_bytes);
     // Stream directly to the output file: the volume header + EFS metadata are
     // written and the rest stays sparse, so even multi-GB disks never
     // materialize the whole image in memory.
     let mut file = std::fs::File::create(&args.image)
         .with_context(|| format!("creating {}", args.image.display()))?;
-    let layout = write_sgi_efs_hdd(&mut file, &opts)
+    let layout = write_sgi_disk(&mut file, &opts)
         .with_context(|| format!("writing {}", args.image.display()))?;
     file.set_len(layout.disk_bytes)
         .with_context(|| format!("sizing {}", args.image.display()))?;
 
+    let fs_name = match root_fs {
+        SgiRootFs::Efs => "EFS",
+        SgiRootFs::Xfs => "XFS",
+    };
     log_stderr(format!(
-        "wrote {} ({} bytes, {} MiB) - SGI volume header + EFS root",
+        "wrote {} ({} bytes, {} MiB) - SGI volume header + {}",
         args.image.display(),
         layout.disk_bytes,
         layout.disk_bytes / (1024 * 1024),
+        if args.label_only {
+            format!("an unformatted {fs_name} root (label only)")
+        } else {
+            format!("{fs_name} root")
+        },
     ));
     log_stderr(format!(
         "  geometry: {} cyls x {} heads x {} secs/trk x 512 ({} sectors, {}-sector cylinders)",
@@ -190,19 +231,27 @@ pub fn run(args: NewSgiHddArgs) -> Result<()> {
         "  slot 8 VOLHDR: sectors 0..{}   slot 10 VOLUME: sectors 0..{} (whole disk)",
         layout.volhdr_sectors, layout.disk_sectors,
     ));
+    if layout.swap_sectors > 0 {
+        log_stderr(format!(
+            "  slot 1 swap: sectors {}..{} ({} MiB)",
+            layout.swap_first_sector,
+            layout.swap_first_sector + layout.swap_sectors,
+            (layout.swap_sectors * 512) / (1024 * 1024),
+        ));
+    }
     log_stderr(format!(
-        "  slot 0 EFS root: sectors {}..{} ({} sectors, {} MiB)",
-        layout.efs_first_sector,
-        layout.efs_first_sector + layout.efs_sectors,
-        layout.efs_sectors,
-        (layout.efs_sectors * 512) / (1024 * 1024),
+        "  slot 0 {fs_name} root: sectors {}..{} ({} sectors, {} MiB)",
+        layout.root_first_sector,
+        layout.root_first_sector + layout.root_sectors,
+        layout.root_sectors,
+        (layout.root_sectors * 512) / (1024 * 1024),
     ));
     if let Some(dir) = &args.from_dir {
         // Drop the write handle before reopening through the normal
         // partition-resolution path.
         drop(file);
-        populate(&args, dir)?;
-    } else {
+        populate(&args, dir, fs_name)?;
+    } else if !args.label_only {
         log_stderr(format!(
             "  populate it with: rb-cli import {} <dir>   (or put ...@1 host/file /file)",
             args.image.display(),
@@ -216,8 +265,8 @@ pub fn run(args: NewSgiHddArgs) -> Result<()> {
     Ok(())
 }
 
-/// Import `dir` into the freshly-formatted disk's EFS root partition.
-fn populate(args: &NewSgiHddArgs, dir: &std::path::Path) -> Result<()> {
+/// Import `dir` into the freshly formatted disk's root partition (`fs_name` names it in errors).
+fn populate(args: &NewSgiHddArgs, dir: &std::path::Path, fs_name: &str) -> Result<()> {
     use crate::cli::resolve::resolve_partition_rw_forced;
     use crate::fs::dir_import::import_dir;
 
@@ -227,7 +276,7 @@ fn populate(args: &NewSgiHddArgs, dir: &std::path::Path) -> Result<()> {
     let (file, ctx, commit) = resolve_partition_rw_forced(&args.image, Some(1u32.into()), None)?;
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow::anyhow!("opening the new EFS filesystem for writing: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("opening the new {fs_name} filesystem for writing: {e}"))?;
     let dest = disk_core::filesystem::Filesystem::root(fs.as_filesystem_mut())
         .map_err(|e| anyhow::anyhow!("resolving volume root: {e}"))?;
 

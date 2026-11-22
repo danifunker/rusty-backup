@@ -3,11 +3,8 @@
 //! Macintosh Plus (until System 3.0 brought HFS).
 //!
 //! Used by the MiSTer **MacPlus** core when a `.dsk` is a 400 KB MFS
-//! floppy rather than an HFS volume. The plan ([`docs/mister_filesystem_
-//! implementation_plan.md`] Wave 1) targets an **extract-only floor**:
-//! browse + read data fork (+ surface resource-fork size). Add/Delete and
-//! resize are intentionally out of scope — the core itself rarely writes
-//! MFS, and `BasiliskII` is the natural authoring path when one does.
+//! floppy rather than an HFS volume. Browse, read both forks, create, delete,
+//! rename, check and repair; resize is out of scope.
 //!
 //! ## On-disk layout (Inside Macintosh: Files, Volume II, ch. 2)
 //!
@@ -90,7 +87,8 @@ pub const MFS_400K_BYTES: u64 = 409_600;
 pub const MFS_800K_BYTES: u64 = 819_200;
 
 /// Maximum allocation blocks per the on-disk u16 field.
-const MAX_ALLOC_BLOCKS: u32 = 0xFFFF;
+/// The most blocks 12-bit map links can name (2..=0xFFF, 0xFFF being end-of-chain).
+const MAX_ALLOC_BLOCKS: u32 = 4094;
 
 /// Maximum allocation-block chain length we walk while reading one fork.
 /// MFS volumes are tiny (≤ 800 KB) so this is generous; the cap is a
@@ -170,7 +168,16 @@ impl MfsMdb {
         }
         if num_alloc_blocks as u32 > MAX_ALLOC_BLOCKS {
             return Err(FilesystemError::InvalidData(format!(
-                "MFS allocation-block count {num_alloc_blocks} exceeds 65535"
+                "MFS allocation-block count {num_alloc_blocks} exceeds {MAX_ALLOC_BLOCKS}"
+            )));
+        }
+        // The map (12 bits a block, from byte 64 of the MDB) must end before the directory
+        // and the free count fit the volume, or writes land on the directory (MAC-002).
+        let map_end = map_offset + (u64::from(num_alloc_blocks) * 3).div_ceil(2);
+        if map_end > u64::from(dir_start_sector) * 512 || free_blocks > num_alloc_blocks {
+            return Err(FilesystemError::InvalidData(format!(
+                "MFS geometry: a {num_alloc_blocks}-block map ends at byte {map_end}, past the \
+                 directory at sector {dir_start_sector}, or {free_blocks} free blocks"
             )));
         }
         if dir_length_sectors == 0 {
@@ -250,6 +257,16 @@ impl<R: Read + Seek + Send> MfsFilesystem<R> {
         let mut mdb_buf = [0u8; 512];
         reader.read_exact(&mut mdb_buf)?;
         let mdb = MfsMdb::parse(&mdb_buf)?;
+        let image_end = reader.seek(SeekFrom::End(0))?;
+        let volume_end = partition_offset
+            + (u64::from(mdb.first_alloc_block_sector)
+                + u64::from(mdb.num_alloc_blocks) * u64::from(mdb.alloc_block_size / 512))
+                * 512;
+        if volume_end > image_end {
+            return Err(FilesystemError::InvalidData(format!(
+                "MFS allocation area ends at byte {volume_end}, past the image ({image_end})"
+            )));
+        }
 
         // Read the allocation-block map. We need (num_alloc_blocks * 12 + 7) / 8
         // bytes starting at `mdb.map_offset`, possibly straddling sectors.
@@ -434,8 +451,8 @@ fn parse_dir_sector(sec: &[u8; 512], out: &mut Vec<MfsDirEntry>) {
     }
 }
 
-/// Maximum length of an MFS filename in bytes (Mac Roman). The on-disk
-/// field is a 28-byte Pascal string, so 1 length byte + up to 27 chars.
+/// Longest name we give a new MFS file, in Mac Roman bytes (names already on disk, up to 255,
+/// are kept as they are).
 pub const MFS_MAX_NAME_LEN: usize = 27;
 
 /// MFS name equality as the File Manager sees it: Mac Roman bytes compared
@@ -489,7 +506,8 @@ impl MfsDirEntry {
             }
         };
         let name_bytes = crate::hfs::utf8_to_mac_roman(&self.name).unwrap_or_default();
-        let name_len = name_bytes.len().min(MFS_MAX_NAME_LEN) as u8;
+        // Existing names up to 255 bytes are kept as read; only new names are held to 27 (MAC-001).
+        let name_len = name_bytes.len().min(255) as u8;
         let total = 51 + name_len as usize;
         let padded = total + (total & 1);
         let mut buf = vec![0u8; padded];
@@ -749,8 +767,7 @@ impl<R: Read + Write + Seek + Send> MfsFilesystem<R> {
         Ok(())
     }
 
-    /// Write the in-memory `map_bytes` back to its on-disk position
-    /// (right after the volume name Pascal string within the MDB sector,
+    /// Write the in-memory `map_bytes` back to its on-disk position (byte 64 of the MDB,
     /// possibly straddling subsequent sectors).
     fn map_write_back(&mut self) -> Result<(), FilesystemError> {
         self.reader
@@ -1223,8 +1240,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
         };
 
         let file_number = self.mdb.next_file_number;
-        self.mdb.next_file_number += 1;
-        self.mdb.num_files += 1;
+        let full =
+            || FilesystemError::DiskFull("MFS file number or file count is at its limit".into());
+        self.mdb.next_file_number = self.mdb.next_file_number.checked_add(1).ok_or_else(full)?;
+        self.mdb.num_files = self.mdb.num_files.checked_add(1).ok_or_else(full)?;
 
         // Honor the caller's Mac type/creator, filling any missing or blank half
         // from the extension dictionary. Written into the dir entry's Finder
@@ -1869,6 +1888,37 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("Doc.rsrc")).unwrap(), b"RSRC");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A name longer than the 27 bytes new names get keeps its length when another edit
+    /// rewrites the directory (MAC-001).
+    #[test]
+    fn a_long_existing_name_survives_an_unrelated_edit() {
+        let long = "A name well past twenty-seven bytes";
+        let mut cur = Cursor::new(build_test_mfs());
+        {
+            let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let opts = CreateFileOptions::default();
+            fs.create_file(&root, "short", &mut &b"a"[..], 1, &opts)
+                .unwrap();
+            let e = fs.entries.iter_mut().find(|e| e.name == "short").unwrap();
+            e.name = long.to_string();
+            fs.sync_metadata().unwrap();
+            fs.create_file(&root, "other", &mut &b"b"[..], 1, &opts)
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&long.to_string()), "{names:?}");
     }
 
     #[test]

@@ -82,9 +82,8 @@ pub fn parse_shortform(
         // pos+1..pos+3 is the 2-byte offset cookie (unused for browse).
         let name_off = pos + 3;
         let name_end = name_off + namelen;
-        // FTYPE byte sits between the name and the inumber when the
-        // feature is enabled. See `xfs_dir2_sf_get_ftype` in libxfs/
-        // xfs_dir2_sf.c: `ftype = sfep->name[sfep->namelen]`.
+        // With the ftype feature, a type byte sits between the name and the inumber
+        // (XFS Algorithms & Data Structures, ch. Directories, sec. Short Form Directories).
         let ftype_extra = usize::from(has_ftype);
         let ino_off = name_end + ftype_extra;
         let next = ino_off + ino_width;

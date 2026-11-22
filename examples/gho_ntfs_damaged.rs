@@ -87,7 +87,7 @@ fn main() {
 
     // 1) Mapped coverage.
     let mut reader = GhoReader::open(p).unwrap();
-    reader.prepare_full_image();
+    reader.prepare_full_image().expect("prepare GHO");
     let ranges = reader.ntfs_mapped_ranges().expect("not NTFS file-aware");
     // Sorted (start, end) intervals for binary-search coverage tests.
     let cov: Vec<(u64, u64)> = ranges.iter().map(|&(l, c)| (l, l + c)).collect();

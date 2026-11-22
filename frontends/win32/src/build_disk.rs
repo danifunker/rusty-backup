@@ -108,6 +108,8 @@ struct DiskStep {
     system_clear: HWND,
     sgi_caption: HWND,
     sgi_label: HWND,
+    sgi_format_caption: HWND,
+    sgi_format: Combo,
     cd_layout_caption: HWND,
     cd_layout: Combo,
     cd_name_caption: HWND,
@@ -157,6 +159,8 @@ impl DiskStep {
             system_clear: ui::button(page, "Clear", ids::SYSTEM_DISK_CLEAR),
             sgi_caption: ui::cell_label(page, "EFS label:"),
             sgi_label: ui::edit(page, ids::SGI_LABEL),
+            sgi_format_caption: ui::cell_label(page, &format!("{}:", labels::SGI_FORMAT)),
+            sgi_format: Combo::build(page, ids::SGI_FORMAT, &labels::SGI_FORMATS),
             cd_layout_caption: ui::cell_label(page, &format!("{}:", labels::CD_LAYOUT)),
             cd_layout: Combo::build(page, ids::CD_LAYOUT, &layouts),
             cd_name_caption: ui::cell_label(page, "Volume name:"),
@@ -537,10 +541,16 @@ impl BuildScreen {
             ),
         );
         let sgi = preset && p.kind == PresetKind::SgiEfs;
-        for h in [d.sgi_caption, d.sgi_label] {
+        for h in [
+            d.sgi_caption,
+            d.sgi_label,
+            d.sgi_format_caption,
+            d.sgi_format.h,
+        ] {
             ui::set_visible(h, sgi);
         }
         set_field(d.sgi_label, &p.sgi_label);
+        d.sgi_format.select(usize::from(p.sgi_label_only));
 
         let c = ctrl.cd();
         for h in [
@@ -668,6 +678,7 @@ impl BuildScreen {
             d.preset.h,
             d.x68k_scsi.h,
             d.sgi_label,
+            d.sgi_format.h,
             d.cd_layout.h,
             self.review,
             self.warnings,
@@ -765,6 +776,7 @@ impl BuildScreen {
         }
         if shown(d.sgi_label) {
             col.push(pair(d.sgi_caption, fixed(d.sgi_label, 120)));
+            col.push(pair(d.sgi_format_caption, fixed(d.sgi_format.h, 220)));
         }
         if shown(d.cd_layout.h) {
             col.push(pair(d.cd_layout_caption, fixed(d.cd_layout.h, 360)));
@@ -927,6 +939,10 @@ impl BuildScreen {
         if from == d.x68k_scsi.h {
             let scsi = d.x68k_scsi.picked()? == 1;
             return Some(self.preset_edit(|p| p.x68k_scsi = scsi));
+        }
+        if from == d.sgi_format.h {
+            let only = d.sgi_format.picked()? == 1;
+            return Some(self.preset_edit(|p| p.sgi_label_only = only));
         }
         if from == d.cd_layout.h {
             let layout = *CdLayout::ALL.get(d.cd_layout.picked()?)?;

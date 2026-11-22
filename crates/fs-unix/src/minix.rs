@@ -205,6 +205,17 @@ impl MinixSuperblock {
                  block_size={block_size})"
             )));
         }
+        // As Linux's minix_fill_super: bitmaps too small to cover every inode and zone are refused.
+        let bits = block_size as u64 * 8;
+        if (imap_blocks as u64) < (ninodes as u64 + 1).div_ceil(bits)
+            || (zmap_blocks as u64) < (zones as u64 - firstdatazone as u64 + 1).div_ceil(bits)
+        {
+            return Err(FilesystemError::InvalidData(format!(
+                "Minix bitmaps too small (imap={imap_blocks} for {ninodes} inodes, \
+                 zmap={zmap_blocks} for {} zones)",
+                zones - firstdatazone
+            )));
+        }
 
         Ok(MinixSuperblock {
             version,
@@ -998,6 +1009,9 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
     }
 
     fn free_inode(&mut self, ino: u32) -> Result<(), FilesystemError> {
+        if ino == 0 || ino > self.sb.ninodes {
+            return Ok(());
+        }
         self.set_bitmap_bit(self.imap_start(), ino as usize, false)
     }
 
@@ -1041,6 +1055,29 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
         data: &mut dyn Read,
         len: u64,
     ) -> Result<(), FilesystemError> {
+        // i_size is 32 bits: a larger file would be recorded as its size mod 4 GiB.
+        if len > u32::MAX as u64 {
+            return Err(FilesystemError::Unsupported(format!(
+                "Minix files stop at 4 GiB; this one is {len} bytes"
+            )));
+        }
+        let mut taken = Vec::new();
+        let result = self.write_file_data_into(inode, data, len, &mut taken);
+        if result.is_err() {
+            for z in taken {
+                let _ = self.free_zone(z);
+            }
+        }
+        result
+    }
+
+    fn write_file_data_into(
+        &mut self,
+        inode: &mut MinixInode,
+        data: &mut dyn Read,
+        len: u64,
+        taken: &mut Vec<u32>,
+    ) -> Result<(), FilesystemError> {
         let zs = self.sb.zone_size() as usize;
         let nzones = (len as usize).div_ceil(zs);
         let mut data_zones = Vec::with_capacity(nzones);
@@ -1050,18 +1087,23 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
             let mut buf = vec![0u8; zs];
             data.read_exact(&mut buf[..take])?;
             let z = self.alloc_zone()?;
+            taken.push(z);
             self.write_zone(z, &buf)?;
             data_zones.push(z);
             remaining -= take;
         }
-        inode.zones = self.build_zone_tree(&data_zones)?;
+        inode.zones = self.build_zone_tree(&data_zones, taken)?;
         inode.size = len as u32;
         Ok(())
     }
 
     /// Build an inode's zone array from a flat list of data zones, writing
     /// indirect blocks as needed.
-    fn build_zone_tree(&mut self, data_zones: &[u32]) -> Result<[u32; 10], FilesystemError> {
+    fn build_zone_tree(
+        &mut self,
+        data_zones: &[u32],
+        taken: &mut Vec<u32>,
+    ) -> Result<[u32; 10], FilesystemError> {
         let mut slots = [0u32; 10];
         let mut idx = 0usize;
         while idx < DIRECT_ZONES && idx < data_zones.len() {
@@ -1078,7 +1120,7 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
                     "file too large for Minix indirection".into(),
                 ));
             }
-            slots[slot] = self.build_indirect(level, data_zones, &mut idx)?;
+            slots[slot] = self.build_indirect(level, data_zones, &mut idx, taken)?;
         }
         if idx < data_zones.len() {
             return Err(FilesystemError::DiskFull(
@@ -1095,8 +1137,10 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
         level: u32,
         data_zones: &[u32],
         idx: &mut usize,
+        taken: &mut Vec<u32>,
     ) -> Result<u32, FilesystemError> {
         let zone = self.alloc_zone()?;
+        taken.push(zone);
         let per = self.sb.ptrs_per_zone() as usize;
         let mut block = vec![0u8; self.sb.zone_size() as usize];
         for i in 0..per {
@@ -1108,7 +1152,7 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
                 *idx += 1;
                 z
             } else {
-                self.build_indirect(level - 1, data_zones, idx)?
+                self.build_indirect(level - 1, data_zones, idx, taken)?
             };
             self.write_ptr(&mut block, i, child);
         }
@@ -1277,6 +1321,44 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
 
     /// Remove `name` from `dir` by zeroing its dirent's inode field (Minix
     /// leaves the slot as a hole). Returns the removed child inode.
+    /// Rewrite the name of `name`'s slot in place, returning its inode: fixed-size dirents
+    /// make a rename one write, with no moment where the inode has no name.
+    fn dir_rename_slot(
+        &mut self,
+        dir: &MinixInode,
+        name: &[u8],
+        new_name: &[u8],
+    ) -> Result<u32, FilesystemError> {
+        let stride = self.sb.dir_entry_size;
+        let ino_field = self.ino_field();
+        let zs = self.sb.zone_size() as usize;
+        if new_name.len() > stride - ino_field {
+            return Err(FilesystemError::InvalidData("Minix: name too long".into()));
+        }
+        let data = self.read_inode_data(dir, dir.size as usize)?;
+        let mut off = 0;
+        while off + stride <= data.len() {
+            let ino = dirent_ino(&data[off..], ino_field);
+            if ino != 0 {
+                let nb = &data[off + ino_field..off + stride];
+                let end = nb.iter().position(|&b| b == 0).unwrap_or(nb.len());
+                if &nb[..end] == name {
+                    let mut walk = dir.clone();
+                    let phys = self.dir_zone(&mut walk, off / zs, false)?;
+                    let mut field = vec![0u8; stride - ino_field];
+                    field[..new_name.len()].copy_from_slice(new_name);
+                    let at = phys as u64 * zs as u64 + (off % zs + ino_field) as u64;
+                    self.write_at(at, &field)?;
+                    return Ok(ino);
+                }
+            }
+            off += stride;
+        }
+        Err(FilesystemError::NotFound(
+            String::from_utf8_lossy(name).into_owned(),
+        ))
+    }
+
     fn dir_remove(&mut self, dir: &MinixInode, name: &[u8]) -> Result<u32, FilesystemError> {
         let stride = self.sb.dir_entry_size;
         let ino_field = self.ino_field();
@@ -1407,6 +1489,15 @@ pub fn write_blank_minix_into<W: Write + Seek>(
         ));
     }
 
+    // These superblock fields are 16 bits on every version: a volume needing more cannot be
+    // described, and a truncated value would put data over the inode table (UNX-013).
+    if imap_blocks > 0xFFFF || zmap_blocks > 0xFFFF || firstdatazone > 0xFFFF {
+        return Err(FilesystemError::Unsupported(format!(
+            "a Minix volume this size needs {imap_blocks} / {zmap_blocks} map blocks and data at \
+             zone {firstdatazone}, past the 16-bit superblock fields"
+        )));
+    }
+
     let (magic, name_len) = blank_magic(version);
     let dir_entry_size = if version == MinixVersion::V3 {
         4 + name_len
@@ -1532,6 +1623,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
             return Err(FilesystemError::AlreadyExists(name.into()));
         }
 
+        if data_len > u32::MAX as u64 {
+            return Err(FilesystemError::Unsupported(format!(
+                "Minix files stop at 4 GiB; this one is {data_len} bytes"
+            )));
+        }
         let inum = self.alloc_inode()?;
         let mut ino = MinixInode::empty(inum);
         ino.mode = options.mode.map(|m| m as u16).unwrap_or(0o100644);
@@ -1540,18 +1636,24 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
         ino.gid = options.gid.unwrap_or(0) as u16;
         // Preserve source mtime on cross-fs copies; else stamp now.
         ino.mtime = disk_core::times::resolve_or_now(options.unix_times).mtime_or_now() as u32;
-        if options.skip_data_write {
-            ino.size = data_len as u32;
-        } else {
-            self.write_file_data(&mut ino, data, data_len)?;
+        let result = (|| {
+            if options.skip_data_write {
+                ino.size = data_len as u32;
+            } else {
+                self.write_file_data(&mut ino, data, data_len)?;
+            }
+            self.write_inode(&ino)?;
+            // Re-read the parent — dir_add may have grown it — link, write back.
+            let mut parent_inode = self.read_inode(parent_inum)?;
+            self.dir_add(&mut parent_inode, name.as_bytes(), inum)?;
+            self.write_inode(&parent_inode)
+        })();
+        // A failure gives back the inode and whatever zones the file got.
+        if let Err(e) = result {
+            let _ = self.free_inode_zones(&ino);
+            let _ = self.free_inode(inum);
+            return Err(e);
         }
-        self.write_inode(&ino)?;
-
-        // Re-read the parent — dir_add may have grown it — link, write back.
-        let mut parent_inode = self.read_inode(parent_inum)?;
-        self.dir_add(&mut parent_inode, name.as_bytes(), inum)?;
-        self.write_inode(&parent_inode)?;
-
         Ok(self.entry_from_inode(name, &parent.path, &ino))
     }
 
@@ -1736,18 +1838,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
         if self.dir_find(&parent_inode, new_name.as_bytes())?.is_some() {
             return Err(FilesystemError::AlreadyExists(new_name.into()));
         }
-        // Fixed-size dirents: remove the old entry (leaves a free slot) and add
-        // the new name pointing at the same inode. Identity/data untouched.
-        let removed = self.dir_remove(&parent_inode, entry.name.as_bytes())?;
-        if removed != entry.location as u32 {
+        // Check the slot names the entry first, then rename it where it sits.
+        if self.dir_find(&parent_inode, entry.name.as_bytes())? != Some(entry.location as u32) {
             return Err(FilesystemError::InvalidData(format!(
-                "Minix rename: dirent inode {removed} != entry inode {}",
-                entry.location
+                "Minix rename: {} is not inode {}",
+                entry.name, entry.location
             )));
         }
-        let mut parent_inode = self.read_inode(parent_inum)?;
-        self.dir_add(&mut parent_inode, new_name.as_bytes(), removed)?;
-        self.write_inode(&parent_inode)?;
+        self.dir_rename_slot(&parent_inode, entry.name.as_bytes(), new_name.as_bytes())?;
         Ok(())
     }
 

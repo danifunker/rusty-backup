@@ -281,7 +281,13 @@ fn rebuild_vhd_ebr_chain(
     let last_end_lba = next_lba;
     let new_extended_total_sectors = last_end_lba - extended_start_lba;
 
-    let ebr_sectors = build_ebr_chain(extended_start_lba, &logical_infos);
+    let ebr_sectors = match build_ebr_chain(extended_start_lba, &logical_infos) {
+        Ok(v) => v,
+        Err(e) => {
+            log_cb(&format!("Warning: could not rebuild the EBR chain: {e}"));
+            return None;
+        }
+    };
     log_cb(&format!(
         "Rebuilt {} EBR sector(s) for logical partitions (extended container at LBA {}, new total_sectors {})",
         ebr_sectors.len(),
@@ -383,7 +389,7 @@ pub fn export_whole_disk_vhd(
         let mut reader: super::BoxReadSeek =
             if crate::model::source_reader::is_gho_path(source_path) {
                 let mut gho = dsk_ghost::gho::GhoReader::open(source_path)?;
-                gho.prepare_full_image();
+                gho.prepare_full_image()?;
                 Box::new(gho)
             } else {
                 crate::model::source_reader::open_read(source_path)?
@@ -618,7 +624,7 @@ pub fn export_whole_disk_vhd(
             reader
                 .read_exact(&mut mbr_buf)
                 .context("failed to read MBR from source")?;
-            patch_mbr_entries(&mut mbr_buf, partition_sizes);
+            patch_mbr_entries(&mut mbr_buf, partition_sizes).context("patching the MBR")?;
 
             // Build repacked EBR chain before writing so we know new positions.
             let ebr_result =
@@ -929,7 +935,7 @@ pub fn export_clonezilla_disk_vhd(
     // Write MBR
     let mut mbr_buf = cz_image.mbr_bytes;
     if !partition_sizes.is_empty() {
-        patch_mbr_entries(&mut mbr_buf, partition_sizes);
+        patch_mbr_entries(&mut mbr_buf, partition_sizes).context("patching the MBR")?;
         log_cb("Patched MBR partition table with export sizes");
     }
     file.write_all(&mbr_buf).context("failed to write MBR")?;

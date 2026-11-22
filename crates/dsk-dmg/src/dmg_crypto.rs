@@ -243,8 +243,11 @@ impl CryptoContext {
         let data_len = be64(header, 0x38);
         let data_offset = be64(header, 0x40);
         let key_count = be32(header, 0x48);
-        if block_size == 0 || !block_size.is_multiple_of(16) {
+        if block_size == 0 || !block_size.is_multiple_of(16) || block_size > 1 << 20 {
             bail!("invalid encrcdsa block size {block_size}");
+        }
+        if data_offset.checked_add(data_len).is_none() {
+            bail!("encrcdsa data range {data_offset}+{data_len} overflows");
         }
 
         // Walk the key-item descriptors for a passphrase-direct entry (type 1).
@@ -264,7 +267,7 @@ impl CryptoContext {
         let b = blob_off.ok_or_else(|| {
             anyhow!("encrypted image has no passphrase key (certificate/keybag-only unlock)")
         })?;
-        if b + 0x68 > header.len() {
+        if !matches!(b.checked_add(0x68), Some(end) if end <= header.len()) {
             bail!("encrcdsa passphrase blob is truncated");
         }
 
@@ -276,8 +279,16 @@ impl CryptoContext {
         let wrap_key_bits = be32(header, b + 0x54) as usize;
         let wrap_alg = be32(header, b + 0x58);
         let enc_blob_len = be32(header, b + 0x64) as usize;
-        if b + 0x68 + enc_blob_len > header.len() {
+        if !matches!((b + 0x68).checked_add(enc_blob_len), Some(end) if end <= header.len()) {
             bail!("encrcdsa key blob length {enc_blob_len} exceeds header");
+        }
+        // The wrap key comes from a 32-byte PBKDF2 output; AES and 3DES keys are 128-256 bits.
+        if !matches!(wrap_key_bits, 128 | 192 | 256) || !matches!(key_bits, 128 | 192 | 256) {
+            bail!("encrcdsa key sizes {wrap_key_bits}/{key_bits} bits are not AES/3DES sizes");
+        }
+        // macOS uses a few hundred thousand rounds; a huge count would hang the unlock.
+        if iterations == 0 || iterations > 10_000_000 {
+            bail!("encrcdsa PBKDF2 iteration count {iterations} is out of range");
         }
         let mut blob = header[b + 0x68..b + 0x68 + enc_blob_len].to_vec();
 

@@ -144,6 +144,17 @@ impl LisaFilesystem {
             ));
         }
 
+        // The sizes come from the header: the file must hold them before we allocate (MAC-015).
+        let here = reader.stream_position().map_err(FilesystemError::Io)?;
+        let end = reader.seek(SeekFrom::End(0)).map_err(FilesystemError::Io)?;
+        reader
+            .seek(SeekFrom::Start(here))
+            .map_err(FilesystemError::Io)?;
+        if (data_size as u64).saturating_add(header.tag_size as u64) > end.saturating_sub(here) {
+            return Err(FilesystemError::Parse(
+                "DiskCopy header sizes run past the file".into(),
+            ));
+        }
         let mut data = vec![0u8; data_size];
         reader.read_exact(&mut data).map_err(FilesystemError::Io)?;
         let mut tags = vec![0u8; numblocks * TAG_SIZE];

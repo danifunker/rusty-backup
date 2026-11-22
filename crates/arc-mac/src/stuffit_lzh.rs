@@ -26,6 +26,8 @@ pub(crate) struct BitReader<'a> {
     pos: usize,
     buf: u64,
     nbits: u32,
+    /// Bits handed out past the end of the input, as zeros.
+    overrun: u64,
 }
 
 impl<'a> BitReader<'a> {
@@ -35,6 +37,7 @@ impl<'a> BitReader<'a> {
             pos: 0,
             buf: 0,
             nbits: 0,
+            overrun: 0,
         }
     }
 
@@ -50,6 +53,7 @@ impl<'a> BitReader<'a> {
         if self.nbits == 0 {
             self.fill();
             if self.nbits == 0 {
+                self.overrun += 1;
                 return 0; // past EOF: pad with zeros
             }
         }
@@ -68,6 +72,7 @@ impl<'a> BitReader<'a> {
             self.fill();
         }
         let take = n.min(self.nbits);
+        self.overrun += (n - take) as u64;
         let mask = if take >= 32 {
             u32::MAX
         } else {
@@ -77,6 +82,11 @@ impl<'a> BitReader<'a> {
         self.buf >>= take;
         self.nbits -= take;
         val
+    }
+
+    /// True once the decoder has read well past the input: a stream that ends short.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.overrun > 64
     }
 
     /// Drop the rest of a partly read byte; the buffer only ever holds whole bytes.
@@ -255,13 +265,17 @@ pub fn decompress(comp: &[u8], want: usize) -> Result<Vec<u8>> {
     };
 
     let mut window = vec![0u8; WINDOW_SIZE];
-    let mut out = Vec::with_capacity(want);
+    // The header's size is only a claim: don't reserve it, and stop if the input runs out.
+    let mut out = Vec::with_capacity(want.min(1 << 24));
     let mut pos: usize = 0;
     let mut match_len: usize = 0;
     let mut match_off: usize = 0;
     let mut use_first = true;
 
     while out.len() < want {
+        if br.exhausted() {
+            bail!("StuffIt method 13: the stream ends before its {want} bytes");
+        }
         if match_len == 0 {
             let curr = if use_first {
                 &firstcode

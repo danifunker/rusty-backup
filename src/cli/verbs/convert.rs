@@ -33,9 +33,10 @@ pub struct ConvertArgs {
 
     /// Output format, for every kind that offers it: raw, vhd, vhd-dynamic, qcow2, vmdk-flat,
     /// vmdk-sparse, 2mg, chd (hard disks); raw, 2mg, woz, moof, dc42, xdf, hdm, dim, d88
-    /// (floppies); chd-cd, chd-dvd, bincue, iso (discs).
-    #[arg(long, default_value = "chd")]
-    pub format: String,
+    /// (floppies); chd-cd, chd-dvd, bincue, iso (discs). Default chd. A single floppy-sized file
+    /// named with a hard-disk format is converted as a hard disk.
+    #[arg(long)]
+    pub format: Option<String>,
 
     /// The floppies' format, overriding --format for them.
     #[arg(long = "floppy-to")]
@@ -91,7 +92,8 @@ fn format_arg(id: &str) -> Result<Format> {
 }
 
 pub fn run(args: ConvertArgs) -> Result<()> {
-    let format = format_arg(args.format.as_str())?;
+    let explicit = args.format.is_some();
+    let format = format_arg(args.format.as_deref().unwrap_or("chd"))?;
     let floppy_to = args.floppy_to.as_deref().map(format_arg).transpose()?;
     let disc_to = args.disc_to.as_deref().map(format_arg).transpose()?;
     let sizing = Sizing::parse(args.size.as_str()).map_err(anyhow::Error::msg)?;
@@ -111,6 +113,16 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         bail!("{e}");
     }
 
+    // One floppy-sized file asked to go to a hard-disk format goes as a hard disk.
+    let hard_disk_only = !crate::controller::convert::formats_for(ImageKind::Floppy)
+        .contains(&format)
+        && crate::controller::convert::formats_for(ImageKind::HardDisk).contains(&format);
+    if explicit && floppy_to.is_none() && hard_disk_only && !ctl.source_is_folder() {
+        let floppy = matches!(ctl.items().first().map(|i| &i.found), Some(Ok(c)) if c.kind == ImageKind::Floppy);
+        if floppy {
+            ctl.apply(ConvertAction::TreatAsHardDisk(0));
+        }
+    }
     for kind in ImageKind::ALL {
         let chosen = match kind {
             ImageKind::Floppy => floppy_to,
@@ -122,6 +134,19 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 .contains(&format)
                 .then_some(format)
         });
+        let present = ctl
+            .items()
+            .iter()
+            .any(|i| matches!(&i.found, Ok(c) if c.kind == kind));
+        if explicit && pick.is_none() && present && kind != ImageKind::HardDisk {
+            eprintln!(
+                "Warning: {} is not a {} format; those go to {} (choose with --{}-to)",
+                format.label(),
+                kind.label().to_ascii_lowercase(),
+                kind.default_format().label(),
+                kind.label().to_ascii_lowercase()
+            );
+        }
         if let Some(f) = pick {
             if let Some(why) = f.unavailable() {
                 bail!("{}: {why}", f.label());

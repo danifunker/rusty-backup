@@ -708,7 +708,30 @@ pub fn build_restore_ebr_chain(
     metadata: &BackupMetadata,
     overrides: &[PartitionSizeOverride],
     mbr_bytes: Option<&[u8; 512]>,
-) -> Option<EbrChainResult> {
+) -> anyhow::Result<Option<EbrChainResult>> {
+    let Some((extended_start_lba, logical_infos, logical_starts)) =
+        plan_restore_ebr_chain(metadata, overrides, mbr_bytes)
+    else {
+        return Ok(None);
+    };
+    // A chain that cannot be placed stops the restore; dropping it would lose every logical partition.
+    let ebr_sectors = build_ebr_chain(extended_start_lba, &logical_infos)
+        .context("rebuilding the EBR chain for the logical partitions")?;
+    Ok(Some(EbrChainResult {
+        extended_start_lba,
+        ebr_sectors,
+        logical_starts,
+    }))
+}
+
+type EbrPlan = (u32, Vec<LogicalPartitionInfo>, Vec<(usize, u64)>);
+
+/// Where each logical partition goes, or `None` when the source has no extended partition.
+fn plan_restore_ebr_chain(
+    metadata: &BackupMetadata,
+    overrides: &[PartitionSizeOverride],
+    mbr_bytes: Option<&[u8; 512]>,
+) -> Option<EbrPlan> {
     // Determine the extended container start LBA.
     // Priority: metadata field → MBR parse → give up.
     let extended_start_lba: u32 = if let Some(ext) = &metadata.extended_container {
@@ -789,12 +812,7 @@ pub fn build_restore_ebr_chain(
         });
     }
 
-    let ebr_sectors = build_ebr_chain(extended_start_lba, &logical_infos);
-    Some(EbrChainResult {
-        extended_start_lba,
-        ebr_sectors,
-        logical_starts,
-    })
+    Some((extended_start_lba, logical_infos, logical_starts))
 }
 
 /// Infer MBR partition type byte from a human-readable type name.
@@ -1822,9 +1840,16 @@ fn run_single_file_chd_restore_resize(
                 .with_context(|| format!("failed to open {}", apm_path.display()))?,
         )
         .context("failed to parse apm.json")?;
-        let block_size = apm.ddr.block_size as u64;
-        let target_blocks = (config.target_size / block_size) as u32;
-        let patched = apm.patch_for_restore(&overrides, target_blocks);
+        // A zero block size in an apm.json written before part-tables 0.2 means 512, as the parser now reads it.
+        let block_size = match apm.ddr.block_size {
+            0 => 512,
+            n => n as u64,
+        };
+        let target_blocks = u32::try_from(config.target_size / block_size)
+            .context("the target has more APM blocks than a 32-bit count can hold")?;
+        let patched = apm
+            .patch_for_restore(&overrides, target_blocks)
+            .context("patching the APM")?;
         let blocks = patched.build_apm_blocks(Some(target_blocks));
         target
             .write_all(&blocks)
@@ -1842,7 +1867,7 @@ fn run_single_file_chd_restore_resize(
         image
             .read_exact(&mut mbr)
             .context("failed to read the MBR from the disk image")?;
-        patch_mbr_entries(&mut mbr, &overrides);
+        patch_mbr_entries(&mut mbr, &overrides).context("patching the MBR")?;
         for index in part_tables::mbr::clear_orphan_entries_overlapping(&mut mbr, &overrides) {
             log(
                 &progress,
@@ -1862,7 +1887,7 @@ fn run_single_file_chd_restore_resize(
         // approach: build the chain, repatch the MBR's extended-container
         // total_sectors to match, then write the EBR sectors after the
         // partition table.
-        ebr_result = build_restore_ebr_chain(metadata, &overrides, Some(&mbr));
+        ebr_result = build_restore_ebr_chain(metadata, &overrides, Some(&mbr))?;
         if let Some(ref result) = ebr_result {
             let extended_start = result.extended_start_lba as u64;
             let last_end_lba = result
@@ -2371,7 +2396,8 @@ fn clonezilla_ebr_layout(
     Some(ClonezillaEbrLayout {
         ext_start,
         ext_sectors,
-        ebr_sectors: build_ebr_chain(ext_start, &infos),
+        // None makes the caller keep the image's own chain, as for any layout it cannot rebuild.
+        ebr_sectors: build_ebr_chain(ext_start, &infos).ok()?,
     })
 }
 
@@ -2826,7 +2852,7 @@ fn write_clonezilla_disk(
         // MBR restore
         let mut mbr_buf = cz_image.mbr_bytes;
         if !overrides.is_empty() {
-            patch_mbr_entries(&mut mbr_buf, overrides);
+            patch_mbr_entries(&mut mbr_buf, overrides).context("patching the MBR")?;
             log(progress, LogLevel::Info, "Patched MBR partition table");
         }
         if let Some(ref layout) = ebr_layout {
@@ -3433,7 +3459,7 @@ mod tests {
             mbr[off + 8..off + 12].copy_from_slice(&start.to_le_bytes());
             mbr[off + 12..off + 16].copy_from_slice(&sectors.to_le_bytes());
         }
-        patch_mbr_entries(&mut mbr, &overrides);
+        patch_mbr_entries(&mut mbr, &overrides).unwrap();
         let cleared = part_tables::mbr::clear_orphan_entries_overlapping(&mut mbr, &overrides);
         assert_eq!(cleared, vec![1]);
         let entries: Vec<(u64, u64)> = (0..4)
@@ -4298,7 +4324,8 @@ mod tests {
                     partition_type: 0x83,
                 },
             ],
-        );
+        )
+        .unwrap();
         for (offset, sector) in &ebrs {
             data[*offset as usize..*offset as usize + 512].copy_from_slice(sector);
         }

@@ -19,15 +19,12 @@
 //!   itself) terminated by a record header. Wired into the GUI via
 //!   `prepare_disk_image_path`.
 //!
-//!   **File-aware mode is deferred.** Despite the plan ordering SECTOR
-//!   after file-aware, the fixture corpus showed SECTOR mode is the path
-//!   that yields a mountable disk image with modest effort, while
-//!   file-aware mode interleaves boot-sector / FAT-entry / directory /
-//!   file-extent metadata records (types 0x0017, 0x0004, 0x0102/3/4)
-//!   with 0x0002 cluster-data records and needs a full filesystem
-//!   rebuilder. The walker (`parse_gho_image`) + `decode_data_blocks_to`
-//!   are kept as scaffolding for that future slice.
-//! - **5.6-span (this commit):** **multi-file span sets.**
+//!   **File-aware mode** (boot-sector / FAT-entry / directory / file-extent
+//!   metadata records, types 0x0017, 0x0004, 0x0102/3/4, interleaved with
+//!   0x0002 cluster-data records) is rebuilt as well: `parse_gho_image`
+//!   walks the stream, and [`GhoReader`] lays each partition out at its
+//!   place behind a synthesized partition table.
+//! - **5.6-span:** **multi-file span sets.**
 //!   `discover_gho_span_set(picked)` walks the picked file's directory
 //!   and returns the ordered set (primary + numbered spans), handling
 //!   three corpus naming patterns: stem-prefix `.GHS` siblings (incl.
@@ -37,7 +34,8 @@
 //!   skipped on every continuation — so SECTOR-mode decode reads one
 //!   continuous stream. The user can pick the primary OR any span
 //!   sibling and the whole set decodes.
-//! - **next:** file-aware filesystem reconstruction; password decrypt.
+//! - **Passwords:** `gho_crypto` derives and checks the seed; the readers
+//!   decrypt per record body (file-aware) or per 32 KiB chunk (SECTOR).
 //!
 //! Layout reverse-engineered from our own fixture corpus (12+ files
 //! spanning Ghost 7.5 and 11.5, with every combination of compression /
@@ -338,17 +336,8 @@ pub fn format_gho_info(path: &Path) -> Result<String> {
 
 /// Materialize a Norton Ghost backup into a raw disk image temp file.
 ///
-/// **Session 5.5a scope**: parses the container header and returns precise
-/// errors for cases not yet supported (password-protected, SECTOR mode,
-/// multi-partition disk reconstruction, unknown container version).
-///
-/// Single-partition file-aware backups decode end-to-end here: the inner
-/// record stream walker finds the lone partition, its block-stream is
-/// decompressed (none / Fast-LZ / zlib) into a fresh tempdir, and the
-/// resulting raw partition image is returned via [`GhoMaterialized`].
-/// Multi-partition full-disk reconstruction (placing each decoded
-/// partition at its MBR-declared LBA) is the next slice — until then we
-/// return a precise error pointing at the deferred session.
+/// SECTOR and file-aware backups, single- or multi-partition, decode into a
+/// fresh tempdir; an unknown container version or a missing password is an error.
 pub fn materialize_gho_to_temp(path: &Path) -> Result<GhoMaterialized> {
     materialize_gho_to_temp_with_password(path, None)
 }
@@ -619,6 +608,13 @@ fn strip_trailing_numeric(s: &str) -> &str {
     &s[..end]
 }
 
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 fn gather_ghs_siblings(
     dir: &Path,
     logical_prefix: &str,
@@ -662,17 +658,13 @@ fn gather_ghs_siblings(
         }
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let stem_prefix = strip_trailing_numeric(stem).to_ascii_lowercase();
-        let matches_any = prefixes
-            .iter()
-            .any(|p| stem_prefix == *p || (!p.is_empty() && stem_prefix.starts_with(p)));
-        if !matches_any {
+        // Exact match only: `backup` must not pull in `backupold001.ghs` from another image.
+        if !prefixes.contains(&stem_prefix) {
             continue;
         }
         if ext == "gho" {
-            // Prefer the picked file as primary if it is the .GHO; otherwise
-            // first .GHO wins. (Either way, a .GHO acts as primary; spans
-            // are .GHS.)
-            if primary.is_none() || entry.path() == picked {
+            // The picked .GHO is the primary; otherwise the first one found.
+            if primary.is_none() || same_path(&entry.path(), picked) {
                 primary = Some(entry.path());
             }
         } else {
@@ -681,6 +673,31 @@ fn gather_ghs_siblings(
         }
     }
     spans.sort_by(|a, b| a.0.cmp(&b.0));
+    // Spans are numbered 001, 002, ...: a gap means a missing piece, and reading on would
+    // serve the next span's bytes in its place.
+    for (i, (name, _)) in spans.iter().enumerate() {
+        let stem = Path::new(name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let digits: String = stem
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if let Ok(n) = digits.parse::<usize>() {
+            if n != i + 1 {
+                bail!(
+                    "Ghost span {} is missing from {} (found {name})",
+                    i + 1,
+                    dir.display()
+                );
+            }
+        }
+    }
 
     let mut out = Vec::new();
     if let Some(p) = primary {
@@ -692,7 +709,7 @@ fn gather_ghs_siblings(
     }
     for (_, p) in spans {
         // Don't double-include the picked file.
-        if out.first().map(|x| x.as_path()) != Some(p.as_path()) {
+        if !out.first().is_some_and(|x| same_path(x, &p)) {
             out.push(p);
         }
     }
@@ -1245,6 +1262,8 @@ fn decode_sector_block_stream<R: Read + Seek, W: Write>(
 // non-final block ever decompresses to a different size.
 
 const GHO_BLOCK_DECOMPRESSED_SIZE: usize = FAST_LZ_BLOCK_SIZE; // 32 KiB
+/// The most one zlib block may inflate to before the scanner treats it as a false start.
+const GHO_MAX_INFLATE: u64 = (FAST_LZ_BLOCK_SIZE + 1024) as u64;
 
 #[derive(Debug, Clone)]
 struct GhoBlockEntry {
@@ -1281,7 +1300,7 @@ pub struct GhoReader {
 struct FileAwarePartition {
     disk_offset: u64,
     image: VirtualFatImage,
-    cluster_cache: Option<(u32, Vec<u8>)>,
+    cluster_cache: ClusterCache,
 }
 
 // Exactly one GhoReaderMode exists per GhoReader, moved by value only once at
@@ -1529,7 +1548,7 @@ impl GhoReader {
                         partitions: vec![FileAwarePartition {
                             disk_offset: 0,
                             image: virtual_image,
-                            cluster_cache: None,
+                            cluster_cache: ClusterCache::default(),
                         }],
                         compression: header.compression,
                         mbr: [0u8; 512],
@@ -1541,14 +1560,8 @@ impl GhoReader {
             // Multi-partition: resolve absolute offsets, then build
             // one VirtualFatImage per partition.
             resolve_absolute_offsets(&mut slices);
-            let mbr = synthesize_mbr(&slices);
-            let primary_end = slices[0].hidden_sectors + slices[0].partition_size / 512;
-            let ext_slices: Vec<GhoPartitionSlice> = slices[1..].to_vec();
-            let ebrs = if !ext_slices.is_empty() {
-                synthesize_ebrs(&ext_slices, primary_end)
-            } else {
-                std::collections::HashMap::new()
-            };
+            let mut ebrs = synthesize_partition_table(&slices)?;
+            let mbr = ebrs.remove(&0).expect("the table has an MBR");
 
             log::info!(
                 "Reconstructing {} partitions from sparsely populated Ghost image...",
@@ -1602,7 +1615,7 @@ impl GhoReader {
                 fa_parts.push(FileAwarePartition {
                     disk_offset,
                     image: virtual_image,
-                    cluster_cache: None,
+                    cluster_cache: ClusterCache::default(),
                 });
             }
 
@@ -1729,6 +1742,17 @@ impl GhoReader {
                                 blocks[end - 1].decompressed_len = n as u32;
                                 break;
                             }
+                            // A read failing is the image, not trailer padding (which may run
+                            // off the end of the file).
+                            Err(e)
+                                if e.chain().any(|c| {
+                                    c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                                        io.kind() != std::io::ErrorKind::UnexpectedEof
+                                    })
+                                }) =>
+                            {
+                                return Err(e);
+                            }
                             Err(_) => {
                                 end -= 1;
                             }
@@ -1748,22 +1772,7 @@ impl GhoReader {
                     let first = &blocks[range.start];
                     let n = decode_block_into(&mut inner, first, header.compression, &mut tmp)?;
                     if n >= 64 {
-                        let bpb = &tmp[..n];
-                        let bps = u16::from_le_bytes([bpb[11], bpb[12]]) as u64;
-                        let hidden =
-                            u32::from_le_bytes([bpb[28], bpb[29], bpb[30], bpb[31]]) as u64;
-                        let tot16 = u16::from_le_bytes([bpb[19], bpb[20]]) as u64;
-                        let tot32 = u32::from_le_bytes([bpb[32], bpb[33], bpb[34], bpb[35]]) as u64;
-                        let total = if tot16 != 0 { tot16 } else { tot32 };
-                        let fs = if n >= 90 && &bpb[82..87] == b"FAT32" {
-                            "FAT32"
-                        } else if n >= 62 && &bpb[54..59] == b"FAT16" {
-                            "FAT16"
-                        } else {
-                            "Unknown"
-                        };
-                        let size = total * bps.max(512);
-                        part_infos.push((hidden, size, fs.to_string()));
+                        part_infos.push(vbr_geometry(&tmp[..n]));
                     } else {
                         part_infos.push((0, 0, "Unknown".to_string()));
                     }
@@ -1805,6 +1814,16 @@ impl GhoReader {
                     part_infos[i].0 = *abs;
                 }
 
+                // Only blocks inside a partition range got their offsets placed; the trimmed
+                // ones keep stale ones and would break the binary search (GHO-003).
+                let mut kept: Vec<GhoBlockEntry> = ranges
+                    .iter()
+                    .flat_map(|r| r.clone())
+                    .map(|i| blocks[i].clone())
+                    .collect();
+                kept.sort_by_key(|b| b.output_offset);
+                let blocks = kept;
+
                 // Synthesize MBR + EBRs. Filter out empty partitions.
                 let slices: Vec<GhoPartitionSlice> = part_infos
                     .iter()
@@ -1818,17 +1837,7 @@ impl GhoReader {
                         reserved_record_index: None,
                     })
                     .collect();
-                let mbr = synthesize_mbr(&slices);
-                let mut synth_sectors = std::collections::HashMap::new();
-                synth_sectors.insert(0u64, mbr);
-
-                if slices.len() > 1 {
-                    let primary_end = slices[0].hidden_sectors + slices[0].partition_size / 512;
-                    let ext_slices: Vec<GhoPartitionSlice> = slices[1..].to_vec();
-                    for (lba, ebr) in synthesize_ebrs(&ext_slices, primary_end) {
-                        synth_sectors.insert(lba, ebr);
-                    }
-                }
+                let synth_sectors = synthesize_partition_table(&slices)?;
 
                 let logical_size = max_end.max(512);
 
@@ -1899,18 +1908,21 @@ impl GhoReader {
         cache_buf.resize(GHO_BLOCK_DECOMPRESSED_SIZE + 1024, 0);
         let n = decode_block_into(&mut self.inner, block, *compression, cache_buf)
             .map_err(|e| disk_core::io_other(format!("GHO block {}: {:#}", idx, e)))?;
-        debug_assert_eq!(
-            n as u32, block.decompressed_len,
-            "block {} decompressed to {} bytes, index says {}",
-            idx, n, block.decompressed_len
-        );
+        // A block short of its indexed length would end the image early without a word.
+        if n as u32 != block.decompressed_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "GHO block {idx} decoded to {n} bytes, the index says {}",
+                    block.decompressed_len
+                ),
+            ));
+        }
         cache_buf.truncate(n);
         *cache_block_index = Some(idx);
         Ok(())
     }
 }
-
-unsafe impl Send for GhoReader {}
 
 impl Read for GhoReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -2044,18 +2056,18 @@ impl GhoReader {
     /// Export paths call this (via `open_source_reader`); inspect/browse don't,
     /// so they keep fast lazy opens (and serve VBR + zeros for `$Boot`, which is
     /// fine since they never need the boot code).
-    pub fn prepare_full_image(&mut self) {
+    pub fn prepare_full_image(&mut self) -> std::io::Result<()> {
         let GhoReaderMode::NtfsFileAware {
             index, compressed, ..
         } = &mut self.mode
         else {
-            return;
+            return Ok(());
         };
 
         // Complete the run index so $Bitmap and $Boot recovery see every run.
         if let Some(cs) = compressed.as_mut() {
             if cs.lazy_scan.is_some() {
-                extend_ntfs_compressed_index(&mut self.inner, index, cs, u64::MAX);
+                extend_ntfs_compressed_index(&mut self.inner, index, cs, u64::MAX)?;
             }
         }
 
@@ -2107,6 +2119,7 @@ impl GhoReader {
                 ntfs_scan_cache_store(&key, index, cs);
             }
         }
+        Ok(())
     }
 
     /// Mapped NTFS cluster runs as `(lcn_start, cluster_count)`, sorted by LCN.
@@ -2240,7 +2253,7 @@ fn read_partition_data_at(
     inner: &mut SpanReader,
     image: &VirtualFatImage,
     compression: GhoCompression,
-    cluster_cache: &mut Option<(u32, Vec<u8>)>,
+    cluster_cache: &mut ClusterCache,
     pos_in_part: u64,
     out: &mut [u8],
     to_read: usize,
@@ -2307,9 +2320,9 @@ fn ensure_cluster_decoded(
     file_id: u32,
     cluster_index_in_file: u32,
     cluster_id: u32,
-    cache: &mut Option<(u32, Vec<u8>)>,
+    cache: &mut ClusterCache,
 ) -> std::io::Result<Vec<u8>> {
-    if let Some((cached_id, cached_bytes)) = cache {
+    if let Some((cached_id, cached_bytes)) = &cache.last {
         if *cached_id == cluster_id {
             return Ok(cached_bytes.clone());
         }
@@ -2319,11 +2332,22 @@ fn ensure_cluster_decoded(
     let cluster_size = image.cluster_size as usize;
     let byte_in_file = cluster_index_in_file as u64 * image.cluster_size;
 
+    // Start at the last record known to begin at or before this cluster, not at the file's
+    // start: decoding from byte 0 on every miss made a large file quadratic (GHO-005).
+    let starts = cache
+        .record_starts
+        .entry(file_id)
+        .or_insert_with(|| vec![0]);
+    let k = match starts.binary_search(&byte_in_file) {
+        Ok(i) => i,
+        Err(i) => i - 1,
+    };
+    let first = starts[k];
     let mut content =
-        GhoFileContentReader::new(inner, file.records.clone(), compression, file.file_size);
+        GhoFileContentReader::new_at(inner, &file.records, compression, file.file_size, k, first);
 
     // Skip to the start of this cluster's bytes within the file.
-    let mut skip = byte_in_file;
+    let mut skip = byte_in_file - first;
     let mut sink = [0u8; 8192];
     while skip > 0 {
         let want = (skip as usize).min(sink.len());
@@ -2347,8 +2371,28 @@ fn ensure_cluster_decoded(
     out.truncate(filled.max(cluster_size).min(cluster_size));
     out.resize(cluster_size, 0);
 
-    *cache = Some((cluster_id, out.clone()));
+    // Remember where each record we just decoded starts, for the next miss.
+    let starts = cache
+        .record_starts
+        .get_mut(&file_id)
+        .expect("inserted above");
+    let mut at = first;
+    for (j, size) in content.record_sizes.iter().enumerate() {
+        at += *size as u64;
+        if k + j + 1 == starts.len() && k + j + 1 < file.records.len() {
+            starts.push(at);
+        }
+    }
+    cache.last = Some((cluster_id, out.clone()));
     Ok(out)
+}
+
+/// What file-aware reads remember between calls: the last cluster served, and per file the
+/// decoded byte offset of each record start found so far.
+#[derive(Default)]
+pub(crate) struct ClusterCache {
+    last: Option<(u32, Vec<u8>)>,
+    record_starts: std::collections::HashMap<u32, Vec<u64>>,
 }
 
 impl Seek for GhoReader {
@@ -3557,7 +3601,9 @@ pub fn parse_checksum_record_body(body: &[u8]) -> Result<u32> {
 /// over-spill if the source happened to pad).
 pub struct GhoFileContentReader<'a, R: Read + Seek> {
     reader: &'a mut R,
-    record_meta: Vec<(u64, u16)>, // (body_start, body_len) — type code is irrelevant for decode
+    record_meta: std::borrow::Cow<'a, [(u64, u16)]>, // (body_start, body_len)
+    /// Decoded size of each record read so far, from the first one this reader started at.
+    record_sizes: Vec<usize>,
     compression: GhoCompression,
     next_idx: usize,
     decoded: Vec<u8>,
@@ -3576,7 +3622,8 @@ impl<'a, R: Read + Seek> GhoFileContentReader<'a, R> {
     ) -> Self {
         Self {
             reader,
-            record_meta,
+            record_meta: std::borrow::Cow::Owned(record_meta),
+            record_sizes: Vec::new(),
             compression,
             next_idx: 0,
             decoded: vec![0u8; FAST_LZ_BLOCK_SIZE + 1024],
@@ -3587,8 +3634,31 @@ impl<'a, R: Read + Seek> GhoFileContentReader<'a, R> {
         }
     }
 
+    /// A reader over `records` that starts at record `start_idx`, `bytes_before` bytes into the file.
+    fn new_at(
+        reader: &'a mut R,
+        records: &'a [(u64, u16)],
+        compression: GhoCompression,
+        file_size: u64,
+        start_idx: usize,
+        bytes_before: u64,
+    ) -> Self {
+        let mut r = Self::new(reader, Vec::new(), compression, file_size);
+        r.record_meta = std::borrow::Cow::Borrowed(records);
+        r.next_idx = start_idx;
+        r.total_left = file_size.saturating_sub(bytes_before);
+        r
+    }
+
     fn fill_next(&mut self) -> std::io::Result<bool> {
         if self.next_idx >= self.record_meta.len() {
+            // Records ran out before the file did: the data is missing, not the file shorter.
+            if self.total_left > 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("GHO file data ends {} bytes short", self.total_left),
+                ));
+            }
             return Ok(false);
         }
         let (body_start, body_len) = self.record_meta[self.next_idx];
@@ -3600,6 +3670,9 @@ impl<'a, R: Read + Seek> GhoFileContentReader<'a, R> {
         self.reader.read_exact(body)?;
         let n = match self.compression {
             GhoCompression::None => {
+                if self.decoded.len() < body.len() {
+                    self.decoded.resize(body.len(), 0);
+                }
                 self.decoded[..body_len as usize].copy_from_slice(body);
                 body_len as usize
             }
@@ -3616,6 +3689,7 @@ impl<'a, R: Read + Seek> GhoFileContentReader<'a, R> {
         };
         self.pos = 0;
         self.end = n;
+        self.record_sizes.push(n);
         Ok(true)
     }
 }
@@ -3908,11 +3982,25 @@ fn build_virtual_fat_image(
 
     let root = fs.root().map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut stack: Vec<(u32, FileEntry)> = vec![(tree.root_cluster, root)];
+    // A directory that points back at an ancestor is emitted once, not nested until the volume fills.
+    let mut seen_dirs = std::collections::HashSet::new();
 
     let mut files: Vec<FileContentRef> = Vec::new();
     let mut cluster_to_file: HashMap<u32, (u32, u32)> = HashMap::new();
+    // Out of space means the derived layout is wrong, so the image can't be served whole.
+    let skip = |name: &str, e: disk_core::filesystem::FilesystemError| -> Result<()> {
+        if matches!(e, disk_core::filesystem::FilesystemError::DiskFull(_)) {
+            bail!("virtual FAT image ran out of space at {name}: {e}");
+        }
+        log::warn!("GHO: skipping {name}: {e}");
+        Ok(())
+    };
 
     while let Some((src_cluster, parent_entry)) = stack.pop() {
+        if !seen_dirs.insert(src_cluster) {
+            log::warn!("GHO: directory cluster {src_cluster} is listed twice; skipping the repeat");
+            continue;
+        }
         let Some(child_idxs) = children_by_parent.get(&src_cluster) else {
             continue;
         };
@@ -3924,10 +4012,10 @@ fn build_virtual_fat_image(
             };
 
             if entry.is_directory() {
-                if let Ok(dir_entry) =
-                    fs.create_directory(&parent_entry, &name, &CreateDirectoryOptions::default())
+                match fs.create_directory(&parent_entry, &name, &CreateDirectoryOptions::default())
                 {
-                    stack.push((entry.source_cluster, dir_entry));
+                    Ok(dir_entry) => stack.push((entry.source_cluster, dir_entry)),
+                    Err(e) => skip(&name, e)?,
                 }
             } else {
                 let mut meta: Vec<(u64, u16)> =
@@ -3943,6 +4031,7 @@ fn build_virtual_fat_image(
                     }
                 }
                 if missing {
+                    log::warn!("GHO: skipping {name}: its data records are not in the image");
                     continue;
                 }
                 let file_size = entry.file_size as u64;
@@ -3955,7 +4044,10 @@ fn build_virtual_fat_image(
                 };
                 let f = match fs.create_file(&parent_entry, &name, &mut empty, file_size, &opts) {
                     Ok(f) => f,
-                    Err(_) => continue,
+                    Err(e) => {
+                        skip(&name, e)?;
+                        continue;
+                    }
                 };
                 let file_id = files.len() as u32;
                 files.push(FileContentRef {
@@ -4310,28 +4402,38 @@ fn parse_vbr_geometry<R: Read + Seek>(
         bail!("boot-sector body too short: {} bytes", rec.body_len);
     }
     let bpb_vec = read_record_body(reader, rec, cache)?;
-    let bpb = &bpb_vec;
-    let n = bpb.len();
-    let byts_per_sec = u16::from_le_bytes([bpb[11], bpb[12]]) as u64;
+    let byts_per_sec = u16::from_le_bytes([bpb_vec[11], bpb_vec[12]]) as u64;
     if byts_per_sec == 0 || byts_per_sec > 4096 {
         bail!("invalid bytes_per_sector: {}", byts_per_sec);
     }
+    Ok(vbr_geometry(&bpb_vec))
+}
+
+/// (hidden sectors, partition bytes, fs type) from a FAT or NTFS boot sector of at least 64 bytes.
+fn vbr_geometry(bpb: &[u8]) -> (u64, u64, String) {
+    let n = bpb.len();
+    let bps = (u16::from_le_bytes([bpb[11], bpb[12]]) as u64).max(512);
     let hidden = u32::from_le_bytes([bpb[28], bpb[29], bpb[30], bpb[31]]) as u64;
+    if n >= 0x30 && &bpb[3..11] == b"NTFS    " {
+        // NTFS counts its sectors at 0x28; the backup boot sector sits one past them.
+        let mut t = [0u8; 8];
+        t.copy_from_slice(&bpb[0x28..0x30]);
+        let total = u64::from_le_bytes(t).saturating_add(1);
+        return (hidden, total.saturating_mul(bps), "NTFS".to_string());
+    }
     let tot16 = u16::from_le_bytes([bpb[19], bpb[20]]) as u64;
     let tot32 = u32::from_le_bytes([bpb[32], bpb[33], bpb[34], bpb[35]]) as u64;
     let total_sectors = if tot16 != 0 { tot16 } else { tot32 };
-    let size = total_sectors * byts_per_sec;
-
     let fs_type = if n >= 90 && &bpb[82..87] == b"FAT32" {
-        "FAT32".to_string()
+        "FAT32"
     } else if n >= 62 && &bpb[54..59] == b"FAT16" {
-        "FAT16".to_string()
+        "FAT16"
     } else if n >= 62 && &bpb[54..59] == b"FAT12" {
-        "FAT12".to_string()
+        "FAT12"
     } else {
-        "Unknown".to_string()
+        "Unknown"
     };
-    Ok((hidden, size, fs_type))
+    (hidden, total_sectors * bps, fs_type.to_string())
 }
 
 /// Split a multi-partition file-aware `GhoImage` into per-partition
@@ -4497,68 +4599,100 @@ const MBR_TYPE_FAT16_LBA: u8 = 0x0E;
 /// MBR partition type byte for extended (LBA).
 const MBR_TYPE_EXTENDED_LBA: u8 = 0x0F;
 
-/// Synthesize an MBR sector from a list of partitions discovered in
-/// a multi-partition GHO. Returns 512 bytes with a valid partition
-/// table and `0x55AA` signature.
-///
-/// The function handles extended partitions: if any partition's
-/// `hidden_sectors` indicates it lives inside another partition's
-/// range, it builds an extended container with EBR chain.
-fn synthesize_mbr(slices: &[GhoPartitionSlice]) -> [u8; 512] {
+/// MBR type byte for a partition Ghost recorded as `fs`.
+fn mbr_type_for(fs: &str) -> u8 {
+    match fs {
+        "FAT32" => MBR_TYPE_FAT32_LBA,
+        "FAT16" => MBR_TYPE_FAT16_LBA,
+        "FAT12" => 0x01,
+        "NTFS" => 0x07,
+        _ => 0xDA, // non-FS data: nothing guesses a filesystem from it
+    }
+}
+
+/// The MBR (at LBA 0) and any EBRs for a multi-partition image, keyed by LBA.
+/// The second partition on are logical when each has 63 free sectors before it for its EBR;
+/// otherwise up to four are primaries, so no EBR is ever served over partition data.
+fn synthesize_partition_table(
+    slices: &[GhoPartitionSlice],
+) -> Result<std::collections::HashMap<u64, [u8; 512]>> {
+    let mut out = std::collections::HashMap::new();
     let mut mbr = [0u8; 512];
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
-
-    if slices.is_empty() {
-        return mbr;
-    }
-
-    // Sort partitions by hidden_sectors (disk LBA order).
     let mut parts: Vec<(u64, u64, u8)> = slices
         .iter()
         .map(|s| {
-            let type_byte = match s.fs_type.as_str() {
-                "FAT32" => MBR_TYPE_FAT32_LBA,
-                "FAT16" => MBR_TYPE_FAT16_LBA,
-                _ => MBR_TYPE_FAT32_LBA,
-            };
-            let sectors = s.partition_size / 512;
-            (s.hidden_sectors, sectors, type_byte)
+            (
+                s.hidden_sectors,
+                s.partition_size / 512,
+                mbr_type_for(&s.fs_type),
+            )
         })
         .collect();
     parts.sort_by_key(|p| p.0);
-
-    // Detect extended partitions: a partition whose start_lba falls
-    // inside the range of the gap between the first partition's end
-    // and the disk's end, with hidden_sectors suggesting an EBR offset
-    // (hidden == container_start + 63 or similar).
-    //
-    // Heuristic: the first partition is primary. If there are multiple
-    // subsequent partitions, they're in an extended container. The
-    // extended container starts right after the first partition.
-    if parts.len() == 1 {
-        write_mbr_entry(&mut mbr, 0, parts[0].0, parts[0].1, parts[0].2, true);
-    } else {
-        // First partition is primary.
-        write_mbr_entry(&mut mbr, 0, parts[0].0, parts[0].1, parts[0].2, true);
-
-        // Extended partition contains all remaining partitions.
-        // Extended start = first partition end.
-        let ext_start = parts[0].0 + parts[0].1;
-        let ext_end = parts.last().map(|p| p.0 + p.1).unwrap_or(ext_start);
-        let ext_sectors = ext_end - ext_start;
-
-        write_mbr_entry(
-            &mut mbr,
-            1,
-            ext_start,
-            ext_sectors,
-            MBR_TYPE_EXTENDED_LBA,
-            false,
-        );
+    let mut prev_end = 1u64;
+    for &(start, len, _) in &parts {
+        if start < prev_end {
+            bail!("GHO partitions overlap or start in the MBR (LBA {start})");
+        }
+        if start.saturating_add(len) > u32::MAX as u64 {
+            bail!("GHO partition at LBA {start} is past what an MBR can address");
+        }
+        prev_end = start + len;
     }
-
-    mbr
+    // Logical partitions as Ghost's source had them, when each has a free gap for its EBR.
+    let logicals = &parts[1..];
+    let mut prev_end = parts[0].0 + parts[0].1;
+    let mut room = true;
+    for &(start, len, _) in logicals {
+        room &= start >= prev_end + 63;
+        prev_end = start + len;
+    }
+    if !room || parts.len() == 1 {
+        if parts.len() > 4 {
+            bail!(
+                "GHO has {} partitions and no room for the EBRs of logical ones",
+                parts.len()
+            );
+        }
+        for (i, &(start, len, t)) in parts.iter().enumerate() {
+            write_mbr_entry(&mut mbr, i, start, len, t, i == 0);
+        }
+        out.insert(0, mbr);
+        return Ok(out);
+    }
+    write_mbr_entry(&mut mbr, 0, parts[0].0, parts[0].1, parts[0].2, true);
+    let ext_start = logicals[0].0 - 63;
+    write_mbr_entry(
+        &mut mbr,
+        1,
+        ext_start,
+        prev_end - ext_start,
+        MBR_TYPE_EXTENDED_LBA,
+        false,
+    );
+    out.insert(0, mbr);
+    for (i, &(start, len, t)) in logicals.iter().enumerate() {
+        let mut ebr = [0u8; 512];
+        ebr[510] = 0x55;
+        ebr[511] = 0xAA;
+        let ebr_lba = start - 63;
+        write_mbr_entry(&mut ebr, 0, 63, len, t, false);
+        if let Some(&(nstart, nlen, _)) = logicals.get(i + 1) {
+            let next_ebr = nstart - 63;
+            write_mbr_entry(
+                &mut ebr,
+                1,
+                next_ebr - ext_start,
+                nlen + 63,
+                MBR_TYPE_EXTENDED_LBA,
+                false,
+            );
+        }
+        out.insert(ebr_lba, ebr);
+    }
+    Ok(out)
 }
 
 /// Write one 16-byte MBR partition entry at slot `idx` (0..3).
@@ -4582,68 +4716,6 @@ fn write_mbr_entry(
     mbr[off + 7] = 0xFF;
     mbr[off + 8..off + 12].copy_from_slice(&(start_lba as u32).to_le_bytes());
     mbr[off + 12..off + 16].copy_from_slice(&(sectors as u32).to_le_bytes());
-}
-
-/// Synthesize Extended Boot Records (EBRs) for logical partitions
-/// inside the extended container. Returns a map of `(disk_lba ->
-/// [u8; 512])` for each EBR sector.
-fn synthesize_ebrs(
-    slices: &[GhoPartitionSlice],
-    ext_start: u64,
-) -> std::collections::HashMap<u64, [u8; 512]> {
-    let mut ebrs = std::collections::HashMap::new();
-    // Sort logical partitions by disk LBA.
-    let mut logicals: Vec<&GhoPartitionSlice> = slices.iter().collect();
-    logicals.sort_by_key(|s| s.hidden_sectors);
-
-    for (i, part) in logicals.iter().enumerate() {
-        // EBR lives 63 sectors before the partition's VBR.
-        let ebr_lba = part.hidden_sectors - 63;
-        let mut ebr = [0u8; 512];
-        ebr[510] = 0x55;
-        ebr[511] = 0xAA;
-
-        // Entry 0: the logical partition (offset relative to this EBR).
-        let type_byte = match part.fs_type.as_str() {
-            "FAT32" => MBR_TYPE_FAT32_LBA,
-            "FAT16" => MBR_TYPE_FAT16_LBA,
-            _ => MBR_TYPE_FAT32_LBA,
-        };
-        let part_sectors = part.partition_size / 512;
-        // Offset from EBR to partition start = 63 sectors.
-        let entry0_off = 446;
-        ebr[entry0_off + 4] = type_byte;
-        ebr[entry0_off + 1] = 0xFE;
-        ebr[entry0_off + 2] = 0xFF;
-        ebr[entry0_off + 3] = 0xFF;
-        ebr[entry0_off + 5] = 0xFE;
-        ebr[entry0_off + 6] = 0xFF;
-        ebr[entry0_off + 7] = 0xFF;
-        ebr[entry0_off + 8..entry0_off + 12].copy_from_slice(&63u32.to_le_bytes());
-        ebr[entry0_off + 12..entry0_off + 16].copy_from_slice(&(part_sectors as u32).to_le_bytes());
-
-        // Entry 1: chain to next EBR (relative to ext_start).
-        if i + 1 < logicals.len() {
-            let next = logicals[i + 1];
-            let next_ebr_lba = next.hidden_sectors - 63;
-            let next_part_sectors = next.partition_size / 512;
-            let entry1_off = 446 + 16;
-            ebr[entry1_off + 4] = MBR_TYPE_EXTENDED_LBA;
-            ebr[entry1_off + 1] = 0xFE;
-            ebr[entry1_off + 2] = 0xFF;
-            ebr[entry1_off + 3] = 0xFF;
-            ebr[entry1_off + 5] = 0xFE;
-            ebr[entry1_off + 6] = 0xFF;
-            ebr[entry1_off + 7] = 0xFF;
-            let offset_from_ext = (next_ebr_lba - ext_start) as u32;
-            let chain_size = (63 + next_part_sectors) as u32;
-            ebr[entry1_off + 8..entry1_off + 12].copy_from_slice(&offset_from_ext.to_le_bytes());
-            ebr[entry1_off + 12..entry1_off + 16].copy_from_slice(&chain_size.to_le_bytes());
-        }
-
-        ebrs.insert(ebr_lba, ebr);
-    }
-    ebrs
 }
 
 /// Decode every `0x0002` data-block record in `image` into `writer`,
@@ -5385,6 +5457,30 @@ fn parse_inline_mft_records<R: Read + Seek>(
 
 /// Build the NTFS cluster run index by walking the packed data stream.
 ///
+/// `(cluster bytes, volume bytes)` from an NTFS boot sector, refusing values no NTFS volume
+/// has, since the volume size sizes allocations (the synthesized `$Bitmap`) downstream.
+fn ntfs_vbr_geometry(vbr: &fs_pc::ntfs::NtfsVbr) -> Result<(u64, u64)> {
+    let (bps, spc) = (vbr.bytes_per_sector, vbr.sectors_per_cluster);
+    if !(512..=4096).contains(&bps) || !bps.is_power_of_two() || spc == 0 || spc > 4096 {
+        bail!("NTFS boot sector: {bps}-byte sectors, {spc} per cluster");
+    }
+    let cluster = bps * spc;
+    let volume = vbr
+        .total_sectors
+        .checked_mul(bps)
+        .filter(|v| v / cluster <= u32::MAX as u64)
+        .ok_or_else(|| {
+            anyhow!(
+                "NTFS boot sector: {} sectors is too many",
+                vbr.total_sectors
+            )
+        })?;
+    if !(256..=65536).contains(&vbr.mft_record_size) {
+        bail!("NTFS boot sector: MFT record size {}", vbr.mft_record_size);
+    }
+    Ok((cluster, volume))
+}
+
 /// Strategy: the first run is always the MFT. We read it, parse every
 /// MFT record to collect all non-resident `$DATA` attribute data runs,
 /// and build a queue of `(LCN, cluster_count)` entries sorted by MFT
@@ -5398,8 +5494,7 @@ fn index_ntfs_file_aware<R: Read + Seek>(
 ) -> Result<NtfsGhoIndex> {
     use fs_pc::ntfs::{apply_fixup, parse_mft_attributes};
 
-    let cluster_size = vbr.bytes_per_sector * vbr.sectors_per_cluster;
-    let volume_size = vbr.total_sectors * vbr.bytes_per_sector;
+    let (cluster_size, volume_size) = ntfs_vbr_geometry(vbr)?;
     let mft_record_size = vbr.mft_record_size as usize;
 
     // Scan for the first run header. For raw files the GHPR metadata
@@ -5763,8 +5858,7 @@ fn open_ntfs_compressed_mft_only(
     use fs_pc::ntfs::{apply_fixup, parse_mft_attributes};
 
     let _ = compression;
-    let cluster_size = vbr.bytes_per_sector * vbr.sectors_per_cluster;
-    let volume_size = vbr.total_sectors * vbr.bytes_per_sector;
+    let (cluster_size, volume_size) = ntfs_vbr_geometry(vbr)?;
     let mft_record_size = vbr.mft_record_size as usize;
 
     let end = file_size;
@@ -5852,6 +5946,11 @@ fn open_ntfs_compressed_mft_only(
         loop {
             let in_before = decompress.total_in() as usize;
             let out_before = decompress.total_out();
+            // A Ghost block inflates to 32 KiB; more means this was not a block start.
+            if out_before > GHO_MAX_INFLATE {
+                ok = false;
+                break;
+            }
             let out_off = (decompress.total_out() as usize) % decomp_buf.len();
             match decompress.decompress(
                 &input[total_in..],
@@ -6199,9 +6298,9 @@ fn extend_ntfs_compressed_index(
     index: &mut NtfsGhoIndex,
     comp: &mut NtfsCompressedState,
     target_lcn: u64,
-) -> bool {
+) -> std::io::Result<bool> {
     let Some(scan) = &mut comp.lazy_scan else {
-        return false;
+        return Ok(false);
     };
 
     let io_chunk: usize = 4 * 1024 * 1024;
@@ -6212,13 +6311,9 @@ fn extend_ntfs_compressed_index(
 
     let mut chunk_buf = vec![0u8; io_chunk + 64 * 1024];
     let mut chunk_start = scan.file_offset;
-    if inner.seek(SeekFrom::Start(chunk_start)).is_err() {
-        return false;
-    }
-    let mut chunk_len = match read_fully_or_eof(inner, &mut chunk_buf) {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
+    // A read error is the image failing, not padding: report it rather than serve zeros.
+    inner.seek(SeekFrom::Start(chunk_start))?;
+    let mut chunk_len = read_fully_or_eof(inner, &mut chunk_buf).map_err(disk_core::io_other)?;
     let mut local = 0usize;
     let mut found_target = false;
     let mut consecutive_fails = 0u32;
@@ -6264,16 +6359,9 @@ fn extend_ntfs_compressed_index(
             chunk_buf.copy_within(local..chunk_len, 0);
             chunk_start += local as u64;
             local = 0;
-            if inner
-                .seek(SeekFrom::Start(chunk_start + remaining as u64))
-                .is_err()
-            {
-                break;
-            }
-            let extra = match read_fully_or_eof(inner, &mut chunk_buf[remaining..]) {
-                Ok(n) => n,
-                Err(_) => break,
-            };
+            inner.seek(SeekFrom::Start(chunk_start + remaining as u64))?;
+            let extra = read_fully_or_eof(inner, &mut chunk_buf[remaining..])
+                .map_err(disk_core::io_other)?;
             chunk_len = remaining + extra;
         }
         if local + 4 > chunk_len {
@@ -6304,6 +6392,11 @@ fn extend_ntfs_compressed_index(
             loop {
                 let in_before = decompress.total_in() as usize;
                 let out_before = decompress.total_out();
+                // A Ghost block inflates to 32 KiB; more means this was not a block start.
+                if out_before > GHO_MAX_INFLATE {
+                    ok = false;
+                    break;
+                }
                 match decompress.decompress(
                     &input[total_in..],
                     &mut discard[..],
@@ -6371,6 +6464,11 @@ fn extend_ntfs_compressed_index(
         loop {
             let in_before = decompress.total_in() as usize;
             let out_before = decompress.total_out();
+            // A Ghost block inflates to 32 KiB; more means this was not a block start.
+            if out_before > GHO_MAX_INFLATE {
+                ok = false;
+                break;
+            }
             let out_off = (decompress.total_out() as usize) % decomp_buf.len();
             match decompress.decompress(
                 &input[total_in..],
@@ -6609,7 +6707,7 @@ fn extend_ntfs_compressed_index(
         );
     }
 
-    found_target
+    Ok(found_target)
 }
 
 /// Try to open an NTFS file-aware GHO. Returns the reader mode and
@@ -7895,7 +7993,7 @@ fn read_ntfs_file_aware_into(
         if index.synth_bitmap.is_empty() {
             if let Some(cs) = compressed.as_mut() {
                 if cs.lazy_scan.is_some() {
-                    extend_ntfs_compressed_index(inner, index, cs, u64::MAX);
+                    extend_ntfs_compressed_index(inner, index, cs, u64::MAX)?;
                 }
             }
             let total_clusters = index.volume_size / index.cluster_size;
@@ -7967,7 +8065,7 @@ fn read_ntfs_file_aware_into(
                     .iter()
                     .any(|&(l, c)| lcn >= l && lcn < l + c);
                 if is_known_lcn {
-                    extend_ntfs_compressed_index(inner, index, cs, lcn);
+                    extend_ntfs_compressed_index(inner, index, cs, lcn)?;
                     found_idx = find_run(&index.runs, *last_run_hint);
                 }
             }
@@ -8024,6 +8122,72 @@ fn read_ntfs_file_aware_into(
 
 #[cfg(test)]
 mod tests {
+
+    fn slice(hidden: u64, sectors: u64, fs: &str) -> GhoPartitionSlice {
+        GhoPartitionSlice {
+            boot_record_index: 0,
+            record_range: 0..0,
+            partition_size: sectors * 512,
+            hidden_sectors: hidden,
+            fs_type: fs.to_string(),
+            reserved_record_index: None,
+        }
+    }
+
+    fn entry(sector: &[u8; 512], i: usize) -> (u8, u32, u32) {
+        let o = 446 + i * 16;
+        let le = |a: usize| u32::from_le_bytes(sector[a..a + 4].try_into().unwrap());
+        (sector[o + 4], le(o + 8), le(o + 12))
+    }
+
+    #[test]
+    fn the_reader_is_send_without_an_unsafe_impl() {
+        fn is_send<T: Send>() {}
+        is_send::<GhoReader>();
+    }
+
+    #[test]
+    fn two_primaries_get_two_mbr_entries_and_no_ebr() {
+        let t = synthesize_partition_table(&[slice(63, 1000, "FAT16"), slice(1063, 500, "NTFS")])
+            .unwrap();
+        assert_eq!(t.len(), 1, "no EBR over the first partition's last track");
+        assert_eq!(entry(&t[&0], 0), (0x0E, 63, 1000));
+        assert_eq!(entry(&t[&0], 1), (0x07, 1063, 500));
+        // With a free gap the second is logical, as Ghost's source disks have it.
+        let t = synthesize_partition_table(&[slice(63, 1000, "FAT16"), slice(1126, 500, "NTFS")])
+            .unwrap();
+        assert_eq!(entry(&t[&0], 1).0, MBR_TYPE_EXTENDED_LBA);
+        assert_eq!(entry(&t[&1063], 0), (0x07, 63, 500));
+    }
+
+    #[test]
+    fn logicals_need_room_for_their_ebr() {
+        let five: Vec<_> = (0..5)
+            .map(|i| slice(63 + i * 1063, 1000, "FAT32"))
+            .collect();
+        let t = synthesize_partition_table(&five).unwrap();
+        assert_eq!(t.len(), 5);
+        assert_eq!(entry(&t[&0], 1).0, MBR_TYPE_EXTENDED_LBA);
+        assert_eq!(entry(&t[&1063], 0), (0x0C, 63, 1000));
+        let tight: Vec<_> = (0..5)
+            .map(|i| slice(63 + i * 1000, 1000, "FAT32"))
+            .collect();
+        assert!(synthesize_partition_table(&tight).is_err());
+        assert!(
+            synthesize_partition_table(&[slice(63, 1000, "FAT32"), slice(500, 10, "FAT32")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_ntfs_boot_sector_is_sized_from_its_own_field() {
+        let mut b = [0u8; 512];
+        b[3..11].copy_from_slice(b"NTFS    ");
+        b[11..13].copy_from_slice(&512u16.to_le_bytes());
+        b[28..32].copy_from_slice(&2048u32.to_le_bytes());
+        b[0x28..0x30].copy_from_slice(&99_999u64.to_le_bytes());
+        assert_eq!(vbr_geometry(&b), (2048, 100_000 * 512, "NTFS".to_string()));
+    }
 
     /// A synthetic High-compression NTFS Ghost stream: junk, the MFT run header, `mft`, a tail.
     fn ghost_ntfs_stream(mft: &[u8], cluster: u64, block: usize) -> Vec<u8> {

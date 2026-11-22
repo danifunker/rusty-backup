@@ -1,4 +1,4 @@
-//! UFS1 / UFS2 (Berkeley Fast Filesystem) read-only support.
+//! UFS1 / UFS2 (Berkeley Fast Filesystem): read, edit and check.
 //!
 //! Implements the [`Filesystem`] trait far enough to detect a UFS partition,
 //! surface its on-disk version, label, and total/used/free sizes in the
@@ -609,6 +609,22 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
                 v as u64
             }
         };
+        // Every fragment belongs to a cylinder group; a size past them all is a bad superblock.
+        if total_frags > ncg as u64 * fpg as u64 {
+            return Err(FilesystemError::Parse(format!(
+                "ufs: size {total_frags} fragments exceeds {ncg} groups of {fpg}"
+            )));
+        }
+        if let Ok(end) = reader.seek(SeekFrom::End(0)) {
+            let want = partition_offset.saturating_add(total_frags.saturating_mul(fsize));
+            if want > end {
+                log::warn!(
+                    "ufs: superblock spans {} bytes but the source ends {} bytes short",
+                    total_frags.saturating_mul(fsize),
+                    want - end
+                );
+            }
+        }
 
         // Refuse a softupdate-journaled volume that is also dirty. The
         // safe path on those is "let FreeBSD fsck_ffs replay the journal
@@ -973,6 +989,12 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             let frag = inode.direct[lbn as usize];
             if frag != 0 {
                 data.push(frag);
+                if data.len() as u64 > self.total_frags {
+                    return Err(FilesystemError::InvalidData(format!(
+                        "ufs: inode {} claims more blocks than the volume holds",
+                        inode.inum
+                    )));
+                }
             }
         }
         if last_lbn <= ndaddr {
@@ -989,6 +1011,12 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
                 let frag = self.read_indirect_pointer(inode.indirect[0], i)?;
                 if frag != 0 {
                     data.push(frag);
+                    if data.len() as u64 > self.total_frags {
+                        return Err(FilesystemError::InvalidData(format!(
+                            "ufs: inode {} claims more blocks than the volume holds",
+                            inode.inum
+                        )));
+                    }
                 }
             }
         }
@@ -1014,6 +1042,12 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
                     let frag = self.read_indirect_pointer(mid, inner - lo)?;
                     if frag != 0 {
                         data.push(frag);
+                        if data.len() as u64 > self.total_frags {
+                            return Err(FilesystemError::InvalidData(format!(
+                                "ufs: inode {} claims more blocks than the volume holds",
+                                inode.inum
+                            )));
+                        }
                     }
                 }
             }
@@ -1050,6 +1084,12 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
                         let frag = self.read_indirect_pointer(inner_idx, leaf - lo)?;
                         if frag != 0 {
                             data.push(frag);
+                            if data.len() as u64 > self.total_frags {
+                                return Err(FilesystemError::InvalidData(format!(
+                                    "ufs: inode {} claims more blocks than the volume holds",
+                                    inode.inum
+                                )));
+                            }
                         }
                     }
                 }
@@ -1342,12 +1382,24 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         )))
     }
 
+    /// Byte position of fragment `frag`, refusing a pointer past the volume (a UFS2 pointer is
+    /// 64 bits, so an unchecked product can overflow or land anywhere).
+    fn frag_byte(&self, frag: u64) -> Result<u64, FilesystemError> {
+        if frag >= self.total_frags {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs: fragment {frag} is past the {}-fragment volume",
+                self.total_frags
+            )));
+        }
+        Ok(self.partition_offset + frag * self.fsize)
+    }
+
     /// Read `idx`-th pointer from the indirect block whose starting
     /// fragment is `block_frag`. Pointer size matches the FS version
     /// (UFS1: 4 bytes; UFS2: 8 bytes).
     fn read_indirect_pointer(&mut self, block_frag: u64, idx: u64) -> Result<u64, FilesystemError> {
         let ptr_size = self.pointer_size();
-        let byte = self.partition_offset + block_frag * self.fsize + idx * ptr_size;
+        let byte = self.frag_byte(block_frag)? + idx * ptr_size;
         self.reader.seek(SeekFrom::Start(byte))?;
         match self.version {
             UfsVersion::Ufs1 => {
@@ -1396,7 +1448,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             if block_frag == 0 {
                 buf[..want].fill(0);
             } else {
-                let byte = self.partition_offset + block_frag * self.fsize;
+                let byte = self.frag_byte(block_frag)?;
                 self.reader.seek(SeekFrom::Start(byte))?;
                 self.reader.read_exact(&mut buf[..want])?;
             }
@@ -1435,14 +1487,15 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
     /// dinode's pointer area; non-inline symlinks live in the first
     /// data block.
     fn read_symlink_target(&mut self, inode: &UfsInode) -> Result<String, FilesystemError> {
-        let size = inode.size as usize;
+        // A target is a path (MAXPATHLEN 1024 on BSD): a larger size is corruption.
+        let size = (inode.size as usize).min(4096);
         if size == 0 {
             return Ok(String::new());
         }
         let bytes = if self.is_inline_symlink(inode) {
-            inode.inline_payload[..size].to_vec()
+            inode.inline_payload[..size.min(inode.inline_payload.len())].to_vec()
         } else {
-            self.read_inode_data(inode, inode.size, size)?
+            self.read_inode_data(inode, size as u64, size)?
         };
         Ok(self.name_from_bytes(&bytes))
     }
@@ -1568,7 +1621,9 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         data: &[u8],
     ) -> Result<(), FilesystemError> {
         let byte_len = data.len() as u64;
-        let end_byte = start_frag * self.fsize + byte_len;
+        let end_byte = start_frag
+            .saturating_mul(self.fsize)
+            .saturating_add(byte_len);
         let max_byte = self.total_frags * self.fsize;
         if end_byte > max_byte {
             return Err(FilesystemError::InvalidData(format!(
@@ -2230,8 +2285,25 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 start + count
             )));
         }
-        let (mut bm, _ndblk) = self.read_cg_free_bitmap(cg as u32)?;
+        let (mut bm, ndblk) = self.read_cg_free_bitmap(cg as u32)?;
+        // A pointer read from disk: refuse a run past the group's fragments, and a fragment that
+        // is already free (a cross-link), rather than freeing it twice (UNX-006).
+        if in_cg + count > ndblk {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs free_frag_run: run [{start}..{}) is past CG {cg}'s {ndblk} fragments",
+                start + count
+            )));
+        }
         let before = bm.clone();
+        for i in 0..count {
+            let bit = in_cg + i;
+            if bm[(bit / 8) as usize] & (1 << (bit % 8)) != 0 {
+                return Err(FilesystemError::InvalidData(format!(
+                    "ufs free_frag_run: fragment {} is already free (cross-linked?)",
+                    start + i
+                )));
+            }
+        }
         for i in 0..count {
             bitmap_set_bit(&mut bm, in_cg + i);
         }
@@ -2422,7 +2494,12 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
             let d_ino = read_u32(&bytes, off, endian);
             let d_reclen = read_u16(&bytes, off + 4, endian) as usize;
             let (_, d_namlen) = read_dirent_namlen(&bytes, off, old_fmt, endian);
-            if d_reclen == 0 || !d_reclen.is_multiple_of(DIRENT_ALIGN) {
+            // The name must sit inside its record, and the record inside the directory.
+            if d_reclen == 0
+                || !d_reclen.is_multiple_of(DIRENT_ALIGN)
+                || off + d_reclen > bytes.len()
+                || d_namlen > d_reclen.saturating_sub(DIRENT_HDR_LEN)
+            {
                 return Err(FilesystemError::Parse(format!(
                     "ufs dir_find: corrupt d_reclen {d_reclen} at off {off}"
                 )));
@@ -2598,7 +2675,10 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 let d_ino = read_u32(&dir_bytes, off, endian);
                 let d_reclen = read_u16(&dir_bytes, off + 4, endian) as usize;
                 let (_, d_namlen) = read_dirent_namlen(&dir_bytes, off, old_fmt, endian);
-                if d_reclen == 0 || off + d_reclen > chunk_end {
+                if d_reclen == 0
+                    || off + d_reclen > chunk_end
+                    || d_namlen > d_reclen.saturating_sub(DIRENT_HDR_LEN)
+                {
                     break;
                 }
                 if d_ino != 0
@@ -2645,6 +2725,31 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
 
     /// Re-write the parent's directory data fork in place. The data fork
     /// length stays at `parent.size`; only contents change.
+    /// Point directory `dir`'s `..` (its second record) at `parent`.
+    fn repoint_dotdot(&mut self, dir: &UfsInode, parent: u32) -> Result<(), FilesystemError> {
+        let mut bytes = self.read_dir_bytes_raw(dir)?;
+        let endian = self.endian;
+        if bytes.len() < DIRENT_HDR_LEN {
+            return Err(FilesystemError::Parse(format!(
+                "ufs: directory {} is empty",
+                dir.inum
+            )));
+        }
+        let at = read_u16(&bytes, 4, endian) as usize;
+        let (_, nl) = read_dirent_namlen(&bytes, at, self.old_dirent_fmt, endian);
+        if at + DIRENT_HDR_LEN + 2 > bytes.len()
+            || nl != 2
+            || &bytes[at + DIRENT_HDR_LEN..at + DIRENT_HDR_LEN + 2] != b".."
+        {
+            return Err(FilesystemError::Parse(format!(
+                "ufs: directory {} has no `..` second record",
+                dir.inum
+            )));
+        }
+        write_u32(&mut bytes, at, parent, endian);
+        self.write_dir_bytes(dir, &bytes)
+    }
+
     fn write_dir_bytes(&mut self, parent: &UfsInode, bytes: &[u8]) -> Result<(), FilesystemError> {
         let padded = parent.size.next_multiple_of(self.dirblksiz as u64);
         if bytes.len() as u64 != parent.size && bytes.len() as u64 != padded {
@@ -2668,6 +2773,12 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 )));
             }
             let take = (bytes.len() - written).min(bs);
+            if frag.saturating_add((take as u64).div_ceil(self.fsize)) > self.total_frags {
+                // An on-disk pointer past the volume: refuse rather than write beyond it (UNX-005).
+                return Err(FilesystemError::InvalidData(format!(
+                    "ufs write_dir_bytes: directory block at fragment {frag} is past the volume"
+                )));
+            }
             // Whole-block writes round up to bsize; the last partial
             // write only updates `take` bytes (preserves anything past
             // the file's logical end).
@@ -2691,11 +2802,32 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
     /// double-indirect levels are built as needed, which is what lets a file
     /// exceed the 12-block (96 KiB at 8 KiB blocks) direct cap. Triple
     /// indirection is refused — it starts at ~32 GiB with 8 KiB blocks.
+    /// Write a file's data; on failure every fragment run taken so far is given back, since the
+    /// caller's rollback (driven by the inode's size) would otherwise free nothing.
     fn write_file_data(
         &mut self,
         inode: &mut UfsInode,
         data: &mut dyn Read,
         data_len: u64,
+    ) -> Result<(), FilesystemError> {
+        let mut taken = Vec::new();
+        let result = self.write_file_data_into(inode, data, data_len, &mut taken);
+        if result.is_err() {
+            for (start, n) in taken {
+                let _ = self.free_frag_run(start, n);
+            }
+            inode.direct = [0; UFS_NDADDR];
+            inode.indirect = [0; UFS_NIADDR];
+        }
+        result
+    }
+
+    fn write_file_data_into(
+        &mut self,
+        inode: &mut UfsInode,
+        data: &mut dyn Read,
+        data_len: u64,
+        taken: &mut Vec<(u64, u64)>,
     ) -> Result<(), FilesystemError> {
         let bs = self.bsize;
         let frags_per_block = self.frag as u64;
@@ -2719,14 +2851,18 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         let mut double_children: Vec<u64> = Vec::new();
         if total_blocks > ndaddr {
             single = self.alloc_frag_run(frags_per_block, cg_hint)?;
+            taken.push((single, frags_per_block));
             meta_frags += frags_per_block;
         }
         if total_blocks > ndaddr + nindir {
             double = self.alloc_frag_run(frags_per_block, cg_hint)?;
+            taken.push((double, frags_per_block));
             meta_frags += frags_per_block;
             let need = (total_blocks - ndaddr - nindir).div_ceil(nindir);
             for _ in 0..need {
-                double_children.push(self.alloc_frag_run(frags_per_block, cg_hint)?);
+                let child = self.alloc_frag_run(frags_per_block, cg_hint)?;
+                taken.push((child, frags_per_block));
+                double_children.push(child);
                 meta_frags += frags_per_block;
             }
         }
@@ -2751,6 +2887,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 frags_per_block
             };
             let start = self.alloc_frag_run(frags, cg_hint)?;
+            taken.push((start, frags));
             data_frags += frags;
             if lbn < ndaddr {
                 inode.direct[lbn as usize] = start;
@@ -3091,6 +3228,9 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
 
         let dirblksiz = self.dirblksiz;
         let new_inum = self.alloc_inode(parent_inum / self.ipg)?;
+        // What a failure part-way has to give back: the data run and the ndir bump.
+        let mut taken: Option<(u64, u64)> = None;
+        let mut counted = false;
 
         let create_result = (|| -> Result<FileEntry, FilesystemError> {
             // Allocate one block for the new dir's initial DIRBLKSIZ
@@ -3100,6 +3240,7 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
             let cg_hint = parent_inum / self.ipg;
             let dir_frags = (dirblksiz as u64).div_ceil(self.fsize);
             let start_frag = self.alloc_frag_run(dir_frags, cg_hint)?;
+            taken = Some((start_frag, dir_frags));
             let endian = self.endian;
             let old_fmt = self.old_dirent_fmt;
             let mut block = vec![0u8; (dir_frags * self.fsize) as usize];
@@ -3143,6 +3284,7 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
             self.set_dirdepth(new_inum, parent_inum)?;
             // Tracking: the new directory bumps the per-CG ndir counter.
             self.update_cg_cs(new_inum / self.ipg, 1, 0, 0, 0)?;
+            counted = true;
 
             // Link into parent + bump parent's nlink for the back-link.
             let mut parent_inode = self.read_inode(parent_inum)?;
@@ -3167,6 +3309,12 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
         })();
 
         if create_result.is_err() {
+            if let Some((start, n)) = taken {
+                let _ = self.free_frag_run(start, n);
+            }
+            if counted {
+                let _ = self.update_cg_cs(new_inum / self.ipg, -1, 0, 0, 0);
+            }
             let _ = self.free_inode(new_inum);
         }
         create_result
@@ -3227,6 +3375,13 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem fo
             )));
         }
 
+        if !is_dir && target.nlink > 1 {
+            // Another name still links the inode: keep it, one link fewer (UNX-001).
+            let mut kept = target;
+            kept.nlink -= 1;
+            self.write_inode(entry_inum, &kept)?;
+            return Ok(());
+        }
         // Free the inode's data blocks, then the inode itself.
         self.free_inode_blocks(&target)?;
         self.free_inode(entry_inum)?;
@@ -3440,6 +3595,7 @@ fn repair_ufs<R: Read + Write + Seek + Send>(
                 continue;
             }
         };
+        let before = bm.clone();
         let mut cleared = 0u32;
         for in_cg in in_cgs {
             if in_cg >= ndblk {
@@ -3463,8 +3619,10 @@ fn repair_ufs<R: Read + Write + Seek + Send>(
                     .push(format!("CG {cg} bitmap write failed: {e}"));
                 continue;
             }
-            // Each cleared free bit means one fewer free fragment in this CG.
-            if let Err(e) = fs.update_cg_cs(cg, 0, 0, 0, -(cleared as i32)) {
+            // A cleared bit can break up a whole free block, so recount blocks and loose
+            // fragments the way allocation does, not just nffree.
+            let (d_nbfree, d_nffree) = cs_delta_for(&before, &bm, fs.frag as u64, 0, ndblk);
+            if let Err(e) = fs.update_cg_cs(cg, 0, d_nbfree, 0, d_nffree) {
                 report
                     .fixes_failed
                     .push(format!("CG {cg} cs nffree update failed: {e}"));
@@ -3613,8 +3771,18 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
     };
 
     let mut adopted: u32 = 0;
-    for orphan in orphans {
-        let inum = orphan.id as u32;
+    // An orphan directory brings its contents back with it; adopt only the outermost orphans.
+    let pairs: Vec<(u32, bool)> = orphans
+        .iter()
+        .map(|o| (o.id as u32, o.is_directory))
+        .collect();
+    let roots = crate::unix_common::orphans::orphan_roots(&pairs, |d| {
+        let dir = FileEntry::new_directory(String::new(), String::new(), d as u64);
+        fs.list_directory(&dir)
+            .map(|v| v.into_iter().map(|e| e.location as u32).collect())
+            .unwrap_or_default()
+    });
+    for inum in roots {
         // Pull the orphan's mode so we stamp the correct d_type into the
         // dirent — getting this wrong only matters for tools that trust
         // d_type without re-reading the inode, but the kernel does, so
@@ -3652,6 +3820,11 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
         }
         match fs.dir_insert(&mut lf_inode, name.as_bytes(), inum, d_type) {
             Ok(()) => {
+                // A directory's `..` now names lost+found, which gains that link.
+                if matches!(unix_file_type(orphan_inode.mode), UnixFileType::Directory) {
+                    fs.repoint_dotdot(&orphan_inode, lf_inum)?;
+                    lf_inode.nlink = lf_inode.nlink.saturating_add(1);
+                }
                 fs.write_inode(lf_inum, &lf_inode)?;
                 adopted += 1;
             }
@@ -4011,7 +4184,7 @@ impl<R: Read + Seek + Send> Filesystem for UfsFilesystem<R> {
 /// byte positions; free fragments emit zeros. UFS uses
 /// **set bit = free** in the per-CG `cg_freeoff` bitmap, so we walk every
 /// CG, group consecutive same-state bits into runs, and emit each run as
-/// either a [`CompactSection::MappedBlocks`] (allocated) or
+/// either a [`CompactSection::MappedRun`] (allocated) or
 /// [`CompactSection::Zeros`] (free) section.
 ///
 /// Per-CG metadata (CG header, SB copy, inode table) is **also** covered
@@ -4068,9 +4241,11 @@ impl<R: Read + Seek + Send> CompactUfsReader<R> {
                     sections.push(CompactSection::Zeros(run_len * fsize));
                 } else {
                     // CLEAR = allocated — map the actual fragments.
-                    let old_blocks: Vec<u64> = (bit..run_end).map(|b| cgbase + b).collect();
                     total_allocated += run_len;
-                    sections.push(CompactSection::MappedBlocks { old_blocks });
+                    sections.push(CompactSection::MappedRun {
+                        first: cgbase + bit,
+                        count: run_end - bit,
+                    });
                 }
                 bit = run_end;
             }

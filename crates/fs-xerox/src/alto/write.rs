@@ -89,6 +89,13 @@ pub fn extract_files(disk: &Disk) -> Result<Vec<FileImage>, FilesystemError> {
         if bare.eq_ignore_ascii_case("SysDir") || bare.eq_ignore_ascii_case("DiskDescriptor") {
             continue;
         }
+        // The rebuild lays out SysDir's files only: a sub-directory's own files would be lost.
+        if e.sn_w1 & DIR_BIT != 0 {
+            return Err(FilesystemError::Unsupported(format!(
+                "{} is a sub-directory; rebuilding a volume with sub-directories is not supported",
+                e.name
+            )));
+        }
         let leader_sec = disk.sector(e.leader_vda).ok_or_else(|| {
             FilesystemError::InvalidData(format!("leader VDA {} out of range", e.leader_vda))
         })?;
@@ -252,6 +259,13 @@ pub fn delete_file(source: &Disk, name: &str) -> Result<Disk, FilesystemError> {
 /// (e.g. backup -> restore), which keeps every page at its original VDA.
 pub fn build_disk(geometry: Geometry, files: &[FileImage]) -> Result<Disk, FilesystemError> {
     let total = geometry.total_sectors();
+    if total > 0xFFFF {
+        // Directory leader addresses and the free-page count are written as 16-bit words, so a
+        // larger pack (a Trident T-300) cannot be rebuilt without corrupting it (XRX-001).
+        return Err(FilesystemError::Unsupported(format!(
+            "rebuilding a {total}-page pack is not supported (16-bit page addresses)"
+        )));
+    }
     // Per-family parameters: the label shape and the page size are the only
     // things that differ between Diablo/BFS and Trident/TFS — everything below
     // (SysDir, leader, FP, bit table) is shared.

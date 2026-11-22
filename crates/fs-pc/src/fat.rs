@@ -201,6 +201,14 @@ impl<R: Read + Seek> FatFilesystem<R> {
             FatType::Fat32
         };
 
+        // The regions must fit the volume; whether the FAT is really in the image is checked before each read of it.
+        if num_fats == 0 || data_start_sector > total_sectors {
+            return Err(FilesystemError::Parse(format!(
+                "FAT BPB regions ({} reserved + {} x {} FAT sectors) do not fit {} sectors",
+                reserved_sectors, num_fats, sectors_per_fat, total_sectors
+            )));
+        }
+
         // Root cluster for FAT32
         let root_cluster = if fat_type == FatType::Fat32 {
             u32::from_le_bytes([bpb[44], bpb[45], bpb[46], bpb[47]])
@@ -295,7 +303,24 @@ impl<R: Read + Seek> FatFilesystem<R> {
     /// Read FAT copy `idx` (0-based) into memory. Read-only counterpart of
     /// [`read_fat_table`](Self::read_fat_table) that also reaches the mirror
     /// copies for the FAT-consistency check. Returns the raw FAT bytes.
+    /// Refuse to size a buffer from a FAT that runs past the image (a damaged BPB can claim TiBs).
+    fn check_fat_in_image(&mut self) -> Result<(), FilesystemError> {
+        let fat_bytes = self.sectors_per_fat * self.bytes_per_sector;
+        let fat_start = self.sector_offset(self.reserved_sectors);
+        // A raw device can report 0 here; only a known length can rule a FAT out. Callers may have seeked already.
+        let here = self.reader.stream_position()?;
+        let end = self.reader.seek(SeekFrom::End(0))?;
+        self.reader.seek(SeekFrom::Start(here))?;
+        if end > fat_start && fat_bytes > end - fat_start {
+            return Err(FilesystemError::Parse(format!(
+                "FAT of {fat_bytes} bytes runs past the end of the image"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_fat_copy(&mut self, idx: u8) -> Result<Vec<u8>, FilesystemError> {
+        self.check_fat_in_image()?;
         let fat_size = (self.sectors_per_fat * self.bytes_per_sector) as usize;
         let base = self.sector_offset(self.reserved_sectors)
             + idx as u64 * self.sectors_per_fat * self.bytes_per_sector;
@@ -308,12 +333,13 @@ impl<R: Read + Seek> FatFilesystem<R> {
     /// Scan the FAT once and return the number of in-use data clusters.
     /// Read-only (so it works from `open`); cached into `used_clusters`.
     fn scan_used_clusters(&mut self) -> Result<u64, FilesystemError> {
+        self.check_fat_in_image()?;
         let fat_offset = self.sector_offset(self.reserved_sectors);
         let fat_size = (self.sectors_per_fat * self.bytes_per_sector) as usize;
         self.reader.seek(SeekFrom::Start(fat_offset))?;
         let mut fat_data = vec![0u8; fat_size];
         self.reader.read_exact(&mut fat_data)?;
-        let total_entries = self.total_clusters as u32 + 2;
+        let total_entries = (self.total_clusters + 2).min(u32::MAX as u64) as u32;
         let mut free: u64 = 0;
         for cluster in 2..total_entries {
             if read_fat_entry(&fat_data, cluster, self.fat_type) == 0 {
@@ -350,6 +376,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 // FAT12 is always small (max ~6 KB) — read entire FAT
                 let fat_size = ((total_entries as usize) * 3).div_ceil(2);
                 self.reader.seek(SeekFrom::Start(fat_offset))?;
+                self.check_fat_in_image()?;
                 let mut fat_data = vec![0u8; fat_size];
                 self.reader.read_exact(&mut fat_data)?;
 
@@ -374,6 +401,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 // FAT16 is at most ~128 KB — read entire FAT
                 let fat_size = total_entries as usize * 2;
                 self.reader.seek(SeekFrom::Start(fat_offset))?;
+                self.check_fat_in_image()?;
                 let mut fat_data = vec![0u8; fat_size];
                 self.reader.read_exact(&mut fat_data)?;
 
@@ -425,6 +453,13 @@ impl<R: Read + Seek> FatFilesystem<R> {
 
     /// Read the next cluster number from the FAT.
     pub fn next_cluster(&mut self, cluster: u32) -> Result<Option<u32>, FilesystemError> {
+        // A link past the volume's last cluster is a corrupt FAT; following it would read or write outside the volume.
+        Ok(self
+            .next_cluster_raw(cluster)?
+            .filter(|&next| (next as u64) <= self.total_clusters + 1))
+    }
+
+    fn next_cluster_raw(&mut self, cluster: u32) -> Result<Option<u32>, FilesystemError> {
         let fat_offset = self.sector_offset(self.reserved_sectors);
         match self.fat_type {
             FatType::Fat12 => {
@@ -863,9 +898,10 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
         let fat_offset = self.sector_offset(self.reserved_sectors);
         let fat_size = (self.sectors_per_fat * self.bytes_per_sector) as usize;
         self.reader.seek(SeekFrom::Start(fat_offset))?;
+        self.check_fat_in_image()?;
         let mut fat_data = vec![0u8; fat_size];
         self.reader.read_exact(&mut fat_data)?;
-        let total_entries = self.total_clusters as u32 + 2;
+        let total_entries = (self.total_clusters + 2).min(u32::MAX as u64) as u32;
         let mut free: u64 = 0;
         for cluster in 2..total_entries {
             if read_fat_entry(&fat_data, cluster, self.fat_type) == 0 {
@@ -952,6 +988,7 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
         let fat_offset = self.sector_offset(self.reserved_sectors);
         let fat_size = (self.sectors_per_fat * self.bytes_per_sector) as usize;
         self.reader.seek(SeekFrom::Start(fat_offset))?;
+        self.check_fat_in_image()?;
         let mut fat_data = vec![0u8; fat_size];
         self.reader.read_exact(&mut fat_data)?;
         Ok(fat_data)
@@ -6454,5 +6491,50 @@ mod sfn_cache_tests {
             .map(|e| e.name)
             .collect();
         assert_eq!(names.len(), 3, "{names:?}");
+    }
+
+    /// FP-002: a FAT link past the volume's last cluster ends the chain instead of leaving the volume.
+    #[test]
+    fn a_link_past_the_volume_ends_the_chain() {
+        let img = create_blank_fat(2 * 1024 * 1024, Some("VOL")).unwrap();
+        let mut fs = FatFilesystem::open(Cursor::new(img), 0).unwrap();
+        let last = (fs.total_clusters + 1) as u32;
+        fs.write_fat_entry_disk(2, last).unwrap();
+        assert_eq!(
+            fs.next_cluster(2).unwrap(),
+            Some(last),
+            "the last cluster is still valid"
+        );
+        fs.write_fat_entry_disk(2, last + 1).unwrap();
+        assert_eq!(fs.next_cluster(2).unwrap(), None);
+        fs.write_fat_entry_disk(2, 0xFFEF).unwrap();
+        assert_eq!(fs.next_cluster(2).unwrap(), None);
+    }
+
+    /// A head buffer holding only the boot sector still opens (detection does this); reading its FAT is refused.
+    #[test]
+    fn a_truncated_image_opens_but_its_fat_is_not_allocated() {
+        let img = create_blank_fat(2 * 1024 * 1024, Some("VOL")).unwrap();
+        let head = img[..512].to_vec();
+        let mut fs = FatFilesystem::open(Cursor::new(head), 0).unwrap();
+        assert!(
+            fs.used_clusters.is_none(),
+            "the best-effort scan skips a FAT the image lacks"
+        );
+        assert!(fs.read_fat_copy(0).is_err());
+    }
+
+    /// FP-001: a BPB whose FAT cannot exist in the image is refused before anything is allocated.
+    #[test]
+    fn a_bpb_with_an_impossible_fat_is_refused() {
+        let mut img = create_blank_fat(2 * 1024 * 1024, Some("VOL")).unwrap();
+        // FAT32-style 32-bit sectors-per-FAT field, with the 16-bit one cleared: about 2 TiB of FAT.
+        img[22..24].fill(0);
+        img[36..40].copy_from_slice(&0xF000_0000u32.to_le_bytes());
+        assert!(FatFilesystem::open(Cursor::new(img.clone()), 0).is_err());
+        // No FAT copies at all is just as impossible.
+        let mut img = create_blank_fat(2 * 1024 * 1024, Some("VOL")).unwrap();
+        img[16] = 0;
+        assert!(FatFilesystem::open(Cursor::new(img), 0).is_err());
     }
 }

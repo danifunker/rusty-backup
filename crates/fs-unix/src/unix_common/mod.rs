@@ -3,3 +3,4 @@
 
 pub mod bitmap;
 pub mod compact;
+pub(crate) mod orphans;

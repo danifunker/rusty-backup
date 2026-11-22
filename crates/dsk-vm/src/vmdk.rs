@@ -219,6 +219,9 @@ fn strip_quotes(s: &str) -> &str {
 ///
 /// Returns `(descriptor_text, descriptor_byte_len, descriptor_dir)`. For
 /// standalone descriptors `descriptor_byte_len == file_size`.
+/// Longest descriptor read; a disk split into thousands of extents fits easily.
+const MAX_DESCRIPTOR_BYTES: u64 = 4 << 20;
+
 fn read_descriptor(path: &Path) -> Result<(String, u64, PathBuf)> {
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -254,14 +257,19 @@ fn read_descriptor(path: &Path) -> Result<(String, u64, PathBuf)> {
 
     // For embedded descriptors the spec rounds the descriptor region to a
     // sector boundary; read enough to be sure we have it.
-    let read_len = file_size.min(64 * 1024) as usize;
+    let read_len = file_size.min(MAX_DESCRIPTOR_BYTES) as usize;
     let mut buf = vec![0u8; read_len];
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut buf)?;
-    let end = buf
-        .iter()
-        .position(|&b| b == 0 || b == 0xFF)
-        .unwrap_or(buf.len());
+    let end = buf.iter().position(|&b| b == 0 || b == 0xFF);
+    // A descriptor cut short would silently drop its later extents.
+    if end.is_none() && file_size > read_len as u64 {
+        bail!(
+            "{}: VMDK descriptor is longer than {MAX_DESCRIPTOR_BYTES} bytes",
+            path.display()
+        );
+    }
+    let end = end.unwrap_or(buf.len());
     let text =
         std::str::from_utf8(&buf[..end]).context("VMDK descriptor is not valid UTF-8/ASCII")?;
     let text_owned = text.to_string();
@@ -330,6 +338,24 @@ impl VmdkFlatReader {
                 .with_context(|| format!("failed to open VMDK extent {}", p.display()))
         };
 
+        // An edit must not reach a file outside the disk's own folder.
+        if writable {
+            for spec in &descriptor.extents {
+                let Some(p) = &spec.path else { continue };
+                let rel = p.strip_prefix(&dir).unwrap_or(p);
+                if rel.is_absolute()
+                    || rel
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    bail!(
+                        "VMDK extent {} is outside the descriptor's folder; refusing to open it \
+                         for writing",
+                        p.display()
+                    );
+                }
+            }
+        }
         let mut extents = Vec::with_capacity(descriptor.extents.len());
         let mut logical = 0u64;
         for spec in descriptor.extents {
@@ -601,7 +627,9 @@ pub fn build_monolithic_flat_descriptor(disk_size_bytes: u64, flat_filename: &st
 /// Errors when the descriptor names more than one FLAT extent (split layouts
 /// would need the caller to pick *which* extent to edit), references a ZERO
 /// extent (no backing file), or is a sparse `KDMV` image (Phase 4).
-pub fn open_flat_extent_for_edit(descriptor_path: &Path) -> Result<File> {
+/// Only the tests use it; edits go through [`VmdkFlatReader::open_rw`].
+#[cfg(test)]
+fn open_flat_extent_for_edit(descriptor_path: &Path) -> Result<File> {
     let (text, _embedded_data_start, dir) = read_descriptor(descriptor_path)?;
     let descriptor = Descriptor::parse(&text, &dir)?;
     let flat_extents: Vec<&ExtentSpec> = descriptor

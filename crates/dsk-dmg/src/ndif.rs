@@ -109,6 +109,13 @@ pub fn reconstruct_to<W: std::io::Write + std::io::Seek>(
         .with_context(|| format!("NDIF: implausible image size ({total_sectors} sectors)"))?;
 
     // Parse the chunk table up front so each chunk knows where the next begins.
+    // Every chunk entry lives in the bcem resource, which bounds the count read from it.
+    if OFF_CHUNKS.saturating_add(count.saturating_mul(CHUNK_LEN)) > bcem.len() {
+        bail!(
+            "NDIF: {count} chunks don't fit the {}-byte bcem resource",
+            bcem.len()
+        );
+    }
     let mut chunks = Vec::with_capacity(count);
     for i in 0..count {
         let base = OFF_CHUNKS + i * CHUNK_LEN;

@@ -446,17 +446,7 @@ pub trait EditableFilesystem: Filesystem {
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
-        if entry.is_directory() {
-            let children = self.list_directory(entry)?;
-            for child in &children {
-                if child.is_directory() {
-                    self.delete_recursive(entry, child)?;
-                } else {
-                    self.delete_entry(entry, child)?;
-                }
-            }
-        }
-        self.delete_entry(parent, entry)
+        delete_tree(self, parent, entry, 0)
     }
 
     /// Rename an entry within its parent directory, in place: the entry keeps
@@ -757,6 +747,37 @@ pub trait EditableFilesystem: Filesystem {
     }
 }
 
+/// Deeper than any real tree; a corrupt directory that lists an ancestor stops here, not at stack overflow.
+const MAX_DELETE_DEPTH: usize = 1024;
+
+fn delete_tree<F: EditableFilesystem + ?Sized>(
+    fs: &mut F,
+    parent: &FileEntry,
+    entry: &FileEntry,
+    depth: usize,
+) -> Result<(), FilesystemError> {
+    if entry.is_directory() {
+        if depth >= MAX_DELETE_DEPTH {
+            return Err(FilesystemError::InvalidData(format!(
+                "{} is nested more than {MAX_DELETE_DEPTH} folders deep; the directory tree loops",
+                entry.path
+            )));
+        }
+        for child in &fs.list_directory(entry)? {
+            // A driver that lists "." or ".." would otherwise delete the folder's own parent.
+            if child.name == "." || child.name == ".." {
+                continue;
+            }
+            if child.is_directory() {
+                delete_tree(fs, entry, child, depth + 1)?;
+            } else {
+                fs.delete_entry(entry, child)?;
+            }
+        }
+    }
+    fs.delete_entry(parent, entry)
+}
+
 /// The child of a listing that `name` addresses: an exact match first, then,
 /// when the filesystem folds case, the way its native OS would match (R-062).
 pub fn find_child<'a>(
@@ -773,6 +794,17 @@ pub fn find_child<'a>(
 
 /// Walk `components` from the root, rejoining neighbours with `/` when a name
 /// holds a literal slash (legal on HFS); see docs/commander_mode.md "Slashes in names".
+/// List `parent` and return its child called `name`, matched the way `fs` matches names.
+pub fn lookup_child(
+    fs: &mut dyn Filesystem,
+    parent: &FileEntry,
+    name: &str,
+) -> Result<Option<FileEntry>, FilesystemError> {
+    let fold = fs.case_insensitive_lookup();
+    let children = fs.list_directory(parent)?;
+    Ok(find_child(fold, &children, name).cloned())
+}
+
 pub fn resolve_components_joined(
     fs: &mut dyn Filesystem,
     components: &[&str],
@@ -893,5 +925,95 @@ mod find_child_tests {
         );
         assert!(find_child(false, &kids, "extra.bin").is_none());
         assert!(find_child(true, &kids, "missing").is_none());
+    }
+}
+
+#[cfg(test)]
+mod delete_tree_tests {
+    use super::*;
+
+    /// `/loop` lists itself as its only child, as a corrupt FAT subdirectory can.
+    #[derive(Default)]
+    struct LoopFs {
+        deleted: Vec<String>,
+    }
+
+    impl Filesystem for LoopFs {
+        fn root(&mut self) -> Result<FileEntry, FilesystemError> {
+            Ok(FileEntry::root())
+        }
+        fn list_directory(&mut self, _: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
+            Ok(vec![
+                FileEntry::new_directory(".".into(), "/loop/.".into(), 2),
+                FileEntry::new_directory("loop".into(), "/loop".into(), 2),
+            ])
+        }
+        fn read_file(&mut self, _: &FileEntry, _: usize) -> Result<Vec<u8>, FilesystemError> {
+            Ok(Vec::new())
+        }
+        fn volume_label(&self) -> Option<&str> {
+            None
+        }
+        fn fs_type(&self) -> &str {
+            "test"
+        }
+        fn total_size(&self) -> u64 {
+            0
+        }
+        fn used_size(&self) -> u64 {
+            0
+        }
+    }
+
+    impl EditableFilesystem for LoopFs {
+        fn as_filesystem(&self) -> &dyn Filesystem {
+            self
+        }
+        fn as_filesystem_mut(&mut self) -> &mut dyn Filesystem {
+            self
+        }
+        fn create_file(
+            &mut self,
+            _: &FileEntry,
+            _: &str,
+            _: &mut dyn std::io::Read,
+            _: u64,
+            _: &CreateFileOptions,
+        ) -> Result<FileEntry, FilesystemError> {
+            unreachable!()
+        }
+        fn create_directory(
+            &mut self,
+            _: &FileEntry,
+            _: &str,
+            _: &CreateDirectoryOptions,
+        ) -> Result<FileEntry, FilesystemError> {
+            unreachable!()
+        }
+        fn delete_entry(&mut self, _: &FileEntry, e: &FileEntry) -> Result<(), FilesystemError> {
+            self.deleted.push(e.path.clone());
+            Ok(())
+        }
+        fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+            Ok(())
+        }
+        fn free_space(&mut self) -> Result<u64, FilesystemError> {
+            Ok(0)
+        }
+    }
+
+    /// DC-005: a looping tree is an error, not a stack overflow, and "." is never deleted.
+    #[test]
+    fn a_looping_tree_stops_with_an_error() {
+        let mut fs = LoopFs::default();
+        let root = FileEntry::root();
+        let dir = FileEntry::new_directory("loop".into(), "/loop".into(), 2);
+        let err = fs.delete_recursive(&root, &dir).unwrap_err();
+        assert!(matches!(err, FilesystemError::InvalidData(_)), "{err}");
+        assert!(
+            fs.deleted.is_empty(),
+            "nothing is deleted before the loop is found"
+        );
+        assert!(!fs.deleted.iter().any(|p| p.ends_with("/.")));
     }
 }

@@ -34,6 +34,8 @@ const LVD_BYTES: usize = 32;
 const PPE_BYTES: usize = 32;
 /// `struct pvd` holds at most this many partition entries.
 const MAX_PPS: usize = 1016;
+/// 32 MiB: far above any VGDA AIX writes.
+const MAX_VGDA_SECTORS: u64 = 65_536;
 
 /// A single-PV AIX volume group as seen from this disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +68,8 @@ impl AixLvm {
         }
         let vgda_len = be32(&rec, 24) as u64;
         let shift = be16(&rec, 46) as u32;
-        if !(20..=30).contains(&shift) || vgda_len < 64 {
+        // Real VGDAs are a few thousand sectors; a corrupt length must not size a huge buffer.
+        if !(20..=30).contains(&shift) || !(64..=MAX_VGDA_SECTORS).contains(&vgda_len) {
             return None;
         }
         let pp_size = 1u64 << shift;
@@ -212,5 +215,14 @@ mod tests {
     #[test]
     fn no_lvm_record_is_none() {
         assert!(AixLvm::detect(&mut Cursor::new(vec![0u8; 1 << 20])).is_none());
+    }
+
+    /// PT-007: a corrupt VGDA length is refused instead of sizing a huge buffer.
+    #[test]
+    fn a_huge_vgda_length_is_refused() {
+        let mut d = sample_disk();
+        let r = 7 * 512;
+        d[r + 24..r + 28].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(AixLvm::detect(&mut Cursor::new(d)).is_none());
     }
 }

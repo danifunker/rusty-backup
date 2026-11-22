@@ -8,6 +8,7 @@ pub mod atr;
 pub mod d88;
 pub mod dim;
 pub mod edsk;
+mod flat_layout;
 pub mod floppy_geom;
 pub mod g64;
 pub mod hdf;

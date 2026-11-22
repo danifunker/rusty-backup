@@ -37,7 +37,7 @@ fn classify(b: &[u8]) -> String {
 fn main() -> anyhow::Result<()> {
     let path = std::env::args().nth(1).expect("path to GHO");
     let mut r = GhoReader::open(std::path::Path::new(&path))?;
-    r.prepare_full_image();
+    r.prepare_full_image().expect("prepare GHO");
     let sentinels = r.debug_sentinel_runs_full(64);
     println!("sentinel runs: {}", sentinels.len());
     let total: u64 = sentinels.iter().map(|(cc, _, _)| cc).sum();

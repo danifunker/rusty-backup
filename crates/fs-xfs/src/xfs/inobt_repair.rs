@@ -27,9 +27,8 @@
 //! need block allocation (and R2 coupling) and is still reported + skipped.
 //!
 //! v4 only: v5 inobt blocks carry a CRC we don't recompute, so rewriting a
-//! leaf there would invalidate it. Porting reference: `xfs_repair` @ v3.1.11
-//! `repair/dino_chunks.c` (free-mask derivation) + `repair/phase5.c`
-//! (`build_ino_tree` / AGI counters).
+//! leaf there would invalidate it. Behavioural reference, validated against
+//! `xfs_repair -n` (its free-mask and inode-btree / AGI counter checks).
 
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -647,6 +646,11 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         root_agbno: u32,
         chunks: &[(u32, u64)],
     ) -> Result<(u64, u64), FilesystemError> {
+        if sb.is_v5() {
+            return Err(FilesystemError::Unsupported(
+                "rebuilding a lost inode btree is v4-only (the rebuild writes v4 blocks)".into(),
+            ));
+        }
         let bs = sb.blocksize as usize;
         let mut block = vec![0u8; bs];
         BigEndian::write_u32(&mut block[0..4], XFS_IBT_MAGIC);
@@ -698,6 +702,11 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         agno: u64,
         chunks: &[(u32, u64)],
     ) -> Result<(u64, u64, u32, u32), FilesystemError> {
+        if sb.is_v5() {
+            return Err(FilesystemError::Unsupported(
+                "rebuilding a lost inode btree is v4-only (the rebuild writes v4 blocks)".into(),
+            ));
+        }
         let bs = sb.blocksize as usize;
         let agblocks = sb.agblocks as u64;
         let expected_len = if agno == sb.agcount as u64 - 1 {
@@ -713,8 +722,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
         // (2) free extents of this AG, carve the tree's blocks off the largest.
         let derived = derive_free_extents(&map, agno, agblocks, expected_len);
-        // R3 currently rejects v5 at the entry point above, so this AG-rebuild
-        // is always v4 today; passing `false` preserves that.
+        // v5 was refused above, so the tree is built with v4 headers.
         let need = blocks_needed_for(chunks.len(), bs, INOBT_REC_SIZE, INOBT_KEY_SIZE, false);
         let (carved, _reduced) = carve_from_largest(&derived, need as u32).ok_or_else(|| {
             FilesystemError::Unsupported(format!(
@@ -767,7 +775,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let agblocks = sb.agblocks as u64;
         let blocksize = sb.blocksize as u64;
         let sectsize = sb.sectsize as u64;
-        let mut map = InUseMap::new(sb.dblocks);
+        let mut map = InUseMap::new(sb.dblocks)?;
         let internal: HashSet<u64> = sb.internal_inodes().into_iter().collect();
         let blocks_per_chunk =
             ((XFS_INODES_PER_CHUNK as u64) * sb.inodesize as u64).div_ceil(blocksize);

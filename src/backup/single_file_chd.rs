@@ -2122,7 +2122,7 @@ fn build_patched_head_segments(
             let mut mbr_buf = [0u8; 512];
             let copy_len = source_partition_table_bytes.len().min(512);
             mbr_buf[..copy_len].copy_from_slice(&source_partition_table_bytes[..copy_len]);
-            patch_mbr_entries(&mut mbr_buf, overrides);
+            patch_mbr_entries(&mut mbr_buf, overrides).context("patching the MBR")?;
             log_cb("  table: MBR (patched with new partition sizes/offsets)");
             let head: Segment = (
                 0,
@@ -2202,8 +2202,11 @@ fn build_patched_head_segments(
             if block_size == 0 {
                 anyhow::bail!("APM DDR block_size is 0 — corrupt partition table");
             }
-            let target_blocks = (target_size / block_size) as u32;
-            let patched = apm.patch_for_restore(overrides, target_blocks);
+            let target_blocks = u32::try_from(target_size / block_size)
+                .context("the target has more APM blocks than a 32-bit count can hold")?;
+            let patched = apm
+                .patch_for_restore(overrides, target_blocks)
+                .context("patching the APM")?;
             let blocks = patched.build_apm_blocks(Some(target_blocks));
             let to_overlay = (blocks.len() as u64).min(head_end);
             head_buf[..to_overlay as usize].copy_from_slice(&blocks[..to_overlay as usize]);

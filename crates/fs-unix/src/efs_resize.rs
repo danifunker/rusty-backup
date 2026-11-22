@@ -338,7 +338,7 @@ pub fn grow_efs<R: Read + Write + Seek>(
             let cg_start = sb.firstcg + cg * sb.cgfsize;
             let zero_sector = [0u8; EFS_BLOCKSIZE_USIZE];
             for i in 0..sb.cgisize as u32 {
-                fs.write_block(cg_start + i, &zero_sector)?;
+                fs.write_block_resizing(cg_start + i, &zero_sector)?;
             }
             // Reservation may have been deferred for blocks past the
             // pre-relocation bitmap end. Catch up here now that the
@@ -609,12 +609,8 @@ pub fn shrink_efs_conservative<R: Read + Write + Seek>(
 /// inodes are reassigned in ascending old-inum order to the lowest
 /// free slots 3, 4, 5, ...
 ///
-/// **Hardlinks**: EFS does not support multi-link semantics (each
-/// inum is referenced from exactly one dirent), so the inum→inum
-/// mapping is unambiguously 1:1. We assert per inode at most one
-/// dirent reference; if a hardlink is encountered, the renumbering
-/// pass falls back to a conservative shrink with a warning rather
-/// than risking dangling references.
+/// **Hard links** need no special case: every dirent naming an old inum,
+/// however many there are, is rewritten through the same old-to-new map.
 ///
 /// Runs Phase-2 fsck both BEFORE the renumber pass (to refuse on a
 /// corrupt source) and AFTER, before the new superblock is sealed.
@@ -746,8 +742,7 @@ fn rewrite_directory_inum_refs<R: Read + Write + Seek>(
         if !ino.is_dir() {
             continue;
         }
-        for i in 0..(ino.numextents as usize).min(EFS_DIRECTEXTENTS_MAX) {
-            let ext = ino.extents[i];
+        for ext in fs.dir_extents(ino)? {
             if ext.length == 0 {
                 continue;
             }
@@ -778,7 +773,7 @@ fn rewrite_directory_inum_refs<R: Read + Write + Seek>(
                             "aggressive shrink: re-serializing dirblock {bn} grew past 512 bytes"
                         ))
                     })?;
-                    fs.write_block(bn, &new_block)?;
+                    fs.write_block_resizing(bn, &new_block)?;
                     dirblocks_rewritten += 1;
                 }
             }

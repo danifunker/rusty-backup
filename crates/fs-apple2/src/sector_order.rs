@@ -277,7 +277,7 @@ pub fn open_apple_ii_dsk(bytes: Vec<u8>, _ext_hint: Option<&str>) -> Result<Vec<
     if bytes.len() != APPLE_II_DISK_BYTES {
         return Err(anyhow!(
             "Apple-II disk image must be exactly {} bytes (got {}); \
-             only standard 35×16×256 floppies are supported",
+             only standard 35x16x256 floppies are supported",
             APPLE_II_DISK_BYTES,
             bytes.len()
         ));

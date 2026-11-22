@@ -25,6 +25,8 @@ use disk_core::filesystem::{Filesystem, FilesystemError};
 /// (2 GiB) — extract it instead. Guards against decompressing a huge tarball
 /// into RAM.
 const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Largest compressed tar inflated to a temp file for indexed browsing.
+const MAX_INDEXED_BYTES: u64 = 64 << 30;
 
 /// Archives opened by path above this are indexed rather than read into memory.
 pub const INLINE_MAX: u64 = 64 * 1024 * 1024;
@@ -293,9 +295,18 @@ pub fn open_zip(
                     "zip is too large to browse inline; extract it instead".into(),
                 ));
             }
-            let mut buf = Vec::with_capacity(zf.size() as usize);
-            zf.read_to_end(&mut buf)
+            // The declared size is only a claim: read no more than it, and say so if there's more.
+            let declared = zf.size();
+            let mut buf = Vec::with_capacity((declared as usize).min(1 << 20));
+            (&mut zf)
+                .take(declared + 1)
+                .read_to_end(&mut buf)
                 .map_err(|e| FilesystemError::Parse(format!("zip read '{name}': {e}")))?;
+            if buf.len() as u64 > declared {
+                return Err(FilesystemError::Parse(format!(
+                    "zip member '{name}' inflates past its stated {declared} bytes"
+                )));
+            }
             buf
         });
         let modified = zf.last_modified().map(|d| {
@@ -411,7 +422,7 @@ pub fn open_tar(
                     "tar is too large to browse inline; extract it instead".into(),
                 ));
             }
-            let mut buf = Vec::with_capacity(entry.size() as usize);
+            let mut buf = Vec::with_capacity((entry.size() as usize).min(1 << 20));
             entry
                 .read_to_end(&mut buf)
                 .map_err(|e| FilesystemError::Parse(format!("tar read: {e}")))?;
@@ -520,13 +531,30 @@ fn open_tar_indexed(
             let mut tmp = tempfile::NamedTempFile::new()?;
             let src = BufReader::new(std::fs::File::open(path)?);
             if head.starts_with(&[0x1f, 0x8b]) {
-                std::io::copy(&mut flate2::read::MultiGzDecoder::new(src), &mut tmp)
-                    .map_err(|e| FilesystemError::Parse(format!("gunzip tar: {e}")))?;
+                // Capped, so a gzip bomb fills neither memory nor the temp disk.
+                let n = std::io::copy(
+                    &mut flate2::read::MultiGzDecoder::new(src).take(MAX_INDEXED_BYTES + 1),
+                    &mut tmp,
+                )
+                .map_err(|e| FilesystemError::Parse(format!("gunzip tar: {e}")))?;
+                if n > MAX_INDEXED_BYTES {
+                    return Err(FilesystemError::Unsupported(format!(
+                        "this .tar.gz inflates past {MAX_INDEXED_BYTES} bytes; extract it instead"
+                    )));
+                }
             } else {
                 #[cfg(feature = "native-zstd")]
                 {
-                    zstd::stream::copy_decode(src, &mut tmp)
+                    let dec = zstd::stream::read::Decoder::new(src)
                         .map_err(|e| FilesystemError::Parse(format!("unzstd tar: {e}")))?;
+                    let n = std::io::copy(&mut dec.take(MAX_INDEXED_BYTES + 1), &mut tmp)
+                        .map_err(|e| FilesystemError::Parse(format!("unzstd tar: {e}")))?;
+                    if n > MAX_INDEXED_BYTES {
+                        return Err(FilesystemError::Unsupported(format!(
+                            "this .tar.zst inflates past {MAX_INDEXED_BYTES} bytes; extract it \
+                             instead"
+                        )));
+                    }
                 }
                 #[cfg(not(feature = "native-zstd"))]
                 {
@@ -597,16 +625,30 @@ fn decompress_tar(bytes: Vec<u8>) -> Result<Vec<u8>, FilesystemError> {
     if bytes.starts_with(&[0x1f, 0x8b]) {
         // gzip (.tgz / .tar.gz)
         let mut out = Vec::new();
-        flate2::read::GzDecoder::new(Cursor::new(&bytes))
+        flate2::read::MultiGzDecoder::new(Cursor::new(&bytes))
+            .take(MAX_TOTAL_BYTES + 1)
             .read_to_end(&mut out)
             .map_err(|e| FilesystemError::Parse(format!("gunzip tar: {e}")))?;
+        if out.len() as u64 > MAX_TOTAL_BYTES {
+            return Err(FilesystemError::Unsupported(
+                "tar is too large to browse inline; extract it instead".into(),
+            ));
+        }
         Ok(out)
     } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
         // zstd (.tar.zst) — only when the optional codec is built.
         #[cfg(feature = "native-zstd")]
         {
-            zstd::stream::decode_all(Cursor::new(&bytes))
-                .map_err(|e| FilesystemError::Parse(format!("unzstd tar: {e}")))
+            let mut out = Vec::new();
+            zstd::stream::read::Decoder::new(Cursor::new(&bytes))
+                .and_then(|d| d.take(MAX_TOTAL_BYTES + 1).read_to_end(&mut out))
+                .map_err(|e| FilesystemError::Parse(format!("unzstd tar: {e}")))?;
+            if out.len() as u64 > MAX_TOTAL_BYTES {
+                return Err(FilesystemError::Unsupported(
+                    "tar is too large to browse inline; extract it instead".into(),
+                ));
+            }
+            Ok(out)
         }
         #[cfg(not(feature = "native-zstd"))]
         {

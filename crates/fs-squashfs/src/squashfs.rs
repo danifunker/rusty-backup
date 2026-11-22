@@ -175,7 +175,9 @@ impl Superblock {
         // block_log must agree with block_size; a mismatch means we are not
         // looking at a real superblock even though the magic matched.
         let block_log = u16le(buf, 22);
-        if block_size == 0 || block_size != 1u32 << block_log {
+        // SquashFS blocks are 4 KiB to 1 MiB; outside that the shift would overflow or the
+        // block buffers grow to gigabytes.
+        if !(12..=20).contains(&block_log) || block_size != 1u32 << block_log {
             return Err(FilesystemError::InvalidData(format!(
                 "squashfs: block size {block_size} disagrees with block_log {block_log}"
             )));
@@ -496,7 +498,8 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
         offset: u16,
         len: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let mut out = Vec::with_capacity(len);
+        // `len` comes from the image; grow as blocks arrive rather than reserving it.
+        let mut out = Vec::with_capacity(len.min(1 << 20));
         let mut pos = start;
         let mut skip = offset as usize;
 
@@ -547,7 +550,7 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             .read_exact(&mut index)
             .map_err(FilesystemError::Io)?;
 
-        let mut entries = Vec::with_capacity(count);
+        let mut entries = Vec::with_capacity(count.min(1 << 16));
         for i in 0..index_count {
             let block_start = u64le(&index, i * 8);
             let (block, _) = self.read_metadata_block(block_start)?;
@@ -583,7 +586,7 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             .read_exact(&mut index)
             .map_err(FilesystemError::Io)?;
 
-        let mut ids = Vec::with_capacity(count);
+        let mut ids = Vec::with_capacity(count.min(1 << 16));
         for i in 0..index_count {
             let block_start = u64le(&index, i * 8);
             let (block, _) = self.read_metadata_block(block_start)?;
@@ -636,7 +639,7 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             .read_exact(&mut index)
             .map_err(FilesystemError::Io)?;
 
-        let mut entries = Vec::with_capacity(count);
+        let mut entries = Vec::with_capacity(count.min(1 << 16));
         for i in 0..index_count {
             let block_start = u64le(&index, i * 8);
             let (block, _) = self.read_metadata_block(block_start)?;
@@ -761,6 +764,21 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
 
     /// Decode the inode at `reference` (block start in the high bits, byte
     /// offset within the decompressed block in the low 16).
+    /// A directory inode's (own number, parent number), for tests of the writer.
+    #[cfg(test)]
+    pub(crate) fn dir_numbers_for_test(&mut self, reference: u64) -> (u32, u32) {
+        let inode = self.read_inode(reference).expect("inode");
+        assert!(
+            matches!(inode.kind, INODE_DIR | INODE_EXT_DIR),
+            "not a directory"
+        );
+        let block = self.sb.inode_table_start + (reference >> 16);
+        let b = self
+            .read_metadata_span(block, (reference & 0xFFFF) as u16, 32)
+            .expect("span");
+        (inode.inode_number, u32le(&b, 28))
+    }
+
     fn read_inode(&mut self, reference: u64) -> Result<Inode, FilesystemError> {
         let block = self.sb.inode_table_start + (reference >> 16);
         let offset = (reference & 0xFFFF) as u16;
@@ -1066,7 +1084,7 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
     /// seam without changing this signature.
     pub fn read_build_tree(&mut self) -> Result<crate::squashfs_write::BuildNode, FilesystemError> {
         let root_ref = self.sb.root_inode_ref;
-        let mut root = self.build_node(String::new(), root_ref)?;
+        let mut root = self.build_node(String::new(), root_ref, 0, &mut HashMap::new())?;
         // The tree's root name is conventionally empty; the writer ignores it.
         root.name = String::new();
         Ok(root)
@@ -1096,18 +1114,27 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
                 .map(|(_, r, _)| r)
                 .ok_or_else(|| FilesystemError::NotFound(path.to_string()))?;
         }
-        let mut node = self.build_node(String::new(), reference)?;
+        let mut node = self.build_node(String::new(), reference, 0, &mut HashMap::new())?;
         node.name = String::new();
         Ok(node)
     }
 
     /// Recursively turn the inode at `reference` into a [`BuildNode`].
+    /// `links` maps an inode number already read to its shared file data, so hard links stay one inode.
     fn build_node(
         &mut self,
         name: String,
         reference: u64,
+        depth: usize,
+        links: &mut HashMap<u32, std::sync::Arc<Vec<u8>>>,
     ) -> Result<crate::squashfs_write::BuildNode, FilesystemError> {
         use crate::squashfs_write::{BuildKind, FileContent};
+        // A directory that contains itself would recurse until the stack overflowed.
+        if depth > 256 {
+            return Err(FilesystemError::InvalidData(
+                "squashfs: directories nested more than 256 deep (a cycle?)".into(),
+            ));
+        }
 
         let inode = self.read_inode(reference)?;
         let xattrs = self.read_xattrs(inode.xattr_idx)?;
@@ -1121,9 +1148,20 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
                 let entries = self.read_dir_entries(&inode)?;
                 let mut children = Vec::with_capacity(entries.len());
                 for (child_name, child_ref, _kind) in entries {
-                    children.push(self.build_node(child_name, child_ref)?);
+                    children.push(self.build_node(child_name, child_ref, depth + 1, links)?);
                 }
                 BuildKind::Dir(children)
+            }
+            INODE_FILE | INODE_EXT_FILE if inode.nlink > 1 => {
+                let shared = match links.get(&inode.inode_number) {
+                    Some(data) => data.clone(),
+                    None => {
+                        let data = std::sync::Arc::new(self.read_regular_file(&inode, usize::MAX)?);
+                        links.insert(inode.inode_number, data.clone());
+                        data
+                    }
+                };
+                BuildKind::File(FileContent::Shared(shared))
             }
             INODE_FILE | INODE_EXT_FILE => {
                 let data = self.read_regular_file(&inode, usize::MAX)?;
@@ -1147,6 +1185,9 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             }
         };
 
+        // Other non-directories with several links (devices, symlinks) are grouped too.
+        let is_dir = matches!(kind, BuildKind::Dir(_));
+        let link_group = (!is_dir && inode.nlink > 1).then_some(inode.inode_number as u64);
         Ok(crate::squashfs_write::BuildNode {
             name,
             mode,
@@ -1155,6 +1196,7 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             mtime,
             xattrs,
             kind,
+            link_group,
         })
     }
 }
@@ -1310,7 +1352,7 @@ fn decompress(
         Compressor::Gzip => {
             // SquashFS uses raw zlib streams, not the gzip wrapper.
             use std::io::Read as _;
-            let mut out = Vec::with_capacity(max_out);
+            let mut out = Vec::with_capacity(max_out.min(1 << 20));
             flate2::read::ZlibDecoder::new(input)
                 .take(max_out as u64)
                 .read_to_end(&mut out)
@@ -1318,16 +1360,16 @@ fn decompress(
             Ok(out)
         }
         Compressor::Xz => {
-            let mut out = Vec::with_capacity(max_out);
+            let mut out = CappedWriter::new(max_out);
             lzma_rs::xz_decompress(&mut std::io::Cursor::new(input), &mut out)
                 .map_err(|e| err("xz", format!("{e:?}")))?;
-            Ok(out)
+            Ok(out.buf)
         }
         Compressor::Lzma => {
-            let mut out = Vec::with_capacity(max_out);
+            let mut out = CappedWriter::new(max_out);
             lzma_rs::lzma_decompress(&mut std::io::Cursor::new(input), &mut out)
                 .map_err(|e| err("lzma", format!("{e:?}")))?;
-            Ok(out)
+            Ok(out.buf)
         }
         Compressor::Lz4 => {
             // SquashFS stores a bare LZ4 block, not a frame, and the caller
@@ -1347,11 +1389,41 @@ fn decompress(
 /// cross builds). The shim `compile_error!`s when neither is enabled, so there
 /// is no "no backend" arm to write here.
 fn decompress_zstd(input: &[u8], max_out: usize) -> Result<Vec<u8>, FilesystemError> {
-    let mut out = crate::zstd_compat::decode_all(input).map_err(|e| {
+    crate::zstd_compat::decode_capped(input, max_out).map_err(|e| {
         FilesystemError::InvalidData(format!("squashfs: zstd decompression failed: {e}"))
-    })?;
-    out.truncate(max_out);
-    Ok(out)
+    })
+}
+
+/// A `Write` sink that fails once more than `max` bytes arrive, so a block that expands past
+/// its known size stops there instead of filling memory.
+struct CappedWriter {
+    buf: Vec<u8>,
+    max: usize,
+}
+
+impl CappedWriter {
+    fn new(max: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(max.min(1 << 20)),
+            max,
+        }
+    }
+}
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() + data.len() > self.max {
+            return Err(disk_core::io_other(format!(
+                "decompressed data passes the {}-byte block size",
+                self.max
+            )));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // ── Little-endian readers ─────────────────────────────────────────────────────

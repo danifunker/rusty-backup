@@ -4,8 +4,7 @@
 //! 512 bytes for floppies (`.adf`) and matches the RDB DosEnv block size for
 //! hard-disk partitions (also 512 in practice).
 //!
-//! Layout reference: the AmigaDOS reference manual and the ADF FAQ; ADFlib was
-//! used as a cross-check only.
+//! Layout reference: the AmigaDOS reference manual and the ADF FAQ.
 
 /// AFFS logical block size in bytes. Both ADF floppies and AmigaDOS hard
 /// disks use 512 bytes — block sizes other than 512 require routing
@@ -213,6 +212,30 @@ fn days_to_ymd(days_since_epoch: i64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m, d)
+}
+
+/// AmigaDOS text is ISO-8859-1: each byte is the code point of that value.
+pub fn latin1_to_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Encode as ISO-8859-1 for disk; a character above U+00FF cannot be stored (AMI-011).
+pub fn string_to_latin1(s: &str) -> Result<Vec<u8>, disk_core::filesystem::FilesystemError> {
+    s.chars()
+        .map(|c| u8::try_from(u32::from(c)).ok())
+        .collect::<Option<Vec<u8>>>()
+        .ok_or_else(|| {
+            disk_core::filesystem::FilesystemError::InvalidData(format!(
+                "'{s}' has a character outside ISO-8859-1, which Amiga names cannot hold"
+            ))
+        })
+}
+
+/// [`string_to_latin1`] for lookups: an unstorable character becomes 0, which no stored name has.
+pub fn latin1_lossy(s: &str) -> Vec<u8> {
+    s.chars()
+        .map(|c| u8::try_from(u32::from(c)).unwrap_or(0))
+        .collect()
 }
 
 /// Decode an AFFS BSTR (Pascal-style: 1 length byte + chars). Reads at most

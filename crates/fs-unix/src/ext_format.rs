@@ -616,9 +616,8 @@ pub fn write_blank_ext4<W: Write + Seek>(
     write_blank_ext(sink, part_off, size_bytes, label, ExtVariant::Ext4)
 }
 
-/// Format a blank ext volume and return the whole image in memory. Used by the
-/// `batch` multi-partition builder and tests; the CLI `new` verb streams straight
-/// to a file instead.
+/// Format a blank ext volume in memory, for tests and fixtures; the builders stream
+/// through [`write_blank_ext`] instead.
 fn create_blank_ext(
     size_bytes: u64,
     label: &str,

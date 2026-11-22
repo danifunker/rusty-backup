@@ -195,6 +195,9 @@ pub struct ExtFilesystem<R> {
     /// every metadata write to keep the volume checksum-consistent.
     #[allow(dead_code)] // consumed by the checksum-aware editor in Phase D
     metadata_csum: bool,
+    /// Why edits are refused on this volume, if they are (features the editor does not
+    /// maintain; UNX-004).
+    edit_blocker: Option<String>,
     /// crc32c seed derived from the volume UUID (`ext_csum::csum_seed`).
     #[allow(dead_code)] // consumed by the checksum-aware editor in Phase D
     csum_seed: u32,
@@ -230,7 +233,12 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         let metadata_csum = feature_ro_compat & 0x0400 != 0;
         let csum_seed = crate::ext_csum::volume_seed(&sb);
 
-        let block_size = 1024u64 << log_block_size;
+        // Range-check the log before shifting by it (UNX-025).
+        let block_size = if log_block_size <= 6 {
+            1024u64 << log_block_size
+        } else {
+            0
+        };
         if !(1024..=65536).contains(&block_size) {
             return Err(FilesystemError::Parse(format!(
                 "ext: invalid block size {block_size}"
@@ -287,8 +295,21 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         if blocks_per_group == 0 {
             return Err(FilesystemError::Parse("ext: blocks_per_group is 0".into()));
         }
-        let group_count =
-            (total_blocks - first_data_block as u64).div_ceil(blocks_per_group as u64) as u32;
+        if total_blocks <= first_data_block as u64 {
+            return Err(FilesystemError::Parse(format!(
+                "ext: {total_blocks} blocks, first data block {first_data_block}"
+            )));
+        }
+        let groups = (total_blocks - first_data_block as u64).div_ceil(blocks_per_group as u64);
+        // The descriptor table is read whole, so its size must be plausible for the volume.
+        if groups > u64::from(u32::MAX)
+            || groups.saturating_mul(u64::from(desc_size)) > total_blocks.saturating_mul(block_size)
+        {
+            return Err(FilesystemError::Parse(format!(
+                "ext: implausible group count {groups}"
+            )));
+        }
+        let group_count = groups as u32;
 
         if inodes_count == 0 || inodes_per_group == 0 {
             return Err(FilesystemError::Parse(
@@ -370,6 +391,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         }
 
         Ok(Self {
+            edit_blocker: ext_edit_blocker(feature_incompat, feature_ro_compat),
             blocks_per_group: blocks_per_group as u64,
             sparse_super: feature_ro_compat & 0x0001 != 0,
             reserved_gdt_blocks: u16::from_le_bytes([sb[0xCE], sb[0xCF]]) as u64,
@@ -618,8 +640,9 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
             return Ok(String::from_utf8_lossy(target).to_string());
         }
 
-        // Slow symlink: target stored in data blocks
-        let data = self.read_inode_data(inode, inode.size as usize)?;
+        // Slow symlink: target stored in data blocks. A target is a path (PATH_MAX 4096); a
+        // larger size is corruption and must not size the read.
+        let data = self.read_inode_data(inode, (inode.size as usize).min(4096))?;
         // Strip trailing null if present
         let len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
         Ok(String::from_utf8_lossy(&data[..len]).to_string())
@@ -638,6 +661,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
             let mut all_blocks = Vec::new();
             for idx in indices {
                 let child_data = self.read_block(idx.child_block)?;
+                check_child_depth(&header, &child_data)?;
                 self.read_extent_node(&child_data, &mut all_blocks)?;
             }
             Ok(all_blocks)
@@ -657,6 +681,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
             let indices = parse_extent_indices(block_data, header.entries);
             for idx in indices {
                 let child_data = self.read_block(idx.child_block)?;
+                check_child_depth(&header, &child_data)?;
                 self.read_extent_node(&child_data, all_blocks)?;
             }
         }
@@ -934,6 +959,21 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
     }
 
     /// Read the fsck-relevant fields of inode `inum` (1-based).
+    /// True for an inode in lazily initialised space (`INODE_UNINIT`, or past the group's
+    /// `itable_unused` mark): never written, so its bytes are whatever the disk held.
+    pub(crate) fn fsck_inode_never_used(&self, inum: u32, checksummed: bool) -> bool {
+        if !checksummed || inum == 0 || self.inodes_per_group == 0 {
+            return false;
+        }
+        let group = ((inum - 1) / self.inodes_per_group) as usize;
+        let idx = (inum - 1) % self.inodes_per_group;
+        let Some(gd) = self.group_descriptors.get(group) else {
+            return false;
+        };
+        gd.flags & BG_INODE_UNINIT != 0
+            || idx >= self.inodes_per_group.saturating_sub(gd.itable_unused)
+    }
+
     pub(crate) fn fsck_read_inode(&mut self, inum: u32) -> Result<FsckInode, FilesystemError> {
         let ino = self.read_inode(inum)?;
         Ok(FsckInode {
@@ -998,6 +1038,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
             for idx in parse_extent_indices(node, header.entries) {
                 out.push(idx.child_block); // the index node is metadata
                 let child = self.read_block(idx.child_block)?;
+                check_child_depth(&header, &child)?;
                 self.fsck_extent_blocks(&child, out)?;
             }
         }
@@ -1099,6 +1140,14 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
         }
 
         let inode = self.read_inode(entry.location as u32)?;
+        // ext4 directories stop at 2 GiB with large_dir, but a listing over 256 MiB is a
+        // corrupt size, not something to allocate.
+        if inode.size > 256 << 20 {
+            return Err(FilesystemError::Parse(format!(
+                "ext: directory inode {} claims {} bytes",
+                entry.location, inode.size
+            )));
+        }
         let data = self.read_inode_data(&inode, inode.size as usize)?;
         let dir_entries = self.parse_directory(&data);
 
@@ -1492,7 +1541,15 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
             let ibm_len = (self.inodes_per_group / 8) as usize;
             let block_bitmap = self.read_block(bb)?;
             let inode_bitmap = self.read_block(ib)?;
-            crate::ext_csum::stamp_block_bitmap_csum(self.csum_seed, &mut buf, &block_bitmap);
+            // The checksum covers blocks_per_group / 8 bytes, the whole block only by default.
+            let bbm_len = (self.blocks_per_group as usize)
+                .div_ceil(8)
+                .min(block_bitmap.len());
+            crate::ext_csum::stamp_block_bitmap_csum(
+                self.csum_seed,
+                &mut buf,
+                &block_bitmap[..bbm_len],
+            );
             crate::ext_csum::stamp_inode_bitmap_csum(
                 self.csum_seed,
                 &mut buf,
@@ -1748,6 +1805,11 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
             if blk == 0 {
                 continue; // sparse blocks
             }
+            if blk < self.first_data_block as u64 || blk >= self.total_blocks {
+                return Err(FilesystemError::InvalidData(format!(
+                    "block {blk} is outside the volume; check it first"
+                )));
+            }
             let group = ((blk - self.first_data_block as u64) / blocks_per_group) as u32;
             by_group.entry(group).or_default().push(blk);
         }
@@ -1758,6 +1820,11 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
 
             for &blk in blk_list {
                 let bit = blk - group_start;
+                // Count a block free only once, and only if it was in use (UNX-024).
+                let byte = (bit / 8) as usize;
+                if byte >= bitmap.len() || bitmap[byte] & (1 << (bit % 8)) == 0 {
+                    continue;
+                }
                 bitmap_clear_bit(&mut bitmap, bit);
                 self.group_descriptors[*group as usize].free_blocks += 1;
                 self.free_blocks += 1;
@@ -1898,6 +1965,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         file_type: u8,
     ) -> Result<(), FilesystemError> {
         let parent = self.read_inode(parent_inode)?;
+        refuse_hashed_dir(parent.flags)?;
         let data_blocks = self.inode_data_blocks(&parent)?;
         let new_entry_len = dir_entry_actual_len(name.len());
 
@@ -1985,7 +2053,8 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
                 dir_entry_actual_len(name_len)
             };
 
-            let slack = rec_len - actual_len;
+            // A record shorter than its own name is corrupt: no slack in it (UNX-022).
+            let slack = rec_len.saturating_sub(actual_len);
             if slack >= new_entry_len {
                 if inode == 0 {
                     // Reuse this deleted entry slot
@@ -2031,6 +2100,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
     /// Remove a directory entry by name from the parent directory.
     fn remove_dir_entry(&mut self, parent_inode: u32, name: &str) -> Result<(), FilesystemError> {
         let parent = self.read_inode(parent_inode)?;
+        refuse_hashed_dir(parent.flags)?;
         let data_blocks = self.inode_data_blocks(&parent)?;
 
         for &block_num in &data_blocks {
@@ -2178,6 +2248,13 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         if header.depth == 0 {
             // Leaf level — try to extend existing extent or add new one
             let max_entries = u16::from_le_bytes([inode.block[4], inode.block[5]]);
+            // 60 bytes of i_block hold the header and at most 4 extents (UNX-026).
+            if header.entries > 4 || max_entries > 4 {
+                return Err(FilesystemError::InvalidData(format!(
+                    "inode {inode_num}: in-inode extent header claims {} / {max_entries} entries",
+                    header.entries
+                )));
+            }
 
             // Check if we can extend the last extent
             if header.entries > 0 {
@@ -2348,35 +2425,6 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         self.reader.seek(SeekFrom::Start(offset))?;
         self.reader.write_all(&sectors.to_le_bytes())?;
         self.reseal_inode_csum(inode_num)
-    }
-
-    /// The index blocks of an inode's extent tree (none at depth 0).
-    fn extent_index_blocks(&mut self, inode: &InodeData) -> Result<Vec<u64>, FilesystemError> {
-        let mut out = Vec::new();
-        if inode.flags & EXT4_EXTENTS_FL == 0 || !is_extent_header(&inode.block) {
-            return Ok(out);
-        }
-        let header = parse_extent_header(&inode.block)?;
-        if header.depth == 0 {
-            return Ok(out);
-        }
-        let mut pending: Vec<u64> = parse_extent_indices(&inode.block, header.entries)
-            .into_iter()
-            .map(|i| i.child_block)
-            .collect();
-        while let Some(b) = pending.pop() {
-            out.push(b);
-            let data = self.read_block(b)?;
-            let h = parse_extent_header(&data)?;
-            if h.depth > 0 {
-                pending.extend(
-                    parse_extent_indices(&data, h.entries)
-                        .into_iter()
-                        .map(|i| i.child_block),
-                );
-            }
-        }
-        Ok(out)
     }
 
     /// Patch just the i_block field (60 bytes at offset 0x28) in an on-disk inode.
@@ -2574,6 +2622,54 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
 
 // ---- EditableFilesystem implementation ----
 
+/// A hashed (htree) directory keeps an index the editor does not maintain: refuse to change
+/// it rather than overwrite `dx_root` or put names out of hash order (UNX-003).
+fn refuse_hashed_dir(flags: u32) -> Result<(), FilesystemError> {
+    const EXT2_INDEX_FL: u32 = 0x1000;
+    if flags & EXT2_INDEX_FL != 0 {
+        return Err(FilesystemError::Unsupported(
+            "this ext directory is hashed (dir_index), which the editor does not maintain".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Features whose layouts the editor does not maintain (UNX-004): META_BG moves group
+/// descriptors, RECOVER means an unreplayed journal, INLINE_DATA keeps file data in the inode,
+/// BIGALLOC counts clusters, and any incompat bit we do not know about.
+fn ext_edit_blocker(incompat: u32, ro_compat: u32) -> Option<String> {
+    const RECOVER: u32 = 0x0004;
+    const META_BG: u32 = 0x0010;
+    const INLINE_DATA: u32 = 0x8000;
+    const BIGALLOC: u32 = 0x0200;
+    // FILETYPE, JOURNAL_DEV-less journal, EXTENTS, 64BIT, MMP, FLEX_BG, CSUM_SEED, LARGEDIR.
+    const KNOWN: u32 =
+        0x0002 | 0x0004 | 0x0010 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x2000 | 0x4000 | 0x8000;
+    let why = if incompat & RECOVER != 0 {
+        "its journal needs recovery (mount it once, or run e2fsck)"
+    } else if incompat & META_BG != 0 {
+        "it uses meta_bg"
+    } else if incompat & INLINE_DATA != 0 {
+        "it uses inline_data"
+    } else if ro_compat & BIGALLOC != 0 {
+        "it uses bigalloc"
+    } else if incompat & !KNOWN != 0 {
+        "it has incompat features this editor does not know"
+    } else {
+        return None;
+    };
+    Some(format!("this ext volume is read-only here: {why}"))
+}
+
+impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
+    fn ensure_editable(&self) -> Result<(), FilesystemError> {
+        match &self.edit_blocker {
+            Some(why) => Err(FilesystemError::Unsupported(why.clone())),
+            None => Ok(()),
+        }
+    }
+}
+
 impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
     fn as_filesystem(&self) -> &dyn disk_core::filesystem::Filesystem {
         self
@@ -2582,6 +2678,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         self
     }
     fn repair(&mut self) -> Result<disk_core::fsck::RepairReport, FilesystemError> {
+        self.ensure_editable()?;
         crate::ext_fsck::repair_ext(self)
     }
 
@@ -2593,6 +2690,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        self.ensure_editable()?;
         validate_ext_name(name)?;
 
         let parent_inode = parent.location as u32;
@@ -2675,6 +2773,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         name: &str,
         options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        self.ensure_editable()?;
         validate_ext_name(name)?;
 
         let parent_inode = parent.location as u32;
@@ -2761,6 +2860,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
+        self.ensure_editable()?;
         if entry.is_directory() {
             let children = self.list_directory(entry)?;
             if !children.is_empty() {
@@ -2773,16 +2873,21 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
 
         let parent_inode = parent.location as u32;
         let entry_inode = entry.location as u32;
+        let victim = self.fsck_read_inode(entry_inode)?;
+        if !entry.is_directory() && victim.links_count > 1 {
+            // Another name still links the inode: drop this name and one link only (UNX-001).
+            self.remove_dir_entry(parent_inode, &entry.name)?;
+            self.update_inode_links(entry_inode, -1)?;
+            return Ok(());
+        }
+
+        // Every block the inode owns: data plus indirect / extent-index blocks, and none for
+        // fast symlinks, devices or inline data, whose i_block is not pointers (UNX-002 / 023).
+        let owned = self.fsck_owned_blocks(&victim)?;
 
         // Remove directory entry from parent
         self.remove_dir_entry(parent_inode, &entry.name)?;
-
-        // Free data blocks, and the extent tree's own index blocks with them.
-        let victim = self.read_inode(entry_inode)?;
-        let data_blocks = self.inode_data_blocks(&victim)?;
-        let mut non_zero: Vec<u64> = data_blocks.into_iter().filter(|&b| b != 0).collect();
-        non_zero.extend(self.extent_index_blocks(&victim)?);
-        self.free_blocks_list(&non_zero)?;
+        self.free_blocks_list(&owned)?;
 
         // If directory, decrement parent's link count and the group's dir count.
         if entry.is_directory() {
@@ -2803,6 +2908,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         entry: &FileEntry,
         new_name: &str,
     ) -> Result<(), FilesystemError> {
+        self.ensure_editable()?;
         if new_name == entry.name {
             return Ok(());
         }
@@ -2819,10 +2925,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
 
         // The name lives only in the dirent; the inode keeps its number
         // and data. Match the file_type create uses for this kind.
-        let file_type = if entry.is_directory() {
-            FT_DIR
-        } else {
-            FT_REG_FILE
+        // From the inode's mode, so a symlink, device or fifo keeps its type (UNX-027).
+        let mode = self.read_inode(entry.location as u32)?.mode;
+        let file_type = match mode & 0xF000 {
+            0x4000 => FT_DIR,
+            0xA000 => FT_SYMLINK,
+            0x2000 => FT_CHRDEV,
+            0x6000 => FT_BLKDEV,
+            0x1000 => FT_FIFO,
+            0xC000 => FT_SOCK,
+            _ => FT_REG_FILE,
         };
 
         // Add the new dirent first (pointing at the same inode), then
@@ -2835,6 +2947,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
     }
 
     fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        self.ensure_editable()?;
         let inode_num = entry.location as u32;
         let inode = self.read_inode(inode_num)?;
 
@@ -2856,6 +2969,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
     }
 
     fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        self.ensure_editable()?;
         let inode_num = entry.location as u32;
 
         // ext splits each id into a low half in the classic 128-byte
@@ -3012,7 +3126,25 @@ fn parse_extent_header(data: &[u8]) -> Result<ExtentHeader, FilesystemError> {
     }
     let entries = u16::from_le_bytes([data[2], data[3]]);
     let depth = u16::from_le_bytes([data[6], data[7]]);
+    // ext4 trees are at most 5 deep (EXT4_MAX_EXTENT_DEPTH).
+    if depth > 5 {
+        return Err(FilesystemError::Parse(format!(
+            "ext: extent tree depth {depth} is past ext4's limit of 5"
+        )));
+    }
     Ok(ExtentHeader { entries, depth })
+}
+
+/// A child extent node must sit below its parent, or a node pointing at itself recurses forever.
+fn check_child_depth(parent: &ExtentHeader, child: &[u8]) -> Result<(), FilesystemError> {
+    let c = parse_extent_header(child)?;
+    if c.depth >= parent.depth {
+        return Err(FilesystemError::Parse(format!(
+            "ext: extent node at depth {} under a depth-{} parent",
+            c.depth, parent.depth
+        )));
+    }
+    Ok(())
 }
 
 /// Write one `ext4_extent` (12 bytes) describing a single block.
@@ -3940,6 +4072,7 @@ fn patch_extent_tree_in_inode<R: Read + Seek>(
             reader.seek(SeekFrom::Start(partition_offset + child_block * block_size))?;
             let mut child_data = vec![0u8; block_size as usize];
             reader.read_exact(&mut child_data)?;
+            check_child_depth(&header, &child_data)?;
 
             patch_extent_block(
                 reader,
@@ -4011,6 +4144,7 @@ fn patch_extent_block<R: Read + Seek>(
             reader.seek(SeekFrom::Start(partition_offset + child_block * block_size))?;
             let mut child_data = vec![0u8; block_size as usize];
             reader.read_exact(&mut child_data)?;
+            check_child_depth(&header, &child_data)?;
 
             patch_extent_block(
                 reader,
@@ -4677,9 +4811,11 @@ pub fn resize_ext_in_place(
             "ext resize: growing from {old_blocks} to {new_blocks} blocks (+{added})"
         ));
     } else {
-        // Shrinking: reduce free and reserved proportionally
+        // Shrinking inside the last group: mark the cut tail as padding in its bitmap and take
+        // only the free blocks it held off the counts (UNX-031).
         let removed = old_blocks - new_blocks;
-        new_free = old_free.saturating_sub(removed);
+        let freed = shrink_last_group(file, partition_offset, &sb, old_blocks, new_blocks)?;
+        new_free = old_free.saturating_sub(freed);
         new_reserved = (old_reserved * new_blocks)
             .checked_div(old_blocks)
             .unwrap_or(0);
@@ -4723,6 +4859,99 @@ pub fn resize_ext_in_place(
     Ok(())
 }
 
+/// Cut the last block group from `old_blocks` to `new_blocks`: the removed tail becomes bitmap
+/// padding (set bits), the group's free count drops by the free blocks it held, and the bitmap
+/// and descriptor checksums are restamped, in the primary GDT and every backup copy. Returns the
+/// free blocks removed. Dropping whole groups is refused: that needs the descriptor table,
+/// inode count and backups rebuilt.
+fn shrink_last_group(
+    file: &mut (impl Read + std::io::Write + Seek),
+    partition_offset: u64,
+    sb: &[u8; SUPERBLOCK_SIZE],
+    old_blocks: u64,
+    new_blocks: u64,
+) -> anyhow::Result<u64> {
+    let fdb = le32(sb, 0x14) as u64;
+    let block_size = 1024u64 << le32(sb, 0x18);
+    let bpg = le32(sb, 0x20) as u64;
+    let feat_ro = le32(sb, 0x64);
+    let is_64bit = le32(sb, 0x60) & INCOMPAT_64BIT != 0;
+    let metadata_csum = feat_ro & 0x0400 != 0;
+    let sparse = feat_ro & 0x0001 != 0;
+    let desc_size: u64 = if is_64bit {
+        (u16::from_le_bytes([sb[0xFE], sb[0xFF]]) as u64).max(64)
+    } else {
+        32
+    };
+    let old_gc = (old_blocks - fdb).div_ceil(bpg);
+    let new_gc = (new_blocks - fdb).div_ceil(bpg);
+    if new_gc != old_gc {
+        anyhow::bail!(
+            "ext resize: shrinking from {old_gc} to {new_gc} block groups in place is not \
+             supported; only the last group can be cut"
+        );
+    }
+    let g = old_gc - 1;
+    let gs = fdb + g * bpg;
+    let sb_blk = if block_size == 1024 { 1u64 } else { 0 };
+    let desc_at = partition_offset + (sb_blk + 1) * block_size + g * desc_size;
+    let mut desc = vec![0u8; desc_size as usize];
+    file.seek(SeekFrom::Start(desc_at))?;
+    file.read_exact(&mut desc)?;
+    let gd_hi = is_64bit && desc_size >= 64;
+    let bbm = le32(&desc, 0) as u64
+        | if gd_hi {
+            (le32(&desc, 0x20) as u64) << 32
+        } else {
+            0
+        };
+    let mut bm = vec![0u8; block_size as usize];
+    file.seek(SeekFrom::Start(partition_offset + bbm * block_size))?;
+    file.read_exact(&mut bm)?;
+    let mut freed = 0u64;
+    for bit in (new_blocks - gs)..(old_blocks - gs) {
+        let (byte, mask) = ((bit / 8) as usize, 1u8 << (bit % 8));
+        if bm[byte] & mask != 0 {
+            anyhow::bail!("ext resize: block {} past the new end is in use", gs + bit);
+        }
+        bm[byte] |= mask;
+        freed += 1;
+    }
+    let free = u16::from_le_bytes([desc[0x0C], desc[0x0D]]) as u64
+        | if gd_hi {
+            (u16::from_le_bytes([desc[0x2C], desc[0x2D]]) as u64) << 16
+        } else {
+            0
+        };
+    let free = free.saturating_sub(freed);
+    desc[0x0C..0x0E].copy_from_slice(&(free as u16).to_le_bytes());
+    if gd_hi {
+        desc[0x2C..0x2E].copy_from_slice(&((free >> 16) as u16).to_le_bytes());
+    }
+    if metadata_csum {
+        let seed = crate::ext_csum::volume_seed(sb);
+        let bbm_len = (bpg as usize).div_ceil(8).min(bm.len());
+        crate::ext_csum::stamp_block_bitmap_csum(seed, &mut desc, &bm[..bbm_len]);
+        crate::ext_csum::stamp_group_desc(seed, g as u32, &mut desc);
+    }
+    file.seek(SeekFrom::Start(partition_offset + bbm * block_size))?;
+    file.write_all(&bm)?;
+    // The descriptor in the primary table and in every backup copy.
+    for bg in 0..old_gc {
+        if bg != 0 && !has_superblock_backup(bg as u32, sparse) {
+            continue;
+        }
+        let table = if bg == 0 {
+            (sb_blk + 1) * block_size
+        } else {
+            (fdb + bg * bpg + 1) * block_size
+        };
+        file.seek(SeekFrom::Start(partition_offset + table + g * desc_size))?;
+        file.write_all(&desc)?;
+    }
+    Ok(freed)
+}
+
 /// Grow an ext2/3/4 filesystem by **adding block groups** — the offline
 /// grow, the mirror of the backup compactor's shrink. Lays down each
 /// new group's block/inode bitmap + (fresh, already-zero) inode table + group
@@ -4754,7 +4983,13 @@ fn grow_ext_add_groups(
     let feat_ro = le32(&sb, 0x64);
     let is_64bit = feat_incompat & INCOMPAT_64BIT != 0;
     let metadata_csum = feat_ro & 0x0400 != 0;
+    // bg_itable_unused and the UNINIT flags mean something only with a group checksum.
+    let checksummed = feat_ro & 0x0410 != 0;
     let sparse = feat_ro & 0x0001 != 0;
+    // Each backup group keeps s_reserved_gdt_blocks after its GDT copy; with resize_inode the
+    // resize inode (7) lists them all.
+    let reserved_gdt = u16::from_le_bytes([sb[0xCE], sb[0xCF]]) as u64;
+    let resize_inode = le32(&sb, 0x5C) & 0x0010 != 0 && reserved_gdt > 0;
     let desc_size: u64 = if is_64bit {
         let d = u16::from_le_bytes([sb[0xFE], sb[0xFF]]);
         if d >= 64 {
@@ -4821,14 +5056,15 @@ fn grow_ext_add_groups(
             gdt[o + 0x0E..o + 0x10].copy_from_slice(&(free_i as u16).to_le_bytes());
             gdt[o + 0x10..o + 0x12].copy_from_slice(&0u16.to_le_bytes()); // used_dirs
             gdt[o + 0x12..o + 0x14].copy_from_slice(&0u16.to_le_bytes()); // flags (explicit bitmaps)
-            gdt[o + 0x1C..o + 0x1E].copy_from_slice(&(ipg as u16).to_le_bytes()); // itable_unused
+            let unused = if checksummed { ipg } else { 0 };
+            gdt[o + 0x1C..o + 0x1E].copy_from_slice(&(unused as u16).to_le_bytes()); // itable_unused
             if gd_hi {
                 gdt[o + 0x20..o + 0x24].copy_from_slice(&((bbm >> 32) as u32).to_le_bytes());
                 gdt[o + 0x24..o + 0x28].copy_from_slice(&((ibm >> 32) as u32).to_le_bytes());
                 gdt[o + 0x28..o + 0x2C].copy_from_slice(&((it >> 32) as u32).to_le_bytes());
                 gdt[o + 0x2C..o + 0x2E].copy_from_slice(&((free_b >> 16) as u16).to_le_bytes());
                 gdt[o + 0x2E..o + 0x30].copy_from_slice(&((free_i >> 16) as u16).to_le_bytes());
-                gdt[o + 0x32..o + 0x34].copy_from_slice(&((ipg >> 16) as u16).to_le_bytes());
+                gdt[o + 0x32..o + 0x34].copy_from_slice(&((unused >> 16) as u16).to_le_bytes());
             }
         };
 
@@ -4840,7 +5076,11 @@ fn grow_ext_add_groups(
         let gs = group_start(g);
         let count = (new_total - gs).min(bpg);
         let has_backup = has_superblock_backup(g as u32, sparse);
-        let meta_off = if has_backup { 1 + gdt_blocks } else { 0 };
+        let meta_off = if has_backup {
+            1 + gdt_blocks + reserved_gdt
+        } else {
+            0
+        };
         let bbm = gs + meta_off;
         let ibm = bbm + 1;
         let it = ibm + 1;
@@ -4905,6 +5145,32 @@ fn grow_ext_add_groups(
         file.write_all(&bm)?;
     }
 
+    // ---- Resize inode: list the new backup groups' reserved GDT blocks ----
+    if resize_inode {
+        let backups: Vec<u64> = (old_gc..new_gc)
+            .filter(|&g| has_superblock_backup(g as u32, sparse))
+            .collect();
+        if !backups.is_empty() {
+            add_resize_inode_backups(
+                file,
+                partition_offset,
+                &gdt,
+                ResizeInodeGrow {
+                    block_size,
+                    inode_size,
+                    gd_hi,
+                    seed: metadata_csum.then_some(seed),
+                    gdt_blocks,
+                    reserved_gdt,
+                    sparse,
+                    bpg,
+                    fdb,
+                },
+                &backups,
+            )?;
+        }
+    }
+
     // ---- Stamp new groups' checksums (bitmap csums first, then bg_checksum) ----
     if metadata_csum {
         let bbm_len = (bpg as usize).div_ceil(8);
@@ -4913,7 +5179,12 @@ fn grow_ext_add_groups(
             let gs = group_start(g);
             let count = (new_total - gs).min(bpg);
             let has_backup = has_superblock_backup(g as u32, sparse);
-            let used = if has_backup { 1 + gdt_blocks } else { 0 } + 2 + itable_blocks;
+            let used = if has_backup {
+                1 + gdt_blocks + reserved_gdt
+            } else {
+                0
+            } + 2
+                + itable_blocks;
             let bm = make_bitmap(used, count);
             let ibm_data = make_bitmap(0, ipg as u64);
             let o = g as usize * desc_size as usize;
@@ -4994,6 +5265,94 @@ fn grow_ext_add_groups(
         "ext grow: added {} groups ({old_total} -> {new_total} blocks)",
         new_gc - old_gc
     ));
+    Ok(())
+}
+
+/// Geometry `add_resize_inode_backups` needs.
+struct ResizeInodeGrow {
+    block_size: u64,
+    inode_size: u64,
+    gd_hi: bool,
+    seed: Option<u32>,
+    gdt_blocks: u64,
+    reserved_gdt: u64,
+    sparse: bool,
+    bpg: u64,
+    fdb: u64,
+}
+
+/// Record the reserved GDT copies of `backups` (new backup groups) in the resize inode: each
+/// primary reserved GDT block, listed in inode 7's double-indirect block, holds the block
+/// numbers of its copies in backup-group order. e2fsck rejects the inode if one is missing.
+fn add_resize_inode_backups(
+    file: &mut (impl Read + std::io::Write + Seek),
+    partition_offset: u64,
+    gdt: &[u8],
+    geo: ResizeInodeGrow,
+    backups: &[u64],
+) -> anyhow::Result<()> {
+    let bs = geo.block_size;
+    let read_u32_at =
+        |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+    // Inode 7 sits in group 0's inode table.
+    let it = le32(gdt, 8) as u64
+        | if geo.gd_hi {
+            (le32(gdt, 0x28) as u64) << 32
+        } else {
+            0
+        };
+    let ino_pos = partition_offset + it * bs + 6 * geo.inode_size;
+    let mut ino = vec![0u8; geo.inode_size as usize];
+    file.seek(SeekFrom::Start(ino_pos))?;
+    file.read_exact(&mut ino)?;
+    let dind = le32(&ino, 0x28 + 13 * 4) as u64;
+    if dind == 0 {
+        anyhow::bail!("ext grow: resize_inode is set but inode 7 has no double-indirect block");
+    }
+    let mut dind_blk = vec![0u8; bs as usize];
+    file.seek(SeekFrom::Start(partition_offset + dind * bs))?;
+    file.read_exact(&mut dind_blk)?;
+    let primaries: Vec<u64> = (0..bs as usize / 4)
+        .map(|i| read_u32_at(&dind_blk, i) as u64)
+        .filter(|&b| b != 0)
+        .collect();
+    if primaries.len() as u64 != geo.reserved_gdt {
+        anyhow::bail!(
+            "ext grow: resize inode lists {} reserved GDT blocks, the superblock {}",
+            primaries.len(),
+            geo.reserved_gdt
+        );
+    }
+    let per = bs / 4;
+    let mut added = 0u64;
+    for &g in backups {
+        // Copies are kept in backup-group order, group 1 first.
+        let j = (1..g)
+            .filter(|&x| has_superblock_backup(x as u32, geo.sparse))
+            .count() as u64;
+        if j >= per {
+            anyhow::bail!("ext grow: too many backup groups for the resize inode");
+        }
+        let gs = geo.fdb + g * geo.bpg;
+        for (r, &p) in primaries.iter().enumerate() {
+            let at = partition_offset + p * bs + j * 4;
+            let copy = gs + 1 + geo.gdt_blocks + r as u64;
+            file.seek(SeekFrom::Start(at))?;
+            file.write_all(&(copy as u32).to_le_bytes())?;
+            added += 1;
+        }
+    }
+    // i_blocks counts 512-byte units of every block the inode maps.
+    let blocks =
+        le32(&ino, 0x1C) as u64 | (u16::from_le_bytes([ino[0x74], ino[0x75]]) as u64) << 32;
+    let blocks = blocks + added * (bs / 512);
+    ino[0x1C..0x20].copy_from_slice(&(blocks as u32).to_le_bytes());
+    ino[0x74..0x76].copy_from_slice(&((blocks >> 32) as u16).to_le_bytes());
+    if let Some(seed) = geo.seed {
+        crate::ext_csum::stamp_inode(seed, &mut ino, 7);
+    }
+    file.seek(SeekFrom::Start(ino_pos))?;
+    file.write_all(&ino)?;
     Ok(())
 }
 
@@ -5323,7 +5682,7 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
             plan.relocations.iter().map(|(&o, &n)| (n, o)).collect();
 
         // Linear scan, coalescing consecutive data blocks into mapped/zero runs.
-        let mut pending_mapped: Vec<u64> = Vec::new();
+        let mut pending_mapped = crate::unix_common::compact::MappedBuilder::new();
         let mut pending_zeros: u64 = 0;
         for b in 0..new_total_blocks {
             // Decide this block's content, flushing pending data runs on any
@@ -5352,11 +5711,7 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
             };
 
             if let Some(bytes) = prebuilt {
-                if !pending_mapped.is_empty() {
-                    sections.push(CompactSection::MappedBlocks {
-                        old_blocks: std::mem::take(&mut pending_mapped),
-                    });
-                }
+                pending_mapped.flush(&mut sections);
                 if pending_zeros > 0 {
                     sections.push(CompactSection::Zeros(pending_zeros * block_size));
                     pending_zeros = 0;
@@ -5378,22 +5733,14 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
                     sections.push(CompactSection::Zeros(pending_zeros * block_size));
                     pending_zeros = 0;
                 }
-                pending_mapped.push(reverse.get(&b).copied().unwrap_or(b));
+                pending_mapped.push(reverse.get(&b).copied().unwrap_or(b), &mut sections);
                 total_data_reads += 1;
             } else {
-                if !pending_mapped.is_empty() {
-                    sections.push(CompactSection::MappedBlocks {
-                        old_blocks: std::mem::take(&mut pending_mapped),
-                    });
-                }
+                pending_mapped.flush(&mut sections);
                 pending_zeros += 1;
             }
         }
-        if !pending_mapped.is_empty() {
-            sections.push(CompactSection::MappedBlocks {
-                old_blocks: pending_mapped,
-            });
-        }
+        pending_mapped.flush(&mut sections);
         if pending_zeros > 0 {
             sections.push(CompactSection::Zeros(pending_zeros * block_size));
         }
@@ -5537,11 +5884,11 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
                 let run_len = run_end - block_idx;
 
                 if is_set {
-                    let old_blocks: Vec<u64> = (block_idx..run_end)
-                        .map(|bi| group_start_block + bi)
-                        .collect();
                     total_allocated += run_len;
-                    sections.push(CompactSection::MappedBlocks { old_blocks });
+                    sections.push(CompactSection::MappedRun {
+                        first: group_start_block + block_idx,
+                        count: run_len,
+                    });
                 } else {
                     sections.push(CompactSection::Zeros(run_len * block_size));
                 }

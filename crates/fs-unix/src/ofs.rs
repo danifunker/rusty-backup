@@ -315,6 +315,24 @@ impl<R: Read + Seek + Send> OfsFilesystem<R> {
     }
 
     /// Every `(start, count)` extent a file occupies, in file order.
+    /// The sectors of a fragmented file's allocation-list chain (none for a contiguous or
+    /// empty file): each is allocated in its own right (UNX-010).
+    pub fn alloc_list_sectors(&mut self, attrs: &OfsAttrs) -> Result<Vec<u64>, FilesystemError> {
+        if attrs.is_contiguous()
+            || attrs.first_alloc_list == EXTENT_END
+            || attrs.first_alloc_list == 0
+        {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut list = attrs.first_alloc_list as u64;
+        while list != 0 && list != EXTENT_END as u64 && out.len() < 256 && !out.contains(&list) {
+            out.push(list);
+            list = be32(&self.read_sectors(list, 1)?, 0) as u64;
+        }
+        Ok(out)
+    }
+
     pub fn file_extents(&mut self, attrs: &OfsAttrs) -> Result<Vec<(u64, u64)>, FilesystemError> {
         // An empty file records `0xFFFFFFFF` in both alloc-list fields rather
         // than a zero, so the contiguous flag reads as set on a file that owns
@@ -377,15 +395,21 @@ impl<R: Read + Seek + Send> OfsFilesystem<R> {
         }
         let extents = self.file_extents(attrs)?;
         let mut written = 0u64;
+        // Read each extent 1 MiB at a time, so a large contiguous file is never held whole.
+        const CHUNK: u64 = (1 << 20) / SECTOR;
         for (start, count) in extents {
+            let mut done = 0u64;
+            while done < count && written < want {
+                let take = ((count - done).min(CHUNK) * SECTOR).min(want - written);
+                let sectors = take.div_ceil(SECTOR);
+                let raw = self.read_sectors(start + done, sectors)?;
+                sink.write_all(&raw[..take as usize])?;
+                written += take;
+                done += sectors;
+            }
             if written >= want {
                 break;
             }
-            let take = (count * SECTOR).min(want - written);
-            let sectors = take.div_ceil(SECTOR);
-            let raw = self.read_sectors(start, sectors)?;
-            sink.write_all(&raw[..take as usize])?;
-            written += take;
         }
         Ok(written)
     }
