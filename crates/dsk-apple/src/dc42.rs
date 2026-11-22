@@ -30,7 +30,7 @@ const DC42_DISK_1440K: u8 = 3;
 pub const DC42_DISK_TWIGGY: u8 = 0x54;
 
 // format_byte values (offset 81).
-const DC42_FMT_SINGLE_SIDED: u8 = 0x02; // 400K Mac single-sided
+const DC42_FMT_SINGLE_SIDED: u8 = 0x12; // 400K, as the 3.5" address field and the WOZ writer have it
 const DC42_FMT_DOUBLE_SIDED: u8 = 0x22; // 800K Mac / HD MFM
 
 /// Parsed DiskCopy 4.2 header.
@@ -48,7 +48,7 @@ pub struct Dc42Header {
     pub tag_checksum: u32,
     /// Disk format: 0=400K GCR, 1=800K GCR, 2=720K MFM, 3=1440K MFM, 0xFF=other.
     pub disk_format: u8,
-    /// Format byte: 0x12=400K/800K Mac, 0x22=HD Mac, 0x24=ProDOS.
+    /// Format byte: 0x12 = 400K, 0x22 = 800K Mac and MFM, 0x24 = 800K Apple II.
     pub format_byte: u8,
 }
 
@@ -204,8 +204,7 @@ pub fn parse_dc42_header(reader: &mut impl Read) -> Option<Dc42Header> {
         return None;
     }
 
-    // Extract disk name (bytes 1..1+name_len), ASCII/MacRoman
-    let disk_name = String::from_utf8_lossy(&buf[1..1 + name_len]).into_owned();
+    let disk_name = disk_core::mac_roman::decode(&buf[1..1 + name_len]);
 
     Some(Dc42Header {
         disk_name,
@@ -246,6 +245,13 @@ pub fn dc42_checksum(data: &[u8]) -> u32 {
     sum
 }
 
+/// A disk name as Mac Roman, with '?' for any character it lacks.
+fn mac_roman_name(name: &str) -> Vec<u8> {
+    name.chars()
+        .map(|c| disk_core::mac_roman::encode(c.encode_utf8(&mut [0; 4])).map_or(b'?', |b| b[0]))
+        .collect()
+}
+
 /// Encode a flat sector buffer as a complete DiskCopy 4.2 file.
 ///
 /// `data.len()` must be one of the standard Mac floppy sizes: 400K, 720K, 800K, or 1440K.
@@ -260,7 +266,7 @@ pub fn encode_dc42(name: &str, data: &[u8]) -> Result<Vec<u8>, &'static str> {
         _ => return Err("DiskCopy 4.2 supports only 400K / 720K / 800K / 1440K images"),
     };
 
-    let name_bytes = name.as_bytes();
+    let name_bytes = mac_roman_name(name);
     let name_len = name_bytes.len().clamp(1, 63);
     let effective_name: &[u8] = if name_bytes.is_empty() {
         b"Untitled"
@@ -297,7 +303,7 @@ pub fn encode_dc42_with_tags(name: &str, data: &[u8], tags: &[u8]) -> Vec<u8> {
         819_200 => DC42_DISK_800K,
         _ => 0xFF,
     };
-    let name_bytes = name.as_bytes();
+    let name_bytes = mac_roman_name(name);
     let name_len = name_bytes.len().clamp(1, 63);
     let effective_name: &[u8] = if name_bytes.is_empty() {
         b"Untitled"
@@ -337,9 +343,9 @@ mod tests {
     fn make_dc42_header(name: &str, data_size: u32, tag_size: u32) -> Vec<u8> {
         let mut buf = vec![0u8; 84];
         // Pascal string: length byte + name
-        let name_bytes = name.as_bytes();
+        let name_bytes = mac_roman_name(name);
         buf[0] = name_bytes.len() as u8;
-        buf[1..1 + name_bytes.len()].copy_from_slice(name_bytes);
+        buf[1..1 + name_bytes.len()].copy_from_slice(&name_bytes);
         // Data size (BE)
         buf[64..68].copy_from_slice(&data_size.to_be_bytes());
         // Tag size (BE)

@@ -65,6 +65,17 @@ fn parse_woz(data: Vec<u8>) -> Result<WozFile> {
     if data[4..8] != HIGH_BIT_CHECK {
         bail!("WOZ high-bit verification failed (file may be corrupted or text-mode transferred)");
     }
+    // A stored CRC of 0 means the writer did not compute one.
+    let stored_crc = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    if stored_crc != 0 {
+        let actual = crc32fast::hash(&data[12..]);
+        if actual != stored_crc {
+            log::warn!(
+                "WOZ CRC32 mismatch (file {stored_crc:08X}, computed {actual:08X}); \
+                 reading on, sector checksums will show what is damaged"
+            );
+        }
+    }
 
     // Parse chunks starting at offset 12
     let mut disk_type = 0u8;

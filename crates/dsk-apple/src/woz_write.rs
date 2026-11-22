@@ -582,7 +582,8 @@ fn write_info_chunk(
     buf[p + 37] = sides;
     buf[p + 38] = 0; // boot_sector_format (0 = unknown / not boot disk)
     buf[p + 39] = if disk_type == DISK_TYPE_525 { 32 } else { 16 };
-    write_u16_le(buf, p + 40, 1); // compatible_hardware bit 0 = Apple ][
+    // Compatible hardware: Apple ][ for 5.25"; 0 (unknown) for 3.5", which no Apple ][ reads.
+    write_u16_le(buf, p + 40, u16::from(disk_type == DISK_TYPE_525));
     write_u16_le(buf, p + 42, 0); // required_ram (0 = unknown)
     write_u16_le(buf, p + 44, largest_track_blocks);
     write_u16_le(buf, p + 46, 0); // flux_block (none)
