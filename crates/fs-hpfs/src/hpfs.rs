@@ -168,6 +168,11 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
         let dirband_start = u32le(&sb, 52);
         let dmap = u32le(&sb, 60);
 
+        if root_fnode < 0x12 || root_fnode >= total_sectors {
+            return Err(FilesystemError::InvalidData(format!(
+                "HPFS: root fnode {root_fnode:#x} is outside the volume"
+            )));
+        }
         if total_sectors == 0 || total_sectors >= 0x8000_0000 {
             return Err(FilesystemError::InvalidData(
                 "HPFS: invalid volume size".into(),
@@ -187,7 +192,11 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
         let dir_sectors = (n_bands * 4).div_ceil(SECTOR as usize).max(1);
         let mut band_bmp = Vec::with_capacity(n_bands);
         for s in 0..dir_sectors {
-            let buf = read_sector_at(&mut reader, partition_offset, bitmap_dir + s as u32)?;
+            let sec = bitmap_dir
+                .checked_add(s as u32)
+                .filter(|&x| x < total_sectors)
+                .ok_or_else(|| FilesystemError::InvalidData("HPFS: bad bitmap directory".into()))?;
+            let buf = read_sector_at(&mut reader, partition_offset, sec)?;
             for i in 0..(SECTOR as usize / 4) {
                 if band_bmp.len() >= n_bands {
                     break;
@@ -373,6 +382,12 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
             )));
         }
         let file_size = u32le(&f, 160);
+        let (extents, _) = self.fnode_tree(&f)?;
+        Ok((file_size, extents))
+    }
+
+    /// An fnode's extents and the anode sectors its B+ tree passes through.
+    fn fnode_tree(&mut self, f: &[u8]) -> Result<(Vec<Extent>, HashSet<u32>), FilesystemError> {
         let mut extents = Vec::new();
         let mut seen = HashSet::new();
         // btree header at offset 56: flags@56, n_free@60, n_used@61, first_free@62
@@ -383,7 +398,7 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
             &mut seen,
             0,
         )?;
-        Ok((file_size, extents))
+        Ok((extents, seen))
     }
 
     /// Recurse a B+ tree (fnode or anode). `hdr` is the 8-byte bplus_header
@@ -403,6 +418,18 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
         let flags = buf_from_header[0];
         let n_used = buf_from_header[5] as usize;
         let internal = flags & 0x80 != 0;
+        // An fnode holds 8 leaf or 12 internal entries, an anode 40 or 60.
+        let cap = match (depth == 0, internal) {
+            (true, false) => 8,
+            (true, true) => 12,
+            (false, false) => 40,
+            (false, true) => 60,
+        };
+        if n_used > cap {
+            return Err(FilesystemError::Parse(format!(
+                "HPFS: allocation node claims {n_used} entries (at most {cap})"
+            )));
+        }
         // Entries start 8 bytes into the header slice.
         let base = 8usize;
         if internal {
@@ -741,7 +768,7 @@ fn is_name_long(name: &[u8]) -> bool {
         return false;
     }
     for &c in &name[i + 1..] {
-        if c == b'.' || matches!(name[i], b'+' | b',' | b';' | b'=' | b'[' | b']') {
+        if c == b'.' || matches!(c, b'+' | b',' | b';' | b'=' | b'[' | b']') {
             return true;
         }
     }
@@ -976,16 +1003,26 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
 
         // Walk the directory tree, tracking which sectors each object owns to
         // detect cross-links (a sector claimed twice).
-        let mut owned: HashSet<u32> = HashSet::new();
-        let claim = |errors: &mut Vec<FsckIssue>, owned: &mut HashSet<u32>, s: u32, what: &str| {
-            if !owned.insert(s) {
-                errors.push(FsckIssue {
-                    code: "CrossLink".into(),
-                    message: format!("sector {s:#x} used by more than one object ({what})"),
-                    repairable: false,
-                    debug: false,
-                });
+        // One bit per sector; a HashSet of every sector costs tens of bytes each.
+        let mut owned = vec![0u64; (self.total_sectors as usize).div_ceil(64)];
+        let mut cross_links = 0u64;
+        let mut claim = |errors: &mut Vec<FsckIssue>, owned: &mut Vec<u64>, s: u32, what: &str| {
+            let (w, bit) = ((s / 64) as usize, 1u64 << (s % 64));
+            let Some(word) = owned.get_mut(w) else {
+                return;
+            };
+            if *word & bit != 0 {
+                cross_links += 1;
+                if cross_links <= 20 {
+                    errors.push(FsckIssue {
+                        code: "CrossLink".into(),
+                        message: format!("sector {s:#x} used by more than one object ({what})"),
+                        repairable: false,
+                        debug: false,
+                    });
+                }
             }
+            *word |= bit;
         };
 
         // Recursive descent using an explicit stack of (dir_fnode, path).
@@ -1017,10 +1054,9 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
                     continue;
                 }
                 dnode_starts.push(dno);
-                claim(&mut errors, &mut owned, dno, "dnode");
-                claim(&mut errors, &mut owned, dno + 1, "dnode");
-                claim(&mut errors, &mut owned, dno + 2, "dnode");
-                claim(&mut errors, &mut owned, dno + 3, "dnode");
+                for s in dno..dno.saturating_add(4) {
+                    claim(&mut errors, &mut owned, s, "dnode");
+                }
                 match self.validate_dnode(dno) {
                     Ok(children) => dstack.extend(children),
                     Err(e) => errors.push(err("BadDnode", format!("{path}: {e}"))),
@@ -1073,10 +1109,18 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
 
         // Bitmap consistency: every owned sector must be marked used (bit 0)
         // in the free-space bitmap.
+        if cross_links > 20 {
+            errors.push(err(
+                "CrossLink",
+                format!("{cross_links} cross-linked sectors in all (the first 20 are listed)"),
+            ));
+        }
         let mut allocated_but_free = 0u32;
-        for &s in &owned {
-            if self.bitmap_is_free(s) {
-                allocated_but_free += 1;
+        for (w, &word) in owned.iter().enumerate() {
+            for b in 0..64 {
+                if word >> b & 1 != 0 && self.bitmap_is_free(w as u32 * 64 + b) {
+                    allocated_but_free += 1;
+                }
             }
         }
         if allocated_but_free > 0 {
@@ -1089,7 +1133,7 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
         // Dnode-bitmap consistency: every in-use dnode inside the directory
         // band must be marked used (bit clear) in the dnode bitmap.
         let band_lo = self.dirband_start;
-        let band_hi = self.dirband_start + self.dirband_size;
+        let band_hi = self.dirband_start.saturating_add(self.dirband_size);
         let mut dnode_free_mismatch = 0u32;
         for &dno in &dnode_starts {
             if dno >= band_lo && dno < band_hi && self.dnode_bitmap_is_free(dno) {
@@ -1111,7 +1155,7 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
                 ("free_sectors".into(), free.to_string()),
                 (
                     "used_sectors".into(),
-                    (self.total_sectors as u64 - free).to_string(),
+                    (self.total_sectors as u64).saturating_sub(free).to_string(),
                 ),
             ],
         };
@@ -1198,8 +1242,14 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
     /// True when the dnode at sector `dno` (dir-band relative) has its bit set
     /// (free) in the dnode bitmap. `dno` must be within the directory band.
     fn dnode_bitmap_is_free(&self, dno: u32) -> bool {
-        let d = (dno - self.dirband_start) / 4;
-        let w = u32le(&self.dmap_data, (d as usize >> 5) * 4);
+        let Some(d) = dno.checked_sub(self.dirband_start).map(|x| x / 4) else {
+            return false;
+        };
+        let at = (d as usize >> 5) * 4;
+        if at + 4 > self.dmap_data.len() {
+            return false;
+        }
+        let w = u32le(&self.dmap_data, at);
         (w >> (d & 0x1f)) & 1 == 1
     }
 }
@@ -1390,12 +1440,6 @@ impl<R: Read + Write + Seek> HpfsFilesystem<R> {
         let n_dnodes = self.dirband_size / 4;
         for d in 0..n_dnodes {
             let dno = self.dirband_start + d * 4;
-            if self.dnode_bitmap_is_free(dno) && self.bitmap_is_free(dno) {
-                // (dir-band sectors are marked used in the main bitmap already,
-                //  but guard anyway) mark used in the dnode bitmap.
-                self.dmap_set_used(dno);
-                return Some(dno);
-            }
             // Dir-band sector is normally allocated in the main bitmap; the
             // dnode bitmap is the real free indicator there.
             if self.dnode_bitmap_is_free(dno) {
@@ -1715,33 +1759,46 @@ impl<R: Read + Write + Seek> HpfsFilesystem<R> {
         let starts = if let Some(start) = self.alloc_run(near, n_sec) {
             vec![(start, n_sec)]
         } else {
-            // Fragmented fallback: up to 8 runs (fnode leaf capacity).
-            let mut runs = Vec::new();
-            let mut remaining = n_sec;
-            while remaining > 0 {
-                let mut got = None;
-                let mut take = remaining;
-                while take > 0 {
-                    if let Some(s) = self.alloc_run(near, take) {
-                        got = Some((s, take));
-                        break;
+            // Fragmented fallback: the largest free runs, at most 8 (an fnode leaf's capacity).
+            let mut free_runs = Vec::new();
+            let mut start = 0u32;
+            let mut len = 0u32;
+            for x in 0x14..self.total_sectors {
+                if self.bitmap_is_free(x) {
+                    if len == 0 {
+                        start = x;
                     }
-                    take -= 1;
-                }
-                let (s, t) = got.ok_or_else(|| {
-                    FilesystemError::DiskFull("HPFS: not enough free space".into())
-                })?;
-                runs.push((s, t));
-                remaining -= t;
-                if runs.len() > 8 {
-                    for (s, t) in &runs {
-                        self.free_run(*s, *t);
-                    }
-                    return Err(FilesystemError::DiskFull(
-                        "HPFS: file too fragmented (writer emits <=8 extents)".into(),
-                    ));
+                    len += 1;
+                } else if len > 0 {
+                    free_runs.push((start, len));
+                    len = 0;
                 }
             }
+            if len > 0 {
+                free_runs.push((start, len));
+            }
+            free_runs.sort_by_key(|r| std::cmp::Reverse(r.1));
+            let mut runs = Vec::new();
+            let mut remaining = n_sec;
+            for (s, l) in free_runs.into_iter().take(8) {
+                let t = l.min(remaining);
+                runs.push((s, t));
+                remaining -= t;
+                if remaining == 0 {
+                    break;
+                }
+            }
+            if remaining > 0 {
+                return Err(FilesystemError::DiskFull(
+                    "HPFS: not enough free space in 8 runs (this writer emits <=8 extents)".into(),
+                ));
+            }
+            for &(s, t) in &runs {
+                for x in s..s + t {
+                    self.mark_used(x);
+                }
+            }
+            runs.sort_unstable();
             runs
         };
         // Write data into the runs.
@@ -1776,6 +1833,11 @@ impl<R: Read + Write + Seek> HpfsFilesystem<R> {
         mtime_secs: Option<u64>,
     ) -> Result<u32, FilesystemError> {
         validate_hpfs_name(name)?;
+        if !is_dir && size > 0x7FFF_FFFF {
+            return Err(FilesystemError::Unsupported(format!(
+                "HPFS: {name} is {size} bytes; HPFS files stop at 2 GiB"
+            )));
+        }
         let nb = name.as_bytes().to_vec();
         // Duplicate check up front (avoids leaking allocations on conflict).
         let root_dno = self.dir_root_dnode(parent_fnode)?;
@@ -1833,39 +1895,27 @@ impl<R: Read + Write + Seek> HpfsFilesystem<R> {
     // ---- deletion ----
     /// Free a file's data extents (and any anode tree) plus its fnode.
     fn free_file_fnode(&mut self, fno: u32) -> Result<(), FilesystemError> {
-        let (_, extents) = self.fnode_extents(fno)?;
+        self.fnode_extents(fno)?;
+        let f = self.read_sectors(fno, 1)?;
+        let (extents, anodes) = self.fnode_tree(&f)?;
+        // Check every run first: freeing a wild one would hand live metadata to the allocator.
+        for e in &extents {
+            if e.disk_secno < 0x12
+                || e.disk_secno as u64 + e.length as u64 > self.total_sectors as u64
+            {
+                return Err(FilesystemError::InvalidData(format!(
+                    "HPFS: fnode {fno:#x} has an extent {:#x}+{} outside the volume",
+                    e.disk_secno, e.length
+                )));
+            }
+        }
         for e in extents {
             self.free_run(e.disk_secno, e.length);
         }
-        // Free any anode sectors referenced by an internal fnode btree.
-        let f = self.read_sectors(fno, 1)?;
-        if f[56] & 0x80 != 0 {
-            let n_used = f[61] as usize;
-            for i in 0..n_used {
-                let down = u32le(&f, 64 + i * 8 + 4);
-                self.free_anode_tree(down)?;
-            }
+        for a in anodes {
+            self.free_run(a, 1);
         }
         self.free_run(fno, 1);
-        Ok(())
-    }
-
-    fn free_anode_tree(&mut self, ano: u32) -> Result<(), FilesystemError> {
-        if ano < 0x12 || ano as u64 >= self.total_sectors as u64 {
-            return Ok(());
-        }
-        let a = self.read_sectors(ano, 1)?;
-        if u32le(&a, 0) != ANODE_MAGIC {
-            return Ok(());
-        }
-        if a[12] & 0x80 != 0 {
-            let n_used = a[13] as usize;
-            for i in 0..n_used {
-                let down = u32le(&a, 20 + i * 8 + 4);
-                self.free_anode_tree(down)?;
-            }
-        }
-        self.free_run(ano, 1);
         Ok(())
     }
 
@@ -2201,6 +2251,7 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem
                 .map(|t| t.mtime_or_now())
                 .unwrap_or_else(disk_core::times::now),
         );
+        let name = hpfs_stored_name(name);
         let fno =
             self.in_txn(|fs| fs.create_entry(parent_fnode, name, false, data, data_len, mtime))?;
         let path = if parent.path == "/" {
@@ -2233,6 +2284,7 @@ impl<R: Read + Write + Seek + Send> disk_core::filesystem::EditableFilesystem
                 .map(|t| t.mtime_or_now())
                 .unwrap_or_else(disk_core::times::now),
         );
+        let name = hpfs_stored_name(name);
         let fno =
             self.in_txn(|fs| fs.create_entry(parent_fnode, name, true, &mut empty, 0, mtime))?;
         let path = if parent.path == "/" {
@@ -2450,6 +2502,14 @@ fn de_meta_template(fnode: u32, size: u32, attrib: u8, mtime_secs: Option<u64>) 
 }
 
 /// Validate a filename against HPFS rules (mirrors kernel `hpfs_chk_name`).
+/// The name as OS/2 stores it, trailing dots and spaces stripped.
+fn hpfs_stored_name(name: &str) -> &str {
+    if name == "." || name == ".." {
+        return name;
+    }
+    name.trim_end_matches(['.', ' '])
+}
+
 pub fn validate_hpfs_name(name: &str) -> Result<(), FilesystemError> {
     if name.is_empty() {
         return Err(FilesystemError::InvalidData("name cannot be empty".into()));
@@ -3202,6 +3262,54 @@ mod tests {
                 &CreateFileOptions::default()
             )
             .is_err());
+    }
+
+    #[test]
+    fn trailing_dots_and_spaces_are_stripped_as_os2_does() {
+        let mut fs = blank_fs(4, "TRIM");
+        let root = fs.root().unwrap();
+        mkfile(&mut fs, &root, "README. ", b"x");
+        let names: Vec<_> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["README"]);
+        assert!(fs.fsck().unwrap().unwrap().errors.is_empty());
+    }
+
+    #[test]
+    fn a_file_scattered_over_free_holes_is_written_whole() {
+        let mut fs = blank_fs(4, "FRAG");
+        let root = fs.root().unwrap();
+        for i in 0..6 {
+            mkfile(&mut fs, &root, &format!("F{i}"), &[i as u8; 64 * 512]);
+        }
+        let files = fs.list_directory(&root).unwrap();
+        for f in files.iter().filter(|f| f.name != "F5") {
+            if f.name.ends_with(['0', '2', '4']) {
+                fs.delete_entry(&root, f).unwrap();
+            }
+        }
+        // Fill the tail so only the three 64-sector holes are left, then ask for 150 sectors.
+        let free = fs.free_space().unwrap() / 512;
+        mkfile(
+            &mut fs,
+            &root,
+            "TAIL",
+            &vec![9u8; (free as usize - 3 * 64 - 8) * 512],
+        );
+        let data = vec![5u8; 150 * 512];
+        mkfile(&mut fs, &root, "BIG", &data);
+        let big = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "BIG")
+            .unwrap();
+        assert_eq!(fs.read_file(&big, usize::MAX).unwrap(), data);
+        assert!(fs.fsck().unwrap().unwrap().errors.is_empty());
     }
 
     #[test]
