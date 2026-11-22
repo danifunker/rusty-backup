@@ -694,11 +694,16 @@ fn validate_cpm_name(name: &str) -> Result<(String, String), FilesystemError> {
     }
     if e.len() > 3 {
         return Err(FilesystemError::InvalidData(format!(
-            "ext part '{e}' must be ≤ 3 chars"
+            "ext part '{e}' must be <= 3 chars"
         )));
     }
     for c in n.chars().chain(e.chars()) {
-        if !c.is_ascii() || !(0x20..=0x7E).contains(&(c as u8)) || c.is_ascii_whitespace() {
+        // The CCP parses these as wildcards or separators, so a file named with one is unreachable.
+        if !c.is_ascii()
+            || !(0x20..=0x7E).contains(&(c as u8))
+            || c.is_ascii_whitespace()
+            || "<>.,;:=?*[]|\"".contains(c)
+        {
             return Err(FilesystemError::InvalidData(format!(
                 "filename '{name}' contains invalid char '{c}'"
             )));
@@ -998,7 +1003,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "CP/M has no directory hierarchy — files are addressed by (user, name)".into(),
+            "CP/M has no directory hierarchy - files are addressed by (user, name)".into(),
         ))
     }
 
@@ -1289,6 +1294,10 @@ mod tests {
         assert!(validate_cpm_name("FOO.BARS").is_err());
         // Empty.
         assert!(validate_cpm_name("").is_err());
+        // Wildcards and CCP separators.
+        for bad in ["A*.TXT", "A?.TXT", "A.B.C", "A,B", "A=B", "A[1]"] {
+            assert!(validate_cpm_name(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

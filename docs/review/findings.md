@@ -358,8 +358,8 @@ Review by a separate agent, 2026-11-21, read-only.
 | B8-011 | S2 | confirmed | os9.rs, qdos.rs, lif.rs reads | Allocations sized from on-disk u32 lengths (4 GiB to ~1 TB). | fixed (7170f90a) |
 | B8-012 | S2 | plausible | qdos.rs `FAT_END_LO` | Chains stop at 0xFFF8+ though clusters up to 65,534 are allowed. | fixed (7170f90a) |
 | B8-013 | S2 | confirmed | dragondos.rs `parse_geometry` | Track counts past the bitmap's 3,488 LSNs flip bits in the directory. | fixed (7170f90a) |
-| B8-014 | S3 | confirmed | cbm.rs, qdos.rs, atari_dos.rs, dragondos.rs, rsdos.rs, trdos.rs | Em dash (U+2014) in user-visible error strings. | open |
-| B8-015 | S4 | confirmed | andos.rs, qdos_mdv.rs | Errors point at moved `src/fs/` paths; andos doc says it lists an empty root. | open |
+| B8-014 | S3 | confirmed | cbm.rs, qdos.rs, atari_dos.rs, dragondos.rs, rsdos.rs, trdos.rs | Em dash (U+2014) in user-visible error strings. | fixed (d6f2d9b7) |
+| B8-015 | S4 | confirmed | andos.rs, qdos_mdv.rs | Errors point at moved `src/fs/` paths; andos doc says it lists an empty root. | fixed (d6f2d9b7) |
 | B8-016 | S4 | confirmed | rsdos.rs, atari_dos.rs, dragondos.rs, trdos.rs | Byte-identical name codecs and sector I/O helpers. | open |
 
 ## crates/fs-unix
@@ -453,8 +453,8 @@ Review by a separate agent, 2026-11-21, read-only.
 | AP2-014 | S2 | confirmed | ucsd.rs `byte_size`, `read_file` | `last_byte` not clamped: reads spill into following files. | fixed (0735476c) |
 | AP2-015 | S2 | confirmed | ucsd.rs `repair_ucsd` | BadName repair drops the entry and frees the file's blocks. | fixed (0735476c) |
 | AP2-016 | S2 | confirmed | ucsd.rs `create_file` | Block count `as u16` wraps at 32 MiB; slice panics. | fixed (0735476c) |
-| AP2-017 | S3 | confirmed | prodos.rs, apple_dos.rs, ucsd.rs, sector_order.rs | Em dash / multiplication sign in user-visible errors. | open |
-| AP2-018 | S3 | confirmed | prodos_types.rs `parse_json` | Format crate reads the app config dir; a bad override file is silently ignored. | open |
+| AP2-017 | S3 | confirmed | prodos.rs, apple_dos.rs, ucsd.rs, sector_order.rs | Em dash / multiplication sign in user-visible errors. | fixed (d3e79acf) |
+| AP2-018 | S3 | confirmed | prodos_types.rs `parse_json` | Format crate reads the app config dir; a bad override file is silently ignored. | fixed (d3e79acf) |
 | AP2-019 | S4 | confirmed | apple_dos.rs, prodos.rs | Catalog walk copied 5 times; read_* duplicate write_*_to; fork walkers duplicated. | open |
 
 ## crates/fs-xerox
