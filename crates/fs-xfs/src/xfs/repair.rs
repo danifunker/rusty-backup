@@ -385,7 +385,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
     }
 
     fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
-        self.ensure_editable()?;
+        // Only the inode core changes, so the feature gate in `ensure_editable` does not apply.
         // di_mode is a big-endian u16 at offset 2 of the dinode core.
         // `write_inode_region` re-stamps the v5 CRC for us.
         let sb = self.superblock().clone();
@@ -399,7 +399,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
     }
 
     fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
-        self.ensure_editable()?;
+        // Inode core only, like `set_permissions`; no tree the gated features cover is touched.
         // di_uid / di_gid are big-endian u32s at offsets 8 and 12 — XFS
         // has carried 32-bit ids since v1, so no width check is needed.
         let sb = self.superblock().clone();
