@@ -141,9 +141,10 @@ impl FileContent {
     }
 
     /// Open a fresh reader over the content.
-    fn open(&self) -> Result<Box<dyn std::io::Read>, FilesystemError> {
+    fn open(&self) -> Result<Box<dyn std::io::Read + '_>, FilesystemError> {
         match self {
-            Self::Bytes(b) => Ok(Box::new(std::io::Cursor::new(b.clone()))),
+            // Borrowed, so a file's bytes are not copied again to be written.
+            Self::Bytes(b) => Ok(Box::new(b.as_slice())),
             Self::Shared(b) => Ok(Box::new(SharedReader(b.clone(), 0))),
             Self::HostFile { path, .. } => {
                 let f = std::fs::File::open(path).map_err(FilesystemError::Io)?;
