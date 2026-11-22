@@ -870,7 +870,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AtariDosFilesystem<R>
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "Atari DOS 2 is a flat filesystem — no subdirectories".into(),
+            "Atari DOS 2 is a flat filesystem - no subdirectories".into(),
         ))
     }
 

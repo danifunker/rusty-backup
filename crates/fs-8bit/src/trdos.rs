@@ -609,7 +609,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for TrdosFilesystem<R> {
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "TR-DOS is a flat filesystem — no subdirectories".into(),
+            "TR-DOS is a flat filesystem - no subdirectories".into(),
         ))
     }
 

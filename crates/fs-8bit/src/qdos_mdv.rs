@@ -140,9 +140,7 @@ impl<R: Read + Seek + Send> Filesystem for QdosMdvFilesystem<R> {
         // sector-chain implementation. Park with a clear message so
         // callers don't silently treat the volume as empty.
         Err(FilesystemError::Unsupported(
-            "QDOS microdrive directory walk not implemented — \
-             see src/fs/qdos_mdv.rs and OPEN-WORK §7"
-                .into(),
+            "QDOS microdrive images can be detected but not yet browsed".into(),
         ))
     }
 

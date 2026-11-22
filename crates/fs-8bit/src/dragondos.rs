@@ -866,7 +866,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for DragonDosFilesystem<R
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "DragonDOS is a flat filesystem — no subdirectories".into(),
+            "DragonDOS is a flat filesystem - no subdirectories".into(),
         ))
     }
 

@@ -1233,7 +1233,7 @@ impl<R: Read + Write + Seek + Send> CbmFilesystem<R> {
                     }
                     chosen.ok_or_else(|| {
                         FilesystemError::DiskFull(
-                            "directory track is full — cannot extend the directory".into(),
+                            "directory track is full - cannot extend the directory".into(),
                         )
                     })?
                 };
@@ -1403,7 +1403,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CbmFilesystem<R> {
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "CBM DOS is a flat filesystem — no subdirectories".into(),
+            "CBM DOS is a flat filesystem - no subdirectories".into(),
         ))
     }
 

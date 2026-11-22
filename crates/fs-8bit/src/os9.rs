@@ -708,7 +708,7 @@ impl<R: Read + Seek + Send> Os9Filesystem<R> {
             warnings.push(FsckIssue {
                 code: "Os9ReservedClusters".into(),
                 message: format!(
-                    "{leaked} cluster(s) are marked allocated but referenced by no file — \
+                    "{leaked} cluster(s) are marked allocated but referenced by no file - \
                      reserved space (boot area / reserved track); left as-is"
                 ),
                 repairable: false,

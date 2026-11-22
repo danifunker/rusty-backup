@@ -713,7 +713,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
     ) -> Result<FileEntry, FilesystemError> {
         if parent.path != "/" {
             return Err(FilesystemError::Unsupported(
-                "QDOS subdir writes deferred — only root supported".into(),
+                "QDOS subdir writes deferred - only root supported".into(),
             ));
         }
         validate_qdos_name(name)?;
@@ -808,7 +808,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "QDOS subdir creation deferred — needs subdir-cluster semantics".into(),
+            "QDOS subdir creation deferred - needs subdir-cluster semantics".into(),
         ))
     }
 
@@ -852,7 +852,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
     ) -> Result<(), FilesystemError> {
         if parent.path != "/" {
             return Err(FilesystemError::Unsupported(
-                "QDOS subdir rename deferred — only root supported".into(),
+                "QDOS subdir rename deferred - only root supported".into(),
             ));
         }
         if new_name == entry.name {
@@ -1011,7 +1011,7 @@ pub fn resize_qdos_in_place(
     let mut cur = old_ffc;
     while cur != 0 && cur < old_cc {
         if !seen.insert(cur) {
-            log_cb("QDOS: refusing resize — cycle detected in free chain");
+            log_cb("QDOS: refusing resize - cycle detected in free chain");
             return Ok(false);
         }
         free_chain.push(cur);
@@ -1020,7 +1020,7 @@ pub fn resize_qdos_in_place(
 
     if (free_chain.len() as u16) != old_fc {
         log_cb(&format!(
-            "QDOS: warning — free-chain walk found {} clusters but header.fc = {}; using walked count",
+            "QDOS: warning - free-chain walk found {} clusters but header.fc = {}; using walked count",
             free_chain.len(),
             old_fc,
         ));
@@ -1038,7 +1038,7 @@ pub fn resize_qdos_in_place(
         for k in lo..hi {
             if !free_set.contains(&k) {
                 log_cb(&format!(
-                    "QDOS: refusing grow from {} to {} clusters — cluster {} would be \
+                    "QDOS: refusing grow from {} to {} clusters - cluster {} would be \
                      absorbed into the FAT region but is currently allocated",
                     old_cc, new_cc, k
                 ));
@@ -1079,7 +1079,7 @@ pub fn resize_qdos_in_place(
         for c in new_cc..old_cc {
             if !free_set.contains(&c) {
                 log_cb(&format!(
-                    "QDOS: refusing shrink from {} to {} clusters — cluster {} \
+                    "QDOS: refusing shrink from {} to {} clusters - cluster {} \
                      is allocated (not on the free chain) and would be discarded",
                     old_cc, new_cc, c
                 ));
@@ -1388,7 +1388,7 @@ mod tests {
 
         assert_eq!(
             fs.header.rlen, rlen_before,
-            "dir should not have grown — slot 1 was reused"
+            "dir should not have grown - slot 1 was reused"
         );
         let post = fs.list_directory(&root).unwrap();
         assert_eq!(post.len(), 1);
