@@ -648,6 +648,13 @@ impl<R: Read + Seek + Send> BfsFilesystem<R> {
                 inode.block
             )));
         }
+        // A directory's B+tree of more than 64 MiB is a corrupt size, not one to allocate.
+        if inode.data.size > 64 << 20 {
+            return Err(FilesystemError::Parse(format!(
+                "bfs: directory at block {} claims {} bytes",
+                inode.block, inode.data.size
+            )));
+        }
         let tree = self.read_stream(&inode.data, 0, inode.data.size.max(0) as usize)?;
         let e = self.sb.endian;
         if tree.len() < BPLUSTREE_HEADER_SIZE || e.u32(&tree, 0) != BPLUSTREE_MAGIC {
@@ -721,7 +728,8 @@ impl<R: Read + Seek + Send> BfsFilesystem<R> {
     /// Resolve a symlink's target, inline or streamed.
     pub fn symlink_target(&mut self, inode: &BfsInode) -> Result<String, FilesystemError> {
         let raw = if inode.is_long_symlink() {
-            self.read_stream(&inode.data, 0, inode.data.size.max(0) as usize)?
+            // A target is a path (B_PATH_NAME_LENGTH 1024); a larger size is corruption.
+            self.read_stream(&inode.data, 0, inode.data.size.clamp(0, 4096) as usize)?
         } else {
             inode.short_symlink.clone()
         };

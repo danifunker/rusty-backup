@@ -640,8 +640,9 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
             return Ok(String::from_utf8_lossy(target).to_string());
         }
 
-        // Slow symlink: target stored in data blocks
-        let data = self.read_inode_data(inode, inode.size as usize)?;
+        // Slow symlink: target stored in data blocks. A target is a path (PATH_MAX 4096); a
+        // larger size is corruption and must not size the read.
+        let data = self.read_inode_data(inode, (inode.size as usize).min(4096))?;
         // Strip trailing null if present
         let len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
         Ok(String::from_utf8_lossy(&data[..len]).to_string())
@@ -660,6 +661,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
             let mut all_blocks = Vec::new();
             for idx in indices {
                 let child_data = self.read_block(idx.child_block)?;
+                check_child_depth(&header, &child_data)?;
                 self.read_extent_node(&child_data, &mut all_blocks)?;
             }
             Ok(all_blocks)
@@ -679,6 +681,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
             let indices = parse_extent_indices(block_data, header.entries);
             for idx in indices {
                 let child_data = self.read_block(idx.child_block)?;
+                check_child_depth(&header, &child_data)?;
                 self.read_extent_node(&child_data, all_blocks)?;
             }
         }
@@ -1020,6 +1023,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
             for idx in parse_extent_indices(node, header.entries) {
                 out.push(idx.child_block); // the index node is metadata
                 let child = self.read_block(idx.child_block)?;
+                check_child_depth(&header, &child)?;
                 self.fsck_extent_blocks(&child, out)?;
             }
         }
@@ -1121,6 +1125,14 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
         }
 
         let inode = self.read_inode(entry.location as u32)?;
+        // ext4 directories stop at 2 GiB with large_dir, but a listing over 256 MiB is a
+        // corrupt size, not something to allocate.
+        if inode.size > 256 << 20 {
+            return Err(FilesystemError::Parse(format!(
+                "ext: directory inode {} claims {} bytes",
+                entry.location, inode.size
+            )));
+        }
         let data = self.read_inode_data(&inode, inode.size as usize)?;
         let dir_entries = self.parse_directory(&data);
 
@@ -3091,7 +3103,25 @@ fn parse_extent_header(data: &[u8]) -> Result<ExtentHeader, FilesystemError> {
     }
     let entries = u16::from_le_bytes([data[2], data[3]]);
     let depth = u16::from_le_bytes([data[6], data[7]]);
+    // ext4 trees are at most 5 deep (EXT4_MAX_EXTENT_DEPTH).
+    if depth > 5 {
+        return Err(FilesystemError::Parse(format!(
+            "ext: extent tree depth {depth} is past ext4's limit of 5"
+        )));
+    }
     Ok(ExtentHeader { entries, depth })
+}
+
+/// A child extent node must sit below its parent, or a node pointing at itself recurses forever.
+fn check_child_depth(parent: &ExtentHeader, child: &[u8]) -> Result<(), FilesystemError> {
+    let c = parse_extent_header(child)?;
+    if c.depth >= parent.depth {
+        return Err(FilesystemError::Parse(format!(
+            "ext: extent node at depth {} under a depth-{} parent",
+            c.depth, parent.depth
+        )));
+    }
+    Ok(())
 }
 
 /// Write one `ext4_extent` (12 bytes) describing a single block.
@@ -4019,6 +4049,7 @@ fn patch_extent_tree_in_inode<R: Read + Seek>(
             reader.seek(SeekFrom::Start(partition_offset + child_block * block_size))?;
             let mut child_data = vec![0u8; block_size as usize];
             reader.read_exact(&mut child_data)?;
+            check_child_depth(&header, &child_data)?;
 
             patch_extent_block(
                 reader,
@@ -4090,6 +4121,7 @@ fn patch_extent_block<R: Read + Seek>(
             reader.seek(SeekFrom::Start(partition_offset + child_block * block_size))?;
             let mut child_data = vec![0u8; block_size as usize];
             reader.read_exact(&mut child_data)?;
+            check_child_depth(&header, &child_data)?;
 
             patch_extent_block(
                 reader,

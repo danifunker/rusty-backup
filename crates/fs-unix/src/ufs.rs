@@ -1471,14 +1471,15 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
     /// dinode's pointer area; non-inline symlinks live in the first
     /// data block.
     fn read_symlink_target(&mut self, inode: &UfsInode) -> Result<String, FilesystemError> {
-        let size = inode.size as usize;
+        // A target is a path (MAXPATHLEN 1024 on BSD): a larger size is corruption.
+        let size = (inode.size as usize).min(4096);
         if size == 0 {
             return Ok(String::new());
         }
         let bytes = if self.is_inline_symlink(inode) {
-            inode.inline_payload[..size].to_vec()
+            inode.inline_payload[..size.min(inode.inline_payload.len())].to_vec()
         } else {
-            self.read_inode_data(inode, inode.size, size)?
+            self.read_inode_data(inode, size as u64, size)?
         };
         Ok(self.name_from_bytes(&bytes))
     }

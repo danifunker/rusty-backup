@@ -414,12 +414,12 @@ drivers are merged.
 | UNX-043 | S2 | confirmed | reiserfs.rs `list_directory` | Each child re-walks every leaf: quadratic listing. | fixed (b6e84a55) |
 | UNX-044 | S2 | plausible | reiserfs.rs | `s_bmap_nr` unchecked: bitmap reads past the volume; compact stream too long. | fixed (b6e84a55) |
 | UNX-045 | S2 | confirmed | jfs.rs, jfs1.rs | Unchecked size multiplications. | fixed (b6e84a55) |
-| UNX-046 | S2 | confirmed | bfs.rs `parse`; bfs_fsck.rs | Geometry not cross-checked: fsck loops 2^60 times. | open |
-| UNX-047 | S2 | confirmed | bfs_write.rs `delete_entry` | Tree stored and runs freed before the double-indirect refusal; attribute dirs never freed. | open |
-| UNX-048 | S2 | confirmed | vxfs_edit.rs | Panics on hostile input (namelen slice, underflow, maps / iau indexing). | open |
-| UNX-049 | S2 | confirmed | minix.rs `create_file` | Size stored as u32 (4 GiB+1 records 1); a failure leaks the inode and zones. | open |
-| UNX-050 | S2 | confirmed | minix.rs, vxfs_edit.rs `rename` | Old dirent removed before the insert: DiskFull leaves the inode nameless. | open |
-| UNX-051 | S2 | confirmed | efs_v1.rs `read_dir_entries` vs efs_v1_fsck.rs | Reader drops out-of-range dirents, so fsck's check can never fire. | open |
+| UNX-046 | S2 | confirmed | bfs.rs `parse`; bfs_fsck.rs | Geometry not cross-checked: fsck loops 2^60 times. | fixed (303f658d) |
+| UNX-047 | S2 | confirmed | bfs_write.rs `delete_entry` | Tree stored and runs freed before the double-indirect refusal; attribute dirs never freed. | fixed (303f658d) |
+| UNX-048 | S2 | confirmed | vxfs_edit.rs | Panics on hostile input (namelen slice, underflow, maps / iau indexing). | fixed (303f658d) |
+| UNX-049 | S2 | confirmed | minix.rs `create_file` | Size stored as u32 (4 GiB+1 records 1); a failure leaks the inode and zones. | fixed (303f658d) |
+| UNX-050 | S2 | confirmed | minix.rs, vxfs_edit.rs `rename` | Old dirent removed before the insert: DiskFull leaves the inode nameless. | fixed (303f658d) |
+| UNX-051 | S2 | confirmed | efs_v1.rs `read_dir_entries` vs efs_v1_fsck.rs | Reader drops out-of-range dirents, so fsck's check can never fire. | fixed (303f658d) |
 | UNX-052 | S2 | plausible | unix_common/compact.rs `MappedBlocks` and callers | One u64 per allocated block (~2 GB for 1 TB); ext's tables add more: breaks the streaming rule. | open |
 | UNX-053 | S3 | confirmed | unix_common/compact.rs `load_block` | One seek + read per block, not 64 KiB-1 MiB runs. | open |
 | UNX-054 | S3 | confirmed | ufs.rs `open` | `total_frags` not compared with `ncg*fpg` or the slice (generic form of SD-001). | open |

@@ -851,6 +851,8 @@ impl<R: Read + Seek> BtrfsFilesystem<R> {
         inode_num: u64,
         size: u64,
     ) -> Result<String, FilesystemError> {
+        // A target is a path (PATH_MAX 4096); a larger size must not size the read.
+        let size = size.min(4096);
         let data = self.read_file_data(tree_root, inode_num, size, size as usize)?;
         let len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
         Ok(String::from_utf8_lossy(&data[..len]).to_string())
