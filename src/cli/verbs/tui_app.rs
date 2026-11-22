@@ -2031,7 +2031,7 @@ impl App {
                         no_permissions: false,
                         include_appledouble: false,
                         exclude_appledouble: false,
-                        line_endings: fs_tar::line_endings::LineEndings::Keep,
+                        line_endings: Default::default(),
                     })
                 }
             },
