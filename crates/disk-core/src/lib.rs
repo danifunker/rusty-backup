@@ -35,6 +35,7 @@
 pub mod bits;
 pub mod bytes;
 pub mod display;
+pub mod mac_roman;
 #[cfg(feature = "rust173-polyfill")]
 pub mod rust173;
 pub mod sgi;
