@@ -589,16 +589,16 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 | ADF-002 | S1 | confirmed | adfs.rs `delete_entry`, `free_fragment` | Delete frees a whole shared fragment (siblings and parent unreadable); multi-fragment files free only the first. | fixed (313cccb3) |
 | ADF-003 | S1 | confirmed | adfs.rs `remove_dir_entry` | Entry shift runs into the directory tail: every delete corrupts the parent pointer, title, name and EndMasSeq. | fixed (313cccb3) |
 | ADF-004 | S1 | confirmed | adfs.rs `insert_dir_entry` | A 78th entry in a full directory overwrites the tail. | fixed (313cccb3) |
-| ADF-005 | S2 | plausible | adfs.rs | Sequence numbers not bumped, check byte not recomputed, entries not sorted. | open |
-| ADF-006 | S2 | confirmed | adfs.rs | Free-space chain broken on allocate and never relinked on delete. | open |
-| ADF-007 | S2 | confirmed | adfs.rs `adfs_calczonecheck` | Truncated last zone underflows and panics (fsck, repair, every write). | open |
+| ADF-005 | S2 | plausible | adfs.rs | Sequence numbers not bumped, check byte not recomputed, entries not sorted. | fixed (a1f98e4a); check byte not yet compared with RISC OS |
+| ADF-006 | S2 | confirmed | adfs.rs | Free-space chain broken on allocate and never relinked on delete. | fixed (a1f98e4a) |
+| ADF-007 | S2 | confirmed | adfs.rs `adfs_calczonecheck` | Truncated last zone underflows and panics (fsck, repair, every write). | fixed (a1f98e4a) |
 | ADF-008 | S2 | confirmed | adfs.rs `delete_entry` | D-format without FSM panics after rewriting the parent; errors fire after the entry is removed. | fixed (313cccb3) |
-| ADF-009 | S2 | confirmed | adfs.rs `DiscRecord::parse` | id_len / log2bpmb / zone_spare unvalidated: shifts overflow. | open |
-| ADF-010 | S2 | confirmed | adfs.rs `read_dir_block` | Capacity from on-disk root size (4 GiB). | open |
-| ADF-011 | S2 | confirmed | adfs.rs `flush_zone` | Backup map zones 1..n-1 go stale on multi-zone discs. | open |
-| ADF-012 | S2 | plausible | adfs.rs | Free runs / sectors not bounded by the partition; overlapping runs accepted. | open |
-| ADF-013 | S3 | confirmed | adfs.rs `AdfsFsm::read` | Zone load sized by on-disk count (128 MiB); every edit rewrites all zones; quadratic copy. | open |
-| ADF-014 | S3 | confirmed | adfs.rs | Map written before data / entry (leaks on failure); no duplicate-name check. | open |
+| ADF-009 | S2 | confirmed | adfs.rs `DiscRecord::parse` | id_len / log2bpmb / zone_spare unvalidated: shifts overflow. | fixed (a1f98e4a) |
+| ADF-010 | S2 | confirmed | adfs.rs `read_dir_block` | Capacity from on-disk root size (4 GiB). | fixed (a1f98e4a) |
+| ADF-011 | S2 | confirmed | adfs.rs `flush_zone` | Backup map zones 1..n-1 go stale on multi-zone discs. | fixed (a1f98e4a) |
+| ADF-012 | S2 | plausible | adfs.rs | Free runs / sectors not bounded by the partition; overlapping runs accepted. | fixed (a1f98e4a) |
+| ADF-013 | S3 | confirmed | adfs.rs `AdfsFsm::read` | Zone load sized by on-disk count (128 MiB); every edit rewrites all zones; quadratic copy. | fixed (a1f98e4a) |
+| ADF-014 | S3 | confirmed | adfs.rs | Map written before data / entry (leaks on failure); no duplicate-name check. | fixed (a1f98e4a) |
 | HPF-001 | S1 | confirmed | fs-hpfs hpfs.rs `fix_up_ptrs` etc. | Edit paths follow unchecked dnode pointers and write 2 KiB through an unchecked `write_sectors`. | fixed (2d2f9c3d) |
 | HPF-002 | S2 | confirmed | hpfs.rs `add_dirent` etc. | Dirent walks don't check `len` / `first_free`: infinite loop, panic. | fixed (2d2f9c3d) |
 | HPF-003 | S1 | confirmed | hpfs.rs `flush_bitmaps`, `open` | A bad bitmap pointer is kept: freeing writes 2 KiB to sector 0 or past the partition. | fixed (2d2f9c3d) |
