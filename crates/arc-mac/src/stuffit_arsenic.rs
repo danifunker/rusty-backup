@@ -19,6 +19,8 @@ struct BitReader<'a> {
     pos: usize,
     buf: u64,
     nbits: u32,
+    /// Bits handed out past the end of the input, as zeros.
+    overrun: u64,
 }
 
 impl<'a> BitReader<'a> {
@@ -28,6 +30,7 @@ impl<'a> BitReader<'a> {
             pos: 0,
             buf: 0,
             nbits: 0,
+            overrun: 0,
         }
     }
 
@@ -50,6 +53,7 @@ impl<'a> BitReader<'a> {
         if self.nbits < n {
             // Pad with zero bits at EOF.
             let avail = self.nbits;
+            self.overrun += (n - avail) as u64;
             let v = if avail == 0 {
                 0
             } else {
@@ -66,6 +70,11 @@ impl<'a> BitReader<'a> {
 
     fn next_bit(&mut self) -> u32 {
         self.next_bits(1)
+    }
+
+    /// True once the decoder has read well past the input: a stream that ends short.
+    fn exhausted(&self) -> bool {
+        self.overrun > 64
     }
 }
 
@@ -366,6 +375,11 @@ impl<'a> Arsenic<'a> {
                     } else {
                         zerocount += 2 * zerostate;
                     }
+                    // A run longer than the block (or input that has run out) is corrupt; stop
+                    // before the doubling state overflows.
+                    if zerocount > self.blocksize || self.br.exhausted() {
+                        bail!("Arsenic: zero run overflows block");
+                    }
                     zerostate *= 2;
                     sel = self.dec.next_symbol(&mut self.br, &mut self.selector);
                 }
@@ -470,8 +484,11 @@ impl<'a> Arsenic<'a> {
 /// the trailing CRC-32.
 pub fn decompress(comp: &[u8], want: usize) -> Result<Vec<u8>> {
     let mut a = Arsenic::new(comp)?;
-    let mut out = Vec::with_capacity(want);
+    let mut out = Vec::with_capacity(want.min(1 << 24));
     while let Some(b) = a.produce_byte()? {
+        if a.br.exhausted() {
+            bail!("Arsenic: the stream ends before its {want} bytes");
+        }
         out.push(b);
         if out.len() > want.saturating_add(1 << 20) {
             bail!("Arsenic: output exceeds expected size");

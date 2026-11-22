@@ -387,7 +387,11 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
             rsrc,
         });
 
-        pos += ENTRY_HEADER_LEN + rsrc_clen as usize + data_clen as usize;
+        pos = pos
+            .checked_add(ENTRY_HEADER_LEN)
+            .and_then(|p| p.checked_add(rsrc_clen as usize))
+            .and_then(|p| p.checked_add(data_clen as usize))
+            .ok_or_else(|| anyhow::anyhow!("StuffIt: fork sizes overflow"))?;
     }
 
     Ok(StuffItArchive {
@@ -472,7 +476,7 @@ pub fn decompress_fork(archive: &[u8], fork: &ForkInfo) -> Result<Vec<u8>> {
         bail!("StuffIt: encrypted forks are not supported");
     }
     let start = fork.offset as usize;
-    let end = start + fork.compressed_len as usize;
+    let end = start.saturating_add(fork.compressed_len as usize);
     if end > archive.len() {
         // Not a bounds-check bug: `compressed_len` is the on-disk length, so
         // this fires only when those bytes genuinely aren't in the container

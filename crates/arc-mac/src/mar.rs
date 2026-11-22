@@ -170,6 +170,10 @@ fn parse_record(
     parent_path: &[String],
     entries: &mut Vec<StuffItEntry>,
 ) -> Result<()> {
+    // Folders recurse: cap the nesting so a crafted archive can't overflow the stack.
+    if parent_path.len() > 256 {
+        bail!("MAR folders nested more than 256 deep");
+    }
     if *pos + HEADER_LEN > data.len() {
         bail!("truncated MAR record header");
     }

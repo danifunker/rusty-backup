@@ -440,19 +440,19 @@ Review by a separate agent, 2026-11-21, read-only.
 | AP2-001 | S1 | confirmed | apple_dos.rs `read_file_bytes` + `read_file` | Type-B header stripped twice: some payloads read back as 1 byte. | fixed (39c02adb) |
 | AP2-002 | S1 | confirmed | apple_dos.rs `create_file` | B header length `as u16`: files over 64 KiB read back truncated. | fixed (39c02adb) |
 | AP2-003 | S1 | confirmed | prodos.rs `create_file` | Exactly 16 MiB accepted; EOF stored as 0, file reads empty, blocks stay allocated. | fixed (39c02adb) |
-| AP2-004 | S2 | confirmed | prodos.rs directory-chain walks | No cycle guard: a self-linked dir block hangs list / create / delete. | open |
-| AP2-005 | S2 | confirmed | prodos.rs `free_file_blocks` | Index pointers not range-checked before freeing: panic, or the volume directory freed. | open |
-| AP2-006 | S2 | confirmed | prodos.rs read / write_to / delete | Storage type 5 (forked) treated as seedling: extract returns the fork descriptor; delete leaks both forks. | open |
-| AP2-007 | S2 | plausible | prodos.rs `resize_prodos_in_place` | Shrink guard uses the used-block count, not the highest used block; stale buffer on a failed read. | open |
-| AP2-008 | S2 | plausible | prodos.rs subdirectory builders | Subdir metadata off-spec (0-based parent entry number, EOF 0, counts not updated, volume dir grows past 4 blocks). | open |
-| AP2-009 | S2 | plausible | prodos.rs `allocate_block`; ucsd.rs `find_gap` | Block 0 allocatable; volume size not checked against the partition. | open |
-| AP2-010 | S2 | confirmed | apple_dos.rs `read_file_bytes` | Sparse (0,0) T/S pairs skipped instead of zero-filled: records shift. | open |
-| AP2-011 | S2 | confirmed | apple_dos.rs `alloc_one_sector`, `free_sector_count` | Track 34 counted free but never allocated: creates fail half-way. | open |
-| AP2-012 | S2 | confirmed | apple_dos.rs `bitmap_mark_free` | Freed T/S pairs not range-checked: panic. | open |
-| AP2-013 | S2 | confirmed | apple_dos.rs `encode_apple_name` | Trailing spaces accepted, trimmed on read: failed create, then duplicates. | open |
-| AP2-014 | S2 | confirmed | ucsd.rs `byte_size`, `read_file` | `last_byte` not clamped: reads spill into following files. | open |
-| AP2-015 | S2 | confirmed | ucsd.rs `repair_ucsd` | BadName repair drops the entry and frees the file's blocks. | open |
-| AP2-016 | S2 | confirmed | ucsd.rs `create_file` | Block count `as u16` wraps at 32 MiB; slice panics. | open |
+| AP2-004 | S2 | confirmed | prodos.rs directory-chain walks | No cycle guard: a self-linked dir block hangs list / create / delete. | fixed (0735476c) |
+| AP2-005 | S2 | confirmed | prodos.rs `free_file_blocks` | Index pointers not range-checked before freeing: panic, or the volume directory freed. | fixed (0735476c) |
+| AP2-006 | S2 | confirmed | prodos.rs read / write_to / delete | Storage type 5 (forked) treated as seedling: extract returns the fork descriptor; delete leaks both forks. | fixed (0735476c) |
+| AP2-007 | S2 | plausible | prodos.rs `resize_prodos_in_place` | Shrink guard uses the used-block count, not the highest used block; stale buffer on a failed read. | fixed (0735476c) |
+| AP2-008 | S2 | plausible | prodos.rs subdirectory builders | Subdir metadata off-spec (0-based parent entry number, EOF 0, counts not updated, volume dir grows past 4 blocks). | fixed (0735476c) |
+| AP2-009 | S2 | plausible | prodos.rs `allocate_block`; ucsd.rs `find_gap` | Block 0 allocatable; volume size not checked against the partition. | fixed (0735476c) |
+| AP2-010 | S2 | confirmed | apple_dos.rs `read_file_bytes` | Sparse (0,0) T/S pairs skipped instead of zero-filled: records shift. | fixed (0735476c) |
+| AP2-011 | S2 | confirmed | apple_dos.rs `alloc_one_sector`, `free_sector_count` | Track 34 counted free but never allocated: creates fail half-way. | fixed (0735476c) |
+| AP2-012 | S2 | confirmed | apple_dos.rs `bitmap_mark_free` | Freed T/S pairs not range-checked: panic. | fixed (0735476c) |
+| AP2-013 | S2 | confirmed | apple_dos.rs `encode_apple_name` | Trailing spaces accepted, trimmed on read: failed create, then duplicates. | fixed (0735476c) |
+| AP2-014 | S2 | confirmed | ucsd.rs `byte_size`, `read_file` | `last_byte` not clamped: reads spill into following files. | fixed (0735476c) |
+| AP2-015 | S2 | confirmed | ucsd.rs `repair_ucsd` | BadName repair drops the entry and frees the file's blocks. | fixed (0735476c) |
+| AP2-016 | S2 | confirmed | ucsd.rs `create_file` | Block count `as u16` wraps at 32 MiB; slice panics. | fixed (0735476c) |
 | AP2-017 | S3 | confirmed | prodos.rs, apple_dos.rs, ucsd.rs, sector_order.rs | Em dash / multiplication sign in user-visible errors. | open |
 | AP2-018 | S3 | confirmed | prodos_types.rs `parse_json` | Format crate reads the app config dir; a bad override file is silently ignored. | open |
 | AP2-019 | S4 | confirmed | apple_dos.rs, prodos.rs | Catalog walk copied 5 times; read_* duplicate write_*_to; fork walkers duplicated. | open |

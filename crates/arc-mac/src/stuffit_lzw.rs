@@ -37,7 +37,8 @@ impl<'a> BitCursor<'a> {
         v
     }
     fn skip(&mut self, n: usize) {
-        self.cursor += n;
+        // Padding past the end just ends the stream; remaining() must not underflow.
+        self.cursor = (self.cursor + n).min(self.data.len() * 8);
     }
 }
 
@@ -146,10 +147,12 @@ impl Lzw {
 /// `flags` is the StuffIt compress-flags byte (0x8e in practice).
 pub fn decompress(comp: &[u8], want: usize, flags: u8) -> Result<Vec<u8>> {
     let blockmode = flags & 0x80 != 0;
-    let maxsymbols = 1i32 << (flags & 0x1f);
-    if maxsymbols <= 256 {
-        bail!("LZW: bad max code width in flags {flags:#x}");
+    // compress(1) codes are 9 to 16 bits; a wider flag would size the tables at gigabytes.
+    let bits = flags & 0x1f;
+    if !(9..=16).contains(&bits) {
+        bail!("LZW: max code width {bits} in flags {flags:#x} (9 to 16 allowed)");
     }
+    let maxsymbols = 1i32 << bits;
     let reserved = if blockmode { 1 } else { 0 };
     let mut lzw = Lzw::new(maxsymbols, reserved);
 
@@ -180,10 +183,16 @@ pub fn decompress(comp: &[u8], want: usize, flags: u8) -> Result<Vec<u8>> {
         };
 
         lzw.next_symbol(symbol, &mut out)?;
+        if out.len() as u64 > MAX_LZW_OUT {
+            bail!("LZW: output passes {MAX_LZW_OUT} bytes (a decompression bomb?)");
+        }
     }
 
     Ok(out)
 }
+
+/// Largest stream this in-memory decoder will produce; a .Z has no stored length.
+const MAX_LZW_OUT: u64 = 1 << 32;
 
 /// Decompress a Unix `compress(1)` `.Z` stream: magic `1F 9D`, a flags byte, then LZW to EOF.
 pub fn decompress_unix_z(data: &[u8]) -> Result<Vec<u8>> {
@@ -292,6 +301,18 @@ pub fn compress_unix_z(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_code_width_past_16_bits_is_refused() {
+        assert!(decompress(&[0u8; 16], 100, 0x9f).is_err());
+    }
+
+    #[test]
+    fn padding_past_the_end_after_a_clear_ends_the_stream() {
+        // A CLEAR (256) as the first 9-bit code, then too little input for the pad.
+        let out = decompress(&[0x00, 0x01], 100, 0x90).unwrap();
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn decodes_plain_lzw_roundtrip() {

@@ -45,7 +45,8 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn need(&self, n: usize) -> Result<()> {
-        if self.pos + n > self.data.len() {
+        // Sizes come from the archive; on a 32-bit target pos + n can wrap.
+        if !matches!(self.pos.checked_add(n), Some(end) if end <= self.data.len()) {
             bail!("StuffIt 5: unexpected end of archive at {}", self.pos);
         }
         Ok(())
@@ -134,7 +135,7 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
         if iters > max_iters {
             bail!("StuffIt 5: entry walk did not terminate");
         }
-        if cur.pos + 48 > data.len() {
+        if cur.pos.saturating_add(48) > data.len() {
             break;
         }
         let offs = cur.pos as u32;
@@ -149,7 +150,9 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
         let entry_version = cur.u8()?;
         cur.skip(1)?;
         let headersize = cur.u16()? as usize;
-        let headerend = offs as usize + headersize;
+        let headerend = (offs as usize)
+            .checked_add(headersize)
+            .ok_or_else(|| anyhow::anyhow!("StuffIt 5: header size overflows"))?;
         cur.skip(1)?;
         let flags = cur.u8()?;
         let creation_date = cur.u32()?;
@@ -287,7 +290,11 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
                 data: data_fork,
                 rsrc,
             });
-            cur.seek(datastart as usize + resourcecomplen as usize + datacomplen as usize);
+            let next = (datastart as usize)
+                .checked_add(resourcecomplen as usize)
+                .and_then(|p| p.checked_add(datacomplen as usize))
+                .ok_or_else(|| anyhow::anyhow!("StuffIt 5: fork sizes overflow"))?;
+            cur.seek(next);
         }
         done += 1;
     }

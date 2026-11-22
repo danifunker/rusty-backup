@@ -40,8 +40,12 @@ pub fn decompress(comp: &[u8], want: usize) -> Result<Vec<u8>> {
     let mut br = BitReaderBE::new(comp);
     let root = parse_tree(&mut br, 0)?;
 
-    let mut out = Vec::with_capacity(want);
+    // The header's size is only a claim: don't reserve it, and stop if the input runs out.
+    let mut out = Vec::with_capacity(want.min(1 << 24));
     while out.len() < want {
+        if br.exhausted() {
+            bail!("StuffIt Huffman: the stream ends before its {want} bytes");
+        }
         let mut node = &root;
         loop {
             match node {
@@ -62,6 +66,13 @@ pub fn decompress(comp: &[u8], want: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_that_ends_early_is_an_error_not_a_4_gib_fill() {
+        // Tree "branch, leaf A, leaf B" and no data, claiming 4 GiB of output.
+        let bytes = [0b0100_0001, 0b0110_0001, 0b0000_0000];
+        assert!(decompress(&bytes, u32::MAX as usize).is_err());
+    }
 
     #[test]
     fn huffman_simple_tree() {

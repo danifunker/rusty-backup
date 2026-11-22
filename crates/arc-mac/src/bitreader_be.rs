@@ -9,6 +9,8 @@ pub struct BitReaderBE<'a> {
     pos: usize,
     buf: u64,
     nbits: u32,
+    /// Bits handed out past the end of the input, as zeros.
+    overrun: u64,
 }
 
 impl<'a> BitReaderBE<'a> {
@@ -18,6 +20,7 @@ impl<'a> BitReaderBE<'a> {
             pos: 0,
             buf: 0,
             nbits: 0,
+            overrun: 0,
         }
     }
 
@@ -39,6 +42,7 @@ impl<'a> BitReaderBE<'a> {
         }
         if self.nbits < n {
             let avail = self.nbits;
+            self.overrun += (n - avail) as u64;
             let v = if avail == 0 {
                 0
             } else {
@@ -55,6 +59,11 @@ impl<'a> BitReaderBE<'a> {
 
     pub fn next_bit(&mut self) -> u32 {
         self.next_bits(1)
+    }
+
+    /// True once the decoder has read well past the input: a stream that ends short.
+    pub fn exhausted(&self) -> bool {
+        self.overrun > 64
     }
 }
 
