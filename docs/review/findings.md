@@ -534,14 +534,14 @@ Review by a separate agent, 2026-11-21, read-only.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| CPM-001 | S1 | confirmed | cpm.rs `create_file`, `free_blocks`, `is_active` | Slots with user >= 16 (CP/M 3 label / SFCB / password, ZSDOS users 16-31) are treated as free: new files overwrite them and their blocks are reallocated. | fixed (CFIX) |
+| CPM-001 | S1 | confirmed | cpm.rs `create_file`, `free_blocks`, `is_active` | Slots with user >= 16 (CP/M 3 label / SFCB / password, ZSDOS users 16-31) are treated as free: new files overwrite them and their blocks are reallocated. | fixed (13054e1c) |
 | CPM-002 | S2 | confirmed | cpm.rs `analyze`, `run_repair` | fsck calls user >= 16 entries invalid and repair deletes them (password entries, ZSDOS files). | open |
 | CPM-003 | S2 | confirmed | cpm.rs `encode_dir_entry`, `dir_write_back` | Every write-back re-encodes all slots lossily: SFCB dates, label mode flags and f1'-f4' attributes are lost. | open |
 | CPM-004 | S2 | confirmed | cpm.rs `collect_files`, `read_group` | EXM ignored: on exm > 0 presets (EINSTEIN, SVI328, MULTICOMP) files over 16 KB list short and read truncated. | open |
-| CPM-005 | S1 | confirmed | cpm.rs `create_file` | Writer ignores EXM too: real CP/M sees a different file than we wrote. | mitigated (CFIX): writes refused on exm > 0 presets until EXM is implemented |
-| CPM-006 | S1 | confirmed | cpm_diskdefs.rs `ZX_PLUS3`, `SVI328_CPM` | Data area runs past the disk geometry: allocations and blank images go past the image end. | fixed (CFIX): allocation clamped to the blocks the image holds; preset values left as they are |
+| CPM-005 | S1 | confirmed | cpm.rs `create_file` | Writer ignores EXM too: real CP/M sees a different file than we wrote. | mitigated (13054e1c): writes refused on exm > 0 presets until EXM is implemented |
+| CPM-006 | S1 | confirmed | cpm_diskdefs.rs `ZX_PLUS3`, `SVI328_CPM` | Data area runs past the disk geometry: allocations and blank images go past the image end. | fixed (13054e1c): allocation clamped to the blocks the image holds; preset values left as they are |
 | CPM-007 | S2 | confirmed | cpm_diskdefs.rs `ALTAIR_CF`, `SVI328_CPM`; cpm.rs | Directory size from al0/al1 disagrees with drm: ALTAIR_CF creates always fail at sync after writing data. | open |
-| CPM-008 | S1 | confirmed | cpm.rs list / find / delete / rename | User number dropped from name handling: same-named files in two users collide; delete removes both. | fixed (CFIX) |
+| CPM-008 | S1 | confirmed | cpm.rs list / find / delete / rename | User number dropped from name handling: same-named files in two users collide; delete removes both. | fixed (13054e1c) |
 | CPM-009 | S2 | confirmed | cpm.rs `create_file` | Empty files never get an entry; a mid-loop "directory full" leaves a truncated file to be synced. | open |
 | CPM-010 | S2 | plausible | cpm_diskdefs.rs `ALTAIR_8IN`; cpm.rs | No sector skew: ibm-3740 images (skew 6) read garbled. | open |
 | CPM-011 | S3 | confirmed | cpm.rs `validate_cpm_name` | Wildcard / separator characters accepted in names. | open |
