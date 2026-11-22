@@ -621,11 +621,11 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 | APF-007 | S2 | confirmed | apfs.rs `der_children` | DER length add overflows on 32-bit: panic. | open |
 | APF-008 | S2 | plausible | apfs.rs `stream_phys` | XTS tweak from the physical block, not the extent's crypto_id. | open |
 | APF-009 | S3 | plausible | apfs.rs `build_catalog` | Whole catalog / omap flattened into HashMaps on first browse. | open |
-| QNX-001 | S2 | confirmed | fs-qnx qnx4.rs `extents` | Self-linked empty extent block loops forever. | open |
-| QNX-002 | S2 | confirmed | qnx4.rs `open` | Volume sized to the end of the reader (whole disk for MBR partitions). | open |
-| QNX-003 | S2 | confirmed | qnx4.rs `read_data`, qnx6.rs `read_node` | Allocation by on-disk size before reading; endless hole zero-fill. | open |
-| QNX-004 | S2 | confirmed | qnx6.rs `bmap` | `levels` uncapped: shift overflow. | open |
-| QNX-005 | S3 | confirmed | qnx6.rs `copy_node`, `open` | Block-at-a-time I/O with repeated pointer reads; backup superblock geometry from the primary. | open |
+| QNX-001 | S2 | confirmed | fs-qnx qnx4.rs `extents` | Self-linked empty extent block loops forever. | fixed (172f817a) |
+| QNX-002 | S2 | confirmed | qnx4.rs `open` | Volume sized to the end of the reader (whole disk for MBR partitions). | fixed (172f817a) |
+| QNX-003 | S2 | confirmed | qnx4.rs `read_data`, qnx6.rs `read_node` | Allocation by on-disk size before reading; endless hole zero-fill. | fixed (172f817a) |
+| QNX-004 | S2 | confirmed | qnx6.rs `bmap` | `levels` uncapped: shift overflow. | fixed (172f817a) |
+| QNX-005 | S3 | confirmed | qnx6.rs `copy_node`, `open` | Block-at-a-time I/O with repeated pointer reads; backup superblock geometry from the primary. | fixed (172f817a): I/O; backup-superblock geometry still from the primary |
 | QN2-001 | S1 | confirmed | qnx2fs lib.rs `extents`, `mark`, `delete` | Extent spans unchecked: delete frees other files' blocks; `mark` panics; directory writes past the partition. | fixed (36314812) |
 | QN2-002 | S1 | confirmed | qnx2fs lib.rs `replace`, `copy_entry` | Space check assumes full extents: a full disk loses the old file. | fixed (36314812) |
 | QN2-003 | S2 | confirmed | qnx2fs lib.rs `open`, `read_chain` | Bitmap read grows by on-disk extent sizes before reading (4 GiB). | fixed (1dbd1562) |

@@ -73,8 +73,17 @@
 //!   25      attrs (0x01 R, 0x02 W, 0x04 locked, 0x08 directory,
 //!                  0x10 E, 0x20 pub R, 0x40 pub W, 0x80 pub locked)
 //!
-//! trailer: tail magic + cycle counter
+//! tail (41 bytes): lastmark, 2 reserved, parent (3), title (19),
+//!   name (10), EndMasSeq, "Hugo", check byte
 //! ```
+//!
+//! Entries are kept sorted (RISC OS binary-searches them). Every change bumps
+//! StartMasSeq (byte 0) and EndMasSeq together. The check byte folds, with
+//! `a = word ^ ror13(a)`, the little-endian words from byte 0 up to the last
+//! whole word before the first empty entry, then the remaining bytes of the
+//! entries one at a time, then the tail words from `len-40` to `len-4`; the
+//! byte is `a ^ a>>8 ^ a>>16 ^ a>>24`. This follows FileCore's documented
+//! algorithm and has not yet been checked against a directory RISC OS wrote.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -262,6 +271,20 @@ impl DiscRecord {
         } else {
             0
         };
+        // Limits the map arithmetic relies on: a fragment id fits a 32-bit shift, a zone holds
+        // more bits than its spare and than one id, and a map bit is less than 4 GiB.
+        let zone_bits = 8u32 << log2_sector_size;
+        if id_len == 0
+            || id_len > 31
+            || zone_spare as u32 >= zone_bits
+            || zone_bits - zone_spare as u32 <= id_len as u32 + 1
+            || log2bpmb > 31
+        {
+            return Err(FilesystemError::InvalidData(format!(
+                "ADFS Disc Record geometry out of range (idlen {id_len}, log2bpmb {log2bpmb}, \
+                 zone_spare {zone_spare})"
+            )));
+        }
         Ok(Self {
             log2_sector_size,
             sectors_per_track,
@@ -441,6 +464,25 @@ impl AdfsOldMap {
             free.push((start, len));
         }
         let disc_sectors = u32::from_le_bytes([s0[0xFC], s0[0xFD], s0[0xFE], 0]);
+        // Free runs past the disc are dropped and overlapping ones merged, so the allocator
+        // can only hand out sectors that exist and are free once.
+        let mut free: Vec<(u32, u32)> = free
+            .into_iter()
+            .filter(|&(st, ln)| ln > 0 && st < disc_sectors)
+            .map(|(st, ln)| (st, ln.min(disc_sectors - st)))
+            .collect();
+        free.sort_by_key(|&(st, _)| st);
+        let mut merged: Vec<(u32, u32)> = Vec::new();
+        for (st, ln) in free {
+            if let Some(last) = merged.last_mut() {
+                if st <= last.0 + last.1 {
+                    last.1 = last.1.max(st + ln - last.0);
+                    continue;
+                }
+            }
+            merged.push((st, ln));
+        }
+        let free = merged;
         let disc_id = u16::from_le_bytes([s1[0xFB], s1[0xFC]]);
         let boot_option = s1[0xFD];
         // Disc name: 10 chars interleaved — odd-index chars in sector 0
@@ -624,6 +666,13 @@ impl AdfsFsm {
         // disc_size_map_bits: total disc size shifted to map-bit units.
         // Mirrors `size = adfs_disc_size(dr) >> log2bpmb` in the kernel.
         let disc_size_map_bits = dr.total_disc_size() >> dr.log2bpmb;
+        // More zones than the disc needs is corruption (and a large read); one spare is allowed.
+        let needed = (disc_size_map_bits + 480).div_ceil(zone_size_bits.max(1) as u64);
+        if nzones as u64 > needed + 1 {
+            return Err(FilesystemError::InvalidData(format!(
+                "ADFS FSM: {nzones} zones for a disc that needs {needed}"
+            )));
+        }
 
         let mut zones = Vec::with_capacity(nzones as usize);
         for zi in 0..nzones {
@@ -632,8 +681,14 @@ impl AdfsFsm {
             let mut buf = vec![0u8; sector_size as usize];
             // Use read (not read_exact) so a truncated tail zone doesn't
             // fail open — kernel clamps `dm_endbit` on the last zone.
-            let n = reader.read(&mut buf)?;
-            buf.truncate(n);
+            // A short read (truncated image) leaves zeros: every zone is a whole sector.
+            let mut n = 0;
+            while n < buf.len() {
+                match reader.read(&mut buf[n..])? {
+                    0 => break,
+                    k => n += k,
+                }
+            }
             zones.push(buf);
         }
 
@@ -1075,6 +1130,12 @@ impl<R: Read + Seek + Send> AdfsFilesystem<R> {
         } else {
             ADFS_NEWDIR_SIZE
         };
+        // RISC OS big directories stop at 4 MiB; a larger size field is corruption.
+        if dir_size == 0 || dir_size > 4 << 20 {
+            return Err(FilesystemError::InvalidData(format!(
+                "ADFS: directory size {dir_size} out of range"
+            )));
+        }
         // Round up to a whole-sector count.
         let n_sectors = dir_size.div_ceil(sector_size);
         let mut out = Vec::with_capacity((n_sectors * sector_size) as usize);
@@ -1462,8 +1523,11 @@ impl<R: Read + Seek + Send> Filesystem for AdfsFilesystem<R> {
 /// is the slot the checksum lives in but is excluded from the running
 /// sums by the kernel's iteration order — we mirror that here.
 fn adfs_calczonecheck(zone: &[u8]) -> u8 {
+    if zone.len() < 4 {
+        return 0;
+    }
     let (mut v0, mut v1, mut v2, mut v3): (u32, u32, u32, u32) = (0, 0, 0, 0);
-    let mut i = zone.len() - 4;
+    let mut i = (zone.len() - 4) & !3;
     while i != 0 {
         v0 += zone[i] as u32 + (v3 >> 8);
         v3 &= 0xff;
@@ -1556,13 +1620,42 @@ impl AdfsFsm {
     /// the kernel's monotonic search order).
     fn find_alloc_slot(&self, min_bits: u32) -> Option<(u32, u32, u32, u32)> {
         for zi in 0..self.nzones {
-            if let Some((start, length, predecessor)) = self.find_chain_head(zi) {
-                if length > min_bits + self.idlen {
+            for (start, length, predecessor) in self.free_chain(zi) {
+                if length > min_bits + self.idlen || length == min_bits {
                     return Some((zi, start, length, predecessor));
                 }
             }
         }
         None
+    }
+
+    /// Every fragment on zone `zi`'s free chain as `(start_bit, length_bits, predecessor_bit)`.
+    fn free_chain(&self, zi: u32) -> Vec<(u32, u32, u32)> {
+        let mut out = Vec::new();
+        let Some((head, len, _)) = self.find_chain_head(zi) else {
+            return out;
+        };
+        let (_, endbit, _) = self.zone_metadata(zi);
+        let Some(zone) = self.zones.get(zi as usize) else {
+            return out;
+        };
+        let mask = (1u32 << self.idlen.min(15)) - 1;
+        let (mut at, mut length, mut pred) = (head, len, 8);
+        while out.len() < 1 << 16 {
+            out.push((at, length, pred));
+            let link = Self::get_frag_id(zone, at, mask);
+            if link <= self.idlen || at + link >= endbit {
+                break;
+            }
+            pred = at;
+            at += link;
+            let fragend = Self::find_next_set_bit(zone, at + self.idlen, endbit);
+            if fragend >= endbit {
+                break;
+            }
+            length = fragend + 1 - at;
+        }
+        out
     }
 
     /// Carve `length_bits` map bits off the head of the free-fragment
@@ -1586,11 +1679,15 @@ impl AdfsFsm {
         predecessor_bit: u32,
     ) -> Result<u64, FilesystemError> {
         debug_assert!(length_bits > self.idlen);
-        debug_assert!(free_length > length_bits + self.idlen);
+        let whole = free_length == length_bits;
         let zone = self
             .zones
             .get_mut(zi as usize)
             .ok_or_else(|| FilesystemError::InvalidData("ADFS FSM: bad zone index".into()))?;
+
+        // The head's id field links to the next free fragment; the shortened head keeps that link.
+        let link_bits = self.idlen.min(15);
+        let old_link = Self::get_frag_id(zone, free_start, (1u32 << link_bits) - 1);
 
         // 1. Clear the old free fragment's id + terminator.
         clear_bits_le(zone, free_start, free_length);
@@ -1604,15 +1701,41 @@ impl AdfsFsm {
         //    trailing terminator.
         let new_free_start = free_start + length_bits;
         let new_free_length = free_length - length_bits;
+        if whole {
+            // The fragment is used up: its predecessor links straight to the next free one.
+            let pred_bits = if predecessor_bit == 8 { 15 } else { link_bits };
+            clear_bits_le(zone, predecessor_bit, pred_bits);
+            if old_link > self.idlen {
+                let next = free_start + old_link;
+                let delta = (next - predecessor_bit) as u64;
+                write_bits_le_inplace(zone, predecessor_bit, pred_bits, delta);
+            }
+            let (startbit, _endbit, startblk) = self.zone_metadata(zi);
+            let sector = signed_asl(free_start as i64 - startbit as i64 + startblk, self.map2blk);
+            return u64::try_from(sector).map_err(|_| {
+                FilesystemError::InvalidData(
+                    "ADFS FSM: carved fragment maps to negative sector".into(),
+                )
+            });
+        }
         set_bit_le(zone, new_free_start + new_free_length - 1, 1);
+        if old_link > length_bits {
+            write_bits_le_inplace(
+                zone,
+                new_free_start,
+                link_bits,
+                (old_link - length_bits) as u64,
+            );
+        }
 
         // 4. Update the predecessor pointer in the chain.
         //    For the root predecessor at bit 8: 15-bit delta to head.
         //    For an inner predecessor: the predecessor's 15-bit
         //    frag-id encodes the delta to the next free entry.
-        clear_bits_le(zone, predecessor_bit, 15);
+        let pred_bits = if predecessor_bit == 8 { 15 } else { link_bits };
+        clear_bits_le(zone, predecessor_bit, pred_bits);
         let new_delta = new_free_start - predecessor_bit;
-        write_bits_le_inplace(zone, predecessor_bit, 15, new_delta as u64);
+        write_bits_le_inplace(zone, predecessor_bit, pred_bits, new_delta as u64);
 
         // Compute the disc-sector address of the new fragment's start.
         let (startbit, _endbit, startblk) = self.zone_metadata(zi);
@@ -1643,6 +1766,8 @@ impl AdfsFsm {
             let Some(zone) = self.zones.get(zi as usize) else {
                 continue;
             };
+            // A free fragment's id field holds its chain link, which may equal `frag_id`.
+            let on_chain: HashSet<u32> = self.free_chain(zi).iter().map(|c| c.0).collect();
             let mut start = startbit;
             let cap = 2 * (self.zone_size_bits / (self.idlen + 1)).max(1) + 16;
             let mut iter = 0;
@@ -1653,7 +1778,7 @@ impl AdfsFsm {
                 if fragend >= endbit {
                     break;
                 }
-                if frag == frag_id {
+                if frag == frag_id && !on_chain.contains(&start) {
                     hit = Some((zi, start));
                     break 'outer;
                 }
@@ -1664,40 +1789,85 @@ impl AdfsFsm {
             let zone = self.zones.get_mut(zi as usize).expect("zone exists");
             // Zero the frag-id bits in place (leave the terminator).
             clear_bits_le(zone, start_bit, self.idlen);
+            self.link_free(zi, start_bit)?;
             Ok(true)
         } else {
             Ok(false)
         }
     }
 
+    /// Thread a just-freed fragment at `start` into zone `zi`'s free chain, which runs in bit
+    /// order from the root pointer at bit 8; without this the space is lost to the allocator.
+    fn link_free(&mut self, zi: u32, start: u32) -> Result<(), FilesystemError> {
+        let link_bits = self.idlen.min(15);
+        let mask = (1u32 << link_bits) - 1;
+        let (_, endbit, _) = self.zone_metadata(zi);
+        let zone = self
+            .zones
+            .get_mut(zi as usize)
+            .ok_or_else(|| FilesystemError::InvalidData("ADFS FSM: bad zone index".into()))?;
+        // Walk to the last chain entry before `start`.
+        let (mut pred, mut pred_bits) = (8u32, 15u32);
+        let mut next = None;
+        let mut link = Self::get_frag_id(zone, 8, 0x7FFF);
+        let mut guard = 0;
+        while link != 0 {
+            let at = pred + link;
+            guard += 1;
+            if at >= endbit || guard > 1 << 16 {
+                return Err(FilesystemError::InvalidData(
+                    "ADFS FSM: free chain runs off its zone".into(),
+                ));
+            }
+            if at >= start {
+                next = (at != start).then_some(at);
+                if at == start {
+                    return Ok(()); // already on the chain
+                }
+                break;
+            }
+            pred = at;
+            pred_bits = link_bits;
+            link = Self::get_frag_id(zone, at, mask);
+        }
+        let frag_end = |zone: &[u8], at: u32| Self::find_next_set_bit(zone, at + link_bits, endbit);
+        // Merge with the following free fragment when they touch: drop the boundary.
+        let my_end = frag_end(zone, start);
+        let mut my_next = next;
+        if let Some(n) = next {
+            if my_end + 1 == n {
+                let n_link = Self::get_frag_id(zone, n, mask);
+                set_bit_le(zone, my_end, 0);
+                clear_bits_le(zone, n, link_bits);
+                my_next = (n_link > self.idlen).then_some(n + n_link);
+            }
+        }
+        // And with the preceding one (not the root pointer).
+        let head = if pred != 8 && frag_end(zone, pred) + 1 == start {
+            set_bit_le(zone, start - 1, 0);
+            pred
+        } else {
+            clear_bits_le(zone, pred, pred_bits);
+            write_bits_le_inplace(zone, pred, pred_bits, (start - pred) as u64);
+            start
+        };
+        clear_bits_le(zone, head, link_bits);
+        if let Some(n) = my_next {
+            write_bits_le_inplace(zone, head, link_bits, (n - head) as u64);
+        }
+        Ok(())
+    }
+
     /// Choose the next unused frag id by scanning every zone's
     /// fragments and bumping past the highest one seen.  Skips ids
     /// 0..=2 (FREE, BAD, ROOT).
     fn next_free_frag_id(&self) -> u32 {
-        let idmask = (1u32 << self.idlen) - 1;
-        let mut max_seen: u32 = 2;
-        for zi in 0..self.nzones {
-            let (startbit, endbit, _) = self.zone_metadata(zi);
-            let Some(zone) = self.zones.get(zi as usize) else {
-                continue;
-            };
-            let mut start = startbit;
-            let cap = 2 * (self.zone_size_bits / (self.idlen + 1)).max(1) + 16;
-            let mut iter = 0;
-            while start + self.idlen < endbit && iter < cap {
-                iter += 1;
-                let frag = Self::get_frag_id(zone, start, idmask);
-                let fragend = Self::find_next_set_bit(zone, start + self.idlen, endbit);
-                if fragend >= endbit {
-                    break;
-                }
-                if frag > max_seen {
-                    max_seen = frag;
-                }
-                start = fragend + 1;
-            }
-        }
-        max_seen + 1
+        self.scan_allocated_frag_ids()
+            .into_iter()
+            .max()
+            .unwrap_or(2)
+            .max(2)
+            + 1
     }
 
     /// Enumerate every *allocated* fragment id across all zones (non-zero id,
@@ -1831,8 +2001,10 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
         // already looks like an FSM (i.e. fingerprint matches): the
         // marutan.net "blank" HDs have only one copy.
         let dup_byte = map_addr_byte + nzones * sector_size + zi as u64 * sector_size;
+        // Only zone 0 carries the Disc Record, so the copy is recognised by its zone 0.
         let dup_present = {
-            self.reader.seek(SeekFrom::Start(dup_byte + 4))?;
+            self.reader
+                .seek(SeekFrom::Start(map_addr_byte + nzones * sector_size + 4))?;
             let mut fp = [0u8; 6];
             self.reader.read_exact(&mut fp).is_ok()
                 && fp[0] == self.disc_record.log2_sector_size
@@ -1875,6 +2047,11 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
             frag_bits = frag_bits.div_ceil(per_sector) * per_sector;
         }
         let frag_id = fsm_ref.next_free_frag_id();
+        if frag_id >= 1 << idlen {
+            return Err(FilesystemError::DiskFull(
+                "ADFS: every fragment id is in use".into(),
+            ));
+        }
 
         let (zi, free_start, free_length, predecessor_bit) = self
             .fsm
@@ -1887,7 +2064,8 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
                 )
             })?;
 
-        // Carve the fragment and capture the disc-sector start.
+        // Carve in memory, write the data, and only then persist the map (ADF-014).
+        let saved_zones = self.fsm.as_ref().unwrap().zones.clone();
         let start_sector = self.fsm.as_mut().unwrap().carve_fragment_into_zone(
             zi,
             free_start,
@@ -1896,22 +2074,47 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
             frag_bits,
             predecessor_bit,
         )?;
-        // Re-stamp checksums across every zone (the cross-check
-        // requires touching the last zone's byte 3 even if we wrote
-        // the fragment elsewhere).
+        let sector_size = self.disc_record.sector_size() as u64;
+        if (start_sector * sector_size).saturating_add(data_bytes)
+            > self.disc_record.total_disc_size()
+        {
+            self.fsm.as_mut().unwrap().zones = saved_zones;
+            return Err(FilesystemError::InvalidData(
+                "ADFS FSM: the free fragment lies past the end of the disc".into(),
+            ));
+        }
+        if let Err(e) = self.write_fragment_data(start_sector, data, data_bytes) {
+            self.fsm.as_mut().unwrap().zones = saved_zones;
+            return Err(e);
+        }
+        // Re-stamp every zone (the cross-check touches the last zone's byte 3) and persist.
         self.fsm.as_mut().unwrap().restamp_all_checksums();
-
-        // Persist every zone (cheap on the small disk sizes we deal
-        // with; mirrors the kernel's "write back every dirty bh"
-        // behaviour without tracking dirtiness ourselves).
         let nzones = self.disc_record.total_zones();
         for z in 0..nzones {
             self.flush_zone(z)?;
         }
+        Ok((frag_id, start_sector))
+    }
 
-        // Write the file data. We may overshoot `data_bytes` slightly
-        // on the last sector — that's fine, the dir entry records the
-        // exact size and read_file truncates.
+    /// RISC OS names are case-insensitive: refuse one the directory already holds, before any
+    /// space is allocated for it.
+    fn ensure_name_free(&mut self, dir_indaddr: u32, name: &str) -> Result<(), FilesystemError> {
+        let block = self.read_dir_block(dir_indaddr)?;
+        if Self::parse_dir_block(&block)?
+            .iter()
+            .any(|e| e.name.eq_ignore_ascii_case(name))
+        {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+        Ok(())
+    }
+
+    fn write_fragment_data(
+        &mut self,
+        start_sector: u64,
+        data: &mut dyn Read,
+        data_bytes: u64,
+    ) -> Result<(), FilesystemError> {
         let sector_size = self.disc_record.sector_size() as u64;
         let abs_byte = self.partition_offset + start_sector * sector_size;
         self.reader.seek(SeekFrom::Start(abs_byte))?;
@@ -1919,16 +2122,13 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
         let mut buf = vec![0u8; sector_size as usize];
         while remaining > 0 {
             let take = remaining.min(sector_size) as usize;
-            // Zero out the tail bytes of the buffer so a partial last
-            // sector doesn't leak prior bytes.
-            for b in buf.iter_mut() {
-                *b = 0;
-            }
+            // A partial last sector is zero-padded, not left with earlier bytes.
+            buf.fill(0);
             data.read_exact(&mut buf[..take])?;
             self.reader.write_all(&buf)?;
             remaining -= take as u64;
         }
-        Ok((frag_id, start_sector))
+        Ok(())
     }
 
     /// Old-map (D-format) allocate + write: reserve `data_bytes` worth of
@@ -2014,22 +2214,26 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
                 "ADFS dir block too small for insert".into(),
             ));
         }
-        // Find the first zero-name slot.
+        // RISC OS binary-searches a directory, so entries stay sorted (case-insensitively).
+        let end = dir_entries_end(block.len());
+        let key = new_entry.name.to_ascii_lowercase();
         let mut off = DIR_SMALL_HEADER;
-        let mut found = false;
-        // Only slots before the tail: a full directory must not write over it (ADF-004).
-        while off + DIR_ENTRY_SIZE <= dir_entries_end(block.len()) {
-            if block[off] == 0 {
-                found = true;
-                break;
+        let mut used = DIR_SMALL_HEADER;
+        while used + DIR_ENTRY_SIZE <= end && block[used] != 0 {
+            let slot: [u8; DIR_ENTRY_SIZE] =
+                block[used..used + DIR_ENTRY_SIZE].try_into().expect("size");
+            if parse_dir_entry(&slot).is_some_and(|e| e.name.to_ascii_lowercase() < key) {
+                off = used + DIR_ENTRY_SIZE;
             }
-            off += DIR_ENTRY_SIZE;
+            used += DIR_ENTRY_SIZE;
         }
-        if !found {
+        // Only slots before the tail: a full directory must not write over it (ADF-004).
+        if used + DIR_ENTRY_SIZE > end {
             return Err(FilesystemError::Unsupported(
                 "ADFS: directory full (F-format cap of 77 entries reached)".into(),
             ));
         }
+        block.copy_within(off..used, off + DIR_ENTRY_SIZE);
         // Stamp the 26-byte entry.
         let mut buf = [0u8; DIR_ENTRY_SIZE];
         let nb = new_entry.name.as_bytes();
@@ -2047,11 +2251,7 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
         buf[24] = ((new_entry.indirect_disc_addr >> 16) & 0xFF) as u8;
         buf[25] = new_entry.attrs;
         block[off..off + DIR_ENTRY_SIZE].copy_from_slice(&buf);
-        // Bump the cycle counter at the very last byte of the block —
-        // the tail layout is (magic, ..., cycle). The kernel uses the
-        // last byte as the cycle counter (`adfs_f_dir.c::dir_cycle`).
-        let last = block.len() - 1;
-        block[last] = block[last].wrapping_add(1);
+        restamp_dir(&mut block);
         self.write_dir_block(dir_indaddr, &block)
     }
 
@@ -2096,9 +2296,7 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
         for b in &mut block[zero_start..tail_end] {
             *b = 0;
         }
-        // Bump cycle counter.
-        let last = block.len() - 1;
-        block[last] = block[last].wrapping_add(1);
+        restamp_dir(&mut block);
         self.write_dir_block(dir_indaddr, &block)?;
         Ok(removed)
     }
@@ -2123,21 +2321,63 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
 
     /// Build an empty Hugo-format directory block (header + tail magic
     /// + zeroed entry slots). Used by `create_directory`.
-    fn build_empty_dir_block(&self) -> Vec<u8> {
-        let mut buf = vec![0u8; ADFS_NEWDIR_SIZE as usize];
-        // header: byte 0 = 0, bytes 1..5 = "Hugo"
-        buf[1] = b'H';
-        buf[2] = b'u';
-        buf[3] = b'g';
-        buf[4] = b'o';
-        // tail: bytes len-5..len-1 = "Hugo", last byte = cycle (0).
-        let len = buf.len();
-        buf[len - 5] = b'H';
-        buf[len - 4] = b'u';
-        buf[len - 3] = b'g';
-        buf[len - 2] = b'o';
-        buf[len - 1] = 0;
-        buf
+    fn build_empty_dir_block(&self, parent_indaddr: u32, name: &str) -> Vec<u8> {
+        empty_dir_block(parent_indaddr, name)
+    }
+}
+
+/// An empty 2048-byte Hugo directory naming its parent, with its check byte.
+fn empty_dir_block(parent_indaddr: u32, name: &str) -> Vec<u8> {
+    let mut buf = vec![0u8; ADFS_NEWDIR_SIZE as usize];
+    let len = buf.len();
+    // Header "Hugo" at 1..5; tail "Hugo" at len-5..len-1, then the check byte.
+    buf[1..5].copy_from_slice(b"Hugo");
+    buf[len - 5..len - 1].copy_from_slice(b"Hugo");
+    // Tail: parent (3 bytes) at len-38, title (19) at len-35, name (10) at len-16.
+    buf[len - 38..len - 35].copy_from_slice(&parent_indaddr.to_le_bytes()[..3]);
+    for (dst, room) in [(len - 35, 19), (len - 16, 10)] {
+        let nb = name.as_bytes();
+        let n = nb.len().min(room);
+        buf[dst..dst + n].copy_from_slice(&nb[..n]);
+        if n < room {
+            buf[dst + n] = 0x0D;
+        }
+    }
+    buf[len - 1] = dir_check_byte(&buf);
+    buf
+}
+
+/// The FileCore check byte of a 2048-byte directory; the algorithm is in the module header.
+fn dir_check_byte(d: &[u8]) -> u8 {
+    let ror = |a: u32| a.rotate_right(13);
+    let mut last = DIR_SMALL_HEADER;
+    while last + DIR_ENTRY_SIZE <= dir_entries_end(d.len()) && d[last] != 0 {
+        last += DIR_ENTRY_SIZE;
+    }
+    let mut a = 0u32;
+    let words = last & !3;
+    for i in (0..words).step_by(4) {
+        a = LittleEndian::read_u32(&d[i..i + 4]) ^ ror(a);
+    }
+    for &b in &d[words..last] {
+        a = b as u32 ^ ror(a);
+    }
+    let len = d.len();
+    for i in (len - 40..len - 4).step_by(4) {
+        a = LittleEndian::read_u32(&d[i..i + 4]) ^ ror(a);
+    }
+    (a ^ (a >> 8) ^ (a >> 16) ^ (a >> 24)) as u8
+}
+
+/// After a change: bump the start and end master sequence numbers together and, on a
+/// 2048-byte directory, recompute the check byte. A 1280-byte (old) directory keeps its own.
+fn restamp_dir(d: &mut [u8]) {
+    let len = d.len();
+    let seq = d[0].wrapping_add(1);
+    d[0] = seq;
+    d[len - 6] = seq;
+    if len == ADFS_NEWDIR_SIZE as usize {
+        d[len - 1] = dir_check_byte(d);
     }
 }
 
@@ -2218,11 +2458,9 @@ pub fn create_blank_adfs(name: &str) -> Vec<u8> {
 
     // --- Empty Hugo root directory at sector 2 (2048-byte new-dir block). ---
     let root = 2 * SECTOR_SIZE;
-    disk[root] = 0;
-    disk[root + 1..root + 5].copy_from_slice(b"Hugo");
-    let root_end = root + ADFS_NEWDIR_SIZE as usize;
-    disk[root_end - 5..root_end - 1].copy_from_slice(b"Hugo");
-    disk[root_end - 1] = 0; // dir cycle
+    // The root is its own parent and is called `$`.
+    let root_dir = empty_dir_block(0x200, "$");
+    disk[root..root + root_dir.len()].copy_from_slice(&root_dir);
 
     // --- Zone 0 checksum (single-zone: cross-check byte 3 = 0xFF). ---
     disk[3] = 0xFF;
@@ -2258,6 +2496,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         } else {
             parent.location as u32
         };
+        self.ensure_name_free(parent_indaddr, name)?;
         // ADFS packs the file's RISC OS filetype and timestamp into the
         // load/exec pair when the load-addr high 12 bits are 0xFFF. A cross-
         // fs copy passes the source mtime through options.unix_times; a
@@ -2325,6 +2564,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         } else {
             parent.location as u32
         };
+        self.ensure_name_free(parent_indaddr, name)?;
         // Same load/exec datestamp packing as create_file.
         let mtime = options.unix_times.map(|t| t.mtime_or_now());
         let (load_addr, exec_addr) = match mtime {
@@ -2333,7 +2573,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         };
         // Build the empty 2-KiB dir block, then write it the same way
         // we'd write file data (alloc + write).
-        let block = self.build_empty_dir_block();
+        let block = self.build_empty_dir_block(parent_indaddr, name);
         // Old-map D-format: contiguous allocation; indaddr = start disc address.
         if self.old_map.is_some() {
             let mut cursor = std::io::Cursor::new(block);
@@ -3155,6 +3395,70 @@ mod tests {
         let recovered_offset = if lo == 0 { 0 } else { lo - 1 };
         assert_eq!(recovered_offset, 4);
         assert_eq!(ia >> 8, 5);
+    }
+
+    fn put(fs: &mut AdfsFilesystem<Cursor<Vec<u8>>>, name: &str, data: &[u8]) {
+        let root = fs.root().unwrap();
+        let mut src = Cursor::new(data.to_vec());
+        fs.create_file(
+            &root,
+            name,
+            &mut src,
+            data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("create {name}: {e}"));
+    }
+
+    #[test]
+    fn freed_space_goes_back_on_the_free_chain() {
+        let mut fs = AdfsFilesystem::open(Cursor::new(create_blank_adfs("CHAIN")), 0).unwrap();
+        let free0 = fs.free_space().unwrap();
+        // Big enough that a second copy only fits in the space the first one gives back.
+        let big = vec![7u8; (free0 as usize) * 6 / 10];
+        put(&mut fs, "BIG", &big);
+        let root = fs.root().unwrap();
+        let e = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "BIG")
+            .unwrap();
+        fs.delete_entry(&root, &e).unwrap();
+        put(&mut fs, "AGAIN", &big);
+        let e = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "AGAIN")
+            .unwrap();
+        assert_eq!(fs.read_file(&e, big.len()).unwrap(), big);
+        let report = fs.fsck().unwrap().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn entries_stay_sorted_and_names_are_unique_ignoring_case() {
+        let mut fs = AdfsFilesystem::open(Cursor::new(create_blank_adfs("SORT")), 0).unwrap();
+        for n in ["Zebra", "apple", "Mango"] {
+            put(&mut fs, n, b"x");
+        }
+        let root = fs.root().unwrap();
+        let names: Vec<_> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["apple", "Mango", "Zebra"]);
+        let mut src = Cursor::new(b"y".to_vec());
+        let dup = fs.create_file(&root, "APPLE", &mut src, 1, &CreateFileOptions::default());
+        assert!(matches!(dup, Err(FilesystemError::AlreadyExists(_))));
+        // Both sequence numbers moved together and the check byte matches the contents.
+        let block = fs.read_dir_block(fs.disc_record.root).unwrap();
+        let len = block.len();
+        assert_eq!(block[0], block[len - 6]);
+        assert_eq!(block[len - 1], dir_check_byte(&block));
     }
 
     #[test]
