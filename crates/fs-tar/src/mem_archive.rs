@@ -543,25 +543,15 @@ fn open_tar_indexed(
                     )));
                 }
             } else {
-                #[cfg(feature = "native-zstd")]
-                {
-                    let dec = zstd::stream::read::Decoder::new(src)
-                        .map_err(|e| FilesystemError::Parse(format!("unzstd tar: {e}")))?;
-                    let n = std::io::copy(&mut dec.take(MAX_INDEXED_BYTES + 1), &mut tmp)
-                        .map_err(|e| FilesystemError::Parse(format!("unzstd tar: {e}")))?;
-                    if n > MAX_INDEXED_BYTES {
-                        return Err(FilesystemError::Unsupported(format!(
-                            "this .tar.zst inflates past {MAX_INDEXED_BYTES} bytes; extract it \
-                             instead"
-                        )));
-                    }
-                }
-                #[cfg(not(feature = "native-zstd"))]
-                {
-                    let _ = src;
-                    return Err(FilesystemError::Unsupported(
-                        "this build can't decompress .tar.zst".into(),
-                    ));
+                // Either zstd backend (native or pure) decodes it (TAR-006).
+                let dec = crate::zstd_compat::decoder(src)
+                    .map_err(|e| FilesystemError::Parse(format!("unzstd tar: {e}")))?;
+                let n = std::io::copy(&mut dec.take(MAX_INDEXED_BYTES + 1), &mut tmp)
+                    .map_err(|e| FilesystemError::Parse(format!("unzstd tar: {e}")))?;
+                if n > MAX_INDEXED_BYTES {
+                    return Err(FilesystemError::Unsupported(format!(
+                        "this .tar.zst inflates past {MAX_INDEXED_BYTES} bytes; extract it instead"
+                    )));
                 }
             }
             let (f, p) = tmp.into_parts();
@@ -636,26 +626,17 @@ fn decompress_tar(bytes: Vec<u8>) -> Result<Vec<u8>, FilesystemError> {
         }
         Ok(out)
     } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        // zstd (.tar.zst) — only when the optional codec is built.
-        #[cfg(feature = "native-zstd")]
-        {
-            let mut out = Vec::new();
-            zstd::stream::read::Decoder::new(Cursor::new(&bytes))
-                .and_then(|d| d.take(MAX_TOTAL_BYTES + 1).read_to_end(&mut out))
-                .map_err(|e| FilesystemError::Parse(format!("unzstd tar: {e}")))?;
-            if out.len() as u64 > MAX_TOTAL_BYTES {
-                return Err(FilesystemError::Unsupported(
-                    "tar is too large to browse inline; extract it instead".into(),
-                ));
-            }
-            Ok(out)
+        // zstd (.tar.zst), through whichever backend is built.
+        let mut out = Vec::new();
+        crate::zstd_compat::decoder(Cursor::new(bytes))
+            .and_then(|d| d.take(MAX_TOTAL_BYTES + 1).read_to_end(&mut out))
+            .map_err(|e| FilesystemError::Parse(format!("unzstd tar: {e}")))?;
+        if out.len() as u64 > MAX_TOTAL_BYTES {
+            return Err(FilesystemError::Unsupported(
+                "tar is too large to browse inline; extract it instead".into(),
+            ));
         }
-        #[cfg(not(feature = "native-zstd"))]
-        {
-            Err(FilesystemError::Unsupported(
-                "this build can't decompress .tar.zst".into(),
-            ))
-        }
+        Ok(out)
     } else {
         Ok(bytes)
     }
@@ -664,6 +645,35 @@ fn decompress_tar(bytes: Vec<u8>) -> Result<Vec<u8>, FilesystemError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `.tar.zst` browses under either zstd backend, inline and indexed from a file (TAR-006).
+    #[test]
+    fn tar_zst_browses_with_any_zstd_backend() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(5);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "hello.txt", &b"hello"[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let mut enc = crate::zstd_compat::ZstdEncoder::new(Vec::new(), 3).unwrap();
+        std::io::Write::write_all(&mut enc, &tar_bytes).unwrap();
+        let zst = enc.finish().unwrap();
+        let check = |mut fs: MemArchiveFilesystem| {
+            let root = fs.root().unwrap();
+            let e = fs.list_directory(&root).unwrap().remove(0);
+            assert_eq!(e.name, "hello.txt");
+            assert_eq!(fs.read_file(&e, usize::MAX).unwrap(), b"hello");
+        };
+        check(open_tar(zst.clone(), None).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.tar.zst");
+        std::fs::write(&path, &zst).unwrap();
+        check(open_path(&path, None).unwrap());
+    }
 
     /// Build a small tar in memory, open it, and verify listing + reads.
     #[test]
