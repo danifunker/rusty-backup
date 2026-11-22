@@ -2301,8 +2301,19 @@ fn adopt_orphans_into_lost_found<R: Read + Write + Seek + Send>(
     };
     let res = (|| -> Result<u32, FilesystemError> {
         let mut adopted: u32 = 0;
-        for orphan in orphans {
-            let inum = orphan.id as u32;
+        // An orphan directory brings its contents back with it; adopt only the outermost.
+        let pairs: Vec<(u32, bool)> = orphans
+            .iter()
+            .map(|o| (o.id as u32, o.is_directory))
+            .collect();
+        let roots = crate::unix_common::orphans::orphan_roots(&pairs, |d| {
+            let dir =
+                disk_core::entry::FileEntry::new_directory(String::new(), String::new(), d as u64);
+            disk_core::filesystem::Filesystem::list_directory(fs, &dir)
+                .map(|v| v.into_iter().map(|e| e.location as u32).collect())
+                .unwrap_or_default()
+        });
+        'orphans: for inum in roots {
             let mut lf_inode = fs.read_inode(lf_inum)?;
             // Avoid name collisions: append a numeric suffix on retry.
             let mut name = format!("ino_{inum}");
@@ -2314,11 +2325,15 @@ fn adopt_orphans_into_lost_found<R: Read + Write + Seek + Send>(
                     report.fixes_failed.push(format!(
                         "Orphan inum {inum}: could not generate unique lost+found name"
                     ));
-                    continue;
+                    continue 'orphans;
                 }
             }
             match fs.dir_insert(&mut lf_inode, &mut bm, name.as_bytes(), inum) {
                 Ok(()) => {
+                    // An adopted directory's `..` link counts against lost+found.
+                    if fs.read_inode(inum).map(|i| i.is_dir()).unwrap_or(false) {
+                        lf_inode.nlink = lf_inode.nlink.saturating_add(1);
+                    }
                     fs.write_inode(&lf_inode)?;
                     adopted += 1;
                 }

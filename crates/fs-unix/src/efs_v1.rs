@@ -2130,7 +2130,22 @@ fn adopt_orphans<R: Read + Write + Seek + Send>(
 
     let mut adopted = 0usize;
     let mut lf = fs.read_inode(lf_inum)?;
+    // An orphan directory brings its contents back with it; adopt only the outermost.
+    let mut pairs = Vec::with_capacity(orphans.len());
     for &inum in orphans {
+        pairs.push((
+            inum,
+            fs.read_inode(inum).map(|i| i.is_dir()).unwrap_or(false),
+        ));
+    }
+    let roots = crate::unix_common::orphans::orphan_roots(&pairs, |d| match fs.read_inode(d) {
+        Ok(ino) if ino.is_dir() => fs
+            .read_dir_entries(&ino)
+            .map(|v| v.into_iter().map(|(i, _)| i).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    });
+    for inum in roots {
         let name = format!("inode_{inum}");
         if fs.dir_find(&lf, &name)?.is_some() {
             continue;

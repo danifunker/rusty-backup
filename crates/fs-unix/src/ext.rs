@@ -959,6 +959,21 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
     }
 
     /// Read the fsck-relevant fields of inode `inum` (1-based).
+    /// True for an inode in lazily initialised space (`INODE_UNINIT`, or past the group's
+    /// `itable_unused` mark): never written, so its bytes are whatever the disk held.
+    pub(crate) fn fsck_inode_never_used(&self, inum: u32, checksummed: bool) -> bool {
+        if !checksummed || inum == 0 || self.inodes_per_group == 0 {
+            return false;
+        }
+        let group = ((inum - 1) / self.inodes_per_group) as usize;
+        let idx = (inum - 1) % self.inodes_per_group;
+        let Some(gd) = self.group_descriptors.get(group) else {
+            return false;
+        };
+        gd.flags & BG_INODE_UNINIT != 0
+            || idx >= self.inodes_per_group.saturating_sub(gd.itable_unused)
+    }
+
     pub(crate) fn fsck_read_inode(&mut self, inum: u32) -> Result<FsckInode, FilesystemError> {
         let ino = self.read_inode(inum)?;
         Ok(FsckInode {
@@ -1526,7 +1541,15 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
             let ibm_len = (self.inodes_per_group / 8) as usize;
             let block_bitmap = self.read_block(bb)?;
             let inode_bitmap = self.read_block(ib)?;
-            crate::ext_csum::stamp_block_bitmap_csum(self.csum_seed, &mut buf, &block_bitmap);
+            // The checksum covers blocks_per_group / 8 bytes, the whole block only by default.
+            let bbm_len = (self.blocks_per_group as usize)
+                .div_ceil(8)
+                .min(block_bitmap.len());
+            crate::ext_csum::stamp_block_bitmap_csum(
+                self.csum_seed,
+                &mut buf,
+                &block_bitmap[..bbm_len],
+            );
             crate::ext_csum::stamp_inode_bitmap_csum(
                 self.csum_seed,
                 &mut buf,

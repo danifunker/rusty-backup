@@ -240,6 +240,10 @@ fn analyze<R: Read + Seek + Send>(fs: &mut ExtFilesystem<R>) -> Result<Analysis,
     let mut multiply_claimed = 0u64;
 
     for inum in 1..=g.inodes_count {
+        // Lazily initialised inode space holds stale bytes, not inodes (e2fsck skips it too).
+        if inum >= g.first_ino && fs.fsck_inode_never_used(inum, g.checksummed) {
+            continue;
+        }
         let ino = match fs.fsck_read_inode(inum) {
             Ok(i) => i,
             Err(_) => continue,
@@ -672,9 +676,12 @@ fn reseal_group_csum<R: Read + Write + Seek + Send>(
     };
     let bb = read_block_no(&desc, 0x00, 0x20); // bg_block_bitmap
     let ib = read_block_no(&desc, 0x04, 0x24); // bg_inode_bitmap
+                                               // The block-bitmap checksum covers blocks_per_group / 8 bytes, not always a whole block.
     let bbm = fs.read_raw(
         g.partition_offset + bb * g.block_size,
-        g.block_size as usize,
+        (g.blocks_per_group as usize)
+            .div_ceil(8)
+            .min(g.block_size as usize),
     )?;
     let ibm = fs.read_raw(
         g.partition_offset + ib * g.block_size,

@@ -2709,6 +2709,31 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
 
     /// Re-write the parent's directory data fork in place. The data fork
     /// length stays at `parent.size`; only contents change.
+    /// Point directory `dir`'s `..` (its second record) at `parent`.
+    fn repoint_dotdot(&mut self, dir: &UfsInode, parent: u32) -> Result<(), FilesystemError> {
+        let mut bytes = self.read_dir_bytes_raw(dir)?;
+        let endian = self.endian;
+        if bytes.len() < DIRENT_HDR_LEN {
+            return Err(FilesystemError::Parse(format!(
+                "ufs: directory {} is empty",
+                dir.inum
+            )));
+        }
+        let at = read_u16(&bytes, 4, endian) as usize;
+        let (_, nl) = read_dirent_namlen(&bytes, at, self.old_dirent_fmt, endian);
+        if at + DIRENT_HDR_LEN + 2 > bytes.len()
+            || nl != 2
+            || &bytes[at + DIRENT_HDR_LEN..at + DIRENT_HDR_LEN + 2] != b".."
+        {
+            return Err(FilesystemError::Parse(format!(
+                "ufs: directory {} has no `..` second record",
+                dir.inum
+            )));
+        }
+        write_u32(&mut bytes, at, parent, endian);
+        self.write_dir_bytes(dir, &bytes)
+    }
+
     fn write_dir_bytes(&mut self, parent: &UfsInode, bytes: &[u8]) -> Result<(), FilesystemError> {
         let padded = parent.size.next_multiple_of(self.dirblksiz as u64);
         if bytes.len() as u64 != parent.size && bytes.len() as u64 != padded {
@@ -3730,8 +3755,18 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
     };
 
     let mut adopted: u32 = 0;
-    for orphan in orphans {
-        let inum = orphan.id as u32;
+    // An orphan directory brings its contents back with it; adopt only the outermost orphans.
+    let pairs: Vec<(u32, bool)> = orphans
+        .iter()
+        .map(|o| (o.id as u32, o.is_directory))
+        .collect();
+    let roots = crate::unix_common::orphans::orphan_roots(&pairs, |d| {
+        let dir = FileEntry::new_directory(String::new(), String::new(), d as u64);
+        fs.list_directory(&dir)
+            .map(|v| v.into_iter().map(|e| e.location as u32).collect())
+            .unwrap_or_default()
+    });
+    for inum in roots {
         // Pull the orphan's mode so we stamp the correct d_type into the
         // dirent — getting this wrong only matters for tools that trust
         // d_type without re-reading the inode, but the kernel does, so
@@ -3769,6 +3804,11 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
         }
         match fs.dir_insert(&mut lf_inode, name.as_bytes(), inum, d_type) {
             Ok(()) => {
+                // A directory's `..` now names lost+found, which gains that link.
+                if matches!(unix_file_type(orphan_inode.mode), UnixFileType::Directory) {
+                    fs.repoint_dotdot(&orphan_inode, lf_inum)?;
+                    lf_inode.nlink = lf_inode.nlink.saturating_add(1);
+                }
                 fs.write_inode(lf_inum, &lf_inode)?;
                 adopted += 1;
             }
