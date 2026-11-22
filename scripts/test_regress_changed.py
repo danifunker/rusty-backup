@@ -59,8 +59,15 @@ class MapTests(unittest.TestCase):
         self.assertTrue(any(c.startswith("fs.new-volume.") for c in p.cases))
 
     def test_integration_target_from_tests_dir(self):
-        self.assertIn("cli_suite", plan_for("tests/cli_suite/cli_hfs.rs").tests)
+        self.assertIn("cli_suite", plan_for("tests/integration/cli_suite/cli_hfs.rs").tests)
+        self.assertIn("cp_engine", plan_for("tests/integration/cp_engine.rs").tests)
+        self.assertIn("integration", plan_for("tests/integration/main.rs").tests)
         self.assertIn("doc_parity", plan_for("tests/doc_parity.rs").tests)
+
+    def test_integration_modules_run_as_filters(self):
+        cmds, _ = rc.commands(plan_for("tests/integration/cp_engine.rs"), Opts())
+        argvs = [a for _, a in cmds]
+        self.assertIn(["cargo", "test", "-p", rc.ROOT_PKG, "--test", "integration", "--", "cp_engine::"], argvs)
 
     def test_frontend_gated_by_host(self):
         cmds, notes = rc.commands(plan_for("frontends/win32/src/restore.rs"), Opts())

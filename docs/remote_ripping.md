@@ -287,7 +287,7 @@ P1.1 (the local refactor) is independent and can land first on its own.
   `optical rip --device rb://…` works (pulled the CLI URL-parse forward from
   P3.3); GUI/CLI local call sites build `OpticalTarget::Local`. Builds clean in
   optical+remote / optical-only / default(GUI); 14 optical unit tests green.
-- [~] **P1.8 — validate.** *(plumbing verified 2026-06-27)* `tests/remote_optical.rs`:
+- [~] **P1.8 — validate.** *(plumbing verified 2026-06-27)* `tests/integration/remote_optical.rs`:
   loopback client↔daemon test green — the `optical`-built daemon handles
   `ListOpticalDrives` (round-trips, doesn't disclaim the feature), and
   `OpenOptical` of a bogus device errors cleanly **and** releases the

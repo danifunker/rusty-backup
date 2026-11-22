@@ -654,7 +654,7 @@ removable-media round-trip proving the native format first (cb-dos Phases 2–4)
   host (host:port only) → browse the daemon's host filesystem (`RemoteHostFilesystem` over
   `ListHostDir`/`ReadHostFile`) → **double-click a file, or right-click → "Open Image"**, to open it as a
   `RemoteFilesystem` and browse inside. `RemoteConn` carries a `mode` (Host | Image). Both the connect and
-  the open run off the UI thread. Headlessly tested in `tests/remote_filesystem.rs` (host browse + image
+  the open run off the UI thread. Headlessly tested in `tests/integration/remote_filesystem.rs` (host browse + image
   browse + byte-exact reads). **Still needs an interactive GUI pass.** (Superseded the first
   connect-with-image-path-upfront attempt.) **Remote-disk BACKUP** (connect → pick a physical drive →
   pull a backup to the desktop via the block tier + `run_backup`; elevated daemon enumerating devices;
@@ -668,7 +668,7 @@ removable-media round-trip proving the native format first (cb-dos Phases 2–4)
   "Connect to remote..." dialog (host:port / image path / partition); the connect + open runs **off the UI
   thread** (`spawn_remote_open` → `poll_remote`, since a connect can block) and swaps the remote image into
   the listing. *Gate (browse a remote image + copy a file from it into a local image):* met by
-  construction; the `RemoteFilesystem` read path is byte-exact in `tests/remote_filesystem.rs`. **Not
+  construction; the `RemoteFilesystem` read path is byte-exact in `tests/integration/remote_filesystem.rs`. **Not
   runtime-verified in the GUI** (no display here) — needs an interactive pass. **Deferred to a Phase 3
   follow-up:** local→**remote** copy (remote panes report `can_receive()=false` for now — needs the copy
   dispatch to route a remote destination through `open_session`/`stage_upload`/`apply`), saved
@@ -706,7 +706,7 @@ removable-media round-trip proving the native format first (cb-dos Phases 2–4)
     the armv7 `rb-cli-mini` release tarball. `rb-cli` installs as `/media/fat/Scripts/rb-cli` (no `.sh`
     → invisible to the menu); the boot line is `[[ -e .../rb-cli ]] && .../rb-cli serve service start`.
   - **Tests** — service unit tests (INI round-trip, section editing, PID, IP, action selection) +
-    `tests/daemon_service.rs` (real spawn→stop round-trip, double-start refusal, install/uninstall
+    `tests/integration/daemon_service.rs` (real spawn→stop round-trip, double-start refusal, install/uninstall
     section editing leaving co-resident entries + a live daemon intact).
 
   **Still open:** the downloader DB JSON (§12) + UPX `-9` compression; the **live connection/transfer

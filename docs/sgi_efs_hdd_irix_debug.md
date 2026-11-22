@@ -313,7 +313,7 @@ Decompress the real EFS oracle: `zstd -dkf tests/fixtures/sgi/efs_small.img.zst 
   EFS layout `~/efs-xfs-refs/efs-linux-5.15/efs/{super,inode}.c`.
 - Disk under test (user): `/Users/dani/irix-toolbox.img` — regenerate with the
   fixed binary before re-testing (the old one had the wrong geometry/checksum).
-- Gates: `cargo clippy --all-targets -- -D warnings`, `cargo test --lib`, `cargo test --test cli_sgi_hdd`.
+- Gates: `cargo clippy --all-targets -- -D warnings`, `cargo test --lib`, `cargo test --test integration cli_suite::cli_sgi_hdd::`.
 
 ## Resume prompt (paste into a fresh session)
 

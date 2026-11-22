@@ -661,7 +661,7 @@ cores at zero per-core cost.
   alloc_chain + free_chain + write_chain, find_free_root_slot,
   fat_write_back to both FAT copies, create_file + delete_entry,
   create_directory Unsupported). 5 new write tests bring the
-  Human68k suite to 10. **Dispatch e2e**: tests/wave2_dispatch_e2e.rs
+  Human68k suite to 10. **Dispatch e2e**: tests/integration/wave2_dispatch_e2e.rs
   (4 tests) — Human68k string-route put + get round-trip, ADFS +
   QDOS + ANDOS auto-detect chains. **OPEN-WORK §7**: added four
   user-side MiSTer boot-test lines (X68000 / Archie / QL / BK0011M)
