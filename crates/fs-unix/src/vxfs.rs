@@ -122,6 +122,9 @@ pub struct VxfsFilesystem<R: Read + Seek + Send> {
     pub(crate) fsh_ino: u32,
     /// The primary fileset's inode-list inode number in the structural list.
     pub(crate) primary_ilist_ino: u32,
+    /// The last indirect extent `bmap` read (block, length, bytes), so a file's consecutive
+    /// blocks do not reread it (UNX-058). Dropped by every write.
+    pub(crate) indirect_cache: Option<(u64, u64, Vec<u8>)>,
 }
 
 impl<R: Read + Seek + Send> VxfsFilesystem<R> {
@@ -146,6 +149,7 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
             st_ilist: Inode::empty(),
             fsh_ino: 0,
             primary_ilist_ino: 0,
+            indirect_cache: None,
         };
         fs.version = fs.u32_at(&sb, 4);
         fs.bsize = fs.u32_at(&sb, 32) as u64;
@@ -319,7 +323,7 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
                 if slot >= self.bsize / 4 {
                     return Ok(None);
                 }
-                let table = self.read_blocks(indir, 1)?;
+                let table = self.read_indirect(indir, 1)?;
                 let start = self.u32_at(&table, slot as usize * 4) as u64;
                 Ok((start != 0).then_some(start + rel % indsize))
             }
@@ -337,6 +341,18 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// `size` blocks of indirect entries at `block`, from the one-entry cache when it holds them.
+    fn read_indirect(&mut self, block: u64, size: u64) -> Result<Vec<u8>, FilesystemError> {
+        if let Some((b, s, bytes)) = &self.indirect_cache {
+            if (*b, *s) == (block, size) {
+                return Ok(bytes.clone());
+            }
+        }
+        let bytes = self.read_blocks(block, size)?;
+        self.indirect_cache = Some((block, size, bytes.clone()));
+        Ok(bytes)
     }
 
     fn bmap_typed(
@@ -360,7 +376,7 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
             match kind {
                 TYPED_DATA if bn - off < size => return Ok(Some(block + bn - off)),
                 TYPED_INDIRECT if size > 0 => {
-                    let raw = self.read_blocks(block, size)?;
+                    let raw = self.read_indirect(block, size)?;
                     let children: Vec<[u8; 16]> = raw
                         .chunks_exact(16)
                         .map(|c| {
