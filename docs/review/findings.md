@@ -321,20 +321,20 @@ Review by a separate agent, 2026-11-21, read-only.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| GHO-001 | S1 | confirmed | gho.rs `synthesize_mbr`, `synthesize_ebrs` | Every partition after the first is put in an extended container with an EBR at `hidden - 63`: with two primaries the EBR lands in P1's last track and is served over real data; P2 is unreachable. | open |
-| GHO-002 | S1 | confirmed | gho.rs multi-partition VBR read | Partition size taken from FAT BPB fields only: an NTFS partition gets size 0 and is dropped from the MBR; FAT12 / unknown typed 0x0C. | open |
+| GHO-001 | S1 | confirmed | gho.rs `synthesize_mbr`, `synthesize_ebrs` | Every partition after the first is put in an extended container with an EBR at `hidden - 63`: with two primaries the EBR lands in P1's last track and is served over real data; P2 is unreachable. | fixed (3612a6a6) |
+| GHO-002 | S1 | confirmed | gho.rs multi-partition VBR read | Partition size taken from FAT BPB fields only: an NTFS partition gets size 0 and is dropped from the MBR; FAT12 / unknown typed 0x0C. | fixed (3612a6a6) |
 | GHO-003 | S2 | confirmed | gho.rs trim / reassign / binary search | Trimmed blocks keep stale offsets in the sorted list, so reads near a partition end hit the wrong block (error or zeros). | open |
 | GHO-004 | S2 | confirmed | gho.rs `ensure_block_cached` | A non-final block that decodes short returns Ok(0) mid-image: the output is silently truncated. | open |
 | GHO-005 | S2 | confirmed | gho.rs `ensure_cluster_decoded` | Each cluster miss decodes the file from its start: O(n^2), effectively a hang on large files. | open |
 | GHO-006 | S2 | confirmed | gho.rs `GhoFileContentReader::fill_next` | Uncompressed body longer than the 33,792-byte buffer panics. | open |
-| GHO-007 | S1 | plausible | gho.rs `build_virtual_fat_image` | create errors swallowed, so files and subtrees silently go missing; layout re-derived from size can change cluster size and run out of space. | open |
-| GHO-008 | S2 | confirmed | gho.rs `build_virtual_fat_image` | DFS without a visited set: a dir pointing back at the root nests until the volume is full, all in RAM. | open |
+| GHO-007 | S1 | plausible | gho.rs `build_virtual_fat_image` | create errors swallowed, so files and subtrees silently go missing; layout re-derived from size can change cluster size and run out of space. | fixed (3612a6a6) |
+| GHO-008 | S2 | confirmed | gho.rs `build_virtual_fat_image` | DFS without a visited set: a dir pointing back at the root nests until the volume is full, all in RAM. | fixed (3612a6a6) |
 | GHO-009 | S2 | confirmed | gho.rs `gather_ghs_siblings` | Spans matched by name prefix only: a neighbouring image's spans are merged in; a relative pick can choose the wrong primary; a missing span is not detected. | open |
 | GHO-010 | S2 | confirmed | gho.rs NTFS file-aware open | VBR `total_sectors` unchecked: a huge value aborts on allocation, products overflow. | open |
 | GHO-011 | S2 | confirmed | gho.rs `open_ntfs_compressed_mft_only`, `extend_ntfs_compressed_index` | Inflate output unbounded (~4 GiB); oversized block shifts later offsets and wrong data is served. | open |
 | GHO-012 | S2 | confirmed | gho.rs lazy NTFS scan; trim | I/O errors swallowed: unmapped clusters served as zeros, real errors treated as padding. | open |
 | GHO-013 | S2 | plausible | gho.rs uncompressed multi-partition | Acknowledged-unsupported layout served as one raw stream instead of refused; later partitions shifted. | open |
-| GHO-014 | S2 | confirmed | gho.rs MBR / EBR synthesis, blocked read | Unchecked subtraction of partition geometry (hidden < 63, overlapping or unsorted) panics or yields garbage. | open |
+| GHO-014 | S2 | confirmed | gho.rs MBR / EBR synthesis, blocked read | Unchecked subtraction of partition geometry (hidden < 63, overlapping or unsorted) panics or yields garbage. | fixed (3612a6a6) |
 | GHO-015 | S3 | confirmed | gho.rs `unsafe impl Send for GhoReader` | Unneeded `unsafe impl Send`. | open |
 | GHO-016 | S4 | confirmed | gho.rs | Dead / duplicated paths (materialize, emit copies, four zlib loops, three Seek impls; one in-RAM volume emitter); 9,850-line file with six jobs. | open |
 | GHO-017 | S4 | confirmed | gho.rs headers | Stale docs (file-aware "deferred", password "errors", "SECTOR only"). | open |
@@ -512,9 +512,9 @@ Review by a separate agent, 2026-11-21, read-only.
 | SQ-005 | S2 | confirmed | squashfs.rs `read_metadata_span` and table loads | Capacities taken from on-disk u32s (4 GiB / 64 GiB). | open |
 | SQ-006 | S3 | confirmed | squashfs_write.rs `write_node`; `read_build_tree` | Dir `parent` written wrong; hard links duplicated on rebuild. | open |
 | SQ-007 | S4 | confirmed | squashfs.rs, squashfs_write.rs | Comment contradicts code; whole-Vec clone per file; near-duplicate table loaders. | open |
-| DVM-001 | S1 | plausible | qcow2.rs `open`, `ensure_free_cluster_index` | Edits accepted on dirty / corrupt images; with lazy refcounts live clusters are reused. | open |
+| DVM-001 | S1 | plausible | qcow2.rs `open`, `ensure_free_cluster_index` | Edits accepted on dirty / corrupt images; with lazy refcounts live clusters are reused. | fixed (3612a6a6) |
 | DVM-002 | S2 | confirmed | qcow2.rs `export_qcow2` | One-cluster refcount table overflows into the first L2 table at small cluster sizes (latent). | open |
-| DVM-003 | S1 | confirmed | vmdk_sparse.rs `export_vmdk_sparse` | Host offset `as u32` sectors: disks past 2 TiB written corrupt. | open |
+| DVM-003 | S1 | confirmed | vmdk_sparse.rs `export_vmdk_sparse` | Host offset `as u32` sectors: disks past 2 TiB written corrupt. | fixed (3612a6a6) |
 | DVM-004 | S2 | confirmed | vmdk.rs descriptor parse / `open_with` | Absolute or `..` extent paths opened read-write: an edit can write into an arbitrary host file. | open |
 | DVM-005 | S2 | confirmed | vhd.rs `write`, `allocate_block` | Unchecked BAT index, 4 GiB block buffers, offset overflow, unaligned file length shifts data. | open |
 | DVM-006 | S2 | confirmed | vmdk_sparse.rs header parse | Grain size / GT entries unbounded: 8 GiB / 1 TiB allocations. | open |
