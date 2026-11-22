@@ -56,8 +56,9 @@ pub struct SparseImageReader<R: Read + Seek> {
     total_size: u64,
     /// Bytes per band.
     band_bytes: u64,
-    /// `virt_to_phys[v]` = Some(physical slot) if virtual band `v` is allocated.
-    virt_to_phys: Vec<Option<u32>>,
+    /// Physical slot of each allocated virtual band. A map, not a vector the size of the
+    /// virtual disk: the header's sizes alone could ask for gigabytes from a 4 KiB file.
+    virt_to_phys: std::collections::HashMap<u64, u32>,
     /// Current virtual read position.
     position: u64,
 }
@@ -108,7 +109,7 @@ pub fn detect_sparseimage<R: Read + Seek>(mut source: R) -> Result<Option<Sparse
 
     // Invert the physical-slot -> virtual-band map into virtual -> physical.
     let total_virtual_bands = total_size.div_ceil(band_bytes) as usize;
-    let mut virt_to_phys = vec![None; total_virtual_bands];
+    let mut virt_to_phys = std::collections::HashMap::with_capacity(physical_bands as usize);
     for p in 0..physical_bands as usize {
         let off = BAND_MAP_OFFSET + p * 4;
         let entry = u32::from_be_bytes(header[off..off + 4].try_into().unwrap());
@@ -119,7 +120,7 @@ pub fn detect_sparseimage<R: Read + Seek>(mut source: R) -> Result<Option<Sparse
         if virt >= total_virtual_bands {
             bail!("sparse band map entry {entry} exceeds virtual band count");
         }
-        virt_to_phys[virt] = Some(p as u32);
+        virt_to_phys.insert(virt as u64, p as u32);
     }
 
     Ok(Some(SparseImageReader {
@@ -146,7 +147,7 @@ impl<R: Read + Seek> Read for SparseImageReader<R> {
             .min(remaining_in_band as usize)
             .min(remaining_in_disk as usize);
 
-        match self.virt_to_phys.get(band as usize).copied().flatten() {
+        match self.virt_to_phys.get(&band).copied() {
             Some(phys) => {
                 let file_off = HEADER_SIZE + phys as u64 * self.band_bytes + offset_in_band;
                 self.source.seek(SeekFrom::Start(file_off))?;
