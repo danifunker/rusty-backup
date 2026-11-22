@@ -603,15 +603,15 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 | HPF-002 | S2 | confirmed | hpfs.rs `add_dirent` etc. | Dirent walks don't check `len` / `first_free`: infinite loop, panic. | fixed (2d2f9c3d) |
 | HPF-003 | S1 | confirmed | hpfs.rs `flush_bitmaps`, `open` | A bad bitmap pointer is kept: freeing writes 2 KiB to sector 0 or past the partition. | fixed (2d2f9c3d) |
 | HPF-004 | S1 | confirmed | hpfs.rs split / move / delete | Not atomic: DiskFull mid-split drops half a directory; delete frees data before the dirent. | fixed (2d2f9c3d) |
-| HPF-005 | S2 | confirmed | hpfs.rs `free_anode_tree` | Unguarded B+ tree parse on delete: panic, stack overflow, metadata freed. | open |
-| HPF-006 | S2 | confirmed | hpfs.rs | dirband size / start unchecked: panics; overflow. | open |
-| HPF-007 | S2 | confirmed | hpfs.rs `validate_hpfs_name` | Validated trimmed, stored untrimmed: oversized dirents. | open |
-| HPF-008 | S2 | confirmed | hpfs.rs `create_entry` | Size `as u32` with no 2 GiB limit. | open |
-| HPF-009 | S2 | confirmed | hpfs.rs `alloc_file_data` | Fragmented fallback does a full scan per size: effectively a hang. | open |
-| HPF-010 | S3 | confirmed | hpfs.rs `run_fsck` | Cross-link set of every sector (~1 GB); `total - free` underflow. | open |
-| HPF-011 | S2 | confirmed | hpfs.rs `open` | `bitmap_dir + s` overflow; root fnode not range-checked. | open |
-| HPF-012 | S4 | confirmed | hpfs.rs `is_name_long` | Tests the dot, not the character: some long names stored as short. | open |
-| HPF-013 | S4 | confirmed | hpfs.rs `alloc_dnode` | Dead branch. | open |
+| HPF-005 | S2 | confirmed | hpfs.rs `free_anode_tree` | Unguarded B+ tree parse on delete: panic, stack overflow, metadata freed. | fixed (9f89a11a) |
+| HPF-006 | S2 | confirmed | hpfs.rs | dirband size / start unchecked: panics; overflow. | fixed (9f89a11a) |
+| HPF-007 | S2 | confirmed | hpfs.rs `validate_hpfs_name` | Validated trimmed, stored untrimmed: oversized dirents. | fixed (9f89a11a) |
+| HPF-008 | S2 | confirmed | hpfs.rs `create_entry` | Size `as u32` with no 2 GiB limit. | fixed (9f89a11a) |
+| HPF-009 | S2 | confirmed | hpfs.rs `alloc_file_data` | Fragmented fallback does a full scan per size: effectively a hang. | fixed (9f89a11a) |
+| HPF-010 | S3 | confirmed | hpfs.rs `run_fsck` | Cross-link set of every sector (~1 GB); `total - free` underflow. | fixed (9f89a11a) |
+| HPF-011 | S2 | confirmed | hpfs.rs `open` | `bitmap_dir + s` overflow; root fnode not range-checked. | fixed (9f89a11a) |
+| HPF-012 | S4 | confirmed | hpfs.rs `is_name_long` | Tests the dot, not the character: some long names stored as short. | fixed (9f89a11a) |
+| HPF-013 | S4 | confirmed | hpfs.rs `alloc_dnode` | Dead branch. | fixed (9f89a11a) |
 | APF-001 | S2 | confirmed | fs-apfs apfs.rs `open_with_passphrase` | Only volume 0 is browsable; a failing volume is skipped silently. | open |
 | APF-002 | S2 | confirmed | apfs.rs `unlock_active_volume` | Only the first KEK tried: other users' passwords / the recovery key fail. | open |
 | APF-003 | S2 | confirmed | apfs.rs `load_omap`, `build_catalog` | No visited set: self-pointing index nodes grow the stack Vec to ~8 GB. | open |

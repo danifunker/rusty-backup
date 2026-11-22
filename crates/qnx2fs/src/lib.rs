@@ -726,7 +726,9 @@ impl<D: Read + Seek> Volume<D> {
                 .iter()
                 .find(|e| e.in_use() && e.name == "bitmap" && !e.is_dir())
             {
-                if let Ok(map) = vol.read_chain(bm.first, usize::MAX) {
+                // One bit per block: nothing past the device's own size is a bitmap byte.
+                let cap = (vol.total_blocks / 8 + 1) as usize;
+                if let Ok(map) = vol.read_chain(bm.first, cap) {
                     vol.total_blocks = (map.len() as u64 * 8).min(vol.total_blocks.max(1));
                     vol.free_blocks = map
                         .iter()
@@ -1020,6 +1022,7 @@ impl<D: Read + Seek> Volume<D> {
         };
         let mut prev = 0;
         let mut held = 0u64;
+        let mut crossed = 0u64;
         for x in &xs {
             if x.prev != prev {
                 report.warnings.push(issue(
@@ -1041,15 +1044,24 @@ impl<D: Read + Seek> Volume<D> {
                     continue;
                 }
                 if let Some(other) = owners.insert(b, path.to_string()) {
-                    report.errors.push(issue(
-                        "CrossLinked",
-                        format!("block {b} is held by both {other} and {path}"),
-                    ));
+                    crossed += 1;
+                    if crossed <= 20 {
+                        report.errors.push(issue(
+                            "CrossLinked",
+                            format!("block {b} is held by both {other} and {path}"),
+                        ));
+                    }
                 }
                 if self.marked(b) == Some(false) {
                     report.unmarked.push(b);
                 }
             }
+        }
+        if crossed > 20 {
+            report.errors.push(issue(
+                "CrossLinked",
+                format!("{path}: {crossed} blocks held by other files in all"),
+            ));
         }
         if let Some(n) = blocks_less_one {
             if u64::from(n) + 1 != held {
@@ -1528,6 +1540,8 @@ impl<D: Read + Write + Seek> Volume<D> {
         if self.name_taken(dir, name)? {
             return Err(Error::AlreadyExists(name.to_string()));
         }
+        // The slot first: a full directory then fails before any data blocks are taken.
+        let slot = self.free_slot(dir)?;
         let runs = self.allocate(len)?;
         let (last, blocks) = self.write_chain(&runs, data, len)?;
         let bits = Self::bits_of(opts, false);
@@ -1542,7 +1556,6 @@ impl<D: Read + Write + Seek> Volume<D> {
             bits,
             date,
         );
-        let slot = self.free_slot(dir)?;
         self.write_entry(EntryLoc { dir, slot }, &e)?;
         self.touch_dir(dir)?;
         Ok(self.entry_for(&parent.path, &Dirent::decode(&e)))
@@ -1587,18 +1600,19 @@ impl<D: Read + Write + Seek> Volume<D> {
             )));
         }
         let xs = self.extents(d.first)?;
-        for x in &xs {
-            self.mark(x.block, x.span, false)?;
-        }
         // As `frel`: the slot is released and the first extent emptied; names and pointers stay.
-        if let Some(x) = xs.first() {
-            self.write_block_bytes(x.block, 8, &0u32.to_le_bytes())?;
-        }
+        // The slot goes first, so a failure part-way never leaves an entry on freed blocks.
         e[0] = 0;
         let [w0, w1] = encode_date(self.now());
         e[27..29].copy_from_slice(&w0.to_le_bytes());
         e[29..31].copy_from_slice(&w1.to_le_bytes());
         self.write_entry(loc, &e)?;
+        if let Some(x) = xs.first() {
+            self.write_block_bytes(x.block, 8, &0u32.to_le_bytes())?;
+        }
+        for x in &xs {
+            self.mark(x.block, x.span, false)?;
+        }
         self.touch_dir(dir)
     }
 
@@ -1741,11 +1755,11 @@ impl<D: Read + Write + Seek> Volume<D> {
         if src_path.trim_matches('/').is_empty() {
             for child in src.list("/")? {
                 if child.name != "bitmap" {
-                    self.copy_entry(src, &child, &dir.path, replace, &mut report)?;
+                    self.copy_entry(src, &child, &dir.path, replace, &mut report, 0)?;
                 }
             }
         } else {
-            self.copy_entry(src, &e, &dir.path, replace, &mut report)?;
+            self.copy_entry(src, &e, &dir.path, replace, &mut report, 0)?;
         }
         Ok(report)
     }
@@ -1757,7 +1771,15 @@ impl<D: Read + Write + Seek> Volume<D> {
         dst_dir: &str,
         replace: bool,
         report: &mut CopyReport,
+        depth: usize,
     ) -> Result<()> {
+        // A directory that loops back to an ancestor would recurse until the disk filled.
+        if depth > 64 {
+            return Err(Error::InvalidData(format!(
+                "qnx2: {} is nested more than 64 deep (a directory loop?)",
+                e.path
+            )));
+        }
         let target = join(dst_dir, &e.name);
         let existing = match self.lookup(&target) {
             Ok(t) => Some(t),
@@ -1775,7 +1797,7 @@ impl<D: Read + Write + Seek> Volume<D> {
                 }
             };
             for child in src.list(&e.path)? {
-                self.copy_entry(src, &child, &target, replace, report)?;
+                self.copy_entry(src, &child, &target, replace, report, depth + 1)?;
             }
             // Adding entries re-dated the folder; give a copied folder its own date back.
             if created {
