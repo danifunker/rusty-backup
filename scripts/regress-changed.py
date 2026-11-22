@@ -37,6 +37,8 @@ import sys
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Integration-test targets of their own; every other `test:` name is a module of `integration`.
+STANDALONE_TESTS = {"doc_parity", "ui_scenarios"}
 MAP_PATH = os.path.join(REPO, "regression-tests", "data", "change-map.tsv")
 EMU_CASES = os.path.join(REPO, "regression-tests", "emulator", "cases.txt")
 RUNNER = os.path.join(REPO, "regression-tests", "runner")
@@ -161,6 +163,11 @@ def automatic(path, plan):
         return True
     if path.startswith("src/") and path.endswith(".rs"):
         plan.add("lib:" + module_filter(path), path)
+        return True
+    # Most integration tests are modules of the one `integration` binary; a module name selects them.
+    m = re.match(r"tests/integration/([^/]+?)(?:\.rs$|/)", path)
+    if m:
+        plan.add("test:" + ("integration" if m.group(1) == "main" else m.group(1)), path)
         return True
     m = re.match(r"tests/([^/]+?)(?:\.rs$|/)", path)
     if m and m.group(1) not in ("fixtures", "ui_scenarios"):
@@ -299,10 +306,20 @@ def commands(plan, opts):
             filters = []
         cmds.append(("app unit tests", ["cargo", "test", "-p", ROOT_PKG, "--lib", "--"] + filters))
     if plan.tests:
-        argv = ["cargo", "test", "-p", ROOT_PKG]
-        for t in sorted(plan.tests):
-            argv += ["--test", t]
-        cmds.append(("app integration tests", argv))
+        # `doc_parity` and `ui_scenarios` are targets of their own; every other name is a module
+        # of the `integration` binary, selected by a `name::` filter (`integration` = all of it).
+        own = sorted(t for t in plan.tests if t in STANDALONE_TESTS)
+        mods = sorted(t for t in plan.tests if t not in STANDALONE_TESTS)
+        if own:
+            argv = ["cargo", "test", "-p", ROOT_PKG]
+            for t in own:
+                argv += ["--test", t]
+            cmds.append(("app integration tests", argv))
+        if mods:
+            argv = ["cargo", "test", "-p", ROOT_PKG, "--test", "integration"]
+            if "integration" not in mods:
+                argv += ["--"] + [m + "::" for m in mods]
+            cmds.append(("app integration tests (integration binary)", argv))
     for front in sorted(plan.fronts):
         if front == "egui":
             cmds.append(("egui shell compiles", ["cargo", "check", "--features", "gui"]))

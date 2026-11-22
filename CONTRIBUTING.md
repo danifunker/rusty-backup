@@ -36,12 +36,18 @@ cargo test                     # All tests
 cargo test --lib               # Unit tests only
 cargo test test_name           # Single test
 cargo test --test '*'          # Integration tests only
+cargo test --test integration cp_engine::  # One integration module
 
 cargo fmt --check              # Check formatting (CI-style)
 cargo fmt                      # Auto-format
 cargo clippy                   # Lint
 cargo build --all-targets      # Must produce zero warnings
 ```
+
+Integration tests live in `tests/integration/`, one module per area, all in a single test
+binary: each separate target re-links the whole crate, which made CI's Windows test step most
+of an hour. Add a new file there with a `mod` line in `tests/integration/main.rs`, not a new
+`tests/*.rs`. `doc_parity` and `ui_scenarios` are the only other targets.
 
 Debug builds are memory-heavy: the crate is ~400k lines in one library and
 `cargo test` links ~100 binaries against it. `Cargo.toml` therefore builds

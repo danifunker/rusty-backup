@@ -124,7 +124,7 @@ Slice 5 notes:
   Folder (staging there never worked); Delete / F8 / rename on a remote pane are
   refused up front; the connect prompt validates the port; a remote copy that hits
   an existing name now gets the review instead of failing the whole upload.
-- Tests: `tests/remote_filesystem.rs` `commander_remote::*` drive the controller
+- Tests: `tests/integration/remote_filesystem.rs` `commander_remote::*` drive the controller
   against a loopback daemon (connect, open, new folder, apply, reopen, close,
   disconnect; Skip and Replace; a refused connect).
 
@@ -1023,7 +1023,7 @@ dialog per step, smallest first; each joins `ENFORCED` in its own commit.
    folder read as a job (`Enter`), `Up`, `OpenImage` (hands the host a `RemoteImage` through
    `take_request()` and collapses), `Disconnect`; `rows()` (`PickRow`: openable images tinted only
    while browsing the host), `hint`, `working`, `error`, `take_log` (the same "connected to ..."
-   lines). `tests/remote_filesystem.rs` `inspect_remote_pick` drives it against a loopback
+   lines). `tests/integration/remote_filesystem.rs` `inspect_remote_pick` drives it against a loopback
    daemon (the ui scenarios have no daemon).
    Behaviour: the connect prompt is the shared text prompt and validates the address as you type
    (a port outside 1..65535, spaces or a slash are refused; it accepted anything non-empty and
@@ -1039,7 +1039,7 @@ dialog per step, smallest first; each joins `ENFORCED` in its own commit.
    the popup's regression tests) and `run_resize`, the popup's worker body moved verbatim (open
    read-write or the device handle, VHD detection, `apply_resize`, the shrunk-file trim). The
    write is a job over it through `run_mirrored` (engine lines to the log panel as they come,
-   bytes to the bar). `tests/resize_suite` `the_resize_controller_writes_the_same_bytes_as_the_engine`
+   bytes to the bar). `tests/integration/resize_suite` `the_resize_controller_writes_the_same_bytes_as_the_engine`
    checks the controller's bytes against `compute_resize_plan` + `apply_resize` on an IRIX disk;
    `tests/ui_scenarios/resize_shrink.toml` refuses a bad size, then shrinks an EFS partition and
    checks the file was trimmed. `rb-cli resize` resizes one filesystem inside its partition (a
@@ -1662,7 +1662,7 @@ User decisions (2026-11-04) on slice 19's two caller differences:
    lists them after the summary; `stop` exits non-zero with "extraction stopped at <path>:
    <error>". Ignored with `--tar`. Rule A applies. The `--tar` help no longer claims symlinks
    can't survive a loose extract (slice 19 Left). cli-reference.md, the HTML help, the help
-   snapshot and `tests/cli_suite/cli_optical_extract.rs` (skip, stop, the non-terminal
+   snapshot and `tests/integration/cli_suite/cli_optical_extract.rs` (skip, stop, the non-terminal
    default, ask over stdin).
 
 ### Semver

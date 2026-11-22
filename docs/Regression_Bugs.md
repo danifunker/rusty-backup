@@ -237,7 +237,7 @@ The map and driver entries are not data partitions, so they never reached `metad
 and only the 2 KB map was saved. The map came back still pointing at a driver, over zeros: the Quadra
 showed the blinking disk. Only a CHD restored at its own size worked, since that copies the whole
 disk. The old comment in the CHD resize path said driver bodies came through the partition loop;
-they never did. Tests: `tests/cli_suite/cli_restore_apm_driver.rs`.
+they never did. Tests: `tests/integration/cli_suite/cli_restore_apm_driver.rs`.
 
 ### R-085 — a remainder under one block looked like outgrowing the volume {#r-085}
 
@@ -447,7 +447,7 @@ other side of a DST change is stored an hour off what that day's clock showed
 (a copy between two zone-less volumes is unaffected).
 
 Original report: found 2026-11-04 by the `cp -p` CLI regression test
-(`tests/cli_suite/cli_cp.rs`, `preserve_times::cp_p_from_hfs_to_fat_keeps_the_modification_date`,
+(`tests/integration/cli_suite/cli_cp.rs`, `preserve_times::cp_p_from_hfs_to_fat_keeps_the_modification_date`,
 `#[ignore = "R-077"]` until fixed). On a host at UTC-5, `rb-cli cp -p` of an HFS
 file whose catalog modify date reads `1991-06-17 10:40` writes a FAT file that
 reads `1991-06-17 15:40`.
@@ -1595,7 +1595,7 @@ was scoped to `regression-tests/` with an explicit instruction not to change
 anything outside it. Flagged rather than silently widening that scope, then
 fixed in the following session once the scope was lifted.
 
-Discovered 2026-08-07 while committing `tests/cli_suite/cli_native_slots.rs`,
+Discovered 2026-08-07 while committing `tests/integration/cli_suite/cli_native_slots.rs`,
 which was written, passing and mutation-verified but could not be committed
 until this cleared.
 
@@ -3706,7 +3706,7 @@ sparse image, DART, MOOF, flat VMDK, CD CHD — refused with a reason). The CLI
 `resolve_image_rw` and the GUI `BrowseSession::open_editable` both route
 their final branch through it, and `fsck_runner::run_repair` (the GUI's
 repair) does too, so the three cannot drift apart again. Round-trip tests for
-all four container shapes: `tests/cli_suite/cli_container_rw.rs`. The three
+all four container shapes: `tests/integration/cli_suite/cli_container_rw.rs`. The three
 tier-3 cases below now pass and are no longer in `known-failures.toml`.
 
 Found 2026-08-25 while authoring the tier-3 cases for the new

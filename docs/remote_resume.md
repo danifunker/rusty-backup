@@ -28,8 +28,8 @@ keeps a file/device open and serves raw byte ranges (`OpenBlock`/`OpenDevice` �
 (`Read + Seek`, `src/remote/block_reader.rs`). The `remote` cargo feature is on
 by default in every build.
 
-**DONE and headless-tested (10/10 loopback tests in `tests/remote_filesystem.rs`,
-`cargo test --test remote_filesystem --features remote,pure-zstd,chd`):**
+**DONE and headless-tested (10/10 loopback tests in `tests/integration/remote_filesystem.rs`,
+`cargo test --test integration remote_filesystem:: --features remote,pure-zstd,chd`):**
 
 - **Remote INSPECT (read-only):** Inspect tab → Source ▾ → "Connect to Remote…"
   → host picker → pick an image → partition table, per-partition **Browse**,
@@ -150,7 +150,7 @@ need per the user — is now **shipped** (plan §15 Phase 5):
 - `mister/rb-daemon.sh` (the one Scripts-menu entry, a shim → `serve setup`) +
   `mister/install.sh`, bundled into the armv7 `rb-cli-mini` tarball. `rb-cli`
   installs as `/media/fat/Scripts/rb-cli` (no `.sh` → not a second menu entry).
-- Tests: service unit tests + `tests/daemon_service.rs` (real spawn→stop,
+- Tests: service unit tests + `tests/integration/daemon_service.rs` (real spawn→stop,
   install/uninstall section editing). **Compile + headless only — needs the
   interactive on-hardware pass** (Scripts-menu launch, enable, reboot-survives).
 - **Still open:** downloader DB JSON + UPX `-9`; the live connection/transfer
@@ -165,7 +165,7 @@ need per the user — is now **shipped** (plan §15 Phase 5):
 > eagerly, expensive HFS/ext/btrfs behind the "Calc min" button) and honors the
 > chosen sizes by routing remote backups through the same `build_partition_sizing`
 > helper as local. Headless tests `remote_min_size_calc_over_block_tier` +
-> `run_backup_pulls_remote_superfloppy_byte_exact` in `tests/remote_filesystem.rs`.
+> `run_backup_pulls_remote_superfloppy_byte_exact` in `tests/integration/remote_filesystem.rs`.
 > Still **interactive-verify only** for the real device path (root + a real disk).
 - **macOS `/dev/rdiskN` read-alignment** — `OpenDevice` reads are unaligned;
   fine on Linux/MiSTer (the target), would need aligned reads for a macOS daemon.
@@ -176,7 +176,7 @@ need per the user — is now **shipped** (plan §15 Phase 5):
   + zero-padding, non-resident files were silently corrupted in smart mode. The
   old test passed only by a hole/dup cancellation coincidence + read a resident
   file. Fix routes NTFS/exFAT smart compaction through `into_layout_preserving()`
-  (position-preserving). Regression tests in `tests/filesystem_e2e.rs`
+  (position-preserving). Regression tests in `tests/integration/filesystem_e2e.rs`
   (`*_smart_compaction_is_layout_preserving`, `ntfs_compaction_preserves_nonresident_file`).
   See `[[ntfs-exfat-packer-audit]]`.
 - **Per-partition sizing UI for remote** — DONE (see the merged item above):
@@ -190,14 +190,14 @@ need per the user — is now **shipped** (plan §15 Phase 5):
 ## How to work (constraints)
 - **GUI is COMPILE-VERIFY ONLY here** (no display) — put confidence in headless
   loopback tests (`serve_on` + `RemoteConnection`/`RemoteBlockReader` in
-  `tests/remote_filesystem.rs`); lean on the user for interactive checks.
+  `tests/integration/remote_filesystem.rs`); lean on the user for interactive checks.
 - `remote` is **feature-gated**; gate model-layer remote code with
   `#[cfg(feature = "remote")]` (see `backup_remote.rs`, `browse_session.rs`).
   `gui` always pulls `remote`.
 - Pre-commit hook enforces `cargo fmt` + `cargo check` + `clippy --all-targets
   -D warnings` — but **NOT tests**. Run the full `cargo test` (not just `--lib`)
   before committing FS/format changes: the FAT32 over-pad regression (`993d2ac`)
-  passed lib+remote tests but broke `tests/filesystem_e2e.rs` on every CI target.
+  passed lib+remote tests but broke `tests/integration/filesystem_e2e.rs` on every CI target.
 - Lib must still build **without** the feature:
   `cargo build --lib --no-default-features --features pure-zstd`. (Also confirm
   the slim CLI: `cargo build --bin rb-cli --no-default-features --features

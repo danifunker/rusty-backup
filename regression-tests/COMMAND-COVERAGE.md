@@ -125,7 +125,7 @@ array in `cases/**/*.toml` and `data/produce.toml`.
 > the reason tier 3 (edit, resize, subcommand sweep) and tier 5 (backup/restore
 > round-trips) were written. `serve` and `write` are the verbs still genuinely
 > uncovered: `serve` needs a daemon lifecycle the case schema cannot drive (its
-> integration tests live in `tests/remote_filesystem.rs` instead), and `write`
+> integration tests live in `tests/integration/remote_filesystem.rs` instead), and `write`
 > needs a hardware allowlist that does not exist. The rest of this section is
 > kept as the measurement that motivated the work.
 

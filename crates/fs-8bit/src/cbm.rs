@@ -740,7 +740,7 @@ impl<R: Read + Seek + Send> CbmFilesystem<R> {
     /// live file's data chain — the same allocation model CBM DOS VALIDATE
     /// uses: blocks reachable from the directory or a directory entry are
     /// allocated, everything else is free. Cross-validated byte-for-byte
-    /// against `c1541 validate` output (tests/fs_e2e_suite/cbm_fsck.rs).
+    /// against `c1541 validate` output (tests/integration/fs_e2e_suite/cbm_fsck.rs).
     fn recompute_bam(&mut self) -> Result<Bam, FilesystemError> {
         let variant = self.variant;
         let tracks = variant.tracks();
@@ -1520,7 +1520,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CbmFilesystem<R> {
     /// Repair BAM inconsistencies by rewriting the Block Availability Map from
     /// the allocation implied by the directory and file chains — the write side
     /// of CBM DOS VALIDATE. The rewritten BAM is byte-identical to what
-    /// `c1541 validate` produces (see tests/fs_e2e_suite/cbm_fsck.rs).
+    /// `c1541 validate` produces (see tests/integration/fs_e2e_suite/cbm_fsck.rs).
     ///
     /// Only the BAM is touched; file data and directory entries are left
     /// untouched. REL volumes are refused (their side-sector blocks are not

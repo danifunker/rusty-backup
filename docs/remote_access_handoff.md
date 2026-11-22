@@ -94,9 +94,9 @@ is in `DISK_IMAGE_EXTS`, a shortened source-bar label, and remote→local copy
 connection.**
 
 ### Tests
-`tests/remote_filesystem.rs` — loopback (port-0 listener + `serve_on`): browses a
+`tests/integration/remote_filesystem.rs` — loopback (port-0 listener + `serve_on`): browses a
 FAT image (`RemoteFilesystem`) and the host FS (`RemoteHostFilesystem`), reads
-files back **byte-exact**. Run with `cargo test --test remote_filesystem
+files back **byte-exact**. Run with `cargo test --test integration remote_filesystem::
 --features remote,pure-zstd,chd` (the `chd` dodges a pre-existing slim-test break
 in `rbformats/export.rs`).
 
@@ -234,7 +234,7 @@ A **`RemoteBrowser` window/component** (own module, e.g.
    `RemoteSession::close` for the read-side `Close{handle}`. Both views expose
    `connection()` to clone the shared `Arc<Mutex<…>>` (open another image on it).
    Test: `two_images_open_on_one_connection_without_reconnect` in
-   `tests/remote_filesystem.rs` — interleaved byte-exact reads of two images on
+   `tests/integration/remote_filesystem.rs` — interleaved byte-exact reads of two images on
    one connection + handle bookkeeping.
 2. **`RemoteBrowser`** egui component; refactor Commander's pane to use it
    (behavior parity: connect → host browse → open image → Close Image → copy).

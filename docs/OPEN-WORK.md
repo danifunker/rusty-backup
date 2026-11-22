@@ -227,7 +227,7 @@ compressed member to the target verbatim. That is the whole of the reported
 "tiny backup that fails to restore with Bad magic number in super-block".
 
 Metadata now records the codec that was actually written, and the `.raw` -> `.img`
-rename is gated on the output really being raw. `tests/superfloppy_compression.rs`
+rename is gated on the output really being raw. `tests/integration/superfloppy_compression.rs`
 pins the invariant: every codec restores byte-identical to the raw restore, and
 metadata names the codec on disk.
 
@@ -256,7 +256,7 @@ regression.
   The combination is now refused up front by `backup::validate_backup_config`,
   before any work starts, and the CHD splitting code is gone.
 
-`tests/split_backup_roundtrip.rs` covers it: raw splits restore byte-identical,
+`tests/integration/split_backup_roundtrip.rs` covers it: raw splits restore byte-identical,
 a 5 MiB file spanning several 1 MiB members reads back intact through the
 filesystem, and `--format chd --split-size` is refused with an error naming both
 (while an unsplit CHD still round-trips).
@@ -1240,7 +1240,7 @@ docs-consolidation pass.
   inspect-tab materializer (`gui::prepare_disk_image_path`) now decodes
   `.xdf` / `.hdm` / `.dim` to tempfile so the inner FAT / Human68k
   filesystem is browsable directly. Tests: 65 container unit + 3
-  integration cells (`tests/floppy_container_roundtrip.rs` covers the
+  integration cells (`tests/integration/floppy_container_roundtrip.rs` covers the
   16-cell matrix, asserts DIM-DD640 rejection, and feeds a 3-file
   mixed-format batch through `start_bulk_convert` to confirm runner
   routing). Drops the `xdf2d88` Linux-tooling note from
@@ -1515,7 +1515,7 @@ docs-consolidation pass.
   `emit_apm_from_non_apm_source` in `src/fs/hfs_clone.rs` (asserts 0 drivers
   copied, HFS at block 64, output parses + fsck-clean) and integration
   `test_expand_runner_wraps_non_apm_source_in_apm` in
-  `tests/filesystem_e2e.rs` (end-to-end runner from `partition-0.img`-style
+  `tests/integration/filesystem_e2e.rs` (end-to-end runner from `partition-0.img`-style
   source to APM-wrapped output with file round-trip).
 - **XFS hole (E.1) — v5/CRC primitives** — new `src/fs/xfs/v5_crc.rs`
   with `crc32c` (Castagnoli, init=0xFFFFFFFF, xorout=0xFFFFFFFF, matched
@@ -1658,7 +1658,7 @@ docs-consolidation pass.
   and shrink in §2.2.
 - **JFS + UFS** — promoted from parked (`additional_nix_filesystems.md`
   "JFS / UFS parked, noted for completeness") to scheduled in §1.
-- **`PLAN-ext-btrfs.md` Task 16** — `tests/filesystem_e2e.rs` ships 89
+- **`PLAN-ext-btrfs.md` Task 16** — `tests/integration/filesystem_e2e.rs` ships 89
   ext2/ext4/btrfs browse + read + symlink + permissions + nested-dir +
   compaction round-trip + resize + detection-routing tests, with
   committed fixtures.

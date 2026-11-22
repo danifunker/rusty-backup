@@ -12,7 +12,7 @@
 //! the result.
 //!
 //! Everything here is synchronous and headlessly testable over a loopback
-//! `serve_on` (see `tests/remote_filesystem.rs`). The no-reconnect property
+//! `serve_on` (see `tests/integration/remote_filesystem.rs`). The no-reconnect property
 //! falls out of the model: `open_image` / `close_image` reuse `self.conn`, so
 //! the daemon's per-connection handle table just gains / loses a handle.
 

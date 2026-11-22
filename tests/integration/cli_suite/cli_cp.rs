@@ -3,7 +3,7 @@
 //! Drives the real binary against scratch FAT images: single-file copy,
 //! whole-volume recursive consolidation, the free-space preflight, and the
 //! same-image guard. The engine-level fidelity matrix lives in
-//! `tests/cp_engine.rs`; this is the grammar / wiring regression net.
+//! `tests/integration/cp_engine.rs`; this is the grammar / wiring regression net.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
