@@ -501,3 +501,38 @@ fn modern_dates_fold_into_1994_keeping_day_and_time() {
     assert_eq!(format_date(e.modified().unwrap()), "1992-02-29 09:00:00");
     assert_eq!(encode_date(at(2026, 1, 1, 0))[0] >> 12, 15);
 }
+
+#[test]
+fn a_replace_that_only_fits_by_block_count_keeps_the_old_file() {
+    let Some(img) = blank_640k() else { return };
+    let mut vol = Volume::open(img, 0).unwrap();
+    vol.mkdir("/d", &NewEntry::default()).unwrap();
+    let mut n = 0;
+    while vol
+        .put(&format!("/d/f{n}"), b"x", &NewEntry::default())
+        .is_ok()
+    {
+        n += 1;
+    }
+    // Every other file goes, so the free space is single blocks that each lose 16 bytes to a header.
+    for i in (0..n).step_by(2) {
+        vol.remove(&format!("/d/f{i}")).unwrap();
+    }
+    let free = vol.free_blocks();
+    let data = vec![7u8; (free as usize + 1) * 500];
+    assert!(matches!(
+        vol.replace("/d/f1", &data, &NewEntry::default()),
+        Err(Error::DiskFull(_))
+    ));
+    assert_eq!(vol.get("/d/f1").unwrap(), b"x");
+    assert!(vol.check().unwrap().is_clean());
+}
+
+#[test]
+fn an_extent_running_past_the_volume_is_refused() {
+    let mut img = editable_sample().into_inner();
+    // HELLO's extent at block 5 claims 1000 blocks on a 16-block volume.
+    img[4 * 512 + 12..4 * 512 + 16].copy_from_slice(&999u32.to_le_bytes());
+    let mut vol = Volume::open(Cursor::new(img), 0).unwrap();
+    assert!(vol.remove("/HELLO").is_err());
+}

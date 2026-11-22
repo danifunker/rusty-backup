@@ -599,10 +599,10 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 | ADF-012 | S2 | plausible | adfs.rs | Free runs / sectors not bounded by the partition; overlapping runs accepted. | open |
 | ADF-013 | S3 | confirmed | adfs.rs `AdfsFsm::read` | Zone load sized by on-disk count (128 MiB); every edit rewrites all zones; quadratic copy. | open |
 | ADF-014 | S3 | confirmed | adfs.rs | Map written before data / entry (leaks on failure); no duplicate-name check. | open |
-| HPF-001 | S1 | confirmed | fs-hpfs hpfs.rs `fix_up_ptrs` etc. | Edit paths follow unchecked dnode pointers and write 2 KiB through an unchecked `write_sectors`. | open |
-| HPF-002 | S2 | confirmed | hpfs.rs `add_dirent` etc. | Dirent walks don't check `len` / `first_free`: infinite loop, panic. | open |
-| HPF-003 | S1 | confirmed | hpfs.rs `flush_bitmaps`, `open` | A bad bitmap pointer is kept: freeing writes 2 KiB to sector 0 or past the partition. | open |
-| HPF-004 | S1 | confirmed | hpfs.rs split / move / delete | Not atomic: DiskFull mid-split drops half a directory; delete frees data before the dirent. | open |
+| HPF-001 | S1 | confirmed | fs-hpfs hpfs.rs `fix_up_ptrs` etc. | Edit paths follow unchecked dnode pointers and write 2 KiB through an unchecked `write_sectors`. | fixed (2d2f9c3d) |
+| HPF-002 | S2 | confirmed | hpfs.rs `add_dirent` etc. | Dirent walks don't check `len` / `first_free`: infinite loop, panic. | fixed (2d2f9c3d) |
+| HPF-003 | S1 | confirmed | hpfs.rs `flush_bitmaps`, `open` | A bad bitmap pointer is kept: freeing writes 2 KiB to sector 0 or past the partition. | fixed (2d2f9c3d) |
+| HPF-004 | S1 | confirmed | hpfs.rs split / move / delete | Not atomic: DiskFull mid-split drops half a directory; delete frees data before the dirent. | fixed (2d2f9c3d) |
 | HPF-005 | S2 | confirmed | hpfs.rs `free_anode_tree` | Unguarded B+ tree parse on delete: panic, stack overflow, metadata freed. | open |
 | HPF-006 | S2 | confirmed | hpfs.rs | dirband size / start unchecked: panics; overflow. | open |
 | HPF-007 | S2 | confirmed | hpfs.rs `validate_hpfs_name` | Validated trimmed, stored untrimmed: oversized dirents. | open |
