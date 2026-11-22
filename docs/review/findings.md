@@ -477,18 +477,18 @@ Review by a separate agent, 2026-11-21, read-only.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| ARC-001 | S2 | confirmed | stuffit_huffman.rs, stuffit_lzah.rs, stuffit_lzh.rs; arsenic, compactpro reserves | Decoders don't stop at end of input and reserve the header length up front: 4 GiB bombs. | open |
-| ARC-002 | S2 | confirmed | stuffit_lzw.rs `decompress`, `BitCursor::skip` | Pad skip after CLEAR overruns: panic (reachable from dsk-tape `.Z`). | open |
-| ARC-003 | S2 | confirmed | stuffit_lzw.rs | `.Z` max bits not capped at 16; output unbounded. | open |
-| ARC-004 | S2 | confirmed | maczip.rs `inflate` | Inflate uncapped, size checked after. | open |
-| ARC-005 | S2 | plausible | mar.rs, compactpro.rs, stuffit.rs | Unbounded folder nesting recursion; per-level path clones. | open |
-| ARC-006 | S2 | confirmed | extract.rs `write_entry` | Entries mapping to the same host path overwrite each other and existing files. | open |
-| ARC-007 | S2 | confirmed | extract.rs `write_entry` | MacBinary / AppleDouble output drops dates and Finder flags. | open |
-| ARC-008 | S2 | plausible | stuffit.rs, stuffit5.rs | usize overflow on 32-bit targets: infinite loop / panic. | open |
+| ARC-001 | S2 | confirmed | stuffit_huffman.rs, stuffit_lzah.rs, stuffit_lzh.rs; arsenic, compactpro reserves | Decoders don't stop at end of input and reserve the header length up front: 4 GiB bombs. | fixed (a6f17e49) |
+| ARC-002 | S2 | confirmed | stuffit_lzw.rs `decompress`, `BitCursor::skip` | Pad skip after CLEAR overruns: panic (reachable from dsk-tape `.Z`). | fixed (a6f17e49) |
+| ARC-003 | S2 | confirmed | stuffit_lzw.rs | `.Z` max bits not capped at 16; output unbounded. | fixed (a6f17e49) |
+| ARC-004 | S2 | confirmed | maczip.rs `inflate` | Inflate uncapped, size checked after. | fixed (a6f17e49) |
+| ARC-005 | S2 | plausible | mar.rs, compactpro.rs, stuffit.rs | Unbounded folder nesting recursion; per-level path clones. | fixed (a6f17e49) |
+| ARC-006 | S2 | confirmed | extract.rs `write_entry` | Entries mapping to the same host path overwrite each other and existing files. | fixed (a6f17e49) |
+| ARC-007 | S2 | confirmed | extract.rs `write_entry` | MacBinary / AppleDouble output drops dates and Finder flags. | fixed (a6f17e49) |
+| ARC-008 | S2 | plausible | stuffit.rs, stuffit5.rs | usize overflow on 32-bit targets: infinite loop / panic. | fixed (a6f17e49) |
 | ARC-009 | S3 | confirmed | stuffit.rs, mar.rs writers | Sizes / counts truncated and names cut silently, returning Ok. | open |
 | ARC-010 | S3 | confirmed | extract.rs, mar.rs, maczip.rs | Archives held whole in RAM, several copies. | open |
 | ARC-011 | S3 | confirmed | maczip.rs, stuffit5.rs `parse` | Unreadable forks dropped silently; ZIP CRC unchecked; truncated SIT5 unreported. | open |
-| ARC-012 | S2 | plausible | stuffit_arsenic.rs `read_block` | Zero-run counters overflow (panic / spin). | open |
+| ARC-012 | S2 | plausible | stuffit_arsenic.rs `read_block` | Zero-run counters overflow (panic / spin). | fixed (a6f17e49) |
 | ARC-013 | S4 | confirmed | arsenic, lzah, lzh, detect.rs | Duplicate bit readers / PrefixCode / three CRC-32s; BinHex decoded twice. | open |
 
 ## crates/dsk-apple

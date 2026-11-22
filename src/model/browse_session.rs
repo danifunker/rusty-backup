@@ -755,7 +755,7 @@ impl BrowseSession {
 
         // Xerox Alto packs: read the whole pack, decode to an in-memory Disk,
         // and hand back an editable BFS view. Edits rebuild the volume and
-        // sync writes it back as a PDI (the no-op container commit applies).
+        // sync writes it back in the file's own container (the no-op container commit applies).
         // PDI magic "PARCDISK"; CopyDisk params block 00 07 00 03 00 0a.
         {
             let mut magic = [0u8; 8];

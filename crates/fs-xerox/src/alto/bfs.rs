@@ -429,6 +429,8 @@ pub struct BfsFilesystem {
     /// When set, edits persist by writing the rebuilt volume as a PDI to this
     /// path. The read-only open leaves it `None`.
     save_path: Option<PathBuf>,
+    /// The container `save_path` holds, kept on save.
+    save_format: super::PackFormat,
 }
 
 impl BfsFilesystem {
@@ -438,6 +440,7 @@ impl BfsFilesystem {
             disk,
             free_pages,
             save_path: None,
+            save_format: super::PackFormat::Pdi,
         }
     }
 
@@ -446,9 +449,36 @@ impl BfsFilesystem {
     /// PARC Disk Image (so a CopyDisk source is converted to PDI on save —
     /// both still open by magic).
     pub fn open_editable(disk: Disk, save_path: PathBuf) -> Self {
+        // Keep the file's own container: a Salto .dsk saved as PDI is no longer a Salto .dsk.
+        let format = std::fs::read(&save_path)
+            .map(|b| super::pack_format(&b))
+            .unwrap_or(super::PackFormat::ReadOnly);
         let mut fs = Self::open(disk);
         fs.save_path = Some(save_path);
+        fs.save_format = format;
         fs
+    }
+
+    /// An edit to a pack whose container can't be written back is refused before it is made.
+    fn ensure_savable(&self) -> Result<(), FilesystemError> {
+        if self.save_path.is_some() && self.save_format == super::PackFormat::ReadOnly {
+            return Err(FilesystemError::Unsupported(
+                "this pack's container can't be written back; convert it to PDI first".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Write the pack to `path` in its own container, via a temporary file and a rename so a
+    /// failure part-way leaves the original intact.
+    fn save_to(&self, path: &std::path::Path) -> Result<(), FilesystemError> {
+        let bytes = super::write_pack(&self.disk, self.save_format)?;
+        let tmp = path.with_extension("rb-tmp");
+        std::fs::write(&tmp, bytes).map_err(FilesystemError::Io)?;
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            FilesystemError::Io(e)
+        })
     }
 
     pub fn disk(&self) -> &Disk {
@@ -559,6 +589,7 @@ impl EditableFilesystem for BfsFilesystem {
     ) -> Result<FileEntry, FilesystemError> {
         let mut buf = Vec::with_capacity(data_len as usize);
         data.read_to_end(&mut buf).map_err(FilesystemError::Io)?;
+        self.ensure_savable()?;
         self.disk = super::write::add_file(&self.disk, name, &buf)?;
         self.refresh_free();
         self.entry_for(name.trim_end_matches('.'))
@@ -581,6 +612,7 @@ impl EditableFilesystem for BfsFilesystem {
         _parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
+        self.ensure_savable()?;
         self.disk = super::write::delete_file(&self.disk, &entry.name)?;
         self.refresh_free();
         Ok(())
@@ -595,6 +627,7 @@ impl EditableFilesystem for BfsFilesystem {
         if new_name == entry.name {
             return Ok(());
         }
+        self.ensure_savable()?;
         self.disk = super::write::rename_file(&self.disk, &entry.name, new_name)?;
         self.refresh_free();
         // Surface the rebuilt entry under its new (normalized, trailing-`.`)
@@ -606,10 +639,10 @@ impl EditableFilesystem for BfsFilesystem {
     }
 
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
-        let path = self.save_path.as_ref().ok_or_else(|| {
+        let path = self.save_path.clone().ok_or_else(|| {
             FilesystemError::Unsupported("Alto volume opened read-only (no save path)".into())
         })?;
-        std::fs::write(path, super::pdi::write(&self.disk)).map_err(FilesystemError::Io)
+        self.save_to(&path)
     }
 
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
@@ -642,7 +675,7 @@ impl EditableFilesystem for BfsFilesystem {
         self.disk = super::write::clone_to(&self.disk, self.disk.geometry.clone())?;
         self.refresh_free();
         if let Some(path) = self.save_path.clone() {
-            std::fs::write(&path, super::pdi::write(&self.disk)).map_err(FilesystemError::Io)?;
+            self.save_to(&path)?;
         }
         Ok(RepairReport {
             fixes_applied: vec![
