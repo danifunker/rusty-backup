@@ -49,6 +49,7 @@
 //! written here per `docs/mister_filesystem_implementation_plan.md` §3.2
 //! (no new crate dependencies).
 
+use crate::flat_layout::{flatten, RawSector};
 use anyhow::{bail, Result};
 
 /// Disk-info header is always 32 bytes.
@@ -143,9 +144,8 @@ pub fn looks_like_d88_header(head: &[u8]) -> bool {
 /// One decoded sector, kept until we sort tracks by (C, H, R).
 #[derive(Debug, Clone)]
 struct DecodedSector {
-    cyl: u8,
-    head: u8,
     sector_id: u8,
+    logical_size: usize,
     data: Vec<u8>,
 }
 
@@ -158,9 +158,12 @@ struct DecodedSector {
 /// format).
 pub fn decode_d88_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
     let geom = parse_header(bytes)?;
-    let mut out = Vec::new();
+    let mut tracks: Vec<Option<Vec<RawSector>>> = Vec::with_capacity(geom.track_offsets.len());
     for (track_index, off) in geom.track_offsets.iter().enumerate() {
-        let Some(track_off) = off else { continue };
+        let Some(track_off) = off else {
+            tracks.push(None);
+            continue;
+        };
         let track_off = *track_off as usize;
         if track_off >= bytes.len() {
             bail!(
@@ -193,11 +196,25 @@ pub fn decode_d88_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
             );
         }
         let block = &bytes[track_off..next_off];
-        let mut sectors = decode_one_track(block, track_index)?;
-        sectors.sort_by_key(|s| (s.cyl, s.head, s.sector_id));
-        for s in &sectors {
-            out.extend_from_slice(&s.data);
-        }
+        let sectors = decode_one_track(block, track_index)?;
+        tracks.push(Some(
+            sectors
+                .into_iter()
+                .map(|s| RawSector {
+                    id: s.sector_id,
+                    size: s.logical_size,
+                    data: s.data,
+                })
+                .collect(),
+        ));
+    }
+    let (out, gaps) = flatten(&tracks);
+    if gaps.missing + gaps.dropped > 0 {
+        log::warn!(
+            "D88: {} sector(s) missing (zero-filled), {} duplicate or out-of-run sector(s) dropped",
+            gaps.missing,
+            gaps.dropped
+        );
     }
     Ok(out)
 }
@@ -260,8 +277,6 @@ fn decode_one_track(block: &[u8], track_index: usize) -> Result<Vec<DecodedSecto
             );
         }
         let hdr = &block[cursor..cursor + SECTOR_INFO_SIZE];
-        let cyl = hdr[0x00];
-        let head = hdr[0x01];
         let sector_id = hdr[0x02];
         let size_code = hdr[0x03];
         let logical_size = size_code_to_bytes(size_code);
@@ -287,9 +302,13 @@ fn decode_one_track(block: &[u8], track_index: usize) -> Result<Vec<DecodedSecto
         }
         let data = block[data_off..data_off + actual_size].to_vec();
         sectors.push(DecodedSector {
-            cyl,
-            head,
             sector_id,
+            // An unknown size code falls back to the recorded data length.
+            logical_size: if logical_size == 0 {
+                data.len()
+            } else {
+                logical_size
+            },
             data,
         });
         cursor = data_off + actual_size;
