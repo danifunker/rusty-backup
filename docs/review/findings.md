@@ -194,7 +194,7 @@ clone / defrag / journal modules. A regression run for 0.1.11 is still owed.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| SQ-001 | S3 | confirmed | [squashfs_edit.rs:1](../../crates/fs-squashfs/src/squashfs_edit.rs#L1) | The editor holds the whole decompressed image in RAM (`FileContent::Bytes`) and rebuilds it into a buffer, against the streaming rule. The module doc calls lazy streaming "the follow-up"; it has no tracking entry. Peak memory is the decompressed image size. | open |
+| SQ-001 | S3 | confirmed | [squashfs_edit.rs:1](../../crates/fs-squashfs/src/squashfs_edit.rs#L1) | The editor holds the whole decompressed image in RAM (`FileContent::Bytes`) and rebuilds it into a buffer, against the streaming rule. The module doc calls lazy streaming "the follow-up"; it has no tracking entry. Peak memory is the decompressed image size. | deferred (needs a lazy FileContent that reuses unchanged blocks; a redesign of the editor) |
 
 ## src/fs
 
@@ -206,8 +206,8 @@ clone / defrag / journal modules. A regression run for 0.1.11 is still owed.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| PR-001 | S4 | confirmed | [restore_patch.rs:579](../../src/partition/restore_patch.rs#L579) | Two X68k table patchers: `restore_patch::patch_x68k` (slot matching, repack, keeps flags) and `part_tables::x68k::patch_x68k_entries` (used by `src/rbformats/mod.rs`). The crate one lost the flags byte until PT-010. One should go. | open |
-| PR-002 | S4 | confirmed | [vhd.rs:246](../../src/rbformats/vhd.rs#L246) | `rebuild_vhd_ebr_chain` re-implements `restore::build_restore_ebr_chain` ("same algorithm", says its own comment), with its own silent fallback when the chain can't be rebuilt. | open |
+| PR-001 | S4 | confirmed | [restore_patch.rs:579](../../src/partition/restore_patch.rs#L579) | Two X68k table patchers: `restore_patch::patch_x68k` (slot matching, repack, keeps flags) and `part_tables::x68k::patch_x68k_entries` (used by `src/rbformats/mod.rs`). The crate one lost the flags byte until PT-010. One should go. | deferred (merging the two X68k patchers changes restore behaviour; needs its own change) |
+| PR-002 | S4 | confirmed | [vhd.rs:246](../../src/rbformats/vhd.rs#L246) | `rebuild_vhd_ebr_chain` re-implements `restore::build_restore_ebr_chain` ("same algorithm", says its own comment), with its own silent fallback when the chain can't be rebuilt. | deferred (merging the EBR chain builders needs its own change and a restore regression) |
 
 ## src/model/convert
 
@@ -336,7 +336,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | GHO-013 | S2 | plausible | gho.rs uncompressed multi-partition | Acknowledged-unsupported layout served as one raw stream instead of refused; later partitions shifted. | open: needs an uncompressed multi-partition sample to detect the layout safely |
 | GHO-014 | S2 | confirmed | gho.rs MBR / EBR synthesis, blocked read | Unchecked subtraction of partition geometry (hidden < 63, overlapping or unsorted) panics or yields garbage. | fixed (3612a6a6) |
 | GHO-015 | S3 | confirmed | gho.rs `unsafe impl Send for GhoReader` | Unneeded `unsafe impl Send`. | fixed (fda1fc41) |
-| GHO-016 | S4 | confirmed | gho.rs | Dead / duplicated paths (materialize, emit copies, four zlib loops, three Seek impls; one in-RAM volume emitter); 9,850-line file with six jobs. | open |
+| GHO-016 | S4 | confirmed | gho.rs | Dead / duplicated paths (materialize, emit copies, four zlib loops, three Seek impls; one in-RAM volume emitter); 9,850-line file with six jobs. | deferred (splitting the 9,850-line gho.rs is a refactor of its own) |
 | GHO-017 | S4 | confirmed | gho.rs headers | Stale docs (file-aware "deferred", password "errors", "SECTOR only"). | fixed (2441e66e) |
 
 ## crates/fs-8bit
@@ -360,7 +360,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | B8-013 | S2 | confirmed | dragondos.rs `parse_geometry` | Track counts past the bitmap's 3,488 LSNs flip bits in the directory. | fixed (7170f90a) |
 | B8-014 | S3 | confirmed | cbm.rs, qdos.rs, atari_dos.rs, dragondos.rs, rsdos.rs, trdos.rs | Em dash (U+2014) in user-visible error strings. | fixed (d6f2d9b7) |
 | B8-015 | S4 | confirmed | andos.rs, qdos_mdv.rs | Errors point at moved `src/fs/` paths; andos doc says it lists an empty root. | fixed (d6f2d9b7) |
-| B8-016 | S4 | confirmed | rsdos.rs, atari_dos.rs, dragondos.rs, trdos.rs | Byte-identical name codecs and sector I/O helpers. | open |
+| B8-016 | S4 | confirmed | rsdos.rs, atari_dos.rs, dragondos.rs, trdos.rs | Byte-identical name codecs and sector I/O helpers. | deferred (shared helpers across four drivers: a refactor of its own) |
 
 ## crates/fs-unix
 
@@ -426,9 +426,9 @@ drivers are merged.
 | UNX-055 | S3 | confirmed | btrfs.rs `list_directory` | `Err(_) => continue` drops children silently. | fixed (4fb60164) |
 | UNX-056 | S3 | confirmed | jfs.rs, jfs_fsck.rs | `≥`, `⇒`, `—` in user-visible messages. | fixed (5694446c) |
 | UNX-057 | S3 | confirmed | bfs_write.rs, ofs_write.rs, ofs.rs | Whole-source `read_to_end`; OFS buffers a whole extent. | fixed (58e7a44e) |
-| UNX-058 | S4 | confirmed | bfs_write.rs, minix.rs, vxfs.rs | Each allocation rereads the whole bitmap; VxFS bmap rereads indirects per block. | open |
-| UNX-059 | S4 | confirmed | efs_fsck.rs, efs_v1_fsck.rs, jfs_fsck.rs, ufs_fsck.rs (+ fs-xfs) | Five copies of the fsck `Builder`; belongs in `disk_core::fsck`. | open |
-| UNX-060 | S4 | confirmed | ufs.rs, efs.rs | Full 27-field `FileEntry` literals (DC-008 class). | open |
+| UNX-058 | S4 | confirmed | bfs_write.rs, minix.rs, vxfs.rs | Each allocation rereads the whole bitmap; VxFS bmap rereads indirects per block. | deferred (cached bitmaps across three drivers: a performance change of its own) |
+| UNX-059 | S4 | confirmed | efs_fsck.rs, efs_v1_fsck.rs, jfs_fsck.rs, ufs_fsck.rs (+ fs-xfs) | Five copies of the fsck `Builder`; belongs in `disk_core::fsck`. | deferred (moving the fsck Builder into disk_core touches five drivers and fs-xfs) |
+| UNX-060 | S4 | confirmed | ufs.rs, efs.rs | Full 27-field `FileEntry` literals (DC-008 class). | deferred (FileEntry constructors: the DC-008 refactor, across drivers) |
 | UNX-061 | S4 | confirmed | lib.rs, ufs.rs, efs_resize.rs, ext_format.rs | Stale docs (ofs GPL note, UFS scope, shrink hard-link claim, batch-builder caller). | fixed (705602dc) |
 
 ## crates/fs-apple2
@@ -455,7 +455,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | AP2-016 | S2 | confirmed | ucsd.rs `create_file` | Block count `as u16` wraps at 32 MiB; slice panics. | fixed (0735476c) |
 | AP2-017 | S3 | confirmed | prodos.rs, apple_dos.rs, ucsd.rs, sector_order.rs | Em dash / multiplication sign in user-visible errors. | fixed (d3e79acf) |
 | AP2-018 | S3 | confirmed | prodos_types.rs `parse_json` | Format crate reads the app config dir; a bad override file is silently ignored. | fixed (d3e79acf) |
-| AP2-019 | S4 | confirmed | apple_dos.rs, prodos.rs | Catalog walk copied 5 times; read_* duplicate write_*_to; fork walkers duplicated. | open |
+| AP2-019 | S4 | confirmed | apple_dos.rs, prodos.rs | Catalog walk copied 5 times; read_* duplicate write_*_to; fork walkers duplicated. | deferred (one catalog walker for apple_dos / prodos: a refactor of its own) |
 
 ## crates/fs-xerox
 
@@ -486,10 +486,10 @@ Review by a separate agent, 2026-11-21, read-only.
 | ARC-007 | S2 | confirmed | extract.rs `write_entry` | MacBinary / AppleDouble output drops dates and Finder flags. | fixed (a6f17e49) |
 | ARC-008 | S2 | plausible | stuffit.rs, stuffit5.rs | usize overflow on 32-bit targets: infinite loop / panic. | fixed (a6f17e49) |
 | ARC-009 | S3 | confirmed | stuffit.rs, mar.rs writers | Sizes / counts truncated and names cut silently, returning Ok. | fixed (6ca2f3b3) |
-| ARC-010 | S3 | confirmed | extract.rs, mar.rs, maczip.rs | Archives held whole in RAM, several copies. | open |
+| ARC-010 | S3 | confirmed | extract.rs, mar.rs, maczip.rs | Archives held whole in RAM, several copies. | deferred (needs the archive readers to work from a Read + Seek source; a redesign) |
 | ARC-011 | S3 | confirmed | maczip.rs, stuffit5.rs `parse` | Unreadable forks dropped silently; ZIP CRC unchecked; truncated SIT5 unreported. | fixed (6ca2f3b3) |
 | ARC-012 | S2 | plausible | stuffit_arsenic.rs `read_block` | Zero-run counters overflow (panic / spin). | fixed (a6f17e49) |
-| ARC-013 | S4 | confirmed | arsenic, lzah, lzh, detect.rs | Duplicate bit readers / PrefixCode / three CRC-32s; BinHex decoded twice. | open |
+| ARC-013 | S4 | confirmed | arsenic, lzah, lzh, detect.rs | Duplicate bit readers / PrefixCode / three CRC-32s; BinHex decoded twice. | deferred (shared bit readers / CRC-32 across five codecs: a refactor of its own) |
 
 ## crates/dsk-apple
 
@@ -511,7 +511,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | SQ-004 | S2 | confirmed | squashfs.rs `build_node`; squashfs_verify.rs | No directory-cycle guard: stack overflow / endless verify. | fixed (32313343) |
 | SQ-005 | S2 | confirmed | squashfs.rs `read_metadata_span` and table loads | Capacities taken from on-disk u32s (4 GiB / 64 GiB). | fixed (32313343) |
 | SQ-006 | S3 | confirmed | squashfs_write.rs `write_node`; `read_build_tree` | Dir `parent` written wrong; hard links duplicated on rebuild. | fixed (0309cc99) |
-| SQ-007 | S4 | confirmed | squashfs.rs, squashfs_write.rs | Comment contradicts code; whole-Vec clone per file; near-duplicate table loaders. | open |
+| SQ-007 | S4 | confirmed | squashfs.rs, squashfs_write.rs | Comment contradicts code; whole-Vec clone per file; near-duplicate table loaders. | partly fixed (21d43797: no per-file Vec clone; comment and table loaders still open) |
 | DVM-001 | S1 | plausible | qcow2.rs `open`, `ensure_free_cluster_index` | Edits accepted on dirty / corrupt images; with lazy refcounts live clusters are reused. | fixed (3612a6a6) |
 | DVM-002 | S2 | confirmed | qcow2.rs `export_qcow2` | One-cluster refcount table overflows into the first L2 table at small cluster sizes (latent). | fixed (f8e6b89b) |
 | DVM-003 | S1 | confirmed | vmdk_sparse.rs `export_vmdk_sparse` | Host offset `as u32` sectors: disks past 2 TiB written corrupt. | fixed (3612a6a6) |
@@ -520,7 +520,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | DVM-006 | S2 | confirmed | vmdk_sparse.rs header parse | Grain size / GT entries unbounded: 8 GiB / 1 TiB allocations. | fixed (f8e6b89b) |
 | DVM-007 | S2 | plausible | vmdk.rs `read_descriptor` | Only 64 KiB of descriptor parsed: many-extent disks fail or silently shorten. | fixed (f8e6b89b) |
 | DVM-008 | S2 | plausible | qcow2.rs `open`, `allocate_cluster` | Unaligned file length gives unaligned new clusters and wrong refcounts. | fixed (f8e6b89b) |
-| DVM-009 | S4 | confirmed | vmdk.rs, lib.rs, qemu_img_test.rs | Test-only public fn; helpers duplicated with src/rbformats. | open |
+| DVM-009 | S4 | confirmed | vmdk.rs, lib.rs, qemu_img_test.rs | Test-only public fn; helpers duplicated with src/rbformats. | partly fixed (707bd60a: helper test-gated; duplicates with src/rbformats still open) |
 | TAR-001 | S1 | plausible | tar_import.rs `NormalizedTar::fill` | Data blocks counted from the ustar size only: pax sizes / GNU sparse headers make data be rewritten as headers (silent corruption). | fixed (8126d65f) |
 | TAR-002 | S2 | confirmed | tar_import.rs; zip_import.rs `plan` | `skip_appledouble=false` ignored: `._` files always consumed; preflight disagrees. | fixed (69648efe) |
 | TAR-003 | S2 | confirmed | mem_archive.rs | Small compressed archives inflated fully into RAM uncapped; indexed path fills disk; zip capacity from declared size. | fixed (69648efe) |
@@ -546,7 +546,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | CPM-010 | S2 | plausible | cpm_diskdefs.rs `ALTAIR_8IN`; cpm.rs | No sector skew: ibm-3740 images (skew 6) read garbled. | open: needs a skewed 8-inch sample |
 | CPM-011 | S3 | confirmed | cpm.rs `validate_cpm_name` | Wildcard / separator characters accepted in names. | fixed (9bd44acf) |
 | CPM-012 | S3 | confirmed | cpm.rs | Non-ASCII glyphs in user-visible errors. | fixed (9bd44acf) |
-| CPM-013 | S3 | confirmed | cpm.rs `read_file`, `create_file` | Whole-file buffering (DC-006 for this crate; largest preset 4 MiB). | open |
+| CPM-013 | S3 | confirmed | cpm.rs `read_file`, `create_file` | Whole-file buffering (DC-006 for this crate; largest preset 4 MiB). | deferred (bounded by the volume, 4 MiB at most; streaming waits on the shared driver change, DC-006) |
 | CPM-014 | S4 | confirmed | cpm.rs, cpm_diskdefs.rs | Dead locals and unread DPB fields; `tracks` documented as a bounds check but unused. | partly fixed (562d5948: tracks doc; dead locals still open) |
 
 ## crates/dsk-dmg, dsk-clonezilla, dsk-floppy, dsk-flux, dsk-imz, dsk-tape
@@ -575,7 +575,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | FLX-005 | S2 | confirmed | dsk-flux flux/kryoflux.rs `parse_stream` | u32 overflow counter overflows (panic / wrong interval). | fixed (50641b3b) |
 | FLX-006 | S4 | confirmed | dsk-flux mfm_emu.rs, mfm.rs | `crc16` twice; byte helpers duplicate disk_core. | fixed (18396b2a) |
 | IMZ-001 | S2 | confirmed | dsk-imz imz.rs `open_with_password` | Capacity from ZIP header sizes; whole entry in RAM with no cap. | fixed (52f2afa6) |
-| TAP-001 | S3 | confirmed | dsk-tape sun2tape.rs, sun2tape_edit.rs | Tape files read whole into RAM (up to three copies). | open |
+| TAP-001 | S3 | confirmed | dsk-tape sun2tape.rs, sun2tape_edit.rs | Tape files read whole into RAM (up to three copies). | deferred (needs tape files streamed from the image; a redesign of the editor) |
 | TAP-002 | S2 | plausible | dsk-tape sun2tape.rs, sun2tape_edit.rs `build_image` | Zero-length tape files dropped on rebuild: later files renumbered. | fixed (fe41fa48) |
 | TAP-003 | S3 | confirmed | dsk-tape tar_section.rs `TarSection::parse` | A leading `./` entry disappears from the rebuilt archive. | fixed (06523f71) |
 
@@ -620,7 +620,7 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 | APF-006 | S2 | confirmed | apfs.rs `parse_kek_blob`; apfs_crypto.rs | PBKDF2 iterations from the keybag unbounded (hour-long hang). | fixed (42f7a075) |
 | APF-007 | S2 | confirmed | apfs.rs `der_children` | DER length add overflows on 32-bit: panic. | fixed (42f7a075) |
 | APF-008 | S2 | plausible | apfs.rs `stream_phys` | XTS tweak from the physical block, not the extent's crypto_id. | no change (42f7a075): the FileVault fixture needs the physical-sector tweak |
-| APF-009 | S3 | plausible | apfs.rs `build_catalog` | Whole catalog / omap flattened into HashMaps on first browse. | open |
+| APF-009 | S3 | plausible | apfs.rs `build_catalog` | Whole catalog / omap flattened into HashMaps on first browse. | deferred (needs a lazy B-tree walk in place of the flattened maps; a redesign) |
 | QNX-001 | S2 | confirmed | fs-qnx qnx4.rs `extents` | Self-linked empty extent block loops forever. | fixed (172f817a) |
 | QNX-002 | S2 | confirmed | qnx4.rs `open` | Volume sized to the end of the reader (whole disk for MBR partitions). | fixed (172f817a) |
 | QNX-003 | S2 | confirmed | qnx4.rs `read_data`, qnx6.rs `read_node` | Allocation by on-disk size before reading; endless hole zero-fill. | fixed (172f817a) |
