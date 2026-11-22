@@ -433,6 +433,9 @@ impl<R: Read + Seek + Send> AppleDosFilesystem<R> {
         let mut tslist_track = e.first_ts_track;
         let mut tslist_sector = e.first_ts_sector;
         let mut seen = std::collections::HashSet::new();
+        // Zero pairs are holes when data follows them (random-access text files) and the end
+        // of file when nothing does, so they are written out only once more data turns up.
+        let mut pending_holes = 0usize;
         for _ in 0..MAX_TS_LISTS {
             if tslist_track == 0 {
                 break;
@@ -454,17 +457,16 @@ impl<R: Read + Seek + Send> AppleDosFilesystem<R> {
                 let off = 0x0C + pair * 2;
                 let dt = list_buf[off];
                 let ds = list_buf[off + 1];
-                if dt == 0 && ds == 0 {
-                    // Trailing zero pairs mark end-of-file within this
-                    // list. Continue scanning to keep things simple
-                    // (DOS 3.3 typically packs from the front).
-                    continue;
-                }
+                // Track 0 holds DOS itself, never file data: a pair there is a hole.
                 if dt == 0 {
-                    // Sparse hole — 256 zeros.
-                    data.extend(disk_core::repeat_n(0u8, APPLE_II_SECTOR_BYTES));
+                    pending_holes += 1;
                     continue;
                 }
+                data.extend(disk_core::repeat_n(
+                    0u8,
+                    pending_holes * APPLE_II_SECTOR_BYTES,
+                ));
+                pending_holes = 0;
                 let sec = read_sector(&mut self.reader, self.partition_offset, dt, ds)?;
                 data.extend_from_slice(&sec);
             }
@@ -810,6 +812,13 @@ fn encode_apple_name(name: &str) -> Result<[u8; 30], FilesystemError> {
             "DOS 3.3 filename '{name}' exceeds 30 chars"
         )));
     }
+    // Names are space-padded on disk, so a trailing space can't be told from padding: the file
+    // would read back under another name.
+    if name.ends_with(' ') {
+        return Err(FilesystemError::InvalidData(format!(
+            "DOS 3.3 filename '{name}' ends in a space; DOS pads names with spaces"
+        )));
+    }
     let mut buf = [0xA0u8; 30];
     for (i, c) in name.chars().enumerate() {
         if !c.is_ascii() {
@@ -841,6 +850,10 @@ impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
 
     /// Mark a sector FREE (bit set in the bitmap).
     fn bitmap_mark_free(&mut self, track: u8, sector: u8) {
+        // A T/S pair from a damaged list can name a track or sector that doesn't exist.
+        if track as usize >= APPLE_II_TRACKS || sector as usize >= APPLE_II_SECTORS_PER_TRACK {
+            return;
+        }
         let row = 0x38 + (track as usize) * 4;
         if sector >= 8 {
             self.vtoc.bitmap[row - 0x38] |= 1 << (sector - 8);
@@ -856,13 +869,14 @@ impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
     fn alloc_one_sector(&mut self) -> Result<(u8, u8), FilesystemError> {
         // Walk outward from track 17 in alternating direction so the
         // catalog stays clustered near the head's typical resting place.
+        // Tracks 1..=34: track 34 is data space too (it is counted free), and track 0 is DOS.
         let order: Vec<u8> = std::iter::once(17u8)
-            .chain((1..=16).flat_map(|d: u8| {
+            .chain((1..=17).flat_map(|d: u8| {
                 let inc = 17u8.checked_add(d);
                 let dec = 17u8.checked_sub(d);
                 inc.into_iter().chain(dec)
             }))
-            .filter(|&t| (t as usize) < APPLE_II_TRACKS)
+            .filter(|&t| t != 0 && (t as usize) < APPLE_II_TRACKS)
             .collect();
         for t in order {
             // Skip the entire VTOC+catalog track for data allocation

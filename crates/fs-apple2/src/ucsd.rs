@@ -70,7 +70,8 @@ impl UcsdEntry {
         if self.last_block <= self.first_block {
             return 0;
         }
-        (self.last_block - self.first_block - 1) as u64 * BLOCK + self.last_byte as u64
+        // DLASTBYTE is 1..=512; a larger value would read into the next file.
+        (self.last_block - self.first_block - 1) as u64 * BLOCK + self.last_byte.min(512) as u64
     }
 }
 
@@ -81,6 +82,8 @@ pub struct UcsdFilesystem<R: Read + Seek> {
     volume_name: String,
     /// Blocks on the volume, from the label (`DEOVBLK`).
     eov_blocks: u16,
+    /// Blocks the image actually holds: allocation stops here even if DEOVBLK claims more.
+    image_blocks: u64,
     /// First block past the directory (`DLASTBLK` of the label): 6 or 10.
     dir_end: u16,
     /// Volume label date word (preserved across writes).
@@ -195,6 +198,8 @@ impl<R: Read + Seek> UcsdFilesystem<R> {
         // (which the format assumes is sorted) are correct even on a foreign
         // volume whose directory order drifted.
         entries.sort_by_key(|e| e.first_block);
+        let end = reader.seek(SeekFrom::End(0))?;
+        let image_blocks = end.saturating_sub(partition_offset) / BLOCK;
 
         Ok(UcsdFilesystem {
             reader,
@@ -202,6 +207,7 @@ impl<R: Read + Seek> UcsdFilesystem<R> {
             little_endian: little,
             volume_name,
             eov_blocks,
+            image_blocks,
             dir_end,
             vol_date,
             entries,
@@ -484,6 +490,8 @@ impl<R: Read + Write + Seek> UcsdFilesystem<R> {
 
     /// First-fit contiguous free run of `need` blocks (entries kept sorted).
     fn find_gap(&self, need: u16) -> Option<u16> {
+        // Never past the image, whatever DEOVBLK says.
+        let eov = (self.eov_blocks as u64).min(self.image_blocks) as u16;
         let mut cursor = self.dir_end;
         for e in &self.entries {
             if e.first_block >= cursor && e.first_block - cursor >= need {
@@ -491,7 +499,7 @@ impl<R: Read + Write + Seek> UcsdFilesystem<R> {
             }
             cursor = cursor.max(e.last_block);
         }
-        if self.eov_blocks >= cursor && self.eov_blocks - cursor >= need {
+        if eov >= cursor && eov - cursor >= need {
             Some(cursor)
         } else {
             None
@@ -545,6 +553,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for UcsdFilesystem<R> {
             return Err(FilesystemError::DiskFull(
                 "UCSD directory full (77 files)".into(),
             ));
+        }
+        // A UCSD volume is at most 65535 blocks, and block numbers are 16 bits.
+        if data_len.div_ceil(BLOCK) > u16::MAX as u64 {
+            return Err(FilesystemError::DiskFull(format!(
+                "a {data_len}-byte file is larger than any UCSD volume"
+            )));
         }
         let need = if data_len == 0 {
             1
@@ -737,10 +751,13 @@ pub fn fsck_ucsd<R: Read + Seek>(
         let kind = read_u16(&dir, off + 4, little) & 0xF;
         let last_byte = read_u16(&dir, off + 22, little);
         let Some(name) = read_name(&dir, off + 6, 15) else {
+            // An empty slot (a count that runs too far) can go; an entry that owns blocks can't,
+            // or the rewrite would drop it and free its file.
+            let owns_blocks = last > first;
             errors.push(issue(
-                "BadName",
+                if owns_blocks { "BadName" } else { "EmptySlot" },
                 format!("directory entry {i} has an invalid name length"),
-                true,
+                !owns_blocks,
             ));
             continue;
         };
@@ -846,6 +863,17 @@ pub fn repair_ucsd<R: Read + Write + Seek>(
     };
     let has_fixable =
         check.errors.iter().any(|e| e.repairable) || check.warnings.iter().any(|w| w.repairable);
+    // The rewrite keeps only entries that parse: one with a bad name would vanish with its file.
+    if check.errors.iter().any(|e| e.code == "BadName") {
+        if has_fixable {
+            report.fixes_failed.push(
+                "the directory has an entry with an invalid name; rewriting it would drop \
+                 that file, so nothing was changed"
+                    .into(),
+            );
+        }
+        return Ok(report);
+    }
     if has_fixable {
         // `fs.entries` is the parsed, valid, block-sorted set; re-serializing
         // corrects DNUMFILES and sort order and drops invalid-name entries.
