@@ -3663,14 +3663,18 @@ fn test_hfv_source_open_unwraps_dynamic_vhd() {
 #[test]
 fn apfs_multi_volume_container_browses_every_volume() {
     use disk_core::filesystem::Filesystem;
-    let img = load_fixture("test_apfs_multivolume.img.zst");
-    let mut fs = fs_apfs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).expect("open APFS");
+    // 1.1 GB decoded (APFS needs 512 MiB per extra volume): decode to disk, not to a Vec,
+    // which a 32-bit test process could not hold.
+    let mut img = tempfile::tempfile().expect("temp file");
+    let src = std::fs::File::open("tests/fixtures/test_apfs_multivolume.img.zst").expect("fixture");
+    zstd::stream::copy_decode(src, &mut img).expect("decode fixture");
+    let mut fs = fs_apfs::apfs::ApfsFilesystem::open(img, 0).expect("open APFS");
     let root = fs.root().expect("root");
     let vols = fs.list_directory(&root).expect("list root");
     let names: Vec<&str> = vols.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["Alpha", "Beta"], "one folder per volume");
 
-    let read = |fs: &mut fs_apfs::apfs::ApfsFilesystem<Cursor<Vec<u8>>>,
+    let read = |fs: &mut fs_apfs::apfs::ApfsFilesystem<std::fs::File>,
                 dir: &disk_core::entry::FileEntry,
                 name: &str| {
         let e = fs
