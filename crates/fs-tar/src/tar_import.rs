@@ -140,6 +140,12 @@ struct NormalizedTar<R> {
     pos: usize,
     len: usize,
     data_blocks: u64,
+    /// GNU sparse extension headers still to pass before the entry's data.
+    sparse_ext: bool,
+    /// Bytes of the pax extended header being passed, kept to read its `size=`.
+    pax: Option<Vec<u8>>,
+    /// A pax `size=` that overrides the next header's size field.
+    pax_size: Option<u64>,
 }
 
 impl<R: Read> NormalizedTar<R> {
@@ -150,6 +156,9 @@ impl<R: Read> NormalizedTar<R> {
             pos: 0,
             len: 0,
             data_blocks: 0,
+            sparse_ext: false,
+            pax: None,
+            pax_size: None,
         }
     }
 
@@ -168,15 +177,39 @@ impl<R: Read> NormalizedTar<R> {
         if n < 512 {
             return Ok(());
         }
+        if self.sparse_ext {
+            self.sparse_ext = self.block[504] != 0;
+            return Ok(());
+        }
         if self.data_blocks > 0 {
             self.data_blocks -= 1;
+            if let Some(buf) = &mut self.pax {
+                buf.extend_from_slice(&self.block);
+                if self.data_blocks == 0 {
+                    self.pax_size = pax_record(buf, "size").and_then(|v| v.parse().ok());
+                    self.pax = None;
+                }
+            }
             return Ok(());
         }
         if self.block.iter().all(|b| *b == 0) {
             return Ok(());
         }
-        let size = header_size(&self.block[124..136]);
-        if b"123456".contains(&self.block[156]) && size > 0 {
+        let typ = self.block[156];
+        let mut size = header_size(&self.block[124..136]);
+        if typ == b'x' && size > 0 && size <= 1 << 20 {
+            self.pax = Some(Vec::with_capacity(size as usize));
+            self.pax_size = None;
+        } else if !matches!(typ, b'g' | b'L' | b'K') {
+            // A pax size outranks the header's field, which may be 0 or capped for big files.
+            if let Some(p) = self.pax_size.take() {
+                size = p;
+            }
+        }
+        if typ == b'S' && self.block[482] != 0 {
+            self.sparse_ext = true;
+        }
+        if b"123456".contains(&typ) && size > 0 {
             self.block[124..135].copy_from_slice(b"00000000000");
             self.block[135] = 0;
             let sum: u32 = self
@@ -213,6 +246,25 @@ impl<R: Read> Read for NormalizedTar<R> {
         self.pos += n;
         Ok(n)
     }
+}
+
+/// The value of `key` in a pax extended header's `len key=value\n` records.
+fn pax_record(buf: &[u8], key: &str) -> Option<String> {
+    let mut rest = buf;
+    while let Some(sp) = rest.iter().position(|b| *b == b' ') {
+        let len: usize = std::str::from_utf8(&rest[..sp]).ok()?.parse().ok()?;
+        if len <= sp || len > rest.len() {
+            return None;
+        }
+        let rec = std::str::from_utf8(&rest[sp + 1..len]).ok()?;
+        if let Some(v) = rec.strip_suffix('\n').and_then(|r| r.strip_prefix(key)) {
+            if let Some(v) = v.strip_prefix('=') {
+                return Some(v.to_string());
+            }
+        }
+        rest = &rest[len..];
+    }
+    None
 }
 
 /// A header's size field: octal, or GNU base-256 when the high bit is set.
@@ -827,6 +879,61 @@ mod tests {
         h.set_mode(0o755);
         h.set_cksum();
         b.append_data(&mut h, name, data).unwrap();
+    }
+
+    fn normalized(raw: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        NormalizedTar::new(raw).read_to_end(&mut out).unwrap();
+        out
+    }
+
+    /// File data that looks like a link header, so a normalizer that lost count would rewrite it.
+    fn link_lookalike() -> Vec<u8> {
+        let mut h = tar::Header::new_ustar();
+        h.set_entry_type(tar::EntryType::Link);
+        h.set_size(100);
+        h.set_cksum();
+        let mut d = h.as_bytes().to_vec();
+        d.resize(1024, 7);
+        d
+    }
+
+    #[test]
+    fn a_pax_size_is_followed_over_the_header_field() {
+        let rec = "13 size=1024\n";
+        let mut x = tar::Header::new_ustar();
+        x.set_entry_type(tar::EntryType::XHeader);
+        x.set_size(rec.len() as u64);
+        x.set_cksum();
+        let mut raw = x.as_bytes().to_vec();
+        let mut body = rec.as_bytes().to_vec();
+        body.resize(512, 0);
+        raw.extend_from_slice(&body);
+        let mut f = tar::Header::new_ustar();
+        f.set_size(0); // the real size is in the pax record
+        f.set_cksum();
+        raw.extend_from_slice(f.as_bytes());
+        raw.extend_from_slice(&link_lookalike());
+        raw.extend_from_slice(&[0u8; 1024]);
+        assert_eq!(normalized(&raw), raw);
+    }
+
+    #[test]
+    fn gnu_sparse_extension_headers_are_not_counted_as_data() {
+        let mut s = tar::Header::new_gnu();
+        s.set_entry_type(tar::EntryType::GNUSparse);
+        s.set_size(1024);
+        let mut raw = s.as_bytes().to_vec();
+        raw[482] = 1; // isextended
+        let b = [0u8; 512]; // isextended (byte 504) clear: the last extension
+        let sum: u32 = raw.iter().map(|b| u32::from(*b)).sum::<u32>()
+            - raw[148..156].iter().map(|b| u32::from(*b)).sum::<u32>()
+            + 8 * 32;
+        raw[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        raw.extend_from_slice(&b);
+        raw.extend_from_slice(&link_lookalike());
+        raw.extend_from_slice(&[0u8; 1024]);
+        assert_eq!(normalized(&raw), raw);
     }
 
     /// A hard link lands as a copy of its target: Opener.app's `gunzip` is `zcat`.
