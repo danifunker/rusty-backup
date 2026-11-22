@@ -330,21 +330,38 @@ impl<R: Read + Write + Seek + Send> BfsFilesystem<R> {
 
     /// Write `data` over a stream's blocks, zero-padding the last block.
     fn write_stream_bytes(&mut self, ds: &DataStream, data: &[u8]) -> Result<(), FilesystemError> {
-        let bs = self.sb.block_size as usize;
+        self.write_stream_from(ds, &mut std::io::Cursor::new(data), data.len() as u64)
+    }
+
+    /// Copy `len` bytes from `src` into the stream's extents, at most 1 MiB at a time.
+    fn write_stream_from(
+        &mut self,
+        ds: &DataStream,
+        src: &mut dyn Read,
+        len: u64,
+    ) -> Result<(), FilesystemError> {
+        let bs = self.sb.block_size as u64;
+        let chunk_blocks = ((1u64 << 20) / bs).max(1);
         let extents = self.stream_extents(ds)?;
-        let mut pos = 0usize;
+        let mut pos = 0u64;
+        let mut buf = Vec::new();
         for (block, count) in extents {
-            if pos >= data.len() {
+            let mut done = 0u64;
+            while done < count && pos < len {
+                let blocks = (count - done).min(chunk_blocks);
+                let take = (blocks * bs).min(len - pos) as usize;
+                buf.clear();
+                buf.resize(take.div_ceil(bs as usize) * bs as usize, 0);
+                src.read_exact(&mut buf[..take])?;
+                self.write_blocks(block + done, &buf)?;
+                pos += take as u64;
+                done += blocks;
+            }
+            if pos >= len {
                 break;
             }
-            let span = count as usize * bs;
-            let take = span.min(data.len() - pos);
-            let mut buf = vec![0u8; take.div_ceil(bs) * bs];
-            buf[..take].copy_from_slice(&data[pos..pos + take]);
-            self.write_blocks(block, &buf)?;
-            pos += take;
         }
-        if pos < data.len() {
+        if pos < len {
             return Err(FilesystemError::InvalidData(
                 "bfs: stream is shorter than the data written into it".into(),
             ));
@@ -534,16 +551,18 @@ impl<R: Read + Write + Seek + Send> BfsFilesystem<R> {
         // leaks blocks that no directory references.
         let built = (|| -> Result<u64, FilesystemError> {
             match payload {
-                Payload::Bytes(data) => {
-                    if data.is_empty() {
+                Payload::Stream(src, len) => {
+                    if len == 0 {
                         return Ok(0);
                     }
                     let bs = self.sb.block_size as u64;
-                    let need = (data.len() as u64).div_ceil(bs);
-                    let runs = self.alloc_runs(need, inode_block)?;
-                    inode.data = self.build_stream(&runs, data.len() as u64, inode_block)?;
-                    self.write_stream_bytes(&inode.data, data)?;
-                    Ok(data.len() as u64)
+                    let runs = self.alloc_runs(len.div_ceil(bs), inode_block)?;
+                    inode.data = self.build_stream(&runs, len, inode_block)?;
+                    if let Err(e) = self.write_stream_from(&inode.data, src, len) {
+                        let _ = self.free_stream(&inode.data);
+                        return Err(e);
+                    }
+                    Ok(len)
                 }
                 Payload::ShortSymlink(target) => {
                     let mut raw = vec![0u8; DATA_STREAM_SIZE];
@@ -617,7 +636,8 @@ struct NewEntryAttrs {
 
 /// What a freshly created inode is filled with.
 enum Payload<'a> {
-    Bytes(&'a [u8]),
+    /// A file's content, read from the source as it is written.
+    Stream(&'a mut dyn Read, u64),
     ShortSymlink(&'a [u8]),
     Directory,
 }
@@ -638,14 +658,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for BfsFilesystem<R> {
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        let mut bytes = Vec::with_capacity(data_len.min(64 << 20) as usize);
-        data.take(data_len).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 != data_len {
-            return Err(FilesystemError::InvalidData(format!(
-                "bfs create_file: source gave {} bytes, expected {data_len}",
-                bytes.len()
-            )));
-        }
         let mtime = disk_core::times::resolve_or_now(options.unix_times).mtime_or_now() as i64;
         self.create_entry(
             parent,
@@ -656,7 +668,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for BfsFilesystem<R> {
                 gid: options.gid.unwrap_or(0),
                 mtime: mtime << INODE_TIME_SHIFT,
             },
-            Payload::Bytes(&bytes),
+            Payload::Stream(data, data_len),
         )
     }
 

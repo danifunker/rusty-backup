@@ -395,15 +395,21 @@ impl<R: Read + Seek + Send> OfsFilesystem<R> {
         }
         let extents = self.file_extents(attrs)?;
         let mut written = 0u64;
+        // Read each extent 1 MiB at a time, so a large contiguous file is never held whole.
+        const CHUNK: u64 = (1 << 20) / SECTOR;
         for (start, count) in extents {
+            let mut done = 0u64;
+            while done < count && written < want {
+                let take = ((count - done).min(CHUNK) * SECTOR).min(want - written);
+                let sectors = take.div_ceil(SECTOR);
+                let raw = self.read_sectors(start + done, sectors)?;
+                sink.write_all(&raw[..take as usize])?;
+                written += take;
+                done += sectors;
+            }
             if written >= want {
                 break;
             }
-            let take = (count * SECTOR).min(want - written);
-            let sectors = take.div_ceil(SECTOR);
-            let raw = self.read_sectors(start, sectors)?;
-            sink.write_all(&raw[..take as usize])?;
-            written += take;
         }
         Ok(written)
     }

@@ -485,9 +485,9 @@ Review by a separate agent, 2026-11-21, read-only.
 | ARC-006 | S2 | confirmed | extract.rs `write_entry` | Entries mapping to the same host path overwrite each other and existing files. | fixed (a6f17e49) |
 | ARC-007 | S2 | confirmed | extract.rs `write_entry` | MacBinary / AppleDouble output drops dates and Finder flags. | fixed (a6f17e49) |
 | ARC-008 | S2 | plausible | stuffit.rs, stuffit5.rs | usize overflow on 32-bit targets: infinite loop / panic. | fixed (a6f17e49) |
-| ARC-009 | S3 | confirmed | stuffit.rs, mar.rs writers | Sizes / counts truncated and names cut silently, returning Ok. | open |
+| ARC-009 | S3 | confirmed | stuffit.rs, mar.rs writers | Sizes / counts truncated and names cut silently, returning Ok. | fixed (6ca2f3b3) |
 | ARC-010 | S3 | confirmed | extract.rs, mar.rs, maczip.rs | Archives held whole in RAM, several copies. | open |
-| ARC-011 | S3 | confirmed | maczip.rs, stuffit5.rs `parse` | Unreadable forks dropped silently; ZIP CRC unchecked; truncated SIT5 unreported. | open |
+| ARC-011 | S3 | confirmed | maczip.rs, stuffit5.rs `parse` | Unreadable forks dropped silently; ZIP CRC unchecked; truncated SIT5 unreported. | fixed (6ca2f3b3) |
 | ARC-012 | S2 | plausible | stuffit_arsenic.rs `read_block` | Zero-run counters overflow (panic / spin). | fixed (a6f17e49) |
 | ARC-013 | S4 | confirmed | arsenic, lzah, lzh, detect.rs | Duplicate bit readers / PrefixCode / three CRC-32s; BinHex decoded twice. | open |
 
