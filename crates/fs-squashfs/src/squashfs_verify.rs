@@ -68,7 +68,15 @@ pub fn verify_squashfs<R: Read + Seek + Send>(
     // hostile or damaged image could nest deeply enough to blow a recursive
     // one, and the verifier of all things must not itself crash on bad input.
     let mut stack = vec![root];
+    // A directory listed inside its own subtree would loop forever: visit each once.
+    let mut seen_dirs = std::collections::HashSet::new();
     while let Some(entry) = stack.pop() {
+        if entry.entry_type == EntryType::Directory && !seen_dirs.insert(entry.location) {
+            return Err(FilesystemError::InvalidData(format!(
+                "squashfs verify: directory '{}' is listed inside itself",
+                entry.path
+            )));
+        }
         verify_entry(fs, &entry, &mut stack, &mut report)?;
     }
     Ok(report)
