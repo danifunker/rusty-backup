@@ -765,16 +765,18 @@ fn emit_folder_marker(
     Ok(())
 }
 
-/// Encode a name as Mac Roman (lossy ASCII fallback); StuffIt holds at most 31 bytes.
+/// Encode a name as Mac Roman (lossy ASCII fallback), cut to StuffIt's 31 bytes.
 fn mac_name_bytes(name: &str) -> Result<Vec<u8>> {
     let bytes = fs_mac::mac_roman::utf8_to_mac_roman(name).unwrap_or_else(|_| {
         name.chars()
             .map(|c| if c.is_ascii() { c as u8 } else { b'_' })
             .collect()
     });
-    // A cut name could collide with a sibling, so refuse rather than shorten.
+    // StuffIt holds 31 bytes, as the Finder does; cut the name, but say so.
+    let mut bytes = bytes;
     if bytes.len() > 31 {
-        bail!("StuffIt: name '{name}' is longer than 31 Mac characters");
+        log::warn!("StuffIt: name '{name}' cut to 31 Mac characters");
+        bytes.truncate(31);
     }
     Ok(bytes)
 }

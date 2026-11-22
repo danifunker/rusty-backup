@@ -410,9 +410,10 @@ fn write_name(hdr: &mut [u8; HEADER_LEN], name: &str) -> Result<()> {
             .map(|c| if c.is_ascii() { c as u8 } else { b'_' })
             .collect()
     });
-    // A cut name could collide with a sibling, so refuse rather than shorten.
+    let mut bytes = bytes;
     if bytes.len() > NAME_MAX {
-        bail!("MAR: name '{name}' is longer than {NAME_MAX} Mac characters");
+        log::warn!("MAR: name '{name}' cut to {NAME_MAX} Mac characters");
+        bytes.truncate(NAME_MAX);
     }
     hdr[NAME_OFF] = bytes.len() as u8;
     hdr[NAME_OFF + 1..NAME_OFF + 1 + bytes.len()].copy_from_slice(&bytes);
