@@ -585,14 +585,14 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| ADF-001 | S1 | confirmed | fs-adfs adfs.rs `alloc_and_write_data` | Fragment bits not rounded to whole sectors: on E-format the next file overwrites the tail of the previous one. | open |
-| ADF-002 | S1 | confirmed | adfs.rs `delete_entry`, `free_fragment` | Delete frees a whole shared fragment (siblings and parent unreadable); multi-fragment files free only the first. | open |
-| ADF-003 | S1 | confirmed | adfs.rs `remove_dir_entry` | Entry shift runs into the directory tail: every delete corrupts the parent pointer, title, name and EndMasSeq. | open |
-| ADF-004 | S1 | confirmed | adfs.rs `insert_dir_entry` | A 78th entry in a full directory overwrites the tail. | open |
+| ADF-001 | S1 | confirmed | fs-adfs adfs.rs `alloc_and_write_data` | Fragment bits not rounded to whole sectors: on E-format the next file overwrites the tail of the previous one. | fixed (AFIX3) |
+| ADF-002 | S1 | confirmed | adfs.rs `delete_entry`, `free_fragment` | Delete frees a whole shared fragment (siblings and parent unreadable); multi-fragment files free only the first. | fixed (AFIX3) |
+| ADF-003 | S1 | confirmed | adfs.rs `remove_dir_entry` | Entry shift runs into the directory tail: every delete corrupts the parent pointer, title, name and EndMasSeq. | fixed (AFIX3) |
+| ADF-004 | S1 | confirmed | adfs.rs `insert_dir_entry` | A 78th entry in a full directory overwrites the tail. | fixed (AFIX3) |
 | ADF-005 | S2 | plausible | adfs.rs | Sequence numbers not bumped, check byte not recomputed, entries not sorted. | open |
 | ADF-006 | S2 | confirmed | adfs.rs | Free-space chain broken on allocate and never relinked on delete. | open |
 | ADF-007 | S2 | confirmed | adfs.rs `adfs_calczonecheck` | Truncated last zone underflows and panics (fsck, repair, every write). | open |
-| ADF-008 | S2 | confirmed | adfs.rs `delete_entry` | D-format without FSM panics after rewriting the parent; errors fire after the entry is removed. | open |
+| ADF-008 | S2 | confirmed | adfs.rs `delete_entry` | D-format without FSM panics after rewriting the parent; errors fire after the entry is removed. | fixed (AFIX3) |
 | ADF-009 | S2 | confirmed | adfs.rs `DiscRecord::parse` | id_len / log2bpmb / zone_spare unvalidated: shifts overflow. | open |
 | ADF-010 | S2 | confirmed | adfs.rs `read_dir_block` | Capacity from on-disk root size (4 GiB). | open |
 | ADF-011 | S2 | confirmed | adfs.rs `flush_zone` | Backup map zones 1..n-1 go stale on multi-zone discs. | open |

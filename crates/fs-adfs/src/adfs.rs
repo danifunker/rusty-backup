@@ -120,6 +120,14 @@ const DIR_ENTRY_SIZE: usize = 26;
 
 /// 5-byte directory header; 5-byte tail too. Limits are 47 entries for
 /// small format, 77 for big format.
+/// End of a directory's entry area: a 2048-byte (new) directory keeps a 41-byte tail, a
+/// 1280-byte (old) one a 53-byte tail; entries are 26 bytes from offset 5.
+fn dir_entries_end(len: usize) -> usize {
+    let tail = if len >= 2048 { 41 } else { 53 };
+    let area = len.saturating_sub(DIR_SMALL_HEADER + tail);
+    DIR_SMALL_HEADER + area / DIR_ENTRY_SIZE * DIR_ENTRY_SIZE
+}
+
 const DIR_SMALL_HEADER: usize = 5;
 const DIR_SMALL_MAX_ENTRIES: usize = 47;
 
@@ -1860,6 +1868,12 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
         if frag_bits < idlen + 1 {
             frag_bits = idlen + 1;
         }
+        // A fragment covers whole sectors: when a sector spans several map bits (E-format: 8),
+        // round up, or the next fragment starts inside this one's last sector (ADF-001).
+        if fsm_ref.map2blk < 0 {
+            let per_sector = 1u32 << (-fsm_ref.map2blk) as u32;
+            frag_bits = frag_bits.div_ceil(per_sector) * per_sector;
+        }
         let frag_id = fsm_ref.next_free_frag_id();
 
         let (zi, free_start, free_length, predecessor_bit) = self
@@ -2003,7 +2017,8 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
         // Find the first zero-name slot.
         let mut off = DIR_SMALL_HEADER;
         let mut found = false;
-        while off + DIR_ENTRY_SIZE + DIR_SMALL_HEADER <= block.len() {
+        // Only slots before the tail: a full directory must not write over it (ADF-004).
+        while off + DIR_ENTRY_SIZE <= dir_entries_end(block.len()) {
             if block[off] == 0 {
                 found = true;
                 break;
@@ -2052,7 +2067,7 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
         let mut off = DIR_SMALL_HEADER;
         let mut found_at: Option<usize> = None;
         let mut removed: Option<AdfsDirEntry> = None;
-        while off + DIR_ENTRY_SIZE <= block.len() - DIR_SMALL_HEADER {
+        while off + DIR_ENTRY_SIZE <= dir_entries_end(block.len()) {
             let slot: [u8; DIR_ENTRY_SIZE] =
                 block[off..off + DIR_ENTRY_SIZE].try_into().expect("size");
             match parse_dir_entry(&slot) {
@@ -2071,9 +2086,10 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
             FilesystemError::InvalidData(format!("ADFS: dir entry '{}' not found", name))
         })?;
         let removed = removed.unwrap();
-        // Shift later entries up.
+        // Shift later entries up, within the entry area: the directory tail after it (parent,
+        // title, name, sequence) must not move (ADF-003).
         let tail_start = off + DIR_ENTRY_SIZE;
-        let tail_end = block.len() - DIR_SMALL_HEADER;
+        let tail_end = dir_entries_end(block.len());
         block.copy_within(tail_start..tail_end, off);
         // Zero out the freed slot at the end.
         let zero_start = tail_end - DIR_ENTRY_SIZE;
@@ -2395,23 +2411,43 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
             self.write_old_map()?;
             return Ok(());
         }
-        // Splice out the dir entry first (cheap rollback if the FSM
-        // mutate fails: re-insert).
-        let removed = self.remove_dir_entry(parent_indaddr, &entry.name)?;
-        let frag_id = removed.indirect_disc_addr >> 8;
-        // Skip the ROOT_FRAG sanity guard — frag id ≤ 2 are reserved
-        // and shouldn't ever appear in a deletable directory entry.
+        // Every check before anything is changed, so a refusal leaves the directory as it was
+        // (ADF-008). A shared fragment holds other objects too: freeing it would make them
+        // unreadable (ADF-002).
+        let indaddr = entry.location as u32;
+        let frag_id = indaddr >> 8;
         if frag_id <= ADFS_ROOT_FRAG {
             return Err(FilesystemError::InvalidData(format!(
-                "ADFS: refused to free reserved frag id {}",
-                frag_id
+                "ADFS: refused to free reserved frag id {frag_id}"
             )));
         }
+        let shared = indaddr & 0xFF != 0
+            || parent_indaddr >> 8 == frag_id
+            || self
+                .list_directory(parent)?
+                .iter()
+                .any(|e| e.name != entry.name && (e.location as u32) >> 8 == frag_id);
+        if shared {
+            return Err(FilesystemError::Unsupported(format!(
+                "ADFS: '{}' shares its fragment with other objects; deleting it is not supported",
+                entry.name
+            )));
+        }
+        if self.fsm.as_ref().is_none() {
+            return Err(FilesystemError::Unsupported(
+                "ADFS: no free-space map to update".into(),
+            ));
+        }
+        self.remove_dir_entry(parent_indaddr, &entry.name)?;
         let fsm = self.fsm.as_mut().unwrap();
-        if !fsm.free_fragment(frag_id)? {
+        // A fragmented file has several fragments carrying its id: free them all.
+        let mut freed = 0;
+        while fsm.free_fragment(frag_id)? {
+            freed += 1;
+        }
+        if freed == 0 {
             return Err(FilesystemError::InvalidData(format!(
-                "ADFS: frag id {} not found in FSM during delete",
-                frag_id
+                "ADFS: frag id {frag_id} not found in FSM during delete"
             )));
         }
         fsm.restamp_all_checksums();
@@ -3142,6 +3178,41 @@ mod tests {
         let greets = entries.iter().find(|e| e.name == "GREETS").unwrap();
         let data = fs.read_file(greets, payload.len() * 2).unwrap();
         assert_eq!(&data, payload);
+    }
+
+    /// A delete shifts entries within the entry area only: the directory tail (parent,
+    /// title, name, end sequence) is left as it was (ADF-003).
+    #[test]
+    fn delete_leaves_the_directory_tail_alone() {
+        let img = create_blank_adfs("TAIL");
+        let mut fs = AdfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        for n in ["ONE", "TWO", "THREE"] {
+            fs.create_file(&root, n, &mut &b"x"[..], 1, &opts).unwrap();
+        }
+        let indaddr = root.location as u32;
+        let before = fs.read_dir_block(indaddr).unwrap();
+        let tail = dir_entries_end(before.len());
+        let one = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "ONE")
+            .unwrap();
+        fs.delete_entry(&root, &one).unwrap();
+        let after = fs.read_dir_block(indaddr).unwrap();
+        assert_eq!(
+            &after[tail..after.len() - 1],
+            &before[tail..before.len() - 1]
+        );
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
     }
 
     #[test]
