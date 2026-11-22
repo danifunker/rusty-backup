@@ -191,15 +191,22 @@ impl<'a> Chunk<'a> {
     }
 
     /// `(pos, ino, reclen, namelen)` of every record.
+    /// A record whose length or name runs past its room ends the walk, so every caller can
+    /// slice names and subtract lengths without checking again.
     fn records(&self) -> Vec<(usize, u32, usize, usize)> {
         let mut out = Vec::new();
         let mut pos = self.first();
         while pos + DIRENT_HDR <= self.buf.len() {
             let reclen = self.u16(pos + 4) as usize;
-            if reclen == 0 || pos + reclen > self.buf.len() {
+            if reclen < DIRENT_HDR || pos + reclen > self.buf.len() {
                 break;
             }
-            out.push((pos, self.u32(pos), reclen, self.u16(pos + 6) as usize));
+            let ino = self.u32(pos);
+            let nl = self.u16(pos + 6) as usize;
+            if ino != 0 && dirent_len(nl) > reclen {
+                break;
+            }
+            out.push((pos, ino, reclen, nl));
             pos += reclen;
         }
         out
@@ -252,7 +259,7 @@ impl<'a> Chunk<'a> {
         self.put16(pos + 4, reclen as u16);
         self.put16(pos + 6, name.len() as u16);
         self.buf[pos + DIRENT_HDR..pos + DIRENT_HDR + name.len()].copy_from_slice(name);
-        if self.nhash() > 0 {
+        if self.nhash() > 0 && self.first() <= self.buf.len() {
             let h = name_hash(name, self.nhash());
             let head = self.u16(4 + 2 * h);
             self.put16(pos + 8, head);
@@ -265,14 +272,18 @@ impl<'a> Chunk<'a> {
     /// Drop the record at `pos`, merging it into the record before it.
     fn remove(&mut self, pos: usize) {
         let nl = self.u16(pos + 6) as usize;
-        if self.nhash() > 0 {
+        if self.nhash() > 0
+            && self.first() <= self.buf.len()
+            && pos + DIRENT_HDR + nl <= self.buf.len()
+        {
             let name = self.buf[pos + DIRENT_HDR..pos + DIRENT_HDR + nl].to_vec();
             let slot = 4 + 2 * name_hash(&name, self.nhash());
             let next = self.u16(pos + 8);
             let mut link = slot;
-            loop {
+            // A looping or wild hash chain stops at the chunk's edge or after every slot.
+            for _ in 0..self.buf.len() / DIRENT_HDR.max(1) {
                 let at = self.u16(link) as usize;
-                if at == 0 {
+                if at == 0 || at + 10 > self.buf.len() {
                     break;
                 }
                 if at == pos {
@@ -1144,8 +1155,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for VxfsEditor<R> {
         if self.lookup(dir, new_name.as_bytes())?.is_some() {
             return Err(FilesystemError::AlreadyExists(new_name.into()));
         }
-        let ino = self.dir_remove(dir, entry.name.as_bytes())?;
-        self.dir_insert(dir, new_name.as_bytes(), ino)
+        // The new name goes in first: a full directory then fails with the old name intact.
+        let ino = entry.location as u32;
+        self.dir_insert(dir, new_name.as_bytes(), ino)?;
+        if let Err(e) = self.dir_remove(dir, entry.name.as_bytes()) {
+            let _ = self.dir_remove(dir, new_name.as_bytes());
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {

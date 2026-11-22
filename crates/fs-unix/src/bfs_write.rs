@@ -729,15 +729,36 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for BfsFilesystem<R> {
             }
         }
 
+        // Everything to free, gathered and checked before the directory changes: the file,
+        // its attribute directory and each attribute's inode.
+        let mut doomed = vec![target.clone()];
+        if target.attributes.len > 0 {
+            let attr_dir = self.read_inode(target.attributes.to_block(self.sb.ag_shift))?;
+            for (_, loc) in self.read_directory(&attr_dir)? {
+                doomed.push(self.read_inode(loc)?);
+            }
+            doomed.push(attr_dir);
+        }
+        // A corrupt attribute entry pointing back at the file must not free it twice.
+        let mut seen = std::collections::HashSet::new();
+        doomed.retain(|i| seen.insert(i.block));
+        if doomed.iter().any(|i| i.data.double_indirect.len > 0) {
+            return Err(FilesystemError::Unsupported(
+                "bfs: freeing a double-indirect stream is not implemented".into(),
+            ));
+        }
+
         let mut tree = self.load_tree(&parent_inode)?;
         if !tree.remove(&entry.name)? {
             return Err(FilesystemError::NotFound(entry.path.clone()));
         }
         self.store_tree(&mut parent_inode, &tree)?;
 
-        self.free_stream(&target.data)?;
-        let inode_run = self.block_to_run(target.block, self.inode_blocks() as u16);
-        self.free_run(inode_run)?;
+        for inode in &doomed {
+            self.free_stream(&inode.data)?;
+            let inode_run = self.block_to_run(inode.block, self.inode_blocks() as u16);
+            self.free_run(inode_run)?;
+        }
         self.sync_superblock()
     }
 

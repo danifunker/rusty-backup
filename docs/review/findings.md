@@ -406,14 +406,14 @@ drivers are merged.
 | UNX-035 | S2 | confirmed | ufs_fsck.rs `record_frags` | Only the first fragment of each block checked: shared fragments, link counts, cg_cs pass. | fixed (4fb60164) |
 | UNX-036 | S2 | confirmed | ufs.rs | `frag * fsize` on UFS2 64-bit pointers unchecked. | fixed (4fb60164) |
 | UNX-037 | S2 | plausible | ufs.rs `walk_inode_blocks` | Bounded by `di_size` only: a huge size with full triple indirects hangs. | fixed (4fb60164) |
-| UNX-038 | S2 | confirmed | jfs.rs `read_fileset_inode` | pmap read per extent, not per inode: after one delete, other inodes in that extent fail to read. | open |
-| UNX-039 | S2 | confirmed | jfs_fsck.rs; jfs.rs | lost+found inode written before an insert that then fails: each repair leaks a directory. | open |
+| UNX-038 | S2 | confirmed | jfs.rs `read_fileset_inode` | pmap read per extent, not per inode: after one delete, other inodes in that extent fail to read. | fixed (b6e84a55) |
+| UNX-039 | S2 | confirmed | jfs_fsck.rs; jfs.rs | lost+found inode written before an insert that then fails: each repair leaks a directory. | fixed (b6e84a55) |
 | UNX-040 | S2 | confirmed | btrfs.rs `parse_btrfs_superblock` | `sys_chunk_array_size` over 3285 panics at open. | fixed (4fb60164) |
 | UNX-041 | S2 | confirmed | btrfs.rs | Compressed extents read as zeros (should be Unsupported); PREALLOC returns stale bytes; short items zero-filled. | fixed (4fb60164) |
 | UNX-042 | S2 | plausible | btrfs.rs `resize_btrfs_in_place` | DEV_ITEM and mirror superblocks not updated; I/O errors return Ok. | fixed (4fb60164); DEV_ITEM patch not yet run past btrfs check |
-| UNX-043 | S2 | confirmed | reiserfs.rs `list_directory` | Each child re-walks every leaf: quadratic listing. | open |
-| UNX-044 | S2 | plausible | reiserfs.rs | `s_bmap_nr` unchecked: bitmap reads past the volume; compact stream too long. | open |
-| UNX-045 | S2 | confirmed | jfs.rs, jfs1.rs | Unchecked size multiplications. | open |
+| UNX-043 | S2 | confirmed | reiserfs.rs `list_directory` | Each child re-walks every leaf: quadratic listing. | fixed (b6e84a55) |
+| UNX-044 | S2 | plausible | reiserfs.rs | `s_bmap_nr` unchecked: bitmap reads past the volume; compact stream too long. | fixed (b6e84a55) |
+| UNX-045 | S2 | confirmed | jfs.rs, jfs1.rs | Unchecked size multiplications. | fixed (b6e84a55) |
 | UNX-046 | S2 | confirmed | bfs.rs `parse`; bfs_fsck.rs | Geometry not cross-checked: fsck loops 2^60 times. | open |
 | UNX-047 | S2 | confirmed | bfs_write.rs `delete_entry` | Tree stored and runs freed before the double-indirect refusal; attribute dirs never freed. | open |
 | UNX-048 | S2 | confirmed | vxfs_edit.rs | Panics on hostile input (namelen slice, underflow, maps / iau indexing). | open |

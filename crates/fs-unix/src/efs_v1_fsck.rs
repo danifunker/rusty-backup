@@ -468,7 +468,7 @@ fn check_connectivity<R: Read + Seek>(
         if !inode.is_dir() {
             continue;
         }
-        let entries = match fs.read_dir_entries(&inode) {
+        let entries = match fs.read_dir_entries_all(&inode) {
             Ok(e) => e,
             Err(e) => {
                 b.warn(

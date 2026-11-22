@@ -364,6 +364,21 @@ impl BfsSuperBlock {
                 "bfs: num_blocks {num_blocks} is not positive"
             )));
         }
+        // The geometry has to hang together, since fsck and the allocator loop over it.
+        let num_ags = endian.u32(buf, 80);
+        let used_blocks = endian.i64(buf, 56);
+        if !(9..=16).contains(&block_shift)
+            || num_blocks > 1 << 40
+            || used_blocks < 0
+            || used_blocks > num_blocks
+            // BeOS rounds the group count down or up, so allow either.
+            || (num_ags as u64).abs_diff((num_blocks as u64) >> ag_shift) > 1
+        {
+            return Err(FilesystemError::Parse(format!(
+                "bfs: geometry does not add up ({num_blocks} blocks of {block_size}, \
+                 {num_ags} groups of 2^{ag_shift}, {used_blocks} used)"
+            )));
+        }
 
         let raw_name = &buf[..32];
         let end = raw_name.iter().position(|&c| c == 0).unwrap_or(32);

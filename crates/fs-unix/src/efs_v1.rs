@@ -808,6 +808,22 @@ impl<R: Read + Seek> EfsV1Filesystem<R> {
         &mut self,
         inode: &EfsV1Inode,
     ) -> Result<Vec<(u32, String)>, FilesystemError> {
+        self.read_dir_entries_with(inode, false)
+    }
+
+    /// Every entry, out-of-range inode numbers included, for fsck to report.
+    pub(crate) fn read_dir_entries_all(
+        &mut self,
+        inode: &EfsV1Inode,
+    ) -> Result<Vec<(u32, String)>, FilesystemError> {
+        self.read_dir_entries_with(inode, true)
+    }
+
+    fn read_dir_entries_with(
+        &mut self,
+        inode: &EfsV1Inode,
+        keep_bad: bool,
+    ) -> Result<Vec<(u32, String)>, FilesystemError> {
         let data = self.read_data(inode, EFS_V1_SANE_ALLOC)?;
         let total = self.sb.total_inodes();
         let mut out = Vec::new();
@@ -824,7 +840,7 @@ impl<R: Read + Seek> EfsV1Filesystem<R> {
             }
             // A dirent pointing past the inode table is damage, not a file;
             // the entry is dropped rather than failing the whole listing.
-            if inum >= total {
+            if inum >= total && !keep_bad {
                 log::warn!(
                     "EFS v1 directory inode {} references inode {inum}, past the {total}-inode table",
                     inode.inum
