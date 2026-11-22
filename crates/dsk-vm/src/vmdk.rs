@@ -627,7 +627,9 @@ pub fn build_monolithic_flat_descriptor(disk_size_bytes: u64, flat_filename: &st
 /// Errors when the descriptor names more than one FLAT extent (split layouts
 /// would need the caller to pick *which* extent to edit), references a ZERO
 /// extent (no backing file), or is a sparse `KDMV` image (Phase 4).
-pub fn open_flat_extent_for_edit(descriptor_path: &Path) -> Result<File> {
+/// Only the tests use it; edits go through [`VmdkFlatReader::open_rw`].
+#[cfg(test)]
+fn open_flat_extent_for_edit(descriptor_path: &Path) -> Result<File> {
     let (text, _embedded_data_start, dir) = read_descriptor(descriptor_path)?;
     let descriptor = Descriptor::parse(&text, &dir)?;
     let flat_extents: Vec<&ExtentSpec> = descriptor
