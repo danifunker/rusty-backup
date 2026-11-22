@@ -500,7 +500,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | DAP-003 | S2 | plausible | dc42.rs `encode_dc42_with_tags`; dart.rs | Tag checksum range, format byte and disk_format look off-spec; tagged DARTs all named "Lisa". | fixed (3de2eee2) |
 | DAP-004 | S4 | confirmed | dc42.rs | Disk names UTF-8 instead of Mac Roman. | fixed (27379918) |
 | DAP-005 | S4 | plausible | woz_write.rs `FORMAT_35_SSDD` | 400K format byte disagrees with dc42.rs; 3.5" WOZ marked Apple ][. | fixed (27379918) |
-| DAP-006 | S4 | confirmed | woz.rs, moof.rs | Duplicate readers, extra TRKS copy, WOZ CRC unchecked, dead code. | open |
+| DAP-006 | S4 | confirmed | woz.rs, moof.rs | Duplicate readers, extra TRKS copy, WOZ CRC unchecked, dead code. | partly fixed (27379918: WOZ CRC checked; duplicate readers still open) |
 
 ## crates/fs-squashfs, crates/dsk-vm, crates/fs-tar
 
@@ -526,7 +526,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | TAR-003 | S2 | confirmed | mem_archive.rs | Small compressed archives inflated fully into RAM uncapped; indexed path fills disk; zip capacity from declared size. | fixed (69648efe) |
 | TAR-004 | S2 | plausible | tar_import.rs `open_tar_stream` | Multi-member .tar.gz imports only the first member. | fixed (69648efe) |
 | TAR-005 | S2 | plausible | tar_export.rs `walk` | Export recursion has no depth / visited guard. | fixed (69648efe) |
-| TAR-006 | S4 | confirmed | import_sink.rs, tar_export.rs, mem_archive.rs, zstd_compat.rs, zip_import.rs | Stats merge drops a field; stale docs; pure-zstd can't browse .tar.zst; duplicate date code. | open |
+| TAR-006 | S4 | confirmed | import_sink.rs, tar_export.rs, mem_archive.rs, zstd_compat.rs, zip_import.rs | Stats merge drops a field; stale docs; pure-zstd can't browse .tar.zst; duplicate date code. | partly fixed (b0a05a07: stats merge; docs, zstd browse and date code still open) |
 
 ## crates/fs-cpm
 
@@ -547,7 +547,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | CPM-011 | S3 | confirmed | cpm.rs `validate_cpm_name` | Wildcard / separator characters accepted in names. | fixed (9bd44acf) |
 | CPM-012 | S3 | confirmed | cpm.rs | Non-ASCII glyphs in user-visible errors. | fixed (9bd44acf) |
 | CPM-013 | S3 | confirmed | cpm.rs `read_file`, `create_file` | Whole-file buffering (DC-006 for this crate; largest preset 4 MiB). | open |
-| CPM-014 | S4 | confirmed | cpm.rs, cpm_diskdefs.rs | Dead locals and unread DPB fields; `tracks` documented as a bounds check but unused. | open |
+| CPM-014 | S4 | confirmed | cpm.rs, cpm_diskdefs.rs | Dead locals and unread DPB fields; `tracks` documented as a bounds check but unused. | partly fixed (562d5948: tracks doc; dead locals still open) |
 
 ## crates/dsk-dmg, dsk-clonezilla, dsk-floppy, dsk-flux, dsk-imz, dsk-tape
 

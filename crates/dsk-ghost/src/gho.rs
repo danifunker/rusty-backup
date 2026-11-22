@@ -19,15 +19,12 @@
 //!   itself) terminated by a record header. Wired into the GUI via
 //!   `prepare_disk_image_path`.
 //!
-//!   **File-aware mode is deferred.** Despite the plan ordering SECTOR
-//!   after file-aware, the fixture corpus showed SECTOR mode is the path
-//!   that yields a mountable disk image with modest effort, while
-//!   file-aware mode interleaves boot-sector / FAT-entry / directory /
-//!   file-extent metadata records (types 0x0017, 0x0004, 0x0102/3/4)
-//!   with 0x0002 cluster-data records and needs a full filesystem
-//!   rebuilder. The walker (`parse_gho_image`) + `decode_data_blocks_to`
-//!   are kept as scaffolding for that future slice.
-//! - **5.6-span (this commit):** **multi-file span sets.**
+//!   **File-aware mode** (boot-sector / FAT-entry / directory / file-extent
+//!   metadata records, types 0x0017, 0x0004, 0x0102/3/4, interleaved with
+//!   0x0002 cluster-data records) is rebuilt as well: `parse_gho_image`
+//!   walks the stream, and [`GhoReader`] lays each partition out at its
+//!   place behind a synthesized partition table.
+//! - **5.6-span:** **multi-file span sets.**
 //!   `discover_gho_span_set(picked)` walks the picked file's directory
 //!   and returns the ordered set (primary + numbered spans), handling
 //!   three corpus naming patterns: stem-prefix `.GHS` siblings (incl.
@@ -37,7 +34,8 @@
 //!   skipped on every continuation — so SECTOR-mode decode reads one
 //!   continuous stream. The user can pick the primary OR any span
 //!   sibling and the whole set decodes.
-//! - **next:** file-aware filesystem reconstruction; password decrypt.
+//! - **Passwords:** `gho_crypto` derives and checks the seed; the readers
+//!   decrypt per record body (file-aware) or per 32 KiB chunk (SECTOR).
 //!
 //! Layout reverse-engineered from our own fixture corpus (12+ files
 //! spanning Ghost 7.5 and 11.5, with every combination of compression /
@@ -338,17 +336,8 @@ pub fn format_gho_info(path: &Path) -> Result<String> {
 
 /// Materialize a Norton Ghost backup into a raw disk image temp file.
 ///
-/// **Session 5.5a scope**: parses the container header and returns precise
-/// errors for cases not yet supported (password-protected, SECTOR mode,
-/// multi-partition disk reconstruction, unknown container version).
-///
-/// Single-partition file-aware backups decode end-to-end here: the inner
-/// record stream walker finds the lone partition, its block-stream is
-/// decompressed (none / Fast-LZ / zlib) into a fresh tempdir, and the
-/// resulting raw partition image is returned via [`GhoMaterialized`].
-/// Multi-partition full-disk reconstruction (placing each decoded
-/// partition at its MBR-declared LBA) is the next slice — until then we
-/// return a precise error pointing at the deferred session.
+/// SECTOR and file-aware backups, single- or multi-partition, decode into a
+/// fresh tempdir; an unknown container version or a missing password is an error.
 pub fn materialize_gho_to_temp(path: &Path) -> Result<GhoMaterialized> {
     materialize_gho_to_temp_with_password(path, None)
 }
