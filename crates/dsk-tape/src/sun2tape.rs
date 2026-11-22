@@ -27,7 +27,7 @@ use disk_core::filesystem::{Filesystem, FilesystemError};
 const BLOCK: u64 = 512;
 const MAGIC: &[u8; 8] = b"SUN2TAPE";
 const MAX_VOLUMES: usize = 3;
-const MAX_FILES: usize = 30;
+pub(crate) const MAX_FILES: usize = 30;
 const COMPRESS_MAGIC: [u8; 2] = [0x1F, 0x9D];
 
 /// Whether `head` (the image's first block) is a `SUN2TAPE` table.

@@ -31,6 +31,8 @@ const BLOCK: usize = 512;
 /// One tape file: where it sits in the table and its (possibly edited) bytes.
 struct TapeBody {
     volume: usize,
+    /// Slot in the volume's table, so zero-length files between bodies keep their place.
+    index: usize,
     kind: TapeFileKind,
     bytes: Vec<u8>,
 }
@@ -40,6 +42,8 @@ pub struct TapeEditor {
     path: PathBuf,
     head: Vec<u8>,
     volumes: usize,
+    /// Table slots per volume, counting zero-length files (which have no body).
+    slots: Vec<usize>,
     bodies: Vec<TapeBody>,
     /// Display node path of each tape file (`/NN-name` or `/volN/NN-name`).
     nodes: Vec<String>,
@@ -97,6 +101,7 @@ impl TapeEditor {
             let end = (f.start + f.len) as usize;
             bodies.push(TapeBody {
                 volume: f.volume,
+                index: f.index,
                 kind: f.kind,
                 bytes: image
                     .get(f.start as usize..end)
@@ -111,10 +116,18 @@ impl TapeEditor {
                 format!("/{}", f.name)
             });
         }
+        let slots = (0..volumes)
+            .map(|v| {
+                let w = (4 + 32 * v) * 4;
+                (u32::from_be_bytes([image[w], image[w + 1], image[w + 2], image[w + 3]]) as usize)
+                    .min(crate::sun2tape::MAX_FILES)
+            })
+            .collect();
         Ok(Self {
             path: path.to_path_buf(),
             head: image[..BLOCK].to_vec(),
             volumes,
+            slots,
             bodies,
             nodes,
             view: Some(view),
@@ -128,9 +141,9 @@ impl TapeEditor {
         let mut out = vec![0u8; BLOCK];
         let mut block = 1u32;
         for v in 0..self.volumes {
-            let files: Vec<&TapeBody> = self.bodies.iter().filter(|b| b.volume == v).collect();
+            let n = self.slots[v];
             let w = 4 + 32 * v;
-            if files.len() + 1 > 31 {
+            if n + 1 > 31 {
                 return Err(FilesystemError::InvalidData(
                     "Sun tape: too many files in a volume".into(),
                 ));
@@ -138,11 +151,14 @@ impl TapeEditor {
             let mut put = |word: usize, value: u32| {
                 head[word * 4..word * 4 + 4].copy_from_slice(&value.to_be_bytes());
             };
-            put(w, files.len() as u32);
+            put(w, n as u32);
             put(w + 1, block);
-            for (k, f) in files.iter().enumerate() {
-                out.extend_from_slice(&f.bytes);
-                out.resize(out.len().div_ceil(BLOCK) * BLOCK, 0);
+            for k in 0..n {
+                let body = self.bodies.iter().find(|b| b.volume == v && b.index == k);
+                if let Some(f) = body {
+                    out.extend_from_slice(&f.bytes);
+                    out.resize(out.len().div_ceil(BLOCK) * BLOCK, 0);
+                }
                 block = (out.len() / BLOCK) as u32;
                 put(w + 2 + k, block);
             }
@@ -555,6 +571,29 @@ mod tests {
             std::fs::read(dir.path().join("t.qic.bak")).unwrap(),
             original
         );
+    }
+
+    #[test]
+    fn a_zero_length_tape_file_keeps_its_slot_on_rebuild() {
+        let mut img = vec![0u8; BLOCK];
+        img[0..8].copy_from_slice(b"SUN2TAPE");
+        img[8..12].copy_from_slice(&1u32.to_be_bytes());
+        img[12..16].copy_from_slice(&1u32.to_be_bytes());
+        img[16..20].copy_from_slice(&3u32.to_be_bytes());
+        // Files 0 and 2 hold a block each; file 1 is empty (start == end).
+        for (k, b) in [1u32, 2, 2, 3].iter().enumerate() {
+            img[20 + k * 4..24 + k * 4].copy_from_slice(&b.to_be_bytes());
+        }
+        let mut text = b"SunOS tape\n".to_vec();
+        text.resize(BLOCK, 0);
+        img.extend_from_slice(&text);
+        let mut tar = tar_member("etc/motd", b"hello\n");
+        tar.resize(BLOCK, 0);
+        img.extend_from_slice(&tar[..BLOCK]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.qic");
+        let ed = TapeEditor::open(Cursor::new(img.clone()), 0, Some(&path)).unwrap();
+        assert_eq!(ed.build_image().unwrap()[..BLOCK], img[..BLOCK]);
     }
 
     #[test]

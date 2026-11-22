@@ -565,8 +565,8 @@ Review by a separate agent, 2026-11-21, read-only.
 | CZL-003 | S2 | confirmed | dsk-clonezilla metadata_scan.rs `identify_ext_metadata_blocks` | Off-by-4 bounds check panics the scan thread and poisons the cache mutex. | fixed (64152ec1) |
 | CZL-004 | S2 | confirmed | dsk-clonezilla metadata_scan.rs | Unchecked shifts / underflow; BPB-driven ranges insert billions of entries. | fixed (64152ec1) |
 | CZL-005 | S4 | confirmed | dsk-clonezilla block_cache.rs | Unneeded `unsafe impl Send`. | open |
-| FLP-001 | S2 | confirmed | dsk-floppy edsk.rs, d88.rs flat decode | Missing tracks / sectors shift every later sector (no zero-filled holes). | open |
-| FLP-002 | S2 | plausible | dsk-floppy g64.rs `decode_track` | Sectors crossing the GCR wrap lost; bad-checksum sectors zeroed silently. | open |
+| FLP-001 | S2 | confirmed | dsk-floppy edsk.rs, d88.rs flat decode | Missing tracks / sectors shift every later sector (no zero-filled holes). | fixed (1c1db841) |
+| FLP-002 | S2 | plausible | dsk-floppy g64.rs `decode_track` | Sectors crossing the GCR wrap lost; bad-checksum sectors zeroed silently. | fixed (1c1db841) |
 | FLP-003 | S4 | confirmed | dsk-floppy msa.rs, dim.rs | Public encoder panics via `assert_eq!`; dead `if`. | open |
 | FLX-001 | S2 | confirmed | dsk-flux flux/mod.rs `decode_disk` | Heads / cylinders from the max over stray sector IDs: the whole image layout shifts. | fixed (50641b3b) |
 | FLX-002 | S2 | confirmed | dsk-flux flux/mfm.rs `vote` | Voting always checks the MFM CRC: FM / Amiga sectors never recover; false clean votes on Amiga. | fixed (50641b3b) |
