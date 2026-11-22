@@ -568,11 +568,11 @@ Review by a separate agent, 2026-11-21, read-only.
 | FLP-001 | S2 | confirmed | dsk-floppy edsk.rs, d88.rs flat decode | Missing tracks / sectors shift every later sector (no zero-filled holes). | open |
 | FLP-002 | S2 | plausible | dsk-floppy g64.rs `decode_track` | Sectors crossing the GCR wrap lost; bad-checksum sectors zeroed silently. | open |
 | FLP-003 | S4 | confirmed | dsk-floppy msa.rs, dim.rs | Public encoder panics via `assert_eq!`; dead `if`. | open |
-| FLX-001 | S2 | confirmed | dsk-flux flux/mod.rs `decode_disk` | Heads / cylinders from the max over stray sector IDs: the whole image layout shifts. | open |
-| FLX-002 | S2 | confirmed | dsk-flux flux/mfm.rs `vote` | Voting always checks the MFM CRC: FM / Amiga sectors never recover; false clean votes on Amiga. | open |
-| FLX-003 | S2 | confirmed | dsk-flux flux/mfm.rs `to_bits_pll` | PLL bit stream unbounded: a 100 KB track runs out of memory. | open |
-| FLX-004 | S2 | confirmed | dsk-flux flux/mfm_emu.rs `decode_to` | Seek does not extend the temp file: truncated disk; header-sized allocations unchecked. | open |
-| FLX-005 | S2 | confirmed | dsk-flux flux/kryoflux.rs `parse_stream` | u32 overflow counter overflows (panic / wrong interval). | open |
+| FLX-001 | S2 | confirmed | dsk-flux flux/mod.rs `decode_disk` | Heads / cylinders from the max over stray sector IDs: the whole image layout shifts. | fixed (50641b3b) |
+| FLX-002 | S2 | confirmed | dsk-flux flux/mfm.rs `vote` | Voting always checks the MFM CRC: FM / Amiga sectors never recover; false clean votes on Amiga. | fixed (50641b3b) |
+| FLX-003 | S2 | confirmed | dsk-flux flux/mfm.rs `to_bits_pll` | PLL bit stream unbounded: a 100 KB track runs out of memory. | fixed (50641b3b) |
+| FLX-004 | S2 | confirmed | dsk-flux flux/mfm_emu.rs `decode_to` | Seek does not extend the temp file: truncated disk; header-sized allocations unchecked. | fixed (50641b3b) |
+| FLX-005 | S2 | confirmed | dsk-flux flux/kryoflux.rs `parse_stream` | u32 overflow counter overflows (panic / wrong interval). | fixed (50641b3b) |
 | FLX-006 | S4 | confirmed | dsk-flux mfm_emu.rs, mfm.rs | `crc16` twice; byte helpers duplicate disk_core. | open |
 | IMZ-001 | S2 | confirmed | dsk-imz imz.rs `open_with_password` | Capacity from ZIP header sizes; whole entry in RAM with no cap. | open |
 | TAP-001 | S3 | confirmed | dsk-tape sun2tape.rs, sun2tape_edit.rs | Tape files read whole into RAM (up to three copies). | open |

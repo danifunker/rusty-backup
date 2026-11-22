@@ -593,12 +593,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Ti99Filesystem<R> {
                 "TI-99 directory full (127 files)".into(),
             ));
         }
-        let n_data = data_len.div_ceil(SECTOR) as u16;
-        if n_data as u64 > BITMAP_BITS as u64 {
+        let n_sectors = data_len.div_ceil(SECTOR);
+        if n_sectors > BITMAP_BITS as u64 {
             return Err(FilesystemError::InvalidData(
                 "file too large for TI-99".into(),
             ));
         }
+        let n_data = n_sectors as u16;
         // Allocate the FDR sector, then the data sectors.
         let fdr_sector = self.alloc_sectors(1).ok_or_else(|| {
             FilesystemError::DiskFull("no free sector for the file descriptor".into())
@@ -612,6 +613,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Ti99Filesystem<R> {
                 )));
             }
         };
+        // The FDR holds at most 76 cluster runs; refuse before writing any data.
+        let clusters = pack_clusters(&data_sectors);
+        if FDR_CLUSTERS_OFF + clusters.len() > SECTOR as usize {
+            for &s in data_sectors.iter().chain(std::iter::once(&fdr_sector)) {
+                self.bitmap_set(s, false);
+            }
+            return Err(FilesystemError::DiskFull(
+                "free space too fragmented for one TI-99 file (over 76 runs)".into(),
+            ));
+        }
         // Write the payload across the data sectors, zero-padding the last one.
         let mut remaining = data_len;
         for &s in &data_sectors {
@@ -629,7 +640,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Ti99Filesystem<R> {
         fdr[0x0C] = 0x01; // program
         fdr[0x0E..0x10].copy_from_slice(&n_data.to_be_bytes());
         fdr[0x10] = (data_len % SECTOR) as u8; // EOF offset (0 = full last sector)
-        let clusters = pack_clusters(&data_sectors);
         fdr[FDR_CLUSTERS_OFF..FDR_CLUSTERS_OFF + clusters.len()].copy_from_slice(&clusters);
         self.write_sector(fdr_sector, &fdr)?;
 

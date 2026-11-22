@@ -342,7 +342,7 @@ impl<R: Read + Seek + Send> Os9Filesystem<R> {
     /// Read a file/directory's full contents by concatenating its segments
     /// and truncating to the declared size.
     fn read_fd_data(&mut self, fd: &FileDescriptor) -> Result<Vec<u8>, FilesystemError> {
-        let mut out = Vec::with_capacity(fd.size as usize);
+        let mut out = Vec::with_capacity((fd.size as usize).min(1 << 20));
         self.copy_fd_data(fd, u64::MAX, &mut out)?;
         Ok(out)
     }
@@ -473,7 +473,7 @@ impl<R: Read + Seek + Send> Filesystem for Os9Filesystem<R> {
                 entry.path
             )));
         }
-        let mut data = Vec::with_capacity((fd.size as usize).min(max_bytes));
+        let mut data = Vec::with_capacity((fd.size as usize).min(max_bytes).min(1 << 20));
         self.copy_fd_data(&fd, max_bytes as u64, &mut data)?;
         Ok(data)
     }
@@ -967,20 +967,31 @@ impl<R: Read + Write + Seek + Send> Os9Filesystem<R> {
                 let zero = vec![0u8; (count * self.sector) as usize];
                 self.write_sectors(lsn, &zero)?;
             }
-            merge_segments(&mut dir_fd.segments, new_seg);
-            if dir_fd.segments.len() > MAX_SEGMENTS {
+            let mut grown = dir_fd.segments.clone();
+            merge_segments(&mut grown, new_seg.clone());
+            if grown.len() > MAX_SEGMENTS {
+                self.free_segments(&new_seg);
                 return Err(FilesystemError::DiskFull(
                     "directory too fragmented to grow".into(),
                 ));
             }
+            dir_fd.segments = grown;
         }
 
         // Write the new entry at offset == old size.
         let slot = (dir_fd.size / DIR_ENTRY_LEN as u64) as usize;
         dir_fd.size = new_size;
         self.write_dir_slot(&dir_fd, slot, &entry)?;
-        // Persist the updated directory FD (size + possibly new segment).
-        let fd_img = Self::build_fd(dir_fd.attributes, dir_fd.size, &dir_fd.segments, None);
+        // Patch size and segments in place so owner, dates and link count survive.
+        let mut fd_img = self.read_sectors(dir_lsn, 1)?;
+        fd_img[9..13].copy_from_slice(&(dir_fd.size as u32).to_be_bytes());
+        fd_img[SEG_LIST_OFFSET..256].fill(0);
+        let mut off = SEG_LIST_OFFSET;
+        for &(lsn, count) in &dir_fd.segments {
+            fd_img[off..off + 3].copy_from_slice(&put_u24_be(lsn));
+            fd_img[off + 3..off + 5].copy_from_slice(&(count as u16).to_be_bytes());
+            off += SEG_ENTRY_LEN;
+        }
         self.write_sectors(dir_lsn, &fd_img)?;
         Ok(())
     }

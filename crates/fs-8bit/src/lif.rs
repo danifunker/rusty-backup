@@ -96,6 +96,10 @@ fn read_raw<R: Read + Seek>(reader: &mut R, base: u64) -> Option<(Vec<u8>, Vec<u
     }
     let dir_start = BigEndian::read_u32(&head[8..12]) as u64;
     let dir_len = BigEndian::read_u32(&head[16..20]) as usize;
+    // A LIF directory is a few sectors; a huge length is a corrupt or foreign header.
+    if dir_len > 4096 {
+        return None;
+    }
     let mut dir = vec![0u8; dir_len * LIF_SECTOR as usize];
     reader
         .seek(SeekFrom::Start(base + dir_start * LIF_SECTOR))
@@ -381,9 +385,15 @@ impl<R: Read + Seek + Send> Filesystem for LifFilesystem<R> {
     ) -> Result<Vec<u8>, FilesystemError> {
         let file = self.file_by_entry(entry)?;
         let (start, len) = (file.start_byte, (file.len_bytes as usize).min(max_bytes));
-        let mut out = vec![0u8; len];
         self.reader.seek(SeekFrom::Start(self.base + start))?;
-        self.reader.read_exact(&mut out)?;
+        let mut out = Vec::with_capacity(len.min(1 << 20));
+        (&mut self.reader).take(len as u64).read_to_end(&mut out)?;
+        if out.len() < len {
+            return Err(FilesystemError::InvalidData(format!(
+                "LIF file '{}' runs past the end of the image",
+                entry.name
+            )));
+        }
         Ok(out)
     }
 

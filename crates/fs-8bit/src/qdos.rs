@@ -105,7 +105,6 @@ use disk_core::filesystem::{
 pub const QXLWIN_SIGNATURE: &[u8; 4] = b"QLWA";
 
 const HEADER_BYTES: usize = 64;
-const FAT_END_LO: u16 = 0xFFF8;
 const DIR_ENTRY_SIZE: usize = 64;
 /// Per-file QDOS header, 64 bytes, mirroring the directory entry layout.
 /// Sits at byte 0 of every regular file's cluster chain; user data starts
@@ -298,7 +297,8 @@ impl<R: Read + Seek + Send> QdosFilesystem<R> {
         let mut visited = std::collections::HashSet::new();
         let mut block = first;
         for _ in 0..MAX_CHAIN_HOPS {
-            if block == 0 || block >= FAT_END_LO {
+            // Chains end at 0; any cluster up to cc - 1 is a valid link.
+            if block == 0 || block >= self.header.cc {
                 break;
             }
             if !visited.insert(block) {
@@ -319,7 +319,7 @@ impl<R: Read + Seek + Send> QdosFilesystem<R> {
         first_cluster: u16,
         len: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let mut buf = Vec::with_capacity(len);
+        let mut buf = Vec::with_capacity(len.min(1 << 20));
         self.copy_chain_bytes(first_cluster, 0, len as u64, &mut buf)?;
         Ok(buf)
     }
@@ -418,7 +418,7 @@ impl<R: Read + Seek + Send> Filesystem for QdosFilesystem<R> {
         // matching sQLux semantics. `entry.size` was already adjusted in
         // `list_directory` to the user-visible length.
         let want = (entry.size as usize).min(max_bytes);
-        let mut out = Vec::with_capacity(want);
+        let mut out = Vec::with_capacity(want.min(1 << 20));
         self.copy_chain_bytes(
             entry.location as u16,
             FILE_HEADER_BYTES as u64,
@@ -1016,9 +1016,6 @@ pub fn resize_qdos_in_place(
         }
         free_chain.push(cur);
         cur = fat_lookup(&fat, cur);
-        if cur >= FAT_END_LO {
-            break;
-        }
     }
 
     if (free_chain.len() as u16) != old_fc {
