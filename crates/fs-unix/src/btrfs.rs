@@ -1032,12 +1032,14 @@ impl<R: Read + Seek + Send> CompactBtrfsReader<R> {
             merged.push((start, end));
         }
 
-        // Also include the superblock region (0x10000..0x11000) as allocated —
-        // it must be preserved for the filesystem to be valid.
-        // Insert it into the merged ranges.
-        let sb_start = SUPERBLOCK_OFFSET;
-        let sb_end = SUPERBLOCK_OFFSET + 4096;
-        merged.push((sb_start, sb_end));
+        // Keep the boot area and the primary superblock (bootloaders such as GRUB live in the
+        // first 64 KiB), plus the 64 MiB and 256 GiB superblock mirrors that fit.
+        merged.push((0, SUPERBLOCK_OFFSET + 4096));
+        for mirror in [0x400_0000u64, 0x40_0000_0000] {
+            if mirror + 4096 <= total_bytes {
+                merged.push((mirror, mirror + 4096));
+            }
+        }
         merged.sort_by_key(|&(s, _)| s);
 
         // Re-merge after adding superblock

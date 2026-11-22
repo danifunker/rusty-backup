@@ -217,18 +217,10 @@ const DTROOT_OFF_FREELIST: usize = 19; // s8
 const DTROOT_OFF_IDOTDOT: usize = 20; // u32 — parent inode #
 const DTROOT_OFF_STBL: usize = 24; // s8[8] — sorted entry index table
 
-/// Maximum directory size we accept inline (i.e. inside the dinode's
-/// dtroot). When `di_size > DT_INLINE_CAP`, the dtree has spilled to
-/// off-disk leaf/internal pages — not supported in this J.3 first
-/// slice. Empirically the kernel keeps a directory inline while its
-/// total entry count fits in the 8 free slots (~7 short-name entries),
-/// so the cap below is generous.
-pub(crate) const DT_INLINE_CAP: u64 = 4096;
-
 /// `IDATASIZE` — the inode inline-data size mkfs / fsck stamp as the
 /// `di_size` of an empty inline directory (`jfs_filsys.h`). fsck does not
 /// validate directory size, but a freshly created `/lost+found` uses this
-/// so the value is kernel-faithful and stays under [`DT_INLINE_CAP`].
+/// so the value is kernel-faithful.
 const IDATASIZE: u64 = 256;
 
 // ---- External dtpage layout (4 KiB) ----

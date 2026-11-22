@@ -205,6 +205,17 @@ impl MinixSuperblock {
                  block_size={block_size})"
             )));
         }
+        // As Linux's minix_fill_super: bitmaps too small to cover every inode and zone are refused.
+        let bits = block_size as u64 * 8;
+        if (imap_blocks as u64) < (ninodes as u64 + 1).div_ceil(bits)
+            || (zmap_blocks as u64) < (zones as u64 - firstdatazone as u64 + 1).div_ceil(bits)
+        {
+            return Err(FilesystemError::InvalidData(format!(
+                "Minix bitmaps too small (imap={imap_blocks} for {ninodes} inodes, \
+                 zmap={zmap_blocks} for {} zones)",
+                zones - firstdatazone
+            )));
+        }
 
         Ok(MinixSuperblock {
             version,
@@ -998,6 +1009,9 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
     }
 
     fn free_inode(&mut self, ino: u32) -> Result<(), FilesystemError> {
+        if ino == 0 || ino > self.sb.ninodes {
+            return Ok(());
+        }
         self.set_bitmap_bit(self.imap_start(), ino as usize, false)
     }
 

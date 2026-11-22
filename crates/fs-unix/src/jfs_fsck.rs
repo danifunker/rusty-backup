@@ -21,14 +21,11 @@
 //!      file/dir xtree-claimed blocks is deferred until the external
 //!      dtree walker lands (a directory > 127 entries would otherwise be
 //!      walked partially and flag false-positive orphan extents).
-//!   5. Connectivity: BFS from `FILESET_ROOT_INO` through inline-dtree
-//!      directories, accumulate reachable fileset inums, flag any
-//!      `mode != 0` IAG-allocated inum outside the reachable set as
-//!      `OrphanInode`. Directories whose dtrees spilled past
-//!      `DT_INLINE_CAP` (external dtree) are reported as
-//!      `ExternalDtreeNotWalked` warnings — their children aren't
-//!      visited so an unreachable subtree under them won't surface as
-//!      an orphan until the multi-page dtree walker lands.
+//!   5. Connectivity: BFS from `FILESET_ROOT_INO` through every directory's
+//!      dtree (inline or external), accumulate reachable fileset inums, flag
+//!      any `mode != 0` IAG-allocated inum outside the reachable set as
+//!      `OrphanInode`. When a directory can't be read, orphans are still
+//!      reported but not offered for repair: their parent may be that one.
 //!
 //! Repairable codes: `OrphanInode`. JFS has no SB replica in the way
 //! UFS/EFS do (the secondary SB at byte 8 MiB is fsck workspace, not a
@@ -42,8 +39,8 @@ use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Seek, Write};
 
 use crate::jfs::{
-    JfsFilesystem, AGGREGATE_I, AIT_INODES, BADBLOCK_I, BMAP_I, DT_INLINE_CAP, EXTSPERIAG,
-    FILESET_ROOT_INO, FILESYSTEM_I, INOSPEREXT, LOG_I, PSIZE,
+    JfsFilesystem, AGGREGATE_I, AIT_INODES, BADBLOCK_I, BMAP_I, EXTSPERIAG, FILESET_ROOT_INO,
+    FILESYSTEM_I, INOSPEREXT, LOG_I, PSIZE,
 };
 use disk_core::filesystem::FilesystemError;
 use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry, RepairReport};
@@ -135,7 +132,7 @@ pub fn fsck_jfs<R: Read + Seek + Send>(
     check_bmap_stats(fs, &mut b);
 
     // ----- 5. Connectivity BFS from fileset root -----
-    let reachable = check_connectivity(fs, &mut b);
+    let (reachable, walked_all) = check_connectivity(fs, &mut b);
 
     // Orphan detection: any pmap-allocated fileset inum we never
     // reached during the BFS.
@@ -171,6 +168,10 @@ pub fn fsck_jfs<R: Read + Seek + Send>(
                 dinode.size
             ),
         );
+        // A directory we could not read may be its real parent: adopting it then would double-link it.
+        if !walked_all {
+            continue;
+        }
         b.orphaned.push(OrphanedEntry {
             id: inum as u64,
             name: format!("ino_{inum}"),
@@ -398,16 +399,13 @@ fn check_bmap_stats<R: Read + Seek + Send>(fs: &mut JfsFilesystem<R>, b: &mut Bu
     }
 }
 
-/// BFS from the fileset root collecting reachable fileset inums. Inline
-/// dtrees are walked through `parse_inline_dtree`; external dtrees emit
-/// an `ExternalDtreeNotWalked` warning and skip — their descendants
-/// stay unreachable from our perspective but won't be flagged as
-/// orphans because the caller filters allocated-but-unreached inums
-/// through the warning-bearing parent's subtree.
+/// BFS from the fileset root collecting reachable fileset inums, inline and external dtrees
+/// alike; the flag is false when some directory could not be read.
 fn check_connectivity<R: Read + Seek + Send>(
     fs: &mut JfsFilesystem<R>,
     b: &mut Builder,
-) -> HashSet<u32> {
+) -> (HashSet<u32>, bool) {
+    let mut walked_all = true;
     let mut reached: HashSet<u32> = HashSet::new();
     reached.insert(FILESET_ROOT_INO);
     let mut queue: VecDeque<u32> = VecDeque::new();
@@ -421,6 +419,7 @@ fn check_connectivity<R: Read + Seek + Send>(
                     "FilesetInodeReadFailed",
                     format!("fileset inum {dir_inum}: {e}"),
                 );
+                walked_all = false;
                 continue;
             }
         };
@@ -430,22 +429,12 @@ fn check_connectivity<R: Read + Seek + Send>(
             continue;
         }
         b.dirs_checked += 1;
-        if dir.size > DT_INLINE_CAP {
-            b.warn(
-                "ExternalDtreeNotWalked",
-                format!(
-                    "fileset inum {dir_inum} has di_size {} > {} — children not \
-                     walked (external dtree walker not yet implemented)",
-                    dir.size, DT_INLINE_CAP
-                ),
-            );
-            continue;
-        }
         let entries = match fs.parse_inline_dtree(&dir) {
             Ok(e) => e,
             Err(e) => {
                 // Internal-flag inline dtree, corrupt stbl, etc.
                 b.err("DtreeParseFailed", format!("fileset inum {dir_inum}: {e}"));
+                walked_all = false;
                 continue;
             }
         };
@@ -458,7 +447,7 @@ fn check_connectivity<R: Read + Seek + Send>(
             }
         }
     }
-    reached
+    (reached, walked_all)
 }
 
 // ---- J.4b repair: orphan-inode adoption into /lost+found ----

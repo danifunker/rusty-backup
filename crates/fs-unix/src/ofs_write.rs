@@ -42,9 +42,20 @@ const MAX_RUN_SECTORS: u64 = 0x7F_FFFF;
 const MAX_DIR_BLOCKS: usize = 4096;
 
 impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
+    /// Directory and file writes: only the data area, after the bitmap and inside the volume.
     fn write_sectors(&mut self, sector: u64, data: &[u8]) -> Result<(), FilesystemError> {
+        let first = self.toc.bitmap_start as u64 + self.toc.bitmap_sectors as u64;
+        if sector < first {
+            return Err(FilesystemError::InvalidData(format!(
+                "ofs: refusing to write sector {sector}, which is before the data area"
+            )));
+        }
+        self.write_raw(sector, data)
+    }
+
+    fn write_raw(&mut self, sector: u64, data: &[u8]) -> Result<(), FilesystemError> {
         let count = (data.len() as u64).div_ceil(SECTOR);
-        if sector.saturating_add(count) > self.toc.total_sectors as u64 + 1 {
+        if sector.saturating_add(count) > self.toc.total_sectors as u64 {
             return Err(FilesystemError::InvalidData(format!(
                 "ofs: write of {count} sectors at {sector} runs past the volume"
             )));
@@ -64,7 +75,7 @@ impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
 
     fn write_bitmap(&mut self, bitmap: &[u8]) -> Result<(), FilesystemError> {
         let start = self.toc.bitmap_start as u64;
-        self.write_sectors(start, bitmap)
+        self.write_bitmap_at(start, bitmap)
     }
 
     /// Bitmap writer for `ofs_fsck`, which takes its own snapshot first.
@@ -73,7 +84,14 @@ impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
         start: u64,
         bitmap: &[u8],
     ) -> Result<(), FilesystemError> {
-        self.write_sectors(start, bitmap)
+        if start != self.toc.bitmap_start as u64
+            || (bitmap.len() as u64).div_ceil(SECTOR) > self.toc.bitmap_sectors as u64
+        {
+            return Err(FilesystemError::InvalidData(
+                "ofs: bitmap write outside the bitmap".into(),
+            ));
+        }
+        self.write_raw(start, bitmap)
     }
 
     fn bit_is_set(bitmap: &[u8], sector: u64) -> bool {
@@ -200,7 +218,7 @@ impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
         }
         let mut buf = self.read_sectors(0, 1)?;
         put_be32(&mut buf, 36, self.toc.used_sectors);
-        self.write_sectors(0, &buf)?;
+        self.write_raw(0, &buf)?;
         self.toc_dirty = false;
         Ok(())
     }
