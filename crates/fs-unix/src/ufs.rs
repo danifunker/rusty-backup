@@ -818,6 +818,19 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         (self.cgstart_frag(i) + self.cblkno as u64) * self.fsize
     }
 
+    /// Absolute fragments `[lo, hi)` of CG `i`'s superblock copy, CG header and inode table
+    /// (the kernel's `cgsblock` to `cgdmin`); CG 0's starts at 0 to take in the boot area.
+    pub(crate) fn cg_metadata_frags(&self, i: u32) -> (u64, u64) {
+        let start = self.cgstart_frag(i);
+        let itable = (self.ipg as u64 * self.dinode_size()).div_ceil(self.fsize);
+        let lo = if i == 0 {
+            0
+        } else {
+            start + self.sblkno as u64
+        };
+        (lo, start + self.iblkno as u64 + itable)
+    }
+
     /// Starting absolute fragment of CG `i`.
     pub(crate) fn cgbase_frag(&self, i: u32) -> u64 {
         (i as u64) * (self.fpg as u64)
@@ -2291,6 +2304,14 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         if in_cg + count > ndblk {
             return Err(FilesystemError::InvalidData(format!(
                 "ufs free_frag_run: run [{start}..{}) is past CG {cg}'s {ndblk} fragments",
+                start + count
+            )));
+        }
+        // Nor may a pointer free the superblock copy, CG header or inode table (UNX-006).
+        let (meta_lo, meta_hi) = self.cg_metadata_frags(cg as u32);
+        if start < meta_hi && start + count > meta_lo {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs free_frag_run: run [{start}..{}) overlaps CG {cg}'s metadata [{meta_lo}..{meta_hi})",
                 start + count
             )));
         }
@@ -5251,11 +5272,27 @@ mod tests {
         // iused bitmap: first 2 bits set (inums 0 + 1 reserved, inum 2 root).
         // Actually mark inums 0, 1, 2 used so the next alloc returns 3.
         img[cg_byte + iusedoff as usize] = 0b0000_0111;
-        // Free bitmap: all fragments free (0xFF, set=free).
+        // Free bitmap: every fragment past the boot area, CG header and inode table is free
+        // (set = free), as newfs leaves it; those metadata fragments are in use.
         let free_bytes = fpg.div_ceil(8) as usize;
         for i in 0..free_bytes {
             img[cg_byte + freeoff as usize + i] = 0xFF;
         }
+        let meta = {
+            let mut probe = img.clone();
+            let fs = UfsFilesystem::open(Cursor::new(&mut probe), 0).expect("open fixture");
+            fs.cg_metadata_frags(0).1
+        };
+        for f in 0..meta as usize {
+            img[cg_byte + freeoff as usize + f / 8] &= !(1 << (f % 8));
+        }
+        // Counters to match: whole free blocks in nbfree, loose fragments in nffree.
+        let frag = (bsize / fsize) as u64;
+        let free = fpg as u64 - meta;
+        let nbfree = free / frag - u64::from(meta % frag != 0);
+        let nffree = free - nbfree * frag;
+        (img[cs_off + 4..cs_off + 8]).copy_from_slice(&(nbfree as i32).to_le_bytes());
+        (img[cs_off + 12..cs_off + 16]).copy_from_slice(&(nffree as i32).to_le_bytes());
         img
     }
 
@@ -5393,10 +5430,11 @@ mod tests {
         let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
         let (_, nbfree_before, _, nffree_before) = fs.read_cg_cs(0).expect("cs before");
         let start = fs.alloc_frag_run(8, 0).expect("alloc 8 frags");
-        // Fragment 0 is never handed out, so the first aligned block is 8..16.
-        assert_eq!(start, 8);
+        // The first aligned block past the boot area, CG header and inode table.
+        let meta = fs.cg_metadata_frags(0).1;
+        assert_eq!(start, meta.next_multiple_of(8));
         let (bm, _) = fs.read_cg_free_bitmap(0).expect("re-read free bitmap");
-        assert_eq!(bm[1], 0, "frags 8..16 are now allocated");
+        assert_eq!(bm[(start / 8) as usize], 0, "the block is now allocated");
         // FFS counts a wholly free block in `nbfree`, and only counts loose
         // fragments in `nffree`. Taking a whole block therefore moves
         // `nbfree`, not `nffree` — debiting `nffree` here drove it negative
@@ -5404,6 +5442,20 @@ mod tests {
         let (_, nbfree_after, _, nffree_after) = fs.read_cg_cs(0).expect("cs after");
         assert_eq!(nbfree_after, nbfree_before - 1, "one free block consumed");
         assert_eq!(nffree_after, nffree_before, "no loose fragments created");
+    }
+
+    /// A pointer into the CG header or inode table is refused, never freed (UNX-006).
+    #[test]
+    fn free_frag_run_refuses_cg_metadata() {
+        let mut backing = build_writable_fixture();
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let (_, hi) = fs.cg_metadata_frags(0);
+        let before = fs.read_cg_free_bitmap(0).expect("map").0;
+        for start in [0, fs.cblkno as u64, fs.iblkno as u64, hi - 1] {
+            let err = fs.free_frag_run(start, 1).unwrap_err();
+            assert!(err.to_string().contains("metadata"), "{err}");
+        }
+        assert_eq!(fs.read_cg_free_bitmap(0).expect("map").0, before);
     }
 
     #[test]
@@ -5415,8 +5467,8 @@ mod tests {
         let (_, nbfree_alloc, _, nffree_alloc) = fs.read_cg_cs(0).expect("cs alloc");
         fs.free_frag_run(start, 8).expect("free");
         let (bm, _) = fs.read_cg_free_bitmap(0).expect("re-read");
-        // First 8 bits must be SET again (all free).
-        assert_eq!(bm[0], 0xFF);
+        // The block's 8 bits are SET again (all free).
+        assert_eq!(bm[(start / 8) as usize], 0xFF);
         let (_, nbfree_free, _, nffree_free) = fs.read_cg_cs(0).expect("cs free");
         assert_eq!(nbfree_free, nbfree_alloc + 1, "the block is whole again");
         assert_eq!(nffree_free, nffree_alloc, "and left no loose fragments");

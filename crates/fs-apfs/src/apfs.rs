@@ -90,6 +90,8 @@ const DT_LNK: u16 = 10;
 
 /// Inode number of the volume root directory (`ROOT_DIR_INO_NUM`).
 const ROOT_DIR_INO: u64 = 2;
+/// In a multi-volume container, entry locations keep the volume in their bits from here up.
+const VOL_SHIFT: u32 = 56;
 
 /// Extended-field type carrying a file's data-stream record (`j_dstream_t`),
 /// whose first field is the logical file size.
@@ -493,6 +495,8 @@ pub struct ApfsFilesystem<R: Read + Seek + Send> {
     vek: Option<[u8; 32]>,
     /// Volumes the container lists that could not be read, with the reason.
     skipped_volumes: Vec<String>,
+    /// The catalog and VEK of each volume not being browsed right now, kept for switching back.
+    parked: Vec<(Option<Catalog>, Option<[u8; 32]>)>,
 }
 
 /// The active volume's decoded catalog, cached after the first browse.
@@ -625,6 +629,7 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             catalog: None,
             vek: None,
             skipped_volumes: Vec::new(),
+            parked: Vec::new(),
         };
 
         // Prefer the newest valid superblock from the checkpoint descriptor
@@ -649,13 +654,30 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             }
         }
 
-        // Unlock the active (browsed) volume if it is encrypted and a
-        // passphrase was supplied. Encrypted-volume unlock needs the `crypto`
-        // feature; without it, encrypted volumes stay locked (vek = None).
+        fs.parked = fs.volumes.iter().map(|_| (None, None)).collect();
+
+        // Unlock every encrypted volume the passphrase opens; an error only when it opens none.
+        // Unlock needs the `crypto` feature; without it encrypted volumes stay locked.
         #[cfg(feature = "crypto")]
-        if fs.active_volume().map(|v| v.encrypted).unwrap_or(false) {
-            if let Some(pass) = passphrase {
-                fs.vek = Some(fs.unlock_active_volume(pass)?);
+        if let Some(pass) = passphrase {
+            let mut opened = false;
+            let mut last_err = None;
+            for vi in 0..fs.volumes.len() {
+                if !fs.volumes[vi].encrypted {
+                    continue;
+                }
+                fs.activate(vi);
+                match fs.unlock_active_volume(pass) {
+                    Ok(vek) => {
+                        fs.vek = Some(vek);
+                        opened = true;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            fs.activate(0);
+            if let (false, Some(e)) = (opened, last_err) {
+                return Err(e);
             }
         }
         #[cfg(not(feature = "crypto"))]
@@ -840,6 +862,58 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
     /// Volumes the container lists that could not be opened, each with the reason.
     pub fn skipped_volumes(&self) -> &[String] {
         &self.skipped_volumes
+    }
+
+    /// Whether the root lists one folder per volume (a container with several).
+    fn multi(&self) -> bool {
+        self.volumes.len() > 1
+    }
+
+    /// Browse volume `vi`, parking the current one's catalog and VEK for later.
+    fn activate(&mut self, vi: usize) {
+        if vi == self.active_vol || vi >= self.volumes.len() {
+            return;
+        }
+        let cur = (self.catalog.take(), self.vek.take());
+        self.parked[self.active_vol] = cur;
+        let (cat, vek) = std::mem::take(&mut self.parked[vi]);
+        self.catalog = cat;
+        self.vek = vek;
+        self.active_vol = vi;
+    }
+
+    /// The inode a location names, with its volume made the active one.
+    fn split(&mut self, loc: u64) -> Result<u64, FilesystemError> {
+        if !self.multi() {
+            return Ok(loc);
+        }
+        let vi = (loc >> VOL_SHIFT) as usize;
+        if vi == 0 || vi > self.volumes.len() {
+            return Err(FilesystemError::NotFound(format!("APFS location {loc:#x}")));
+        }
+        self.activate(vi - 1);
+        Ok(loc & ((1 << VOL_SHIFT) - 1))
+    }
+
+    /// The folder names a multi-volume container's root shows: each volume's name, numbered
+    /// when two share one, and never empty.
+    fn volume_folder_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for (i, v) in self.volumes.iter().enumerate() {
+            let base = if v.name.is_empty() {
+                format!("Volume {}", i + 1)
+            } else {
+                v.name.clone()
+            };
+            let mut name = base.clone();
+            let mut n = 2;
+            while names.contains(&name) {
+                name = format!("{base} {n}");
+                n += 1;
+            }
+            names.push(name);
+        }
+        names
     }
 
     /// The volume currently selected for browsing, if the container has one.
@@ -1514,35 +1588,57 @@ fn decode_finder_info_xattr(key: &[u8], val: &[u8]) -> Option<FinderInfo> {
 
 impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
-        // The APFS volume root directory is inode 2; carry that as `location`
-        // so `list_directory` can find its children.
-        Ok(FileEntry::new_directory(
-            "/".into(),
-            "/".into(),
-            ROOT_DIR_INO,
-        ))
+        // One volume: its root directory (inode 2). Several: a root of one folder per volume.
+        let loc = if self.multi() { 0 } else { ROOT_DIR_INO };
+        Ok(FileEntry::new_directory("/".into(), "/".into(), loc))
     }
 
     fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
         if !entry.is_directory() {
             return Err(FilesystemError::NotADirectory(entry.path.clone()));
         }
-        let parent_oid = entry.location;
         let parent_path = entry.path.trim_end_matches('/').to_string();
+        if self.multi() && entry.location == 0 {
+            let names = self.volume_folder_names();
+            let mut out = Vec::new();
+            for (vi, name) in names.into_iter().enumerate() {
+                let loc = ((vi as u64 + 1) << VOL_SHIFT) | ROOT_DIR_INO;
+                out.push(FileEntry::new_directory(
+                    name.clone(),
+                    format!("{parent_path}/{name}"),
+                    loc,
+                ));
+            }
+            return Ok(out);
+        }
+        // A multi-volume location keeps its volume in the top `VOL_SHIFT` bits, plus 1.
+        let parent_oid = self.split(entry.location)?;
+        let vol_bits = if self.multi() {
+            (self.active_vol as u64 + 1) << VOL_SHIFT
+        } else {
+            0
+        };
         let cat = self.catalog()?;
         let mut out = Vec::new();
         if let Some(children) = cat.children.get(&parent_oid) {
             for child in children {
                 let path = format!("{parent_path}/{}", child.name);
                 let fe = if child.dtype == DT_DIR {
-                    FileEntry::new_directory(child.name.clone(), path, child.oid)
+                    FileEntry::new_directory(child.name.clone(), path, vol_bits | child.oid)
                 } else if child.dtype == DT_LNK {
                     let target = cat.symlinks.get(&child.oid).cloned().unwrap_or_default();
                     let size = target.len() as u64;
-                    FileEntry::new_symlink(child.name.clone(), path, size, child.oid, target)
+                    FileEntry::new_symlink(
+                        child.name.clone(),
+                        path,
+                        size,
+                        vol_bits | child.oid,
+                        target,
+                    )
                 } else {
                     let size = cat.inodes.get(&child.oid).map(|i| i.size).unwrap_or(0);
-                    let mut fe = FileEntry::new_file(child.name.clone(), path, size, child.oid);
+                    let mut fe =
+                        FileEntry::new_file(child.name.clone(), path, size, vol_bits | child.oid);
                     // Classic-Mac resource fork, stored as the
                     // `com.apple.ResourceFork` xattr (read via
                     // `write_resource_fork_to`).
@@ -1567,19 +1663,16 @@ impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
         entry: &FileEntry,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
+        let oid = self.split(entry.location)?;
         if entry.is_symlink() {
             // A symlink's "contents" is its target path.
             let cat = self.catalog()?;
-            let target = cat
-                .symlinks
-                .get(&entry.location)
-                .cloned()
-                .unwrap_or_default();
+            let target = cat.symlinks.get(&oid).cloned().unwrap_or_default();
             let mut bytes = target.into_bytes();
             bytes.truncate(max_bytes);
             return Ok(bytes);
         }
-        let (size, extents) = self.gather_file(entry.location)?;
+        let (size, extents) = self.gather_file(oid)?;
         let limit = size.min(max_bytes as u64);
         let mut out = Vec::with_capacity(limit.min(1 << 20) as usize);
         self.stream_extents(&extents, size, limit, &mut out)?;
@@ -1591,25 +1684,25 @@ impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
         entry: &FileEntry,
         writer: &mut dyn Write,
     ) -> Result<u64, FilesystemError> {
+        let oid = self.split(entry.location)?;
         if entry.is_symlink() {
             let cat = self.catalog()?;
-            let target = cat
-                .symlinks
-                .get(&entry.location)
-                .cloned()
-                .unwrap_or_default();
+            let target = cat.symlinks.get(&oid).cloned().unwrap_or_default();
             writer.write_all(target.as_bytes())?;
             return Ok(target.len() as u64);
         }
-        let (size, extents) = self.gather_file(entry.location)?;
+        let (size, extents) = self.gather_file(oid)?;
         self.stream_extents(&extents, size, size, writer)
     }
 
     fn resource_fork_size(&mut self, entry: &FileEntry) -> u64 {
+        let Ok(oid) = self.split(entry.location) else {
+            return 0;
+        };
         match self.catalog() {
             Ok(cat) => cat
                 .resource_forks
-                .get(&entry.location)
+                .get(&oid)
                 .map(|rf| rf.size())
                 .unwrap_or(0),
             Err(_) => 0,
@@ -1628,9 +1721,10 @@ impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
     ) -> Result<u64, FilesystemError> {
         // Pull what we need out of the (borrowed) catalog into owned locals so
         // the later `&mut self` stream call doesn't overlap the borrow.
+        let oid = self.split(entry.location)?;
         let plan = {
             let cat = self.catalog()?;
-            match cat.resource_forks.get(&entry.location) {
+            match cat.resource_forks.get(&oid) {
                 None => return Ok(0),
                 Some(ResourceFork::Embedded(bytes)) => Ok(bytes.clone()),
                 Some(ResourceFork::Stream { stream_id, size }) => {
@@ -1664,6 +1758,11 @@ impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
     fn used_size(&self) -> u64 {
         // Blocks allocated to the active volume. (A multi-volume container
         // shares free space; this reports the browsed volume's own usage.)
+        // Several volumes share the container's space: their allocations add up.
+        if self.multi() {
+            return self.volumes.iter().map(|v| v.alloc_count).sum::<u64>()
+                * self.block_size as u64;
+        }
         self.active_volume()
             .map(|v| v.alloc_count * self.block_size as u64)
             .unwrap_or(0)

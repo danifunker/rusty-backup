@@ -98,12 +98,34 @@ impl<R: Read + Write + Seek + Send> BfsFilesystem<R> {
         self.sb.num_ags as u64 * self.sb.blocks_per_ag as u64
     }
 
-    fn read_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
-        self.read_blocks(1, self.bitmap_blocks())
+    /// The cached bitmap, taken out for a change; read from disk the first time (UNX-058).
+    fn take_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        match self.bitmap_cache.take() {
+            Some(b) => Ok(b),
+            None => self.read_blocks(1, self.bitmap_blocks()),
+        }
     }
 
-    fn write_bitmap(&mut self, bitmap: &[u8]) -> Result<(), FilesystemError> {
-        self.write_blocks(1, bitmap)
+    /// Put the bitmap back after changing blocks `[block, block + count)`, writing only the
+    /// bitmap blocks those bits live in.
+    fn store_bitmap(
+        &mut self,
+        bitmap: Vec<u8>,
+        block: u64,
+        count: u64,
+    ) -> Result<(), FilesystemError> {
+        let bs = self.sb.block_size as usize;
+        let lo = (block / 32) as usize * 4 / bs;
+        let hi = (((block + count).div_ceil(32) as usize * 4).div_ceil(bs))
+            .min(bitmap.len().div_ceil(bs));
+        let result = if lo < hi {
+            let end = (hi * bs).min(bitmap.len());
+            self.write_blocks(1 + lo as u64, &bitmap[lo * bs..end])
+        } else {
+            Ok(())
+        };
+        self.bitmap_cache = Some(bitmap);
+        result
     }
 
     fn bit_is_set(&self, bitmap: &[u8], block: u64) -> bool {
@@ -172,14 +194,15 @@ impl<R: Read + Write + Seek + Send> BfsFilesystem<R> {
                 "bfs: cannot allocate a {count}-block run (limit {MAX_RUN_LEN})"
             )));
         }
-        let mut bitmap = self.read_bitmap()?;
-        let start = self.find_free_run(&bitmap, count, hint).ok_or_else(|| {
-            FilesystemError::DiskFull(format!(
+        let mut bitmap = self.take_bitmap()?;
+        let Some(start) = self.find_free_run(&bitmap, count, hint) else {
+            self.bitmap_cache = Some(bitmap);
+            return Err(FilesystemError::DiskFull(format!(
                 "bfs: no free run of {count} blocks inside a single allocation group"
-            ))
-        })?;
+            )));
+        };
         self.set_bits(&mut bitmap, start, count, true);
-        self.write_bitmap(&bitmap)?;
+        self.store_bitmap(bitmap, start, count)?;
         self.sb.used_blocks += count as i64;
         self.sb_dirty = true;
         Ok(self.block_to_run(start, count as u16))
@@ -217,14 +240,10 @@ impl<R: Read + Write + Seek + Send> BfsFilesystem<R> {
         if run.len == 0 {
             return Ok(());
         }
-        let mut bitmap = self.read_bitmap()?;
-        self.set_bits(
-            &mut bitmap,
-            run.to_block(self.sb.ag_shift),
-            run.len as u64,
-            false,
-        );
-        self.write_bitmap(&bitmap)?;
+        let mut bitmap = self.take_bitmap()?;
+        let start = run.to_block(self.sb.ag_shift);
+        self.set_bits(&mut bitmap, start, run.len as u64, false);
+        self.store_bitmap(bitmap, start, run.len as u64)?;
         self.sb.used_blocks -= run.len as i64;
         self.sb_dirty = true;
         Ok(())

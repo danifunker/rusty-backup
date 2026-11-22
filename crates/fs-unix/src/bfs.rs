@@ -424,6 +424,8 @@ pub struct BfsFilesystem<R> {
     pub(crate) sb_offset: u64,
     /// Set once a write has dirtied the superblock's counters.
     pub(crate) sb_dirty: bool,
+    /// The allocation bitmap, read on the first allocation and kept in step with the disk.
+    pub(crate) bitmap_cache: Option<Vec<u8>>,
 }
 
 impl<R: Read + Seek + Send> BfsFilesystem<R> {
@@ -444,6 +446,7 @@ impl<R: Read + Seek + Send> BfsFilesystem<R> {
                         sb,
                         sb_offset: at,
                         sb_dirty: false,
+                        bitmap_cache: None,
                     })
                 }
                 Err(e) => last_err = Some(e),

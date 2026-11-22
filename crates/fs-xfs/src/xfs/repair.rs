@@ -256,10 +256,23 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
 impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Refuse any change to a volume whose features the editor does not maintain.
-    fn ensure_editable(&self) -> Result<(), FilesystemError> {
-        match self.superblock().edit_blocker() {
-            Some(why) => Err(FilesystemError::Unsupported(why)),
-            None => Ok(()),
+    fn ensure_editable(&mut self) -> Result<(), FilesystemError> {
+        if let Some(why) = self.superblock().edit_blocker() {
+            return Err(FilesystemError::Unsupported(why));
+        }
+        self.ensure_log_clean()
+    }
+
+    /// Refuse to write while the log holds transactions a mount would replay over our changes.
+    fn ensure_log_clean(&mut self) -> Result<(), FilesystemError> {
+        match self.log_state()? {
+            super::log::LogState::Dirty { head_lsn } => Err(FilesystemError::Unsupported(format!(
+                "this XFS was not cleanly unmounted (log head at cycle {}, block {}); mount it \
+                 or run xfs_repair on its own system first, or the replay would undo edits",
+                head_lsn >> 32,
+                head_lsn & 0xFFFF_FFFF
+            ))),
+            _ => Ok(()),
         }
     }
 }
@@ -386,6 +399,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
 
     fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
         // Only the inode core changes, so the feature gate in `ensure_editable` does not apply.
+        self.ensure_log_clean()?;
         // di_mode is a big-endian u16 at offset 2 of the dinode core.
         // `write_inode_region` re-stamps the v5 CRC for us.
         let sb = self.superblock().clone();
@@ -400,6 +414,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
 
     fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
         // Inode core only, like `set_permissions`; no tree the gated features cover is touched.
+        self.ensure_log_clean()?;
         // di_uid / di_gid are big-endian u32s at offsets 8 and 12 — XFS
         // has carried 32-bit ids since v1, so no width check is needed.
         let sb = self.superblock().clone();

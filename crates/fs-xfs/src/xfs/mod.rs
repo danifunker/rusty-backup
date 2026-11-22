@@ -29,6 +29,7 @@ pub mod fsck;
 pub mod inobt_repair;
 pub mod inode;
 pub mod inode_repair;
+pub mod log;
 pub mod repair;
 pub mod sb;
 pub mod symlink;
@@ -66,6 +67,8 @@ pub struct XfsFilesystem<R: Read + Seek + Send> {
     dir_format: DirFormat,
     label: String,
     fs_type_name: &'static str,
+    /// The log's state, scanned on the first edit ([`Self::log_state`]).
+    log: Option<log::LogState>,
 }
 
 impl<R: Read + Seek + Send> XfsFilesystem<R> {
@@ -126,6 +129,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             dir_format,
             label,
             fs_type_name,
+            log: None,
         })
     }
 
@@ -446,6 +450,18 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             check_bmbt_header(&block, Some(0), self.sb.is_v5())?;
         }
         Ok(out)
+    }
+
+    /// Whether the internal log is clean; read once, then cached.
+    pub fn log_state(&mut self) -> Result<log::LogState, FilesystemError> {
+        if self.log.is_none() {
+            self.log = Some(log::log_state(
+                &mut self.reader,
+                self.partition_offset,
+                &self.sb,
+            )?);
+        }
+        Ok(self.log.clone().expect("set above"))
     }
 
     /// Read the bytes of one filesystem block at `fsblock` into `out`.

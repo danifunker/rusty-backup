@@ -3,6 +3,15 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.2.1
+
+### Fixed
+- Edits, repair, chmod and chown refuse a volume whose log was not cleanly unmounted (the head
+  record is not the unmount transaction), since the next mount would replay the log over them.
+  `XfsFilesystem::log_state` reports it (XFS-012).
+- chmod and chown work on v5 volumes with features the editor does not maintain: they rewrite
+  only the inode core.
+
 ## 0.2.0
 
 ### Fixed (review, 2026-11-21)

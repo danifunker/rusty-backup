@@ -102,11 +102,12 @@ pub(super) fn analyze_partitions(
         }
         let compact_result = match clone_result {
             Err(_) => None,
-            Ok(clone) => match fs::try_compact_partition_reader(
+            Ok(clone) => match fs::try_compact_partition_reader_sized(
                 BufReader::new(clone),
                 part_offset,
                 part.partition_type_byte,
                 part.partition_type_string.as_deref(),
+                Some(part.size_bytes),
             ) {
                 Ok((_, result)) => {
                     log(

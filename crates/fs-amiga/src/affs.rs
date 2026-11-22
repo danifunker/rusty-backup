@@ -1813,13 +1813,20 @@ pub struct CompactAffsReader<R: Read + Seek> {
 }
 
 impl<R: Read + Seek> CompactAffsReader<R> {
-    pub fn new(
+    pub fn new(reader: R, partition_offset: u64) -> Result<(Self, CompactResult), FilesystemError> {
+        Self::new_sized(reader, partition_offset, None)
+    }
+
+    /// [`Self::new`] for a partition of `partition_size` bytes, which places the root block
+    /// right on an RDB disk where the volume is not last ([`AffsFilesystem::open_sized`]).
+    pub fn new_sized(
         mut reader: R,
         partition_offset: u64,
+        partition_size: Option<u64>,
     ) -> Result<(Self, CompactResult), FilesystemError> {
-        // Read the full filesystem header info via AffsFilesystem::open
+        // Read the full filesystem header info via AffsFilesystem::open_sized
         // so we share the same bitmap-load + validation code.
-        let fs = AffsFilesystem::open(&mut reader, partition_offset)?;
+        let fs = AffsFilesystem::open_sized(&mut reader, partition_offset, partition_size)?;
         let partition_size = fs.partition_size;
         let block_size = fs.block_size;
         let total_blocks = fs.total_blocks;
@@ -3085,6 +3092,32 @@ mod tests {
                 res.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
             );
         }
+    }
+
+    /// A volume that is not last in its image: sized, the compactor finds its root and covers
+    /// just the partition; unsized it would take the image end as the volume's end (AMI-014).
+    #[test]
+    fn compact_reader_sized_stops_at_the_partition() {
+        let first = make_empty_floppy_image(1, "FIRST");
+        let len = first.len() as u64;
+        let mut img = first.clone();
+        img.extend_from_slice(&make_empty_floppy_image(1, "SECOND"));
+        let mut cur = Cursor::new(img);
+        let (mut reader, info) =
+            CompactAffsReader::new_sized(&mut cur, 0, Some(len)).expect("compact");
+        assert_eq!(info.original_size, len);
+        let mut out = Vec::new();
+        std::io::copy(&mut reader, &mut out).expect("copy");
+        assert_eq!(out.len() as u64, len, "only the first partition's bytes");
+        let mut cur2 = Cursor::new(cur.get_ref().clone());
+        let unsized_size = CompactAffsReader::new(&mut cur2, 0)
+            .map(|(_, i)| i.original_size)
+            .ok();
+        assert_ne!(
+            unsized_size,
+            Some(len),
+            "without the size it reads past the partition"
+        );
     }
 
     #[test]

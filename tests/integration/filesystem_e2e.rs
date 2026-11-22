@@ -3657,6 +3657,43 @@ fn test_hfv_source_open_unwraps_dynamic_vhd() {
 // ============================================================================
 // Test Group APFS: read-only browse of a real macOS-formatted APFS container
 //
+// Fixture: tests/fixtures/test_apfs_multivolume.img.zst — a bare 1.1 GB APFS container made with
+// `hdiutil create -fs APFS -layout NONE` plus `diskutil apfs addVolume`: volume Alpha holds
+// a.txt and dir/n.txt, volume Beta holds b.txt.
+#[test]
+fn apfs_multi_volume_container_browses_every_volume() {
+    use disk_core::filesystem::Filesystem;
+    let img = load_fixture("test_apfs_multivolume.img.zst");
+    let mut fs = fs_apfs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).expect("open APFS");
+    let root = fs.root().expect("root");
+    let vols = fs.list_directory(&root).expect("list root");
+    let names: Vec<&str> = vols.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["Alpha", "Beta"], "one folder per volume");
+
+    let read = |fs: &mut fs_apfs::apfs::ApfsFilesystem<Cursor<Vec<u8>>>,
+                dir: &disk_core::entry::FileEntry,
+                name: &str| {
+        let e = fs
+            .list_directory(dir)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} in {}", dir.path));
+        (fs.read_file(&e, usize::MAX).unwrap_or_default(), e)
+    };
+    // Interleave the volumes so each switch has to restore the right catalog.
+    let (b, _) = read(&mut fs, &vols[1], "b.txt");
+    assert_eq!(b, b"beta file\n");
+    let (a, _) = read(&mut fs, &vols[0], "a.txt");
+    assert_eq!(a, b"alpha file\n");
+    let (_, dir) = read(&mut fs, &vols[0], "dir");
+    let (b2, _) = read(&mut fs, &vols[1], "b.txt");
+    assert_eq!(b2, b"beta file\n");
+    let (n, _) = read(&mut fs, &dir, "n.txt");
+    assert_eq!(n, b"nested\n");
+    assert_eq!(dir.path, "/Alpha/dir");
+}
+
 // Fixture: tests/fixtures/test_apfs.img.zst — a 24 MiB unencrypted APFS
 // container (one volume "RBTEST") captured from macOS. Checksum oracle for the
 // file tree lives in tests/fixtures/apfs/oracle_checksums.txt.

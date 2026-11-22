@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "fs-amiga"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2479,11 +2479,11 @@ dependencies = [
 
 [[package]]
 name = "fs-apfs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes 0.9.3",
  "disk-core",
- "sha2 0.11.1",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2500,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "fs-cpm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "disk-core",
 ]
@@ -2587,7 +2587,7 @@ dependencies = [
 
 [[package]]
 name = "fs-unix"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2611,7 +2611,7 @@ dependencies = [
 
 [[package]]
 name = "fs-xfs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "byteorder",
  "crc32c",

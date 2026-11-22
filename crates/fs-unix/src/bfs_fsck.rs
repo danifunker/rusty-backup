@@ -464,6 +464,8 @@ impl<R: Read + Write + Seek + Send> BfsFilesystem<R> {
         }
         if cleared > 0 {
             self.write_blocks(1, &bitmap)?;
+            // The allocator's cached copy is stale now.
+            self.bitmap_cache = None;
             report.fixes_applied.push(format!(
                 "freed {cleared} leaked block(s) in the allocation bitmap"
             ));
