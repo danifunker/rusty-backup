@@ -4811,9 +4811,11 @@ pub fn resize_ext_in_place(
             "ext resize: growing from {old_blocks} to {new_blocks} blocks (+{added})"
         ));
     } else {
-        // Shrinking: reduce free and reserved proportionally
+        // Shrinking inside the last group: mark the cut tail as padding in its bitmap and take
+        // only the free blocks it held off the counts (UNX-031).
         let removed = old_blocks - new_blocks;
-        new_free = old_free.saturating_sub(removed);
+        let freed = shrink_last_group(file, partition_offset, &sb, old_blocks, new_blocks)?;
+        new_free = old_free.saturating_sub(freed);
         new_reserved = (old_reserved * new_blocks)
             .checked_div(old_blocks)
             .unwrap_or(0);
@@ -4857,6 +4859,99 @@ pub fn resize_ext_in_place(
     Ok(())
 }
 
+/// Cut the last block group from `old_blocks` to `new_blocks`: the removed tail becomes bitmap
+/// padding (set bits), the group's free count drops by the free blocks it held, and the bitmap
+/// and descriptor checksums are restamped, in the primary GDT and every backup copy. Returns the
+/// free blocks removed. Dropping whole groups is refused: that needs the descriptor table,
+/// inode count and backups rebuilt.
+fn shrink_last_group(
+    file: &mut (impl Read + std::io::Write + Seek),
+    partition_offset: u64,
+    sb: &[u8; SUPERBLOCK_SIZE],
+    old_blocks: u64,
+    new_blocks: u64,
+) -> anyhow::Result<u64> {
+    let fdb = le32(sb, 0x14) as u64;
+    let block_size = 1024u64 << le32(sb, 0x18);
+    let bpg = le32(sb, 0x20) as u64;
+    let feat_ro = le32(sb, 0x64);
+    let is_64bit = le32(sb, 0x60) & INCOMPAT_64BIT != 0;
+    let metadata_csum = feat_ro & 0x0400 != 0;
+    let sparse = feat_ro & 0x0001 != 0;
+    let desc_size: u64 = if is_64bit {
+        (u16::from_le_bytes([sb[0xFE], sb[0xFF]]) as u64).max(64)
+    } else {
+        32
+    };
+    let old_gc = (old_blocks - fdb).div_ceil(bpg);
+    let new_gc = (new_blocks - fdb).div_ceil(bpg);
+    if new_gc != old_gc {
+        anyhow::bail!(
+            "ext resize: shrinking from {old_gc} to {new_gc} block groups in place is not \
+             supported; only the last group can be cut"
+        );
+    }
+    let g = old_gc - 1;
+    let gs = fdb + g * bpg;
+    let sb_blk = if block_size == 1024 { 1u64 } else { 0 };
+    let desc_at = partition_offset + (sb_blk + 1) * block_size + g * desc_size;
+    let mut desc = vec![0u8; desc_size as usize];
+    file.seek(SeekFrom::Start(desc_at))?;
+    file.read_exact(&mut desc)?;
+    let gd_hi = is_64bit && desc_size >= 64;
+    let bbm = le32(&desc, 0) as u64
+        | if gd_hi {
+            (le32(&desc, 0x20) as u64) << 32
+        } else {
+            0
+        };
+    let mut bm = vec![0u8; block_size as usize];
+    file.seek(SeekFrom::Start(partition_offset + bbm * block_size))?;
+    file.read_exact(&mut bm)?;
+    let mut freed = 0u64;
+    for bit in (new_blocks - gs)..(old_blocks - gs) {
+        let (byte, mask) = ((bit / 8) as usize, 1u8 << (bit % 8));
+        if bm[byte] & mask != 0 {
+            anyhow::bail!("ext resize: block {} past the new end is in use", gs + bit);
+        }
+        bm[byte] |= mask;
+        freed += 1;
+    }
+    let free = u16::from_le_bytes([desc[0x0C], desc[0x0D]]) as u64
+        | if gd_hi {
+            (u16::from_le_bytes([desc[0x2C], desc[0x2D]]) as u64) << 16
+        } else {
+            0
+        };
+    let free = free.saturating_sub(freed);
+    desc[0x0C..0x0E].copy_from_slice(&(free as u16).to_le_bytes());
+    if gd_hi {
+        desc[0x2C..0x2E].copy_from_slice(&((free >> 16) as u16).to_le_bytes());
+    }
+    if metadata_csum {
+        let seed = crate::ext_csum::volume_seed(sb);
+        let bbm_len = (bpg as usize).div_ceil(8).min(bm.len());
+        crate::ext_csum::stamp_block_bitmap_csum(seed, &mut desc, &bm[..bbm_len]);
+        crate::ext_csum::stamp_group_desc(seed, g as u32, &mut desc);
+    }
+    file.seek(SeekFrom::Start(partition_offset + bbm * block_size))?;
+    file.write_all(&bm)?;
+    // The descriptor in the primary table and in every backup copy.
+    for bg in 0..old_gc {
+        if bg != 0 && !has_superblock_backup(bg as u32, sparse) {
+            continue;
+        }
+        let table = if bg == 0 {
+            (sb_blk + 1) * block_size
+        } else {
+            (fdb + bg * bpg + 1) * block_size
+        };
+        file.seek(SeekFrom::Start(partition_offset + table + g * desc_size))?;
+        file.write_all(&desc)?;
+    }
+    Ok(freed)
+}
+
 /// Grow an ext2/3/4 filesystem by **adding block groups** — the offline
 /// grow, the mirror of the backup compactor's shrink. Lays down each
 /// new group's block/inode bitmap + (fresh, already-zero) inode table + group
@@ -4888,7 +4983,13 @@ fn grow_ext_add_groups(
     let feat_ro = le32(&sb, 0x64);
     let is_64bit = feat_incompat & INCOMPAT_64BIT != 0;
     let metadata_csum = feat_ro & 0x0400 != 0;
+    // bg_itable_unused and the UNINIT flags mean something only with a group checksum.
+    let checksummed = feat_ro & 0x0410 != 0;
     let sparse = feat_ro & 0x0001 != 0;
+    // Each backup group keeps s_reserved_gdt_blocks after its GDT copy; with resize_inode the
+    // resize inode (7) lists them all.
+    let reserved_gdt = u16::from_le_bytes([sb[0xCE], sb[0xCF]]) as u64;
+    let resize_inode = le32(&sb, 0x5C) & 0x0010 != 0 && reserved_gdt > 0;
     let desc_size: u64 = if is_64bit {
         let d = u16::from_le_bytes([sb[0xFE], sb[0xFF]]);
         if d >= 64 {
@@ -4955,14 +5056,15 @@ fn grow_ext_add_groups(
             gdt[o + 0x0E..o + 0x10].copy_from_slice(&(free_i as u16).to_le_bytes());
             gdt[o + 0x10..o + 0x12].copy_from_slice(&0u16.to_le_bytes()); // used_dirs
             gdt[o + 0x12..o + 0x14].copy_from_slice(&0u16.to_le_bytes()); // flags (explicit bitmaps)
-            gdt[o + 0x1C..o + 0x1E].copy_from_slice(&(ipg as u16).to_le_bytes()); // itable_unused
+            let unused = if checksummed { ipg } else { 0 };
+            gdt[o + 0x1C..o + 0x1E].copy_from_slice(&(unused as u16).to_le_bytes()); // itable_unused
             if gd_hi {
                 gdt[o + 0x20..o + 0x24].copy_from_slice(&((bbm >> 32) as u32).to_le_bytes());
                 gdt[o + 0x24..o + 0x28].copy_from_slice(&((ibm >> 32) as u32).to_le_bytes());
                 gdt[o + 0x28..o + 0x2C].copy_from_slice(&((it >> 32) as u32).to_le_bytes());
                 gdt[o + 0x2C..o + 0x2E].copy_from_slice(&((free_b >> 16) as u16).to_le_bytes());
                 gdt[o + 0x2E..o + 0x30].copy_from_slice(&((free_i >> 16) as u16).to_le_bytes());
-                gdt[o + 0x32..o + 0x34].copy_from_slice(&((ipg >> 16) as u16).to_le_bytes());
+                gdt[o + 0x32..o + 0x34].copy_from_slice(&((unused >> 16) as u16).to_le_bytes());
             }
         };
 
@@ -4974,7 +5076,11 @@ fn grow_ext_add_groups(
         let gs = group_start(g);
         let count = (new_total - gs).min(bpg);
         let has_backup = has_superblock_backup(g as u32, sparse);
-        let meta_off = if has_backup { 1 + gdt_blocks } else { 0 };
+        let meta_off = if has_backup {
+            1 + gdt_blocks + reserved_gdt
+        } else {
+            0
+        };
         let bbm = gs + meta_off;
         let ibm = bbm + 1;
         let it = ibm + 1;
@@ -5039,6 +5145,32 @@ fn grow_ext_add_groups(
         file.write_all(&bm)?;
     }
 
+    // ---- Resize inode: list the new backup groups' reserved GDT blocks ----
+    if resize_inode {
+        let backups: Vec<u64> = (old_gc..new_gc)
+            .filter(|&g| has_superblock_backup(g as u32, sparse))
+            .collect();
+        if !backups.is_empty() {
+            add_resize_inode_backups(
+                file,
+                partition_offset,
+                &gdt,
+                ResizeInodeGrow {
+                    block_size,
+                    inode_size,
+                    gd_hi,
+                    seed: metadata_csum.then_some(seed),
+                    gdt_blocks,
+                    reserved_gdt,
+                    sparse,
+                    bpg,
+                    fdb,
+                },
+                &backups,
+            )?;
+        }
+    }
+
     // ---- Stamp new groups' checksums (bitmap csums first, then bg_checksum) ----
     if metadata_csum {
         let bbm_len = (bpg as usize).div_ceil(8);
@@ -5047,7 +5179,12 @@ fn grow_ext_add_groups(
             let gs = group_start(g);
             let count = (new_total - gs).min(bpg);
             let has_backup = has_superblock_backup(g as u32, sparse);
-            let used = if has_backup { 1 + gdt_blocks } else { 0 } + 2 + itable_blocks;
+            let used = if has_backup {
+                1 + gdt_blocks + reserved_gdt
+            } else {
+                0
+            } + 2
+                + itable_blocks;
             let bm = make_bitmap(used, count);
             let ibm_data = make_bitmap(0, ipg as u64);
             let o = g as usize * desc_size as usize;
@@ -5128,6 +5265,94 @@ fn grow_ext_add_groups(
         "ext grow: added {} groups ({old_total} -> {new_total} blocks)",
         new_gc - old_gc
     ));
+    Ok(())
+}
+
+/// Geometry `add_resize_inode_backups` needs.
+struct ResizeInodeGrow {
+    block_size: u64,
+    inode_size: u64,
+    gd_hi: bool,
+    seed: Option<u32>,
+    gdt_blocks: u64,
+    reserved_gdt: u64,
+    sparse: bool,
+    bpg: u64,
+    fdb: u64,
+}
+
+/// Record the reserved GDT copies of `backups` (new backup groups) in the resize inode: each
+/// primary reserved GDT block, listed in inode 7's double-indirect block, holds the block
+/// numbers of its copies in backup-group order. e2fsck rejects the inode if one is missing.
+fn add_resize_inode_backups(
+    file: &mut (impl Read + std::io::Write + Seek),
+    partition_offset: u64,
+    gdt: &[u8],
+    geo: ResizeInodeGrow,
+    backups: &[u64],
+) -> anyhow::Result<()> {
+    let bs = geo.block_size;
+    let read_u32_at =
+        |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+    // Inode 7 sits in group 0's inode table.
+    let it = le32(gdt, 8) as u64
+        | if geo.gd_hi {
+            (le32(gdt, 0x28) as u64) << 32
+        } else {
+            0
+        };
+    let ino_pos = partition_offset + it * bs + 6 * geo.inode_size;
+    let mut ino = vec![0u8; geo.inode_size as usize];
+    file.seek(SeekFrom::Start(ino_pos))?;
+    file.read_exact(&mut ino)?;
+    let dind = le32(&ino, 0x28 + 13 * 4) as u64;
+    if dind == 0 {
+        anyhow::bail!("ext grow: resize_inode is set but inode 7 has no double-indirect block");
+    }
+    let mut dind_blk = vec![0u8; bs as usize];
+    file.seek(SeekFrom::Start(partition_offset + dind * bs))?;
+    file.read_exact(&mut dind_blk)?;
+    let primaries: Vec<u64> = (0..bs as usize / 4)
+        .map(|i| read_u32_at(&dind_blk, i) as u64)
+        .filter(|&b| b != 0)
+        .collect();
+    if primaries.len() as u64 != geo.reserved_gdt {
+        anyhow::bail!(
+            "ext grow: resize inode lists {} reserved GDT blocks, the superblock {}",
+            primaries.len(),
+            geo.reserved_gdt
+        );
+    }
+    let per = bs / 4;
+    let mut added = 0u64;
+    for &g in backups {
+        // Copies are kept in backup-group order, group 1 first.
+        let j = (1..g)
+            .filter(|&x| has_superblock_backup(x as u32, geo.sparse))
+            .count() as u64;
+        if j >= per {
+            anyhow::bail!("ext grow: too many backup groups for the resize inode");
+        }
+        let gs = geo.fdb + g * geo.bpg;
+        for (r, &p) in primaries.iter().enumerate() {
+            let at = partition_offset + p * bs + j * 4;
+            let copy = gs + 1 + geo.gdt_blocks + r as u64;
+            file.seek(SeekFrom::Start(at))?;
+            file.write_all(&(copy as u32).to_le_bytes())?;
+            added += 1;
+        }
+    }
+    // i_blocks counts 512-byte units of every block the inode maps.
+    let blocks =
+        le32(&ino, 0x1C) as u64 | (u16::from_le_bytes([ino[0x74], ino[0x75]]) as u64) << 32;
+    let blocks = blocks + added * (bs / 512);
+    ino[0x1C..0x20].copy_from_slice(&(blocks as u32).to_le_bytes());
+    ino[0x74..0x76].copy_from_slice(&((blocks >> 32) as u16).to_le_bytes());
+    if let Some(seed) = geo.seed {
+        crate::ext_csum::stamp_inode(seed, &mut ino, 7);
+    }
+    file.seek(SeekFrom::Start(ino_pos))?;
+    file.write_all(&ino)?;
     Ok(())
 }
 
@@ -5457,7 +5682,7 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
             plan.relocations.iter().map(|(&o, &n)| (n, o)).collect();
 
         // Linear scan, coalescing consecutive data blocks into mapped/zero runs.
-        let mut pending_mapped: Vec<u64> = Vec::new();
+        let mut pending_mapped = crate::unix_common::compact::MappedBuilder::new();
         let mut pending_zeros: u64 = 0;
         for b in 0..new_total_blocks {
             // Decide this block's content, flushing pending data runs on any
@@ -5486,11 +5711,7 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
             };
 
             if let Some(bytes) = prebuilt {
-                if !pending_mapped.is_empty() {
-                    sections.push(CompactSection::MappedBlocks {
-                        old_blocks: std::mem::take(&mut pending_mapped),
-                    });
-                }
+                pending_mapped.flush(&mut sections);
                 if pending_zeros > 0 {
                     sections.push(CompactSection::Zeros(pending_zeros * block_size));
                     pending_zeros = 0;
@@ -5512,22 +5733,14 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
                     sections.push(CompactSection::Zeros(pending_zeros * block_size));
                     pending_zeros = 0;
                 }
-                pending_mapped.push(reverse.get(&b).copied().unwrap_or(b));
+                pending_mapped.push(reverse.get(&b).copied().unwrap_or(b), &mut sections);
                 total_data_reads += 1;
             } else {
-                if !pending_mapped.is_empty() {
-                    sections.push(CompactSection::MappedBlocks {
-                        old_blocks: std::mem::take(&mut pending_mapped),
-                    });
-                }
+                pending_mapped.flush(&mut sections);
                 pending_zeros += 1;
             }
         }
-        if !pending_mapped.is_empty() {
-            sections.push(CompactSection::MappedBlocks {
-                old_blocks: pending_mapped,
-            });
-        }
+        pending_mapped.flush(&mut sections);
         if pending_zeros > 0 {
             sections.push(CompactSection::Zeros(pending_zeros * block_size));
         }
@@ -5671,11 +5884,11 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
                 let run_len = run_end - block_idx;
 
                 if is_set {
-                    let old_blocks: Vec<u64> = (block_idx..run_end)
-                        .map(|bi| group_start_block + bi)
-                        .collect();
                     total_allocated += run_len;
-                    sections.push(CompactSection::MappedBlocks { old_blocks });
+                    sections.push(CompactSection::MappedRun {
+                        first: group_start_block + block_idx,
+                        count: run_len,
+                    });
                 } else {
                     sections.push(CompactSection::Zeros(run_len * block_size));
                 }

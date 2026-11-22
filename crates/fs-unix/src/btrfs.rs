@@ -1156,11 +1156,11 @@ impl<R: Read + Seek + Send> CompactBtrfsReader<R> {
             let aligned_start = range_start / sector_size * sector_size;
             let aligned_end = (range_end.div_ceil(sector_size) * sector_size).min(total_bytes);
             let num_sectors = (aligned_end - aligned_start) / sector_size;
-            let old_blocks: Vec<u64> = (0..num_sectors)
-                .map(|i| aligned_start / sector_size + i)
-                .collect();
             total_allocated_sectors += num_sectors;
-            sections.push(CompactSection::MappedBlocks { old_blocks });
+            sections.push(CompactSection::MappedRun {
+                first: aligned_start / sector_size,
+                count: num_sectors,
+            });
 
             pos = aligned_end;
         }

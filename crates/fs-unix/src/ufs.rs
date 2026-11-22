@@ -4168,7 +4168,7 @@ impl<R: Read + Seek + Send> Filesystem for UfsFilesystem<R> {
 /// byte positions; free fragments emit zeros. UFS uses
 /// **set bit = free** in the per-CG `cg_freeoff` bitmap, so we walk every
 /// CG, group consecutive same-state bits into runs, and emit each run as
-/// either a [`CompactSection::MappedBlocks`] (allocated) or
+/// either a [`CompactSection::MappedRun`] (allocated) or
 /// [`CompactSection::Zeros`] (free) section.
 ///
 /// Per-CG metadata (CG header, SB copy, inode table) is **also** covered
@@ -4225,9 +4225,11 @@ impl<R: Read + Seek + Send> CompactUfsReader<R> {
                     sections.push(CompactSection::Zeros(run_len * fsize));
                 } else {
                     // CLEAR = allocated — map the actual fragments.
-                    let old_blocks: Vec<u64> = (bit..run_end).map(|b| cgbase + b).collect();
                     total_allocated += run_len;
-                    sections.push(CompactSection::MappedBlocks { old_blocks });
+                    sections.push(CompactSection::MappedRun {
+                        first: cgbase + bit,
+                        count: run_end - bit,
+                    });
                 }
                 bit = run_end;
             }

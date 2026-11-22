@@ -2627,12 +2627,10 @@ impl<R: Read + Seek + Send> CompactJfsReader<R> {
                 sections.push(CompactSection::Zeros(start_byte - covered));
             }
             if run.allocated {
-                let n_blocks_per_section = run.length as usize;
-                let mut old_blocks = Vec::with_capacity(n_blocks_per_section);
-                for b in run.start_block..run.start_block + run.length {
-                    old_blocks.push(b);
-                }
-                sections.push(CompactSection::MappedBlocks { old_blocks });
+                sections.push(CompactSection::MappedRun {
+                    first: run.start_block,
+                    count: run.length,
+                });
             } else {
                 sections.push(CompactSection::Zeros(len_bytes));
             }
@@ -2669,8 +2667,10 @@ impl<R: Read + Seek + Send> CompactJfsReader<R> {
                 let blocks_start = trimmed_start.div_ceil(bsize);
                 let blocks_end = end / bsize;
                 if blocks_end > blocks_start {
-                    let old_blocks: Vec<u64> = (blocks_start..blocks_end).collect();
-                    sections.push(CompactSection::MappedBlocks { old_blocks });
+                    sections.push(CompactSection::MappedRun {
+                        first: blocks_start,
+                        count: blocks_end - blocks_start,
+                    });
                     covered = blocks_end * bsize;
                 }
                 continue;
@@ -2682,8 +2682,10 @@ impl<R: Read + Seek + Send> CompactJfsReader<R> {
             let blocks_start = start / bsize;
             let blocks_end = end / bsize;
             if blocks_end > blocks_start {
-                let old_blocks: Vec<u64> = (blocks_start..blocks_end).collect();
-                sections.push(CompactSection::MappedBlocks { old_blocks });
+                sections.push(CompactSection::MappedRun {
+                    first: blocks_start,
+                    count: blocks_end - blocks_start,
+                });
                 covered = end;
             }
         }

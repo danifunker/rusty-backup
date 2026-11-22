@@ -945,9 +945,11 @@ impl<R: Read + Seek + Send> CompactReiserFsReader<R> {
                 let run_len = run_end - bit;
 
                 if is_set {
-                    let old_blocks: Vec<u64> = (bit..run_end).map(|b| group_start + b).collect();
                     total_allocated += run_len;
-                    sections.push(CompactSection::MappedBlocks { old_blocks });
+                    sections.push(CompactSection::MappedRun {
+                        first: group_start + bit,
+                        count: run_len,
+                    });
                 } else {
                     sections.push(CompactSection::Zeros(run_len * block_size));
                 }

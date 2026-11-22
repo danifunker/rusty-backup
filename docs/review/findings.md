@@ -386,7 +386,7 @@ drivers are merged.
 | UNX-015 | S1 | plausible | ofs_write.rs `write_sectors`, `claim_slot` | Bound allows one sector past the volume; directory chain pointer can write into the bitmap. | fixed (e9e11e89) |
 | UNX-016 | S1 | plausible | jfs_fsck.rs `check_connectivity`, `repair_jfs` | Directories over 4096 bytes skipped: children reported as orphans and double-linked. | fixed (e9e11e89) |
 | UNX-017 | S1 | plausible | btrfs.rs `CompactBtrfsReader::new` | Boot area and superblock mirrors zeroed in a compacted backup: restored partition does not boot. | fixed (e9e11e89) |
-| UNX-018 | S2 | confirmed | ufs.rs, efs.rs, efs_v1.rs orphan adoption | Children of an orphaned directory adopted twice; UFS `..` and lost+found nlink stale; efs `continue` in the wrong loop. | open |
+| UNX-018 | S2 | confirmed | ufs.rs, efs.rs, efs_v1.rs orphan adoption | Children of an orphaned directory adopted twice; UFS `..` and lost+found nlink stale; efs `continue` in the wrong loop. | fixed (47957566) |
 | UNX-019 | S2 | confirmed | ext.rs, btrfs.rs, jfs.rs, reiserfs.rs tree walks | No depth cap / level check: self-pointing nodes overflow the stack or loop. | fixed (267f907c) |
 | UNX-020 | S2 | confirmed | ext, ufs, jfs, jfs1, btrfs, bfs, vxfs | Allocations sized from on-disk fields (symlink size 1<<40 aborts a listing). | fixed (267f907c) |
 | UNX-021 | S2 | confirmed | efs.rs `open`, `inode_byte_offset` | `cgisize` / `cgfsize` / `ncg` not validated: divide by zero on listing. | fixed (72c94099) |
@@ -396,9 +396,9 @@ drivers are merged.
 | UNX-025 | S2 | confirmed | ext.rs `open` | Shift before range check, underflow, descriptor Vec sized from disk (up to 128 GiB). | fixed (72c94099) |
 | UNX-026 | S2 | confirmed | ext.rs `add_block_to_extent_inode` | `eh_entries` / `eh_max` trusted: indexes past `i_block`. | fixed (72c94099) |
 | UNX-027 | S2 | confirmed | ext.rs `rename` | File type recomputed as dir / regular: symlinks, devices, fifos get the wrong type. | fixed (72c94099) |
-| UNX-028 | S2 | plausible | ext_fsck.rs; ext.rs | INODE_UNINIT / `itable_unused` ignored: false errors and repairs on lazy-init volumes. | open |
+| UNX-028 | S2 | plausible | ext_fsck.rs; ext.rs | INODE_UNINIT / `itable_unused` ignored: false errors and repairs on lazy-init volumes. | fixed (47957566) |
 | UNX-029 | S2 | plausible | ext.rs `grow_ext_add_groups` | Grow ignores reserved GDT blocks and the resize inode. | open |
-| UNX-030 | S2 | plausible | ext.rs; ext_fsck.rs | Block-bitmap checksum covers the whole block, not blocks_per_group / 8. | open |
+| UNX-030 | S2 | plausible | ext.rs; ext_fsck.rs | Block-bitmap checksum covers the whole block, not blocks_per_group / 8. | fixed (47957566) |
 | UNX-031 | S2 | plausible | ext.rs `resize_ext_in_place` shrink | Only counts patched: padding bits, descriptor table, inode count stale. | open |
 | UNX-032 | S2 | confirmed | ufs.rs `dir_find`, `dir_remove` | Name slices without the `namlen <= reclen - 8` check: panic on create. | fixed (4fb60164) |
 | UNX-033 | S2 | confirmed | ufs.rs `create_file`, `create_directory` | Rollback runs with size 0 and frees nothing: blocks leak; `cs_ndir` off by one. | fixed (4fb60164) |
