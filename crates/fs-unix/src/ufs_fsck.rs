@@ -182,9 +182,29 @@ pub fn fsck_ufs<R: Read + Seek + Send>(
                 continue;
             }
         };
+        // Every fragment of each block is claimed, not just the first: a shared tail fragment
+        // or an overlapping run would otherwise pass. A direct-only file's last block may be a
+        // shorter fragment run.
+        let per_block = fs.frag as u64;
+        let blocks = ino.size.div_ceil(fs.bsize);
+        let tail = (blocks > 0 && blocks <= 12)
+            .then(|| {
+                let last = ino.direct[blocks as usize - 1];
+                let bytes = ino.size - (blocks - 1) * fs.bsize;
+                (last, bytes.div_ceil(fs.fsize))
+            })
+            .filter(|t| t.0 != 0);
+        let spread = |starts: &[u64], tail: Option<(u64, u64)>| -> Vec<u64> {
+            let mut out = Vec::with_capacity(starts.len() * per_block as usize);
+            for &f in starts {
+                let n = tail.filter(|t| t.0 == f).map_or(per_block, |t| t.1);
+                out.extend((0..n).map(|k| f.saturating_add(k)));
+            }
+            out
+        };
         record_frags(
             &mut allocated,
-            &data_frags,
+            &spread(&data_frags, tail),
             "data",
             inum,
             total_frags,
@@ -192,7 +212,7 @@ pub fn fsck_ufs<R: Read + Seek + Send>(
         );
         record_frags(
             &mut allocated,
-            &indirect_frags,
+            &spread(&indirect_frags, None),
             "indirect",
             inum,
             total_frags,
