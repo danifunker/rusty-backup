@@ -1728,6 +1728,61 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         )))
     }
 
+    /// Free the inodes on each AGI's unlinked lists (files deleted while still open at a crash),
+    /// as a mount does after recovery. Their blocks are left for the free-space rebuild.
+    pub(crate) fn free_unlinked_inodes(&mut self) -> Result<usize, FilesystemError> {
+        const NULLAGINO: u32 = u32::MAX;
+        const AGI_UNLINKED_OFF: usize = 40;
+        let sb = self.superblock().clone();
+        let sectsize = sb.sectsize as u64;
+        let ino_shift = sb.agblklog + sb.inopblog;
+        let mut freed = 0usize;
+        for agno in 0..u64::from(sb.agcount) {
+            let agi_byte = self.partition_offset
+                + agno * u64::from(sb.agblocks) * u64::from(sb.blocksize)
+                + 2 * sectsize;
+            let mut agi = vec![0u8; sectsize as usize];
+            read_at_aligned(&mut self.reader, agi_byte, sectsize, &mut agi)?;
+            let mut chain = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for bucket in 0..64 {
+                let o = AGI_UNLINKED_OFF + 4 * bucket;
+                let mut agino = BigEndian::read_u32(&agi[o..o + 4]);
+                while agino != NULLAGINO && seen.insert(agino) {
+                    let ino = (agno << ino_shift) | u64::from(agino);
+                    let (_c, buf) = self.read_inode_buf(ino)?;
+                    chain.push(ino);
+                    agino = BigEndian::read_u32(&buf[96..100]);
+                }
+                BigEndian::write_u32(&mut agi[o..o + 4], NULLAGINO);
+            }
+            if chain.is_empty() {
+                continue;
+            }
+            self.write_agi_sector(&sb, agi_byte, &mut agi)?;
+            for ino in chain {
+                let (core, mut buf) = self.read_inode_buf(ino)?;
+                BigEndian::write_u32(&mut buf[96..100], NULLAGINO);
+                if core.nlink > 0 {
+                    // Still linked (an O_TMPFILE that was given a name): only leave the list.
+                    self.write_inode_region(&sb, ino, &buf)?;
+                    continue;
+                }
+                // A free inode owns nothing: empty extent forks, no size, no blocks.
+                buf[5] = 2;
+                buf[56..84].fill(0);
+                buf[83] = 2;
+                let fork = if sb.is_v5() { 176 } else { 100 };
+                buf[fork..].fill(0);
+                self.write_inode_region(&sb, ino, &buf)?;
+                self.free_inode(&sb, ino)?;
+                freed += 1;
+            }
+        }
+        self.reader.flush()?;
+        Ok(freed)
+    }
+
     /// Return `extents` (as `(fsblock, count)`) to the free-space btrees by
     /// rebuilding each touched AG's bno/cnt over its current free set plus the
     /// freed blocks, then resyncing `sb_fdblocks`. The inverse of

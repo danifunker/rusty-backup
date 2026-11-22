@@ -14,6 +14,23 @@ use anyhow::{anyhow, Context, Result};
 use crate::fs::{open_editable_filesystem, open_filesystem, FsckResult, RepairReport};
 use crate::model::source_reader::{is_chd_path, open_read};
 
+/// Throw away the internal log of the XFS volume at `offset` (`xfs_repair -L`), for a log no
+/// repair can replay. Every change the log holds that had not reached the disk is lost.
+pub fn discard_xfs_log<R: std::io::Read + std::io::Write + std::io::Seek>(
+    reader: &mut R,
+    offset: u64,
+) -> Result<()> {
+    let mut sector = [0u8; 512];
+    reader.seek(std::io::SeekFrom::Start(offset))?;
+    reader.read_exact(&mut sector)?;
+    let sb = fs_xfs::xfs::sb::XfsSuperblock::parse(&sector)
+        .map_err(|e| anyhow!("--discard-log works on XFS volumes only: {e}"))?;
+    fs_xfs::xfs::log_replay::zero_log(reader, offset, &sb)
+        .map_err(|e| anyhow!("discarding the XFS log: {e}"))?;
+    reader.flush()?;
+    Ok(())
+}
+
 /// Run `fsck` against the partition at `offset` inside `path`.
 ///
 /// Returns `Ok(None)` when the underlying filesystem implementation does

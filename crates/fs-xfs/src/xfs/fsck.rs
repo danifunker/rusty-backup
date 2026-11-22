@@ -23,6 +23,7 @@ use std::io::{Read, Seek};
 use byteorder::{BigEndian, ByteOrder};
 
 use super::ag::{XfsAgf, XfsAgi};
+use super::log_replay::LogCheck;
 use super::sb::XfsSuperblock;
 use super::types::{
     NULLAGBLOCK, XFS_ABTB_CRC_MAGIC, XFS_ABTB_MAGIC, XFS_ABTC_CRC_MAGIC, XFS_ABTC_MAGIC,
@@ -45,7 +46,7 @@ use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
 fn is_repairable_code(code: &str) -> bool {
     matches!(
         code,
-        "ReplicaSbMismatch" | "AgfFreeblksMismatch" | "OrphanInode"
+        "ReplicaSbMismatch" | "AgfFreeblksMismatch" | "OrphanInode" | "LogDirty"
     )
 }
 
@@ -137,6 +138,34 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     pub(crate) fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
         let mut b = Builder::new();
         let sb = self.superblock().clone();
+
+        // Like xfs_repair, judge nothing else while the log holds changes the volume lacks.
+        match super::log_replay::check_log(&mut self.reader, self.partition_offset, &sb) {
+            Ok(LogCheck::Clean) => {}
+            Ok(LogCheck::Replayable { transactions }) => {
+                b.err(
+                    "LogDirty",
+                    format!(
+                        "the volume was not cleanly unmounted: its log holds {transactions} \
+                         committed transactions not yet written to it. A repair replays them, \
+                         as a mount would, then checks the rest"
+                    ),
+                );
+                return Ok(b.finish());
+            }
+            Ok(LogCheck::Unrecoverable(why)) => {
+                b.err(
+                    "LogUnrecoverable",
+                    format!(
+                        "the volume was not cleanly unmounted and its log cannot be replayed \
+                         ({why}). Only discarding the log makes it usable, and that loses the \
+                         changes it holds: `rb-cli fsck --repair --discard-log`, or xfs_repair -L"
+                    ),
+                );
+                return Ok(b.finish());
+            }
+            Err(e) => b.warn("LogUnreadable", format!("could not read the log: {e}")),
+        }
 
         check_superblock_geometry(&sb, &mut b);
         let ag_headers = self.check_ag_headers(&sb, &mut b);

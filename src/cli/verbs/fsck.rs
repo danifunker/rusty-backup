@@ -44,6 +44,11 @@ pub struct FsckArgs {
     #[arg(long, conflicts_with = "checkonly")]
     pub repair: bool,
 
+    /// XFS only, with `--repair`: throw away a log that cannot be replayed (`xfs_repair -L`)
+    /// before repairing. The changes the log holds are lost.
+    #[arg(long = "discard-log", requires = "repair")]
+    pub discard_log: bool,
+
     /// Seconds to wait for an interactive repair confirmation before
     /// resolving to "No" (default 30; or `[fsck] prompt-timeout` from
     /// the config file when set). `0` waits indefinitely (TTY only).
@@ -98,7 +103,12 @@ pub fn run(args: FsckArgs) -> Result<()> {
     require_non_flat(args.format, "fsck")?;
 
     if args.repair {
-        return repair_mode(&args.image, args.format, &args.fs_override);
+        return repair_mode(
+            &args.image,
+            args.format,
+            &args.fs_override,
+            args.discard_log,
+        );
     }
     check_mode(&args.image, args.format, &args.fs_override)
 }
@@ -185,6 +195,7 @@ fn repair_mode(
     image: &ImageRef,
     format: OutputFormat,
     fs_override: &FsDispatchOverride,
+    discard_log: bool,
 ) -> Result<()> {
     // Alto disk packs open through the container parser + persist as PDI, not
     // through the block-factory / commit path.
@@ -192,13 +203,17 @@ fn repair_mode(
         return alto_repair(disk, is_pdi, image, format);
     }
 
-    let (file, mut ctx, commit) = resolve_partition_rw_forced(
+    let (mut file, mut ctx, commit) = resolve_partition_rw_forced(
         &image.path,
         image.partition.clone(),
         fs_override.fs_type.as_deref(),
     )?;
     fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
+    if discard_log {
+        crate::model::fsck_runner::discard_xfs_log(&mut file, ctx.offset)?;
+        log_stderr("Discarded the XFS log; the changes it held are lost");
+    }
     let mut fs = ctx
         .open_editable(file)
         .map_err(|e| anyhow!("opening filesystem for repair: {e}"))?;

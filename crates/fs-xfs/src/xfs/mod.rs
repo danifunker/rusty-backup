@@ -30,6 +30,7 @@ pub mod inobt_repair;
 pub mod inode;
 pub mod inode_repair;
 pub mod log;
+pub mod log_replay;
 pub mod repair;
 pub mod sb;
 pub mod symlink;
@@ -450,6 +451,19 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             check_bmbt_header(&block, Some(0), self.sb.is_v5())?;
         }
         Ok(out)
+    }
+
+    /// Re-read the superblock after something rewrote it under us (log replay or discard).
+    pub(crate) fn reload_superblock(&mut self) -> Result<(), FilesystemError> {
+        let mut sector = [0u8; SECTOR as usize];
+        read_at_aligned(&mut self.reader, self.partition_offset, SECTOR, &mut sector)?;
+        let sb = XfsSuperblock::parse(&sector)?;
+        sb.validate_geometry()?;
+        self.dir_format = sb.dir_format();
+        self.label = sb.label();
+        self.sb = sb;
+        self.log = None;
+        Ok(())
     }
 
     /// Whether the internal log is clean; read once, then cached.

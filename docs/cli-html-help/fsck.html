@@ -21,6 +21,8 @@
 <dd>Scan only. Never prompt, never repair. Exits non-zero on issues</dd>
 <dt><code>--repair</code></dt>
 <dd>Auto-repair detected issues without prompting</dd>
+<dt><code>--discard-log</code></dt>
+<dd>XFS only, with `--repair`: throw away a log that cannot be replayed (`xfs_repair -L`) before repairing. The changes the log holds are lost</dd>
 <dt><code>--prompt-timeout</code></dt>
 <dd>Seconds to wait for an interactive repair confirmation before resolving to &quot;No&quot; (default 30; or `[fsck] prompt-timeout` from the config file when set). `0` waits indefinitely (TTY only)</dd>
 <dt><code>--format</code></dt>

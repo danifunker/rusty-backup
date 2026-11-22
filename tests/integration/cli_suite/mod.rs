@@ -37,3 +37,4 @@ mod cli_restore_hfs;
 mod cli_sgi_hdd;
 mod cli_show_partmap;
 mod cli_x68000;
+mod cli_xfs_log;

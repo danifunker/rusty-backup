@@ -104,7 +104,12 @@ fn put_modes_present() {
 #[test]
 fn fsck_modes_present() {
     let h = help(&["fsck"]);
-    for flag in &["--checkonly", "--repair", "--prompt-timeout"] {
+    for flag in &[
+        "--checkonly",
+        "--repair",
+        "--discard-log",
+        "--prompt-timeout",
+    ] {
         assert!(h.contains(flag), "`fsck` help missing flag {flag:?}");
     }
 }

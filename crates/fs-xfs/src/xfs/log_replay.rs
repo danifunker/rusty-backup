@@ -1,0 +1,1320 @@
+//! XFS log recovery: replay the committed transactions in the internal log, as a mount would,
+//! or (`-L` style) throw the log away. See `docs/xfs_log_replay.md` for the format notes.
+//!
+//! Written clean-room from the public "XFS Algorithms & Data Structures" format description,
+//! with the numeric flag values and the recovered byte layout pinned by black-box comparison
+//! against `xfs_logprint` and the kernel's own recovery of the same images.
+//!
+//! The walk runs twice over the records from the tail to the head. The first pass writes
+//! nothing: it collects buffer cancellations and intent / done pairs, and refuses a log holding
+//! anything this module cannot finish (quota items, unfinished rmap / refcount / bmap / attr /
+//! exchange intents). The second pass applies each transaction when its commit record arrives.
+//! Only open transactions are held in memory. Unfinished extent-free intents are reported, not
+//! applied: the blocks they name are left allocated but unowned, which the repair that follows
+//! (the free-space rebuild) returns to the free space.
+
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom, Write};
+
+use disk_core::filesystem::FilesystemError;
+
+use super::ag::{XfsAgf, XfsAgi};
+use super::bmap::fsblock_to_partition_byte;
+use super::sb::XfsSuperblock;
+use super::v5_crc::stamp_crc;
+
+const BB: u64 = 512;
+const HEADER_MAGIC: u32 = 0xFEED_BABE;
+/// `h_cycle_data` slots per header sector (`XLOG_HEADER_CYCLE_SIZE / BBSIZE`).
+const CYCLE_SLOTS: usize = 64;
+const HEADER_CYCLE_SIZE: u32 = 32 * 1024;
+const MAX_RECORD_BYTES: u32 = 256 * 1024;
+
+const CLIENT_TRANS: u8 = 0x69;
+const OP_START: u8 = 0x01;
+const OP_COMMIT: u8 = 0x02;
+const OP_WAS_CONT: u8 = 0x08;
+const OP_UNMOUNT: u8 = 0x20;
+
+const TRANS_MAGIC: u32 = 0x5452_414E;
+const LI_EFI: u16 = 0x1236;
+const LI_EFD: u16 = 0x1237;
+const LI_INODE: u16 = 0x123b;
+const LI_BUF: u16 = 0x123c;
+const LI_DQUOT: u16 = 0x123d;
+const LI_QUOTAOFF: u16 = 0x123e;
+const LI_ICREATE: u16 = 0x123f;
+const LI_RT_EFI: u16 = 0x124a;
+const LI_RT_EFD: u16 = 0x124b;
+
+const BLF_INODE_BUF: u16 = 0x1;
+const BLF_CANCEL: u16 = 0x2;
+const BLF_CHUNK: usize = 128;
+
+const ILOG_CORE: u32 = 0x1;
+const ILOG_DDATA: u32 = 0x2;
+const ILOG_DEXT: u32 = 0x4;
+const ILOG_DBROOT: u32 = 0x8;
+const ILOG_DEV: u32 = 0x10;
+const ILOG_UUID: u32 = 0x20;
+const ILOG_ADATA: u32 = 0x40;
+const ILOG_AEXT: u32 = 0x80;
+const ILOG_ABROOT: u32 = 0x100;
+const ILOG_DFORK: u32 = ILOG_DDATA | ILOG_DEXT | ILOG_DBROOT;
+const ILOG_AFORK: u32 = ILOG_ADATA | ILOG_AEXT | ILOG_ABROOT;
+
+/// Offset of `di_next_unlinked` in an on-disk inode.
+const DI_NEXT_UNLINKED: usize = 96;
+const DI_CRC: usize = 100;
+const DI_LSN: usize = 112;
+
+/// What replay did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplayReport {
+    /// Log records walked, tail to head.
+    pub records: usize,
+    /// Committed transactions applied.
+    pub transactions: usize,
+    /// Transactions with no commit record at the head; a mount drops these too.
+    pub incomplete: usize,
+    pub buffers: usize,
+    /// Buffer writes skipped because the blocks were freed later in the log.
+    pub cancelled: usize,
+    pub inodes: usize,
+    pub inode_chunks: usize,
+    /// Extent-free intents with no done record: blocks the repair's free-space rebuild reclaims.
+    pub unfinished_frees: usize,
+}
+
+/// What [`replay_log`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    /// Nothing to replay: the head is an unmount record, or the log is blank or external.
+    Clean,
+    /// The log was replayed and a clean unmount record written in its place.
+    Replayed(ReplayReport),
+    /// The log cannot be replayed faithfully; nothing was written. The reason says why.
+    Unrecoverable(String),
+}
+
+/// Byte order of the log's host-endian fields, from `h_fmt`.
+#[derive(Clone, Copy)]
+struct En {
+    big: bool,
+}
+
+impl En {
+    fn u16(self, b: &[u8], o: usize) -> u16 {
+        let a = [b[o], b[o + 1]];
+        if self.big {
+            u16::from_be_bytes(a)
+        } else {
+            u16::from_le_bytes(a)
+        }
+    }
+    fn u32(self, b: &[u8], o: usize) -> u32 {
+        let a = [b[o], b[o + 1], b[o + 2], b[o + 3]];
+        if self.big {
+            u32::from_be_bytes(a)
+        } else {
+            u32::from_le_bytes(a)
+        }
+    }
+    fn u64(self, b: &[u8], o: usize) -> u64 {
+        let a: [u8; 8] = b[o..o + 8].try_into().expect("8 bytes");
+        if self.big {
+            u64::from_be_bytes(a)
+        } else {
+            u64::from_le_bytes(a)
+        }
+    }
+}
+
+fn be32(b: &[u8], o: usize) -> u32 {
+    u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+
+fn be64(b: &[u8], o: usize) -> u64 {
+    u64::from_be_bytes(b[o..o + 8].try_into().expect("8 bytes"))
+}
+
+fn corrupt(msg: String) -> FilesystemError {
+    FilesystemError::Parse(msg)
+}
+
+/// The internal log's place on the device.
+struct Log {
+    start: u64,
+    bbs: u64,
+}
+
+impl Log {
+    fn new(partition_offset: u64, sb: &XfsSuperblock) -> Self {
+        Log {
+            start: partition_offset
+                + fsblock_to_partition_byte(sb.logstart, sb.agblocks, sb.agblklog, sb.blocksize),
+            bbs: u64::from(sb.logblocks) * u64::from(sb.blocksize) / BB,
+        }
+    }
+
+    /// Read `n` basic blocks from `blk`, wrapping at the end of the log.
+    fn read<R: Read + Seek>(&self, dev: &mut R, blk: u64, n: u64) -> std::io::Result<Vec<u8>> {
+        let mut out = vec![0u8; (n * BB) as usize];
+        let mut done = 0u64;
+        while done < n {
+            let at = (blk + done) % self.bbs;
+            let run = (self.bbs - at).min(n - done);
+            dev.seek(SeekFrom::Start(self.start + at * BB))?;
+            dev.read_exact(&mut out[(done * BB) as usize..((done + run) * BB) as usize])?;
+            done += run;
+        }
+        Ok(out)
+    }
+}
+
+/// One log record with its cycle stamps undone.
+struct Record {
+    blk: u64,
+    lsn: u64,
+    tail_lsn: u64,
+    num_ops: u32,
+    en: En,
+    data: Vec<u8>,
+    /// Where the next record starts.
+    next: u64,
+}
+
+/// Read the record whose header sits at `blk`; `None` if there is none or it was torn.
+fn read_record<R: Read + Seek>(
+    dev: &mut R,
+    log: &Log,
+    blk: u64,
+) -> Result<Option<Record>, FilesystemError> {
+    let h = log.read(dev, blk, 1)?;
+    if be32(&h, 0) != HEADER_MAGIC {
+        return Ok(None);
+    }
+    let cycle = be32(&h, 4);
+    let version = be32(&h, 8);
+    let len = be32(&h, 12);
+    let size = be32(&h, 320);
+    if !(version == 1 || version == 2) || len > MAX_RECORD_BYTES || cycle == 0 {
+        return Ok(None);
+    }
+    let header_bbs = if version == 2 && size > HEADER_CYCLE_SIZE {
+        u64::from(size.div_ceil(HEADER_CYCLE_SIZE))
+    } else {
+        1
+    };
+    let headers = log.read(dev, blk, header_bbs)?;
+    let data_bbs = u64::from(len).div_ceil(BB);
+    let mut data = log.read(dev, blk + header_bbs, data_bbs)?;
+    for i in 0..data_bbs as usize {
+        let (hdr, slot) = (i / CYCLE_SLOTS, i % CYCLE_SLOTS);
+        let hb = &headers[hdr * BB as usize..(hdr + 1) * BB as usize];
+        // Slot data starts at h_cycle_data (44) in the first header, after xh_cycle (4) in the rest.
+        let base = if hdr == 0 { 44 } else { 4 };
+        if hdr > 0 && be32(hb, 0) != cycle {
+            return Ok(None);
+        }
+        let s = &mut data[i * BB as usize..i * BB as usize + 4];
+        if be32(s, 0) != cycle {
+            return Ok(None); // a sector from an older pass: the write never finished
+        }
+        s.copy_from_slice(&hb[base + 4 * slot..base + 4 * slot + 4]);
+    }
+    data.truncate(len as usize);
+    Ok(Some(Record {
+        blk,
+        lsn: be64(&h, 16),
+        tail_lsn: be64(&h, 24),
+        num_ops: be32(&h, 40),
+        // h_fmt: 1 little-endian Linux, 2 big-endian Linux, 3 big-endian IRIX.
+        en: En {
+            big: matches!(be32(&h, 300), 2 | 3),
+        },
+        data,
+        next: (blk + header_bbs + data_bbs) % log.bbs,
+    }))
+}
+
+/// The newest complete record: the highest-LSN header whose sectors all carry its cycle.
+fn find_head<R: Read + Seek>(dev: &mut R, log: &Log) -> Result<Option<Record>, FilesystemError> {
+    let mut found: Vec<(u64, u64)> = Vec::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let per = buf.len() as u64 / BB;
+    let mut bb = 0u64;
+    dev.seek(SeekFrom::Start(log.start))?;
+    while bb < log.bbs {
+        let n = (log.bbs - bb).min(per);
+        dev.read_exact(&mut buf[..(n * BB) as usize])?;
+        for i in 0..n {
+            let s = &buf[(i * BB) as usize..((i + 1) * BB) as usize];
+            let lsn = be64(s, 16);
+            // A real header names its own block in the low half of its LSN.
+            if be32(s, 0) == HEADER_MAGIC && lsn & 0xFFFF_FFFF == bb + i {
+                found.push((lsn, bb + i));
+            }
+        }
+        bb += n;
+    }
+    found.sort_unstable_by(|a, b| b.cmp(a));
+    for (_, blk) in found {
+        if let Some(r) = read_record(dev, log, blk)? {
+            return Ok(Some(r));
+        }
+    }
+    Ok(None)
+}
+
+fn is_unmount(r: &Record) -> bool {
+    r.num_ops == 1 && r.data.len() >= 12 && r.data[9] & OP_UNMOUNT != 0
+}
+
+/// A transaction being reassembled from its operations.
+#[derive(Default)]
+struct Trans {
+    regions: Vec<Vec<u8>>,
+    /// LSN of the record holding the start operation.
+    lsn: u64,
+}
+
+/// Walk the records from the tail to `head`, handing each committed transaction to `on_commit`.
+fn walk<R: Read + Seek>(
+    dev: &mut R,
+    log: &Log,
+    head: &Record,
+    mut on_commit: impl FnMut(&mut R, &Trans, En) -> Result<(), FilesystemError>,
+) -> Result<(usize, usize), FilesystemError> {
+    let mut open: HashMap<u32, Trans> = HashMap::new();
+    let mut blk = head.tail_lsn & 0xFFFF_FFFF;
+    let mut records = 0usize;
+    loop {
+        if records as u64 > log.bbs {
+            return Err(corrupt("XFS log walk did not reach the head".into()));
+        }
+        let rec = read_record(dev, log, blk)?.ok_or_else(|| {
+            corrupt(format!(
+                "XFS log record at block {blk}, between the tail and the head, is missing or torn"
+            ))
+        })?;
+        records += 1;
+        let d = &rec.data;
+        let mut p = 0usize;
+        for _ in 0..rec.num_ops {
+            if p + 12 > d.len() {
+                return Err(corrupt(format!(
+                    "XFS log record {} overruns its length",
+                    rec.blk
+                )));
+            }
+            let tid = be32(d, p);
+            let len = be32(d, p + 4) as usize;
+            let (client, flags) = (d[p + 8], d[p + 9]);
+            let body = p + 12;
+            if body + len > d.len() {
+                return Err(corrupt(format!(
+                    "XFS log op in record {} overruns it",
+                    rec.blk
+                )));
+            }
+            p = body + len;
+            if client != CLIENT_TRANS {
+                continue;
+            }
+            if flags & OP_START != 0 {
+                open.insert(
+                    tid,
+                    Trans {
+                        regions: Vec::new(),
+                        lsn: rec.lsn,
+                    },
+                );
+            }
+            // Ops of a transaction that began before the tail were already written back.
+            let Some(t) = open.get_mut(&tid) else {
+                continue;
+            };
+            if len > 0 {
+                let payload = &d[body..body + len];
+                match t.regions.last_mut() {
+                    Some(last) if flags & OP_WAS_CONT != 0 => last.extend_from_slice(payload),
+                    _ => t.regions.push(payload.to_vec()),
+                }
+            }
+            if flags & OP_COMMIT != 0 {
+                let t = open.remove(&tid).expect("present");
+                on_commit(dev, &t, rec.en)?;
+            }
+        }
+        if rec.blk == head.blk {
+            break;
+        }
+        blk = rec.next;
+    }
+    Ok((records, open.len()))
+}
+
+/// One log item: its format region and the data regions after it.
+struct Item<'a> {
+    kind: u16,
+    regions: &'a [Vec<u8>],
+}
+
+/// Split a transaction's regions into items, skipping the leading transaction header.
+fn items(t: &Trans, en: En) -> Result<Vec<Item<'_>>, FilesystemError> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let r = &t.regions;
+    while i < r.len() {
+        let f = &r[i];
+        if f.len() >= 4 && en.u32(f, 0) == TRANS_MAGIC {
+            i += 1;
+            continue;
+        }
+        if f.len() < 4 {
+            return Err(corrupt("XFS log item shorter than its header".into()));
+        }
+        let kind = en.u16(f, 0);
+        let size = usize::from(en.u16(f, 2)).max(1);
+        if i + size > r.len() {
+            return Err(corrupt(format!(
+                "XFS log item 0x{kind:x} is missing regions"
+            )));
+        }
+        out.push(Item {
+            kind,
+            regions: &r[i..i + size],
+        });
+        i += size;
+    }
+    Ok(out)
+}
+
+/// The id an intent or done item carries at offset 8; done items name their intent there.
+fn item_id(f: &[u8], en: En) -> Option<u64> {
+    (f.len() >= 16).then(|| en.u64(f, 8))
+}
+
+fn intent_name(kind: u16) -> Option<&'static str> {
+    Some(match kind {
+        0x1240 => "reverse-mapping update",
+        0x1242 => "reference-count update",
+        0x1244 => "file block-mapping update",
+        0x1246 => "extended-attribute update",
+        0x1248 => "file-mapping exchange",
+        _ => return None,
+    })
+}
+
+/// The done item that completes each intent kind.
+fn done_for(intent: u16) -> u16 {
+    intent + 1
+}
+
+/// Buffer key for cancellation: (daddr, sectors).
+type BufKey = (u64, u32);
+
+/// First-pass findings.
+#[derive(Default)]
+struct Survey {
+    cancels: HashMap<BufKey, u32>,
+    intents: HashMap<u64, u16>,
+    done: HashSet<(u16, u64)>,
+    problem: Option<String>,
+    transactions: usize,
+}
+
+fn buf_key(f: &[u8], en: En) -> BufKey {
+    (en.u64(f, 8), u32::from(en.u16(f, 6)))
+}
+
+fn survey(t: &Trans, en: En, s: &mut Survey) -> Result<(), FilesystemError> {
+    s.transactions += 1;
+    for it in items(t, en)? {
+        let f = &it.regions[0];
+        match it.kind {
+            LI_BUF => {
+                if f.len() < 24 {
+                    return Err(corrupt("XFS buffer log item too short".into()));
+                }
+                if en.u16(f, 4) & BLF_CANCEL != 0 {
+                    *s.cancels.entry(buf_key(f, en)).or_insert(0) += 1;
+                }
+            }
+            LI_INODE | LI_ICREATE => {}
+            LI_EFI | LI_RT_EFI => {
+                if let Some(id) = item_id(f, en) {
+                    s.intents.insert(id, it.kind);
+                }
+            }
+            LI_EFD | LI_RT_EFD => {
+                if let Some(id) = item_id(f, en) {
+                    s.done.insert((it.kind, id));
+                }
+            }
+            LI_DQUOT | LI_QUOTAOFF => {
+                s.problem.get_or_insert_with(|| {
+                    "the log holds quota updates, which this tool does not replay".into()
+                });
+            }
+            k if intent_name(k).is_some() => {
+                if let Some(id) = item_id(f, en) {
+                    s.intents.insert(id, k);
+                }
+            }
+            k if intent_name(k.wrapping_sub(1)).is_some() => {
+                if let Some(id) = item_id(f, en) {
+                    s.done.insert((k, id));
+                }
+            }
+            k => {
+                s.problem.get_or_insert_with(|| {
+                    format!("the log holds an item of unknown type 0x{k:x}")
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Volume facts the apply pass needs.
+struct Geo {
+    off: u64,
+    v5: bool,
+    isize: usize,
+    blocksize: u64,
+    agblocks: u64,
+    agblklog: u8,
+    inopblog: u8,
+    meta_uuid: [u8; 16],
+}
+
+impl Geo {
+    fn new(off: u64, sb: &XfsSuperblock) -> Self {
+        Geo {
+            off,
+            v5: sb.versionnum & 0xF == 5,
+            isize: usize::from(sb.inodesize),
+            blocksize: u64::from(sb.blocksize),
+            agblocks: u64::from(sb.agblocks),
+            agblklog: sb.agblklog,
+            inopblog: sb.inopblog,
+            meta_uuid: *sb.meta_uuid(),
+        }
+    }
+
+    fn byte(&self, daddr: u64) -> u64 {
+        self.off + daddr * BB
+    }
+}
+
+fn read_exact_at<D: Read + Seek>(dev: &mut D, at: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut b = vec![0u8; len];
+    dev.seek(SeekFrom::Start(at))?;
+    dev.read_exact(&mut b)?;
+    Ok(b)
+}
+
+fn write_at<D: Write + Seek>(dev: &mut D, at: u64, b: &[u8]) -> std::io::Result<()> {
+    dev.seek(SeekFrom::Start(at))?;
+    dev.write_all(b)
+}
+
+/// Set a v5 metadata block's LSN and checksum, picked by its magic; other blocks are left alone.
+fn restamp_v5_block(b: &mut [u8], lsn: u64) {
+    if b.len() < 64 {
+        return;
+    }
+    let m32 = be32(b, 0);
+    let (lsn_off, crc_off) = match &m32.to_be_bytes() {
+        b"XFSB" => (240, 224),
+        b"XAGF" => (208, 216),
+        b"XAGI" => (320, 312),
+        b"XAFL" => (24, 32),
+        b"AB3B" | b"AB3C" | b"IAB3" | b"FIB3" | b"RMB3" | b"R3FC" => (24, 52),
+        b"BMA3" => (32, 64),
+        b"XDB3" | b"XDD3" | b"XDF3" => (16, 4),
+        b"XSLM" => (48, 12),
+        _ => match u16::from_be_bytes([b[8], b[9]]) {
+            // xfs_da3_blkinfo magics: dir leaf1 / leafn, da node, attr leaf.
+            0x3DF1 | 0x3DFF | 0x3EBE | 0x3BEE => (24, 12),
+            _ => return,
+        },
+    };
+    // Superblock, AG headers and the AGFL checksum only their sector.
+    let span = match &m32.to_be_bytes() {
+        b"XFSB" | b"XAGF" | b"XAGI" | b"XAFL" => b.len().min(BB as usize),
+        _ => b.len(),
+    };
+    b[lsn_off..lsn_off + 8].copy_from_slice(&lsn.to_be_bytes());
+    stamp_crc(&mut b[..span], crc_off);
+}
+
+/// Restamp every v3 inode in an inode-cluster buffer.
+fn restamp_inodes(b: &mut [u8], isize: usize, lsn: u64) {
+    for ino in b.chunks_mut(isize) {
+        if ino.len() == isize && ino[0..2] == *b"IN" && ino[4] == 3 {
+            ino[DI_LSN..DI_LSN + 8].copy_from_slice(&lsn.to_be_bytes());
+            stamp_crc(ino, DI_CRC);
+        }
+    }
+}
+
+fn apply_buffer<D: Read + Write + Seek>(
+    dev: &mut D,
+    g: &Geo,
+    it: &Item<'_>,
+    en: En,
+    lsn: u64,
+) -> Result<(), FilesystemError> {
+    let f = &it.regions[0];
+    let flags = en.u16(f, 4);
+    let (daddr, sectors) = buf_key(f, en);
+    let map_words = en.u32(f, 16) as usize;
+    if f.len() < 20 + 4 * map_words {
+        return Err(corrupt("XFS buffer log item map overruns it".into()));
+    }
+    let bit = |i: usize| en.u32(f, 20 + 4 * (i / 32)) >> (i % 32) & 1 != 0;
+    let nbits = map_words * 32;
+    let len = sectors as usize * BB as usize;
+    let mut b = read_exact_at(dev, g.byte(daddr), len)?;
+    let mut region = 1usize;
+    let mut i = 0usize;
+    while i < nbits {
+        if !bit(i) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < nbits && bit(i) {
+            i += 1;
+        }
+        let Some(data) = it.regions.get(region) else {
+            return Err(corrupt(
+                "XFS buffer log item has fewer regions than its map".into(),
+            ));
+        };
+        region += 1;
+        let at = start * BLF_CHUNK;
+        let n = data
+            .len()
+            .min((i - start) * BLF_CHUNK)
+            .min(len.saturating_sub(at));
+        if flags & BLF_INODE_BUF != 0 {
+            // Only the unlinked-list pointers in an inode buffer are logged this way.
+            let mut o = 0usize;
+            while o < len {
+                let field = o + DI_NEXT_UNLINKED;
+                if field >= at && field + 4 <= at + n {
+                    b[field..field + 4].copy_from_slice(&data[field - at..field - at + 4]);
+                }
+                o += g.isize;
+            }
+        } else {
+            b[at..at + n].copy_from_slice(&data[..n]);
+        }
+    }
+    if g.v5 {
+        if b.len() >= 2 && b[0..2] == *b"IN" {
+            restamp_inodes(&mut b, g.isize, lsn);
+        } else {
+            restamp_v5_block(&mut b, lsn);
+        }
+    }
+    write_at(dev, g.byte(daddr), &b)?;
+    Ok(())
+}
+
+/// (offset, width) of each multi-byte field of the inode core, which the log holds host-endian.
+fn core_fields(v3: bool) -> Vec<(usize, usize)> {
+    let mut f = vec![
+        (2, 2),
+        (6, 2),
+        (8, 4),
+        (12, 4),
+        (16, 4),
+        (20, 2),
+        (22, 2),
+        (56, 8),
+        (64, 8),
+        (72, 4),
+        (76, 4),
+        (80, 2),
+        (84, 4),
+        (88, 2),
+        (90, 2),
+        (92, 4),
+    ];
+    if v3 {
+        f.extend_from_slice(&[
+            (24, 8),
+            (96, 4),
+            (104, 8),
+            (112, 8),
+            (120, 8),
+            (128, 4),
+            (152, 8),
+        ]);
+    } else {
+        f.push((30, 2));
+    }
+    f
+}
+
+/// Turn a logged (host-endian) inode core into its big-endian on-disk form.
+fn core_to_disk(log: &[u8], en: En) -> Vec<u8> {
+    let mut d = log.to_vec();
+    let v3 = log.len() >= 176 && log[4] == 3;
+    let swap = |d: &mut [u8], o: usize, w: usize| {
+        if !en.big {
+            d[o..o + w].reverse();
+        }
+    };
+    d[0..2].copy_from_slice(&en.u16(log, 0).to_be_bytes());
+    for (o, w) in core_fields(v3) {
+        swap(&mut d, o, w);
+    }
+    // Timestamps: one 64-bit count with bigtime (di_flags2 bit 3), else two 32-bit halves.
+    let bigtime = v3 && en.u64(log, 120) & (1 << 3) != 0;
+    let mut stamps = vec![32, 40, 48];
+    if v3 {
+        stamps.push(144);
+    }
+    for o in stamps {
+        if bigtime {
+            swap(&mut d, o, 8);
+        } else {
+            swap(&mut d, o, 4);
+            swap(&mut d, o + 4, 4);
+        }
+    }
+    d
+}
+
+/// Copy a logged fork into the inode. A btree root is logged as an in-memory long-format block
+/// (`hdr` bytes of header, keys and pointers sized to the logged length) and stored as a `bmdr`.
+fn put_fork(fork: &mut [u8], logged: &[u8], broot: bool, hdr: usize) {
+    if !broot || logged.len() < hdr {
+        let n = logged.len().min(fork.len());
+        fork[..n].copy_from_slice(&logged[..n]);
+        return;
+    }
+    let numrecs = usize::from(u16::from_be_bytes([logged[6], logged[7]]));
+    let in_max = (logged.len() - hdr) / 16;
+    let disk_max = fork.len().saturating_sub(4) / 16;
+    let n = numrecs.min(in_max).min(disk_max);
+    fork.fill(0);
+    fork[0..2].copy_from_slice(&logged[4..6]);
+    fork[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+    fork[4..4 + 8 * n].copy_from_slice(&logged[hdr..hdr + 8 * n]);
+    let (src, dst) = (hdr + 8 * in_max, 4 + 8 * disk_max);
+    fork[dst..dst + 8 * n].copy_from_slice(&logged[src..src + 8 * n]);
+}
+
+fn apply_inode<D: Read + Write + Seek>(
+    dev: &mut D,
+    g: &Geo,
+    it: &Item<'_>,
+    en: En,
+    lsn: u64,
+) -> Result<(), FilesystemError> {
+    let f = &it.regions[0];
+    // The 32-bit format lacks ilf_pad, so everything after ilf_dsize sits 4 bytes earlier.
+    let (ino_o, u_o, blk_o, boff_o) = match f.len() {
+        56 => (16, 24, 40, 52),
+        52 => (12, 20, 36, 48),
+        n => return Err(corrupt(format!("XFS inode log item of {n} bytes"))),
+    };
+    let fields = en.u32(f, 4);
+    let _ino = en.u64(f, ino_o);
+    let blkno = en.u64(f, blk_o);
+    let boff = en.u32(f, boff_o) as u64;
+    let at = g.byte(blkno) + boff;
+    let mut ino = read_exact_at(dev, at, g.isize)?;
+    let mut next = 1usize;
+    let mut take = || {
+        let r = it.regions.get(next);
+        next += 1;
+        r
+    };
+    if fields & ILOG_CORE != 0 {
+        let core = take().ok_or_else(|| corrupt("XFS inode log item lacks its core".into()))?;
+        let disk = core_to_disk(core, en);
+        let n = disk.len().min(g.isize);
+        // The on-disk unlinked pointer is kept; inode-buffer items carry its changes.
+        let unlinked: [u8; 4] = ino[DI_NEXT_UNLINKED..DI_NEXT_UNLINKED + 4]
+            .try_into()
+            .expect("4 bytes");
+        ino[..n].copy_from_slice(&disk[..n]);
+        ino[DI_NEXT_UNLINKED..DI_NEXT_UNLINKED + 4].copy_from_slice(&unlinked);
+    }
+    let v3 = ino[4] == 3;
+    let dfork = if v3 { 176 } else { 100 };
+    let aoff = dfork + usize::from(ino[82]) * 8;
+    let dend = if ino[82] == 0 { g.isize } else { aoff };
+    let bhdr = if v3 { 72 } else { 24 };
+    if fields & ILOG_DFORK != 0 {
+        if let Some(r) = take() {
+            put_fork(&mut ino[dfork..dend], r, fields & ILOG_DBROOT != 0, bhdr);
+        }
+    } else if fields & ILOG_DEV != 0 {
+        ino[dfork..dfork + 4].copy_from_slice(&en.u32(f, u_o).to_be_bytes());
+    } else if fields & ILOG_UUID != 0 {
+        ino[dfork..dfork + 16].copy_from_slice(&f[u_o..u_o + 16]);
+    }
+    if fields & ILOG_AFORK != 0 && ino[82] != 0 {
+        if let Some(r) = take() {
+            let end = g.isize;
+            put_fork(&mut ino[aoff..end], r, fields & ILOG_ABROOT != 0, bhdr);
+        }
+    }
+    if g.v5 && v3 {
+        ino[DI_LSN..DI_LSN + 8].copy_from_slice(&lsn.to_be_bytes());
+        stamp_crc(&mut ino, DI_CRC);
+    }
+    write_at(dev, at, &ino)?;
+    Ok(())
+}
+
+fn apply_icreate<D: Read + Write + Seek>(
+    dev: &mut D,
+    g: &Geo,
+    it: &Item<'_>,
+) -> Result<(u64, u32), FilesystemError> {
+    let f = &it.regions[0];
+    if f.len() < 28 {
+        return Err(corrupt("XFS inode-create log item too short".into()));
+    }
+    let (ag, agbno, count) = (u64::from(be32(f, 4)), u64::from(be32(f, 8)), be32(f, 12));
+    let (isize, length, gen) = (be32(f, 16) as usize, u64::from(be32(f, 20)), be32(f, 24));
+    if isize != g.isize || count as usize * isize > (length * g.blocksize) as usize {
+        return Err(corrupt(
+            "XFS inode-create log item does not fit its chunk".into(),
+        ));
+    }
+    let daddr = (ag * g.agblocks + agbno) * (g.blocksize / BB);
+    let mut chunk = vec![0u8; count as usize * isize];
+    let first_agino = agbno << g.inopblog;
+    for (i, ino) in chunk.chunks_mut(isize).enumerate() {
+        ino[0..2].copy_from_slice(b"IN");
+        ino[4] = if g.v5 { 3 } else { 2 };
+        ino[92..96].copy_from_slice(&gen.to_be_bytes());
+        ino[DI_NEXT_UNLINKED..DI_NEXT_UNLINKED + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        if g.v5 {
+            let agino = first_agino + i as u64;
+            let inum = (ag << (u32::from(g.agblklog) + u32::from(g.inopblog))) | agino;
+            ino[152..160].copy_from_slice(&inum.to_be_bytes());
+            ino[160..176].copy_from_slice(&g.meta_uuid);
+            stamp_crc(ino, DI_CRC);
+        }
+    }
+    write_at(dev, g.byte(daddr), &chunk)?;
+    Ok((daddr, (length * g.blocksize / BB) as u32))
+}
+
+/// What the first pass decided.
+enum Plan {
+    Clean,
+    Unrecoverable(String),
+    Ready {
+        head: Box<Record>,
+        survey: Survey,
+        unfinished_frees: usize,
+    },
+}
+
+/// Find the head and survey the log without writing anything.
+fn plan<R: Read + Seek>(
+    dev: &mut R,
+    log: &Log,
+    sb: &XfsSuperblock,
+) -> Result<Plan, FilesystemError> {
+    if sb.logstart == 0 {
+        return Ok(Plan::Clean);
+    }
+    let Some(head) = find_head(dev, log)? else {
+        return Ok(Plan::Clean);
+    };
+    // An unmount record is written after everything reached the disk, whatever its tail says.
+    if is_unmount(&head) {
+        return Ok(Plan::Clean);
+    }
+    let mut s = Survey::default();
+    if let Err(e) = walk(dev, log, &head, |_, t, en| survey(t, en, &mut s)) {
+        return Ok(Plan::Unrecoverable(e.to_string()));
+    }
+    if let Some(p) = s.problem.take() {
+        return Ok(Plan::Unrecoverable(p));
+    }
+    let mut unfinished_frees = 0usize;
+    for (id, kind) in &s.intents {
+        if s.done.contains(&(done_for(*kind), *id)) {
+            continue;
+        }
+        match intent_name(*kind) {
+            Some(name) => {
+                return Ok(Plan::Unrecoverable(format!(
+                    "the log holds an unfinished {name}, which this tool cannot complete"
+                )))
+            }
+            None => unfinished_frees += 1,
+        }
+    }
+    Ok(Plan::Ready {
+        head: Box::new(head),
+        survey: s,
+        unfinished_frees,
+    })
+}
+
+/// What a read-only look at the log found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogCheck {
+    Clean,
+    /// Committed transactions a replay would write to the volume.
+    Replayable {
+        transactions: usize,
+    },
+    /// The volume was not cleanly unmounted and the log cannot be replayed; the reason says why.
+    Unrecoverable(String),
+}
+
+/// Say whether the log is clean, replayable or beyond replay, writing nothing.
+pub fn check_log<R: Read + Seek>(
+    dev: &mut R,
+    partition_offset: u64,
+    sb: &XfsSuperblock,
+) -> Result<LogCheck, FilesystemError> {
+    let log = Log::new(partition_offset, sb);
+    Ok(match plan(dev, &log, sb)? {
+        Plan::Clean => LogCheck::Clean,
+        Plan::Unrecoverable(why) => LogCheck::Unrecoverable(why),
+        Plan::Ready { survey, .. } => LogCheck::Replayable {
+            transactions: survey.transactions,
+        },
+    })
+}
+
+/// Replay the internal log of the volume at `partition_offset` and leave it clean.
+///
+/// Nothing is written unless the whole log can be replayed; [`ReplayOutcome::Unrecoverable`]
+/// says why not, and [`zero_log`] is then the only way to make the volume mountable.
+pub fn replay_log<D: Read + Write + Seek>(
+    dev: &mut D,
+    partition_offset: u64,
+    sb: &XfsSuperblock,
+) -> Result<ReplayOutcome, FilesystemError> {
+    let log = Log::new(partition_offset, sb);
+    let (head, s, unfinished_frees) = match plan(dev, &log, sb)? {
+        Plan::Clean => return Ok(ReplayOutcome::Clean),
+        Plan::Unrecoverable(why) => return Ok(ReplayOutcome::Unrecoverable(why)),
+        Plan::Ready {
+            head,
+            survey,
+            unfinished_frees,
+        } => (head, survey, unfinished_frees),
+    };
+
+    let g = Geo::new(partition_offset, sb);
+    let mut report = ReplayReport {
+        unfinished_frees,
+        ..ReplayReport::default()
+    };
+    let mut cancels = s.cancels;
+    let cancelled_at =
+        |c: &HashMap<BufKey, u32>, daddr: u64| c.iter().any(|(k, n)| *n > 0 && k.0 == daddr);
+    let (records, incomplete) = walk(dev, &log, &head, |dev, t, en| {
+        // v5 recovery stamps each block with the LSN of the record the transaction started in.
+        let lsn = t.lsn;
+        for it in items(t, en)? {
+            match it.kind {
+                LI_BUF => {
+                    let f = &it.regions[0];
+                    let key = buf_key(f, en);
+                    if en.u16(f, 4) & BLF_CANCEL != 0 {
+                        if let Some(n) = cancels.get_mut(&key) {
+                            *n = n.saturating_sub(1);
+                        }
+                        report.cancelled += 1;
+                    } else if cancels.get(&key).copied().unwrap_or(0) > 0 {
+                        report.cancelled += 1;
+                    } else {
+                        apply_buffer(dev, &g, &it, en, lsn)?;
+                        report.buffers += 1;
+                    }
+                }
+                LI_INODE => {
+                    let f = &it.regions[0];
+                    let blk_o = if f.len() == 56 { 40 } else { 36 };
+                    if cancelled_at(&cancels, en.u64(f, blk_o)) {
+                        report.cancelled += 1;
+                    } else {
+                        apply_inode(dev, &g, &it, en, lsn)?;
+                        report.inodes += 1;
+                    }
+                }
+                LI_ICREATE => {
+                    let f = &it.regions[0];
+                    let ag = u64::from(be32(f, 4));
+                    let agbno = u64::from(be32(f, 8));
+                    let daddr = (ag * g.agblocks + agbno) * (g.blocksize / BB);
+                    if cancelled_at(&cancels, daddr) {
+                        report.cancelled += 1;
+                    } else {
+                        apply_icreate(dev, &g, &it)?;
+                        report.inode_chunks += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        report.transactions += 1;
+        Ok(())
+    })?;
+    report.records = records;
+    report.incomplete = incomplete;
+    resync_sb_counters(dev, &g, sb)?;
+    write_clean_log(dev, &log, sb, head.lsn >> 32)?;
+    Ok(ReplayOutcome::Replayed(report))
+}
+
+/// Discard the log (`xfs_repair -L`): every change it holds that is not yet on disk is lost.
+pub fn zero_log<D: Read + Write + Seek>(
+    dev: &mut D,
+    partition_offset: u64,
+    sb: &XfsSuperblock,
+) -> Result<(), FilesystemError> {
+    if sb.logstart == 0 {
+        return Ok(());
+    }
+    let log = Log::new(partition_offset, sb);
+    let cycle = find_head(dev, &log)?.map_or(0, |h| h.lsn >> 32);
+    resync_sb_counters(dev, &Geo::new(partition_offset, sb), sb)?;
+    write_clean_log(dev, &log, sb, cycle)
+}
+
+/// Rewrite the log as one unmount record at its start, a cycle past the old head so no v5
+/// metadata LSN is ahead of the log.
+fn write_clean_log<D: Write + Seek>(
+    dev: &mut D,
+    log: &Log,
+    sb: &XfsSuperblock,
+    old_cycle: u64,
+) -> Result<(), FilesystemError> {
+    let cycle = (old_cycle + 1).min(u64::from(u32::MAX)) as u32;
+    // Every other sector carries the previous cycle, so the log reads as wrapped once, with the
+    // head right after the unmount record.
+    let mut fill = vec![0u8; 1 << 20];
+    for s in fill.chunks_mut(BB as usize) {
+        s[..4].copy_from_slice(&(cycle - 1).to_be_bytes());
+    }
+    let total = log.bbs * BB;
+    let mut done = 0u64;
+    dev.seek(SeekFrom::Start(log.start))?;
+    while done < total {
+        let n = (total - done).min(fill.len() as u64) as usize;
+        dev.write_all(&fill[..n])?;
+        done += n as u64;
+    }
+    let head = super::format::build_log_head(&sb.sb_uuid, cycle);
+    write_at(dev, log.start, &head)?;
+    Ok(())
+}
+
+/// Superblock offsets of the lazily kept counters a mount recomputes after recovery.
+const SB_ICOUNT: usize = 128;
+const SB_IFREE: usize = 136;
+const SB_FDBLOCKS: usize = 144;
+const SB_CRC: usize = 224;
+
+/// Set `sb_icount`, `sb_ifree` and `sb_fdblocks` from the AG headers, as a mount does.
+fn resync_sb_counters<D: Read + Write + Seek>(
+    dev: &mut D,
+    g: &Geo,
+    sb: &XfsSuperblock,
+) -> Result<(), FilesystemError> {
+    let sect = usize::from(sb.sectsize);
+    let (mut icount, mut ifree, mut fdblocks) = (0u64, 0u64, 0u64);
+    for agno in 0..u64::from(sb.agcount) {
+        let ag = g.off + agno * g.agblocks * g.blocksize;
+        let agf = XfsAgf::parse(&read_exact_at(dev, ag + sect as u64, sect)?)?;
+        let agi = XfsAgi::parse(&read_exact_at(dev, ag + 2 * sect as u64, sect)?)?;
+        fdblocks += u64::from(agf.freeblks) + u64::from(agf.flcount) + u64::from(agf.btreeblks);
+        icount += u64::from(agi.count);
+        ifree += u64::from(agi.freecount);
+    }
+    let mut p = read_exact_at(dev, g.off, sect)?;
+    p[SB_ICOUNT..SB_ICOUNT + 8].copy_from_slice(&icount.to_be_bytes());
+    p[SB_IFREE..SB_IFREE + 8].copy_from_slice(&ifree.to_be_bytes());
+    p[SB_FDBLOCKS..SB_FDBLOCKS + 8].copy_from_slice(&fdblocks.to_be_bytes());
+    if g.v5 {
+        stamp_crc(&mut p, SB_CRC);
+    }
+    write_at(dev, g.off, &p)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xfs::XfsFilesystem;
+    use disk_core::entry::{EntryType, FileEntry};
+    use disk_core::filesystem::{EditableFilesystem, Filesystem};
+    use std::io::Cursor;
+
+    /// A dirty fixture decoded to disk: 300 MB is too much for a 32-bit `Vec`.
+    fn dirty_fixture(name: &str) -> std::fs::File {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/sgi")
+            .join(name);
+        let mut out = tempfile::tempfile().unwrap();
+        let src = std::fs::File::open(path).expect("fixture present");
+        zstd::stream::copy_decode(src, &mut out).unwrap();
+        out
+    }
+
+    fn child<R: Read + Seek + Send>(
+        fs: &mut XfsFilesystem<R>,
+        dir: &FileEntry,
+        n: &str,
+    ) -> Option<FileEntry> {
+        fs.list_directory(dir)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == n)
+    }
+
+    /// A crash after deletes, a sparse btree file, xattrs, a device node and a hard link;
+    /// `docs/xfs_log_replay.md` lists the workload. The kernel's recovery is the reference.
+    fn replays_like_the_kernel(name: &str) {
+        let mut fs = XfsFilesystem::open(dirty_fixture(name), 0).unwrap();
+        let before = fs.run_fsck().unwrap();
+        assert!(before.repairable, "{:?}", before.errors);
+        assert_eq!(before.errors[0].code, "LogDirty");
+
+        let report = fs.repair().unwrap();
+        assert!(
+            report.fixes_applied[0].starts_with("log: replayed 101"),
+            "{report:?}"
+        );
+        assert_eq!(fs.log_state().unwrap(), crate::xfs::log::LogState::Clean);
+        let after = fs.run_fsck().unwrap();
+        assert!(after.errors.is_empty(), "{:?}", after.errors);
+
+        let root = fs.root().unwrap();
+        let big = child(&mut fs, &root, "big").unwrap();
+        let names = fs.list_directory(&big).unwrap();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|e| e.name.starts_with("entry_"))
+                .count(),
+            300
+        );
+        let last = child(&mut fs, &big, "entry_with_a_long_name_1500").unwrap();
+        assert_eq!(fs.read_file(&last, 64).unwrap(), b"k1500\n");
+        assert!(child(&mut fs, &big, "entry_with_a_long_name_1200").is_none());
+
+        let keep = child(&mut fs, &root, "keep").unwrap();
+        assert!(child(&mut fs, &keep, "old.txt").is_none());
+        let hard = child(&mut fs, &keep, "hard.txt").unwrap();
+        assert_eq!(fs.read_file(&hard, 64).unwrap(), b"data\n");
+        assert_eq!(child(&mut fs, &keep, "blob").unwrap().size, 100_000);
+        let null = child(&mut fs, &keep, "null").unwrap();
+        assert_eq!(null.mode.map(|m| m & 0o170000), Some(0o020000));
+
+        // The sparse file's bmap went to a btree: 4 KiB written every 8 KiB.
+        let frag = child(&mut fs, &root, "frag.bin").unwrap();
+        assert_eq!(frag.entry_type, EntryType::File);
+        assert_eq!(frag.size, 99 * 8192 + 4096);
+        let data = fs.read_file(&frag, frag.size as usize).unwrap();
+        for i in [0usize, 50, 99] {
+            assert!(
+                data[i * 8192..i * 8192 + 4096].iter().all(|&b| b == 0xCD),
+                "extent {i}"
+            );
+        }
+        assert!(data[8192 - 4096..8192].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_v5_log_replays_like_the_kernel() {
+        replays_like_the_kernel("xfs_v5_dirty_log.img.zst");
+    }
+
+    #[test]
+    fn a_v4_log_replays_like_the_kernel() {
+        replays_like_the_kernel("xfs_v4_dirty_log.img.zst");
+    }
+
+    /// A 640 KiB file deleted while still open at the crash sits on the AGI unlinked list.
+    #[test]
+    fn repair_frees_what_was_deleted_while_open() {
+        let mut fs =
+            XfsFilesystem::open(dirty_fixture("xfs_v4_dirty_log_unlinked.img.zst"), 0).unwrap();
+        let free_before = fs.free_space().unwrap();
+        let report = fs.repair().unwrap();
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f.contains("freed 1 inodes")),
+            "{report:?}"
+        );
+        assert!(fs.run_fsck().unwrap().errors.is_empty());
+        // 640 KiB comes back, less the block more.txt took.
+        assert!(fs.free_space().unwrap() >= free_before + 600 * 1024);
+        let root = fs.root().unwrap();
+        assert!(child(&mut fs, &root, "open.bin").is_none());
+        let more = child(&mut fs, &root, "more.txt").unwrap();
+        assert_eq!(fs.read_file(&more, 64).unwrap(), b"more\n");
+    }
+
+    #[test]
+    fn discarding_the_log_leaves_the_pre_crash_volume() {
+        let mut fs = XfsFilesystem::open(dirty_fixture("xfs_v5_dirty_log.img.zst"), 0).unwrap();
+        fs.discard_log().unwrap();
+        assert_eq!(fs.log_state().unwrap(), crate::xfs::log::LogState::Clean);
+        // The deletes never reached the disk.
+        let root = fs.root().unwrap();
+        let big = child(&mut fs, &root, "big").unwrap();
+        assert!(child(&mut fs, &big, "entry_with_a_long_name_1").is_some());
+        assert!(child(&mut fs, &root, "frag.bin").is_none());
+    }
+
+    fn blank() -> (Vec<u8>, XfsSuperblock) {
+        let mut img = Cursor::new(Vec::new());
+        crate::xfs::format::write_blank_xfs(&mut img, 0, 64 * 1024 * 1024, "LOG").unwrap();
+        let mut img = img.into_inner();
+        let sb = XfsSuperblock::parse(&img[..512]).unwrap();
+        img.resize((sb.dblocks * u64::from(sb.blocksize)) as usize, 0);
+        (img, sb)
+    }
+
+    /// Write one v2 log record of `ops` (tid, flags, payload) at log block `blk`, cycle 1.
+    fn put_record(img: &mut [u8], sb: &XfsSuperblock, blk: u64, ops: &[(u32, u8, Vec<u8>)]) {
+        let mut data = Vec::new();
+        for (tid, flags, payload) in ops {
+            data.extend_from_slice(&tid.to_be_bytes());
+            data.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            data.extend_from_slice(&[CLIENT_TRANS, *flags, 0, 0]);
+            data.extend_from_slice(payload);
+        }
+        let len = data.len();
+        data.resize(len.div_ceil(512) * 512, 0);
+        let mut h = vec![0u8; 512];
+        h[0..4].copy_from_slice(&HEADER_MAGIC.to_be_bytes());
+        h[4..8].copy_from_slice(&1u32.to_be_bytes());
+        h[8..12].copy_from_slice(&2u32.to_be_bytes());
+        h[12..16].copy_from_slice(&(len as u32).to_be_bytes());
+        h[16..24].copy_from_slice(&(1u64 << 32 | blk).to_be_bytes());
+        h[24..32].copy_from_slice(&(1u64 << 32 | blk).to_be_bytes());
+        h[40..44].copy_from_slice(&(ops.len() as u32).to_be_bytes());
+        h[300..304].copy_from_slice(&1u32.to_be_bytes());
+        h[320..324].copy_from_slice(&32768u32.to_be_bytes());
+        for (i, s) in data.chunks_mut(512).enumerate() {
+            h[44 + 4 * i..48 + 4 * i].copy_from_slice(&s[..4]);
+            s[..4].copy_from_slice(&1u32.to_be_bytes());
+        }
+        let start = fsblock_to_partition_byte(sb.logstart, sb.agblocks, sb.agblklog, sb.blocksize)
+            as usize
+            + blk as usize * 512;
+        img[start..start + 512].copy_from_slice(&h);
+        img[start + 512..start + 512 + data.len()].copy_from_slice(&data);
+    }
+
+    fn trans_header(tid: u32, items: u32) -> Vec<u8> {
+        [TRANS_MAGIC, 1, tid, items]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect()
+    }
+
+    /// A buffer item logging the first 128 bytes of the `sectors`-long buffer at `daddr`.
+    fn buf_item(daddr: u64, sectors: u16) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&LI_BUF.to_le_bytes());
+        f.extend_from_slice(&2u16.to_le_bytes());
+        f.extend_from_slice(&0u16.to_le_bytes());
+        f.extend_from_slice(&sectors.to_le_bytes());
+        f.extend_from_slice(&daddr.to_le_bytes());
+        f.extend_from_slice(&1u32.to_le_bytes());
+        f.extend_from_slice(&1u32.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn only_committed_transactions_are_replayed() {
+        let (mut img, sb) = blank();
+        let last = (sb.dblocks - 1) * u64::from(sb.blocksize) / 512;
+        let spare = last - 8;
+        put_record(
+            &mut img,
+            &sb,
+            2,
+            &[
+                (7, OP_START, vec![]),
+                (7, 0, trans_header(7, 1)),
+                (7, 0, buf_item(last, 8)),
+                (7, 0, vec![0xAB; 128]),
+                (7, OP_COMMIT, vec![]),
+                (9, OP_START, vec![]),
+                (9, 0, trans_header(9, 1)),
+                (9, 0, buf_item(spare, 8)),
+                (9, 0, vec![0xEE; 128]),
+            ],
+        );
+        let mut dev = Cursor::new(img);
+        assert_eq!(
+            check_log(&mut dev, 0, &sb).unwrap(),
+            LogCheck::Replayable { transactions: 1 }
+        );
+        let ReplayOutcome::Replayed(r) = replay_log(&mut dev, 0, &sb).unwrap() else {
+            panic!("not replayed");
+        };
+        assert_eq!((r.transactions, r.incomplete, r.buffers), (1, 1, 1));
+        let img = dev.into_inner();
+        let at = (last * 512) as usize;
+        assert!(img[at..at + 128].iter().all(|&b| b == 0xAB));
+        assert!(img[(spare * 512) as usize..][..128].iter().all(|&b| b == 0));
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert_eq!(fs.log_state().unwrap(), crate::xfs::log::LogState::Clean);
+        assert!(fs.run_fsck().unwrap().errors.is_empty());
+    }
+
+    #[test]
+    fn a_log_with_quota_items_is_refused_untouched() {
+        let (mut img, sb) = blank();
+        let mut dq = Vec::new();
+        dq.extend_from_slice(&LI_DQUOT.to_le_bytes());
+        dq.extend_from_slice(&2u16.to_le_bytes());
+        dq.resize(24, 0);
+        put_record(
+            &mut img,
+            &sb,
+            2,
+            &[
+                (5, OP_START, vec![]),
+                (5, 0, trans_header(5, 1)),
+                (5, 0, dq),
+                (5, 0, vec![0; 104]),
+                (5, OP_COMMIT, vec![]),
+            ],
+        );
+        let before = img.clone();
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let res = fs.run_fsck().unwrap();
+        assert_eq!(res.errors[0].code, "LogUnrecoverable");
+        assert!(!res.repairable);
+        let err = fs.repair().unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be replayed") && err.contains("quota"),
+            "{err}"
+        );
+        assert!(fs.reader.get_ref() == &before, "nothing may be written");
+
+        fs.discard_log().unwrap();
+        assert!(fs.run_fsck().unwrap().errors.is_empty());
+    }
+}

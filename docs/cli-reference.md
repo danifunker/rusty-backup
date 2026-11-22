@@ -809,6 +809,7 @@ Usage: fsck [OPTIONS] <IMAGE>
 
 - `--checkonly` — Scan only. Never prompt, never repair. Exits non-zero on issues
 - `--repair` — Auto-repair detected issues without prompting
+- `--discard-log` — XFS only, with `--repair`: throw away a log that cannot be replayed (`xfs_repair -L`) before repairing. The changes the log holds are lost
 - `--prompt-timeout` — Seconds to wait for an interactive repair confirmation before resolving to "No" (default 30; or `[fsck] prompt-timeout` from the config file when set). `0` waits indefinitely (TTY only)
 - `--format` — Output format. `text` (default) emits the human-readable report; `json` / `yaml` emit a status-wrapped envelope mirroring the other read-only verbs. `csv` / `tsv` are rejected — the report is nested
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
