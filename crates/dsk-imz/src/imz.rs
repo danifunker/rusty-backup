@@ -15,7 +15,7 @@
 //! framing (or where the password is wrong) surface as an explicit error.
 
 use crate::zip_compat::ZipEntryName as _;
-#[cfg(feature = "rust173-polyfill")]
+#[cfg(all(feature = "rust173-polyfill", feature = "crypto"))]
 use disk_core::rust173::IntIsMultipleOf as _;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
