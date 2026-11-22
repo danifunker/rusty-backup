@@ -35,8 +35,9 @@ pub struct EmuHeader {
     pub command: String,
 }
 
+/// Header fields, read after the header's length was checked.
 fn le32(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    disk_core::bytes::le32(b, o).unwrap_or(0)
 }
 
 /// Whether `head` starts like an `.emu` file.
@@ -81,20 +82,7 @@ fn option<'a>(command: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-fn crc16(data: &[u8]) -> u16 {
-    let mut c = 0xFFFFu16;
-    for &b in data {
-        c ^= (b as u16) << 8;
-        for _ in 0..8 {
-            c = if c & 0x8000 != 0 {
-                (c << 1) ^ 0x1021
-            } else {
-                c << 1
-            };
-        }
-    }
-    c
-}
+use super::mfm::crc16;
 
 fn ecc32(data: &[u8]) -> u32 {
     let mut c = 0xFFFF_FFFFu32;

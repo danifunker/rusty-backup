@@ -20,9 +20,7 @@ pub fn looks_like_scp(head: &[u8]) -> bool {
     head.len() >= 16 && &head[0..3] == b"SCP" && head[5] > 0 && head[9] == 0
 }
 
-fn le32(b: &[u8], o: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?))
-}
+use disk_core::bytes::le32;
 
 /// Every track's flux, all revolutions back to back, in nanoseconds.
 pub fn parse(data: &[u8]) -> Result<Vec<FluxTrack>, String> {
