@@ -555,11 +555,11 @@ Review by a separate agent, 2026-11-21, read-only.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| DMG-001 | S2 | confirmed | dsk-dmg dmg.rs `detect_dmg`, `ensure_cached`, `parse_mish` | XML length, pack / unpack sizes and zero blocks sized from the header unchecked: OOM; offset product overflows. | open |
-| DMG-002 | S2 | confirmed | dsk-dmg dmg.rs `Read for DmgReader`, `copy_match` | A short chunk returns Ok(0) mid-disk (silent truncation); bad ADC distances become zeros. | open |
-| DMG-003 | S2 | confirmed | dsk-dmg dmg_crypto.rs `CryptoContext::open` | `wrap_key_bits` slice panics; offset overflow; PBKDF2 iterations uncapped. | open |
-| DMG-004 | S2 | confirmed | dsk-dmg sparseimage.rs `detect_sparseimage` | Band table sized from header values: 32 GiB from a 4 KiB file. | open |
-| DMG-005 | S2 | confirmed | dsk-dmg ndif.rs `reconstruct_to` | Capacity from an unchecked entry count (~128 GiB). | open |
+| DMG-001 | S2 | confirmed | dsk-dmg dmg.rs `detect_dmg`, `ensure_cached`, `parse_mish` | XML length, pack / unpack sizes and zero blocks sized from the header unchecked: OOM; offset product overflows. | fixed (70f1b62d) |
+| DMG-002 | S2 | confirmed | dsk-dmg dmg.rs `Read for DmgReader`, `copy_match` | A short chunk returns Ok(0) mid-disk (silent truncation); bad ADC distances become zeros. | fixed (70f1b62d) |
+| DMG-003 | S2 | confirmed | dsk-dmg dmg_crypto.rs `CryptoContext::open` | `wrap_key_bits` slice panics; offset overflow; PBKDF2 iterations uncapped. | fixed (70f1b62d) |
+| DMG-004 | S2 | confirmed | dsk-dmg sparseimage.rs `detect_sparseimage` | Band table sized from header values: 32 GiB from a 4 KiB file. | fixed (70f1b62d) |
+| DMG-005 | S2 | confirmed | dsk-dmg ndif.rs `reconstruct_to` | Capacity from an unchecked entry count (~128 GiB). | fixed (70f1b62d) |
 | CZL-001 | S2 | confirmed | dsk-clonezilla partclone.rs `parse_header`, `parse_bitmap` | `block_size` / `total_blocks` unvalidated: OOM, a block size of 0 hangs, overflow. | open |
 | CZL-002 | S2 | plausible | dsk-clonezilla partclone.rs `parse_header` | v1 images likely rejected by the magic check; endianness field ignored. | open |
 | CZL-003 | S2 | confirmed | dsk-clonezilla metadata_scan.rs `identify_ext_metadata_blocks` | Off-by-4 bounds check panics the scan thread and poisons the cache mutex. | open |

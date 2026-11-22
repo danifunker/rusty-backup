@@ -249,6 +249,22 @@ fn identify_metadata_blocks(
 }
 
 /// Identify FAT12/16/32 metadata blocks: reserved area + FAT tables + root directory.
+/// Add the blocks covering bytes `start..end`, at most `MAX_RANGE_BLOCKS` of them: the range
+/// comes from an on-disk header, and a corrupt one could ask for billions.
+fn insert_range(blocks: &mut BTreeSet<u64>, start: u64, end: u64, block_size: u64) {
+    if block_size == 0 || end <= start {
+        return;
+    }
+    let first = start / block_size;
+    let last = (end - 1) / block_size;
+    for b in first..=last.min(first.saturating_add(MAX_RANGE_BLOCKS)) {
+        blocks.insert(b);
+    }
+}
+
+/// The most blocks one metadata range may add to the cache list.
+const MAX_RANGE_BLOCKS: u64 = 1 << 16;
+
 fn identify_fat_metadata_blocks(bpb: &[u8], block_size: u64) -> Vec<u64> {
     let mut blocks = BTreeSet::new();
 
@@ -269,25 +285,20 @@ fn identify_fat_metadata_blocks(bpb: &[u8], block_size: u64) -> Vec<u64> {
 
     // Reserved area (includes boot sector)
     let reserved_end = reserved_sectors * bytes_per_sector;
-    for byte_off in (0..reserved_end).step_by(block_size as usize) {
-        blocks.insert(byte_off / block_size);
-    }
+    insert_range(&mut blocks, 0, reserved_end, block_size);
 
     // FAT tables
     let fat_start = reserved_sectors * bytes_per_sector;
-    let fat_end = fat_start + num_fats * sectors_per_fat * bytes_per_sector;
-    for byte_off in (fat_start..fat_end).step_by(block_size as usize) {
-        blocks.insert(byte_off / block_size);
-    }
+    let fat_end = num_fats
+        .saturating_mul(sectors_per_fat)
+        .saturating_mul(bytes_per_sector)
+        .saturating_add(fat_start);
+    insert_range(&mut blocks, fat_start, fat_end, block_size);
 
     // Root directory (FAT12/16 only — fixed area after FAT)
     if root_entry_count > 0 {
-        let root_start = fat_end;
-        let root_size = root_entry_count * 32;
-        let root_end = root_start + root_size;
-        for byte_off in (root_start..root_end).step_by(block_size as usize) {
-            blocks.insert(byte_off / block_size);
-        }
+        let root_end = fat_end.saturating_add(root_entry_count * 32);
+        insert_range(&mut blocks, fat_end, root_end, block_size);
     }
 
     // For FAT32, we also need the root directory cluster — but that requires
@@ -317,20 +328,23 @@ fn identify_ntfs_metadata_blocks(vbr: &[u8], block_size: u64) -> Vec<u64> {
     // Compute MFT record size
     let clusters_per_mft_raw = vbr[0x40] as i8;
     let mft_record_size: u64 = if clusters_per_mft_raw < 0 {
-        1u64 << (-clusters_per_mft_raw as u32)
+        // 2^-n bytes; NTFS records are at most 64 KiB, and a larger shift would overflow.
+        let shift = -(clusters_per_mft_raw as i32) as u32;
+        if shift > 16 {
+            return blocks.into_iter().collect();
+        }
+        1u64 << shift
     } else {
         clusters_per_mft_raw as u64 * cluster_size
     };
 
     // Cache the first 64 MFT records (covers $MFT, $MFTMirr, $LogFile, $Volume,
     // $AttrDef, root directory, $Bitmap, $Boot, $BadClus, $Secure, $UpCase, $Extend, etc.)
-    let mft_byte_start = mft_cluster * cluster_size;
+    let mft_byte_start = mft_cluster.saturating_mul(cluster_size);
     let mft_records_to_cache: u64 = 64;
-    let mft_byte_end = mft_byte_start + mft_records_to_cache * mft_record_size;
-
-    for byte_off in (mft_byte_start..mft_byte_end).step_by(block_size as usize) {
-        blocks.insert(byte_off / block_size);
-    }
+    let mft_byte_end =
+        mft_byte_start.saturating_add(mft_records_to_cache.saturating_mul(mft_record_size));
+    insert_range(&mut blocks, mft_byte_start, mft_byte_end, block_size);
 
     blocks.into_iter().collect()
 }
@@ -351,24 +365,23 @@ fn identify_exfat_metadata_blocks(vbr: &[u8], block_size: u64) -> Vec<u64> {
     if !(9..=12).contains(&bytes_per_sector_shift) {
         return blocks.into_iter().collect();
     }
+    // exFAT clusters are at most 32 MiB (sector shift + cluster shift <= 25).
+    if bytes_per_sector_shift + sectors_per_cluster_shift > 25 {
+        return blocks.into_iter().collect();
+    }
     let bytes_per_sector = 1u64 << bytes_per_sector_shift;
-    let _cluster_size = bytes_per_sector << sectors_per_cluster_shift;
 
     let fat_offset_sectors = u32::from_le_bytes([vbr[80], vbr[81], vbr[82], vbr[83]]) as u64;
     let fat_length_sectors = u32::from_le_bytes([vbr[84], vbr[85], vbr[86], vbr[87]]) as u64;
 
     // VBR region (first 12 sectors for main + backup boot region)
     let vbr_end = 24 * bytes_per_sector; // 12 main + 12 backup
-    for byte_off in (0..vbr_end).step_by(block_size as usize) {
-        blocks.insert(byte_off / block_size);
-    }
+    insert_range(&mut blocks, 0, vbr_end, block_size);
 
     // FAT table
     let fat_start = fat_offset_sectors * bytes_per_sector;
     let fat_end = fat_start + fat_length_sectors * bytes_per_sector;
-    for byte_off in (fat_start..fat_end).step_by(block_size as usize) {
-        blocks.insert(byte_off / block_size);
-    }
+    insert_range(&mut blocks, fat_start, fat_end, block_size);
 
     // Root directory cluster — need to read the FAT to follow the chain.
     // The root cluster is at a known offset. Cache the first cluster.
@@ -379,9 +392,7 @@ fn identify_exfat_metadata_blocks(vbr: &[u8], block_size: u64) -> Vec<u64> {
     if root_cluster >= 2 {
         let root_byte =
             (cluster_heap_offset * bytes_per_sector) + (root_cluster - 2) * cluster_size;
-        for byte_off in (root_byte..root_byte + cluster_size).step_by(block_size as usize) {
-            blocks.insert(byte_off / block_size);
-        }
+        insert_range(&mut blocks, root_byte, root_byte + cluster_size, block_size);
     }
 
     blocks.into_iter().collect()
@@ -486,6 +497,10 @@ fn identify_ext_metadata_blocks(data: &[u8], block_size: u64) -> Vec<u64> {
     let first_data_block =
         u32::from_le_bytes(data[sb_off + 0x14..sb_off + 0x18].try_into().unwrap()) as u64;
     let log_block_size = u32::from_le_bytes(data[sb_off + 0x18..sb_off + 0x1C].try_into().unwrap());
+    // ext blocks are 1 KiB to 64 KiB; a larger log would overflow the shift.
+    if log_block_size > 6 {
+        return blocks.into_iter().collect();
+    }
     let ext_block_size = 1024u64 << log_block_size;
     let blocks_per_group =
         u32::from_le_bytes(data[sb_off + 0x20..sb_off + 0x24].try_into().unwrap()) as u64;
@@ -527,10 +542,14 @@ fn identify_ext_metadata_blocks(data: &[u8], block_size: u64) -> Vec<u64> {
     // Group descriptor table starts at the block after the superblock block
     let gdt_start_ext_block = first_data_block + 1;
     let gdt_total_bytes = group_count * desc_size;
-    let gdt_ext_blocks = gdt_total_bytes.div_ceil(ext_block_size);
+    // A real table is a few thousand blocks; cap what a corrupt group count can ask for.
+    let gdt_ext_blocks = gdt_total_bytes
+        .div_ceil(ext_block_size)
+        .min(MAX_RANGE_BLOCKS);
 
     // Convert ext blocks to partition blocks
-    let ext_to_partition = |ext_block: u64| -> u64 { (ext_block * ext_block_size) / block_size };
+    let ext_to_partition =
+        |ext_block: u64| -> u64 { ext_block.saturating_mul(ext_block_size) / block_size };
 
     // Add GDT blocks
     for i in 0..gdt_ext_blocks {
@@ -592,7 +611,7 @@ fn identify_ext_metadata_blocks(data: &[u8], block_size: u64) -> Vec<u64> {
             u32::from_le_bytes(data[gd_offset + 8..gd_offset + 12].try_into().unwrap()) as u64;
 
         // 64-bit high parts
-        let (bb, ib, it) = if is_64bit && desc_size >= 64 && gd_offset + 0x28 <= data.len() {
+        let (bb, ib, it) = if is_64bit && desc_size >= 64 && gd_offset + 0x2C <= data.len() {
             let bb_hi =
                 u32::from_le_bytes(data[gd_offset + 0x20..gd_offset + 0x24].try_into().unwrap())
                     as u64;
