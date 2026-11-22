@@ -764,6 +764,21 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
 
     /// Decode the inode at `reference` (block start in the high bits, byte
     /// offset within the decompressed block in the low 16).
+    /// A directory inode's (own number, parent number), for tests of the writer.
+    #[cfg(test)]
+    pub(crate) fn dir_numbers_for_test(&mut self, reference: u64) -> (u32, u32) {
+        let inode = self.read_inode(reference).expect("inode");
+        assert!(
+            matches!(inode.kind, INODE_DIR | INODE_EXT_DIR),
+            "not a directory"
+        );
+        let block = self.sb.inode_table_start + (reference >> 16);
+        let b = self
+            .read_metadata_span(block, (reference & 0xFFFF) as u16, 32)
+            .expect("span");
+        (inode.inode_number, u32le(&b, 28))
+    }
+
     fn read_inode(&mut self, reference: u64) -> Result<Inode, FilesystemError> {
         let block = self.sb.inode_table_start + (reference >> 16);
         let offset = (reference & 0xFFFF) as u16;
@@ -1069,7 +1084,7 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
     /// seam without changing this signature.
     pub fn read_build_tree(&mut self) -> Result<crate::squashfs_write::BuildNode, FilesystemError> {
         let root_ref = self.sb.root_inode_ref;
-        let mut root = self.build_node(String::new(), root_ref, 0)?;
+        let mut root = self.build_node(String::new(), root_ref, 0, &mut HashMap::new())?;
         // The tree's root name is conventionally empty; the writer ignores it.
         root.name = String::new();
         Ok(root)
@@ -1099,17 +1114,19 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
                 .map(|(_, r, _)| r)
                 .ok_or_else(|| FilesystemError::NotFound(path.to_string()))?;
         }
-        let mut node = self.build_node(String::new(), reference, 0)?;
+        let mut node = self.build_node(String::new(), reference, 0, &mut HashMap::new())?;
         node.name = String::new();
         Ok(node)
     }
 
     /// Recursively turn the inode at `reference` into a [`BuildNode`].
+    /// `links` maps an inode number already read to its shared file data, so hard links stay one inode.
     fn build_node(
         &mut self,
         name: String,
         reference: u64,
         depth: usize,
+        links: &mut HashMap<u32, std::sync::Arc<Vec<u8>>>,
     ) -> Result<crate::squashfs_write::BuildNode, FilesystemError> {
         use crate::squashfs_write::{BuildKind, FileContent};
         // A directory that contains itself would recurse until the stack overflowed.
@@ -1131,9 +1148,20 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
                 let entries = self.read_dir_entries(&inode)?;
                 let mut children = Vec::with_capacity(entries.len());
                 for (child_name, child_ref, _kind) in entries {
-                    children.push(self.build_node(child_name, child_ref, depth + 1)?);
+                    children.push(self.build_node(child_name, child_ref, depth + 1, links)?);
                 }
                 BuildKind::Dir(children)
+            }
+            INODE_FILE | INODE_EXT_FILE if inode.nlink > 1 => {
+                let shared = match links.get(&inode.inode_number) {
+                    Some(data) => data.clone(),
+                    None => {
+                        let data = std::sync::Arc::new(self.read_regular_file(&inode, usize::MAX)?);
+                        links.insert(inode.inode_number, data.clone());
+                        data
+                    }
+                };
+                BuildKind::File(FileContent::Shared(shared))
             }
             INODE_FILE | INODE_EXT_FILE => {
                 let data = self.read_regular_file(&inode, usize::MAX)?;
@@ -1157,6 +1185,9 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             }
         };
 
+        // Other non-directories with several links (devices, symlinks) are grouped too.
+        let is_dir = matches!(kind, BuildKind::Dir(_));
+        let link_group = (!is_dir && inode.nlink > 1).then_some(inode.inode_number as u64);
         Ok(crate::squashfs_write::BuildNode {
             name,
             mode,
@@ -1165,6 +1196,7 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             mtime,
             xattrs,
             kind,
+            link_group,
         })
     }
 }

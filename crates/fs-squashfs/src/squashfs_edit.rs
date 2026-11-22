@@ -761,6 +761,7 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
             // them (D4) — otherwise a replaced binary loses its
             // `security.capability` and quietly stops working.
             xattrs: options.xattrs.clone(),
+            link_group: None,
             kind: BuildKind::File(FileContent::Bytes(bytes)),
         });
         Ok(Self::to_entry(
@@ -804,6 +805,7 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
             gid: attrs.gid,
             mtime: disk_core::times::resolve_or_now(options.unix_times).mtime_or_now() as u32,
             xattrs: Vec::new(),
+            link_group: None,
             kind: BuildKind::Dir(Vec::new()),
         });
         Ok(Self::to_entry(
@@ -886,6 +888,7 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
             gid,
             mtime: disk_core::times::resolve_or_now(options.unix_times).mtime_or_now() as u32,
             xattrs: Vec::new(),
+            link_group: None,
             kind: BuildKind::Symlink(target.to_string()),
         });
         Ok(Self::to_entry(
@@ -1008,6 +1011,7 @@ mod tests {
             gid: 0,
             mtime: 1_700_000_000,
             xattrs: Vec::new(),
+            link_group: None,
             kind: BK::Dir(vec![
                 BuildNode::file("readme", 0o644, b"original readme\n".to_vec()),
                 BuildNode::dir(
@@ -1023,6 +1027,7 @@ mod tests {
                             name: "security.capability".into(),
                             value: vec![1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0],
                         }],
+                        link_group: None,
                         kind: BK::File(FileContent::Bytes(b"ping binary\n".to_vec())),
                     }],
                 ),

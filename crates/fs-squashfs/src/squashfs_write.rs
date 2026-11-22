@@ -109,6 +109,8 @@ pub enum FileContent {
     Bytes(Vec<u8>),
     /// Streamed from a host file, so a large added file never fully loads.
     HostFile { path: std::path::PathBuf, len: u64 },
+    /// In-memory content shared by the members of a hard-link group.
+    Shared(std::sync::Arc<Vec<u8>>),
 }
 
 impl FileContent {
@@ -129,6 +131,7 @@ impl FileContent {
         match self {
             Self::Bytes(b) => b.len() as u64,
             Self::HostFile { len, .. } => *len,
+            Self::Shared(b) => b.len() as u64,
         }
     }
 
@@ -141,11 +144,25 @@ impl FileContent {
     fn open(&self) -> Result<Box<dyn std::io::Read>, FilesystemError> {
         match self {
             Self::Bytes(b) => Ok(Box::new(std::io::Cursor::new(b.clone()))),
+            Self::Shared(b) => Ok(Box::new(SharedReader(b.clone(), 0))),
             Self::HostFile { path, .. } => {
                 let f = std::fs::File::open(path).map_err(FilesystemError::Io)?;
                 Ok(Box::new(std::io::BufReader::new(f)))
             }
         }
+    }
+}
+
+/// Reads a hard-link group's shared bytes without copying them.
+struct SharedReader(std::sync::Arc<Vec<u8>>, usize);
+
+impl std::io::Read for SharedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let rest = &self.0[self.1.min(self.0.len())..];
+        let n = rest.len().min(buf.len());
+        buf[..n].copy_from_slice(&rest[..n]);
+        self.1 += n;
+        Ok(n)
     }
 }
 
@@ -171,6 +188,8 @@ pub struct BuildNode {
     pub mtime: u32,
     pub xattrs: Vec<Xattr>,
     pub kind: BuildKind,
+    /// Non-directories sharing a group are hard links to one inode.
+    pub link_group: Option<u64>,
 }
 
 impl BuildNode {
@@ -184,6 +203,7 @@ impl BuildNode {
             gid: 0,
             mtime: 0,
             xattrs: Vec::new(),
+            link_group: None,
             kind: BuildKind::Dir(children),
         }
     }
@@ -197,6 +217,7 @@ impl BuildNode {
             gid: 0,
             mtime: 0,
             xattrs: Vec::new(),
+            link_group: None,
             kind: BuildKind::File(FileContent::Bytes(data)),
         }
     }
@@ -210,6 +231,7 @@ impl BuildNode {
             gid: 0,
             mtime: 0,
             xattrs: Vec::new(),
+            link_group: None,
             kind: BuildKind::Symlink(target.to_string()),
         }
     }
@@ -322,6 +344,7 @@ fn collect_dir(dir: &std::path::Path) -> Result<Vec<BuildNode>, FilesystemError>
             gid: 0,
             mtime,
             xattrs: Vec::new(),
+            link_group: None,
             kind,
         });
     }
@@ -612,7 +635,47 @@ impl XattrBuilder {
     }
 }
 
+/// Inode numbers worked out in write order before anything is written.
+#[derive(Default)]
+struct Plan {
+    /// Each directory's inode number, by node address; a child records it as its parent.
+    dir_numbers: HashMap<*const BuildNode, u32>,
+    /// Members of each hard-link group: the shared inode's link count.
+    group_links: HashMap<u64, u32>,
+    /// Inodes the image will hold.
+    total: u32,
+}
+
+/// Children in the order the writer emits them.
+fn sorted_children(children: &[BuildNode]) -> Vec<&BuildNode> {
+    let mut sorted: Vec<&BuildNode> = children.iter().collect();
+    sorted.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+    sorted
+}
+
+/// Number `node`'s subtree post-order, as [`Builder::write_node`] will.
+fn plan_numbers(node: &BuildNode, seen: &mut std::collections::HashSet<u64>, plan: &mut Plan) {
+    match (&node.kind, node.link_group) {
+        (BuildKind::Dir(children), _) => {
+            for child in sorted_children(children) {
+                plan_numbers(child, seen, plan);
+            }
+            plan.total += 1;
+            plan.dir_numbers
+                .insert(node as *const BuildNode, plan.total);
+        }
+        (_, Some(group)) => {
+            *plan.group_links.entry(group).or_default() += 1;
+            if seen.insert(group) {
+                plan.total += 1;
+            }
+        }
+        (_, None) => plan.total += 1,
+    }
+}
+
 /// What writing one node produced, for its parent's directory entry.
+#[derive(Clone)]
 struct Written {
     inode_ref: u64,
     inode_number: u32,
@@ -631,6 +694,9 @@ struct Builder<'a, W: Write + Seek> {
     next_inode: u32,
     /// Current write position for data blocks.
     data_pos: u64,
+    plan: Plan,
+    /// The inode each hard-link group was written as.
+    linked: HashMap<u64, Written>,
 }
 
 impl<'a, W: Write + Seek> Builder<'a, W> {
@@ -730,7 +796,30 @@ impl<'a, W: Write + Seek> Builder<'a, W> {
 
     /// Emit one node (post-order: a directory's children are written before the
     /// directory itself, because its entries carry their inode references).
-    fn write_node(&mut self, node: &BuildNode) -> Result<Written, FilesystemError> {
+    /// `parent` is the containing directory's inode number (the root's is the inode count + 1).
+    fn write_node(&mut self, node: &BuildNode, parent: u32) -> Result<Written, FilesystemError> {
+        let group = match node.kind {
+            BuildKind::Dir(_) => None,
+            _ => node.link_group,
+        };
+        if let Some(w) = group.and_then(|g| self.linked.get(&g)) {
+            return Ok(w.clone());
+        }
+        let written = self.write_inode(node, parent)?;
+        if let Some(g) = group {
+            self.linked.insert(g, written.clone());
+        }
+        Ok(written)
+    }
+
+    fn nlink(&self, node: &BuildNode) -> u32 {
+        node.link_group
+            .and_then(|g| self.plan.group_links.get(&g).copied())
+            .unwrap_or(1)
+    }
+
+    fn write_inode(&mut self, node: &BuildNode, parent: u32) -> Result<Written, FilesystemError> {
+        let nlink = self.nlink(node);
         let uid_idx = self.ids.intern(node.uid)?;
         let gid_idx = self.ids.intern(node.gid)?;
         let xattr_idx = self.xattrs.intern(&node.xattrs)?;
@@ -738,15 +827,23 @@ impl<'a, W: Write + Seek> Builder<'a, W> {
 
         match &node.kind {
             BuildKind::Dir(children) => {
-                // Children first.
-                let mut sorted: Vec<&BuildNode> = children.iter().collect();
-                sorted.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+                // Children first; they record this directory's planned number as their parent.
+                let me = self
+                    .plan
+                    .dir_numbers
+                    .get(&(node as *const BuildNode))
+                    .copied();
+                let me = me.ok_or_else(|| {
+                    FilesystemError::InvalidData("squashfs: directory missing from the plan".into())
+                })?;
+                let sorted = sorted_children(children);
                 let mut written = Vec::with_capacity(sorted.len());
                 for child in &sorted {
-                    written.push((child.name.clone(), self.write_node(child)?));
+                    written.push((child.name.clone(), self.write_node(child, me)?));
                 }
 
                 let inode_number = self.take_inode_number();
+                debug_assert_eq!(inode_number, me, "squashfs inode plan out of step");
                 let (dir_start, dir_offset, dir_size) = self.write_dir_entries(&written)?;
 
                 let inode_ref = self.inodes.current_ref();
@@ -762,12 +859,12 @@ impl<'a, W: Write + Seek> Builder<'a, W> {
                     b.extend_from_slice(&(2u32 + count_subdirs(children)).to_le_bytes());
                     b.extend_from_slice(&(dir_size as u16).to_le_bytes());
                     b.extend_from_slice(&dir_offset.to_le_bytes());
-                    b.extend_from_slice(&(self.next_inode).to_le_bytes()); // parent
+                    b.extend_from_slice(&parent.to_le_bytes());
                 } else {
                     b.extend_from_slice(&(2u32 + count_subdirs(children)).to_le_bytes());
                     b.extend_from_slice(&dir_size.to_le_bytes());
                     b.extend_from_slice(&dir_start.to_le_bytes());
-                    b.extend_from_slice(&(self.next_inode).to_le_bytes()); // parent
+                    b.extend_from_slice(&parent.to_le_bytes());
                     b.extend_from_slice(&0u16.to_le_bytes()); // index count
                     b.extend_from_slice(&dir_offset.to_le_bytes());
                     b.extend_from_slice(&xattr_idx.to_le_bytes());
@@ -784,7 +881,9 @@ impl<'a, W: Write + Seek> Builder<'a, W> {
                 let (start, sizes, frag_index, frag_offset) = self.write_file_data(content)?;
                 let inode_number = self.take_inode_number();
                 let inode_ref = self.inodes.current_ref();
-                let needs_ext = has_xattr || file_len > u32::MAX as u64 || start > u32::MAX as u64;
+                // Only the extended file inode carries a link count.
+                let needs_ext =
+                    has_xattr || nlink > 1 || file_len > u32::MAX as u64 || start > u32::MAX as u64;
                 let kind = if needs_ext {
                     INODE_EXT_FILE
                 } else {
@@ -801,7 +900,7 @@ impl<'a, W: Write + Seek> Builder<'a, W> {
                     b.extend_from_slice(&start.to_le_bytes());
                     b.extend_from_slice(&file_len.to_le_bytes());
                     b.extend_from_slice(&0u64.to_le_bytes()); // sparse
-                    b.extend_from_slice(&1u32.to_le_bytes()); // nlink
+                    b.extend_from_slice(&nlink.to_le_bytes());
                     b.extend_from_slice(&frag_index.to_le_bytes());
                     b.extend_from_slice(&frag_offset.to_le_bytes());
                     b.extend_from_slice(&xattr_idx.to_le_bytes());
@@ -826,7 +925,7 @@ impl<'a, W: Write + Seek> Builder<'a, W> {
                 };
                 let mut b = Vec::new();
                 self.push_common(&mut b, kind, node, uid_idx, gid_idx, inode_number);
-                b.extend_from_slice(&1u32.to_le_bytes()); // nlink
+                b.extend_from_slice(&nlink.to_le_bytes());
                 b.extend_from_slice(&(target.len() as u32).to_le_bytes());
                 b.extend_from_slice(target.as_bytes());
                 if kind == INODE_EXT_SYMLINK {
@@ -852,7 +951,7 @@ impl<'a, W: Write + Seek> Builder<'a, W> {
                 let kind = if has_xattr { ext } else { basic };
                 let mut b = Vec::new();
                 self.push_common(&mut b, kind, node, uid_idx, gid_idx, inode_number);
-                b.extend_from_slice(&1u32.to_le_bytes()); // nlink
+                b.extend_from_slice(&nlink.to_le_bytes());
                 let dev = ((major & 0xFFF) << 8) | (minor & 0xFF) | ((minor & 0xFFF00) << 12);
                 b.extend_from_slice(&dev.to_le_bytes());
                 if kind == ext {
@@ -881,7 +980,7 @@ impl<'a, W: Write + Seek> Builder<'a, W> {
                 let kind = if has_xattr { ext } else { basic };
                 let mut b = Vec::new();
                 self.push_common(&mut b, kind, node, uid_idx, gid_idx, inode_number);
-                b.extend_from_slice(&1u32.to_le_bytes()); // nlink
+                b.extend_from_slice(&nlink.to_le_bytes());
                 if kind == ext {
                     b.extend_from_slice(&xattr_idx.to_le_bytes());
                 }
@@ -1027,9 +1126,17 @@ pub fn write_squashfs<W: Write + Seek>(
         frags: FragmentWriter::new(opts.block_size),
         next_inode: 1,
         data_pos: SUPERBLOCK_SIZE as u64,
+        plan: Plan::default(),
+        linked: HashMap::new(),
     };
+    plan_numbers(
+        root,
+        &mut std::collections::HashSet::new(),
+        &mut builder.plan,
+    );
+    let root_parent = builder.plan.total + 1;
 
-    let root_written = builder.write_node(root)?;
+    let root_written = builder.write_node(root, root_parent)?;
     // The last partly-filled fragment block still has to land in the data area,
     // before any of the tables are written after it.
     builder.flush_fragment()?;
@@ -1243,6 +1350,7 @@ mod tests {
             gid: 0,
             mtime: 1_700_000_000,
             xattrs: Vec::new(),
+            link_group: None,
             kind: BuildKind::Dir(vec![
                 BuildNode::file("hello.txt", 0o644, b"hello squashfs\n".to_vec()),
                 BuildNode::file("empty.bin", 0o600, Vec::new()),
@@ -1264,6 +1372,7 @@ mod tests {
                                 name: "security.capability".into(),
                                 value: vec![1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0],
                             }],
+                            link_group: None,
                             kind: BuildKind::File(FileContent::Bytes(b"has an xattr\n".to_vec())),
                         },
                     ],
@@ -1275,6 +1384,7 @@ mod tests {
                     gid: 0,
                     mtime: 1_700_000_000,
                     xattrs: Vec::new(),
+                    link_group: None,
                     kind: BuildKind::CharDev { major: 1, minor: 3 },
                 },
             ]),
@@ -1328,6 +1438,59 @@ mod tests {
             .find(|e| e.name == "hello.txt")
             .expect("hello.txt");
         assert!(fs.list_xattrs(&hello).expect("list_xattrs").is_empty());
+    }
+
+    #[test]
+    fn directories_record_their_parent_and_hard_links_stay_one_inode() {
+        let data = std::sync::Arc::new(b"shared\n".to_vec());
+        let mut a = BuildNode::file("a", 0o644, Vec::new());
+        a.kind = BuildKind::File(FileContent::Shared(data.clone()));
+        a.link_group = Some(7);
+        let mut b = BuildNode::file("b", 0o644, Vec::new());
+        b.kind = BuildKind::File(FileContent::Shared(data));
+        b.link_group = Some(7);
+        let tree = BuildNode::dir(
+            "",
+            0o755,
+            vec![
+                BuildNode::dir("d1", 0o755, vec![BuildNode::dir("inner", 0o755, vec![a])]),
+                BuildNode::dir("d2", 0o755, vec![b]),
+            ],
+        );
+        let mut cur = Cursor::new(Vec::new());
+        write_squashfs(&mut cur, &tree, &BuildOptions::default()).expect("write");
+        let mut fs = SquashfsFilesystem::open(Cursor::new(cur.into_inner()), 0).expect("open");
+
+        let root = fs.root().expect("root");
+        let (root_no, root_parent) = fs.dir_numbers_for_test(root.location);
+        let kids = fs.list_directory(&root).expect("list");
+        for d in &kids {
+            let (no, parent) = fs.dir_numbers_for_test(d.location);
+            assert_eq!(parent, root_no, "{} parent", d.name);
+            if d.name == "d1" {
+                let inner = &fs.list_directory(d).expect("list d1")[0];
+                assert_eq!(
+                    fs.dir_numbers_for_test(inner.location).1,
+                    no,
+                    "inner parent"
+                );
+            }
+        }
+        // a, b share one inode: 5 inodes in all, and the root's parent is count + 1.
+        assert_eq!(root_no, 5);
+        assert_eq!(root_parent, 6);
+
+        let rebuilt = fs.read_build_tree().expect("tree");
+        let mut groups = Vec::new();
+        fn walk(n: &BuildNode, out: &mut Vec<Option<u64>>) {
+            match &n.kind {
+                BuildKind::Dir(c) => c.iter().for_each(|c| walk(c, out)),
+                _ => out.push(n.link_group),
+            }
+        }
+        walk(&rebuilt, &mut groups);
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].is_some() && groups[0] == groups[1], "{groups:?}");
     }
 
     /// Round-trip through **our own** reader: every field we wrote comes back.
@@ -1873,6 +2036,7 @@ mod tests {
             gid: 0,
             mtime: 0,
             xattrs: Vec::new(),
+            link_group: None,
             kind: BuildKind::Dir(vec![BuildNode {
                 name: "payload.bin".into(),
                 mode: 0o644,
@@ -1880,6 +2044,7 @@ mod tests {
                 gid: 0,
                 mtime: 0,
                 xattrs: Vec::new(),
+                link_group: None,
                 kind: BuildKind::File(
                     FileContent::host_file(host.clone()).expect("stat host file"),
                 ),
@@ -1915,6 +2080,7 @@ mod tests {
             gid: 0,
             mtime: 0,
             xattrs: Vec::new(),
+            link_group: None,
             kind: BuildKind::Dir(vec![BuildNode {
                 name: "vanishes.bin".into(),
                 mode: 0o644,
@@ -1922,6 +2088,7 @@ mod tests {
                 gid: 0,
                 mtime: 0,
                 xattrs: Vec::new(),
+                link_group: None,
                 kind: BuildKind::File(content),
             }]),
         };
@@ -2066,6 +2233,7 @@ mod tests {
     fn read_content(c: &FileContent) -> Vec<u8> {
         match c {
             FileContent::Bytes(b) => b.clone(),
+            FileContent::Shared(b) => b.as_ref().clone(),
             FileContent::HostFile { path, .. } => std::fs::read(path).expect("read host file"),
         }
     }

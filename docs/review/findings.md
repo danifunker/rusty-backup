@@ -577,7 +577,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | IMZ-001 | S2 | confirmed | dsk-imz imz.rs `open_with_password` | Capacity from ZIP header sizes; whole entry in RAM with no cap. | fixed (52f2afa6) |
 | TAP-001 | S3 | confirmed | dsk-tape sun2tape.rs, sun2tape_edit.rs | Tape files read whole into RAM (up to three copies). | open |
 | TAP-002 | S2 | plausible | dsk-tape sun2tape.rs, sun2tape_edit.rs `build_image` | Zero-length tape files dropped on rebuild: later files renumbered. | fixed (fe41fa48) |
-| TAP-003 | S3 | confirmed | dsk-tape tar_section.rs `TarSection::parse` | A leading `./` entry disappears from the rebuilt archive. | open |
+| TAP-003 | S3 | confirmed | dsk-tape tar_section.rs `TarSection::parse` | A leading `./` entry disappears from the rebuilt archive. | fixed (06523f71) |
 
 ## crates/fs-adfs, fs-hpfs, fs-apfs, fs-qnx, qnx2fs
 

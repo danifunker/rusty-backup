@@ -137,6 +137,7 @@ mod tests {
             gid: 0,
             mtime: 0,
             xattrs: Vec::new(),
+            link_group: None,
             kind: BuildKind::Dir(vec![
                 BuildNode::file("readme", 0o644, b"hello\n".to_vec()),
                 BuildNode::symlink("link", "readme"),
@@ -153,6 +154,7 @@ mod tests {
                             name: "security.capability".into(),
                             value: vec![1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0],
                         }],
+                        link_group: None,
                         // Compressible, so its data blocks are gzip-compressed
                         // — a corrupt-block test needs a block that *decompresses*,
                         // and an incompressible file is stored raw (no checksum,
