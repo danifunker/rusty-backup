@@ -414,6 +414,14 @@ fn export_zip_file(
     Ok(summary)
 }
 
+/// One zip path component: a Mac name may hold a slash or backslash, which would nest or escape.
+fn zip_component(name: &str) -> String {
+    name.chars()
+        .filter(|&c| c != '\0')
+        .map(|c| if c == '/' || c == '\\' { ':' } else { c })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn zip_recurse<W: Write + std::io::Seek>(
     fs: &mut dyn Filesystem,
@@ -431,10 +439,10 @@ fn zip_recurse<W: Write + std::io::Seek>(
         }
         // A volume root contributes its children at the current level; zip, like
         // tar, has no member name for it (its literal name is "/").
-        let member = e.archive_name();
-        let arch = match (prefix.is_empty(), member) {
+        let member = e.archive_name().map(zip_component);
+        let arch = match (prefix.is_empty(), &member) {
             (_, None) => prefix.to_string(),
-            (true, Some(n)) => n.to_string(),
+            (true, Some(n)) => n.clone(),
             (false, Some(n)) => format!("{prefix}/{n}"),
         };
         match e.entry_type {
@@ -652,6 +660,12 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn zip_component_keeps_mac_names_in_one_member() {
+        assert_eq!(zip_component("../../x"), "..:..:x");
+        assert_eq!(zip_component("a/b\\c"), "a:b:c");
+    }
     use disk_core::filesystem::EditableFilesystem;
     use std::io::Read;
 

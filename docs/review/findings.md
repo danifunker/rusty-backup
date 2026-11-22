@@ -574,7 +574,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | FLX-004 | S2 | confirmed | dsk-flux flux/mfm_emu.rs `decode_to` | Seek does not extend the temp file: truncated disk; header-sized allocations unchecked. | fixed (50641b3b) |
 | FLX-005 | S2 | confirmed | dsk-flux flux/kryoflux.rs `parse_stream` | u32 overflow counter overflows (panic / wrong interval). | fixed (50641b3b) |
 | FLX-006 | S4 | confirmed | dsk-flux mfm_emu.rs, mfm.rs | `crc16` twice; byte helpers duplicate disk_core. | open |
-| IMZ-001 | S2 | confirmed | dsk-imz imz.rs `open_with_password` | Capacity from ZIP header sizes; whole entry in RAM with no cap. | open |
+| IMZ-001 | S2 | confirmed | dsk-imz imz.rs `open_with_password` | Capacity from ZIP header sizes; whole entry in RAM with no cap. | fixed (52f2afa6) |
 | TAP-001 | S3 | confirmed | dsk-tape sun2tape.rs, sun2tape_edit.rs | Tape files read whole into RAM (up to three copies). | open |
 | TAP-002 | S2 | plausible | dsk-tape sun2tape.rs, sun2tape_edit.rs `build_image` | Zero-length tape files dropped on rebuild: later files renumbered. | fixed (fe41fa48) |
 | TAP-003 | S3 | confirmed | dsk-tape tar_section.rs `TarSection::parse` | A leading `./` entry disappears from the rebuilt archive. | open |
