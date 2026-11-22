@@ -904,6 +904,7 @@ Usage: import [OPTIONS] <IMAGE> <DIR> [DEST]
 - `--no-permissions` — Ignore the host's Unix mode and ownership. Imported entries then inherit uid/gid from the directory they land in and take the filesystem's default mode, the same rule `put` follows
 - `--include-appledouble` — Import macOS AppleDouble sidecars (`._*`) as files of their own, on top of the fork they already contribute. Off by default: on a fork-bearing target (HFS / HFS+ / MFS / ProDOS) a `._name` or `name.rsrc` sidecar is consumed into the resource fork of the file it belongs to, which is where it wanted to end up, and elsewhere it is skipped as Mac metadata cruft. Only an orphan with no primary file is ever dropped outright
 - `--exclude-appledouble` — Leave macOS `._*` sidecars out entirely: neither copied as files nor taken as a file's resource fork. For a folder that only has them because it came off a modern Mac
+- `--line-endings` — Convert text files' line endings as they go in: keep (default), unix (CRLF to LF), mac (to CR) or dos (LF to CRLF). Binary files and archives copied as files are left as they are
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
@@ -1333,6 +1334,7 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 - `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too
 - `--exclude-appledouble` — Leave macOS `._*` sidecars out entirely: neither copied as files nor taken as a file's resource fork. For a folder that only has them because it came off a modern Mac
+- `--line-endings` — Convert text files' line endings as they go in: keep (default), unix, mac or dos
 - `--name` — Volume label (EFS keeps up to 6 bytes, XFS 12; longer is truncated). Defaults to `rusty`
 - `--fs` — Root filesystem: it sets the root partition's type and, unless `--label-only`, is formatted. XFS is written as v5 (CRC), which IRIX itself cannot mount
 - `--label-only` — Write the SGI volume header and partition table only; leave the partitions as they are (unformatted on a new image)
@@ -2452,6 +2454,7 @@ Usage: untar [OPTIONS] <IMAGE> <ARCHIVE> [DEST]
 - `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
 - `--no-permissions` — Ignore the archive's Unix mode and ownership. Imported entries then inherit uid/gid from the directory they land in and take the filesystem's default mode, the same rule `put` follows
 - `--include-appledouble` — Import macOS AppleDouble sidecars (`._*`) too. By default they are skipped as Mac metadata cruft
+- `--line-endings` — Convert text files' line endings as they go in: keep (default), unix, mac or dos
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 

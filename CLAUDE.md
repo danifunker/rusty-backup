@@ -32,6 +32,7 @@ cargo test --workspace         # All tests (a bare `cargo test` skips crates/)
 cargo test test_name           # Single test
 cargo test --lib               # Unit tests only
 cargo test --test '*'          # Integration tests only
+cargo test --test integration cp_engine::  # One integration module
 cargo fmt --check              # Check formatting
 cargo fmt                      # Auto-format
 cargo clippy                   # Lint

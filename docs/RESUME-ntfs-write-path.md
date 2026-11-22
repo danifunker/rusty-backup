@@ -108,7 +108,7 @@ The restore path was never at fault. Backup forced `CompressionType::None`
 force made the lie harmless, and honouring the format made the two diverge,
 so restore (which dispatches on `metadata.compression_type`) wrote the
 compressed member to the target verbatim. Metadata now records the codec
-actually written. `tests/superfloppy_compression.rs` pins it.
+actually written. `tests/integration/superfloppy_compression.rs` pins it.
 
 Still open, and unchanged by that fix: a superfloppy restore ignores a
 `--target-size` larger than the source and lands the original size. Raw

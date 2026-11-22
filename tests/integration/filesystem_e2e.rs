@@ -14,7 +14,7 @@
 //!   subdir/           — directory
 //!   subdir/nested.txt — "nested file"
 //!
-//! Run with: cargo test --test filesystem_e2e
+//! Run with: cargo test --test integration filesystem_e2e::
 
 use disk_core::filesystem::Filesystem;
 use rusty_backup::fs::entry::FileEntryTypeDisplay as _;

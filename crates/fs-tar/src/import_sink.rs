@@ -21,6 +21,7 @@ use std::path::{Component, Path};
 
 use anyhow::{anyhow, bail, Result};
 
+use crate::line_endings::{converts, read_head, LineEndingReader, LineEndings};
 use disk_core::attrs::AttrOverrides;
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::{EditableFilesystem, FilesystemError};
@@ -50,6 +51,9 @@ pub struct ImportOptions {
     /// a Mac adds to trees and archives. On by default; almost never wanted
     /// inside a disk image.
     pub skip_appledouble: bool,
+    /// Convert the line endings of text files ([`crate::line_endings`]); `Keep` copies every
+    /// byte as it is, and is the default.
+    pub line_endings: LineEndings,
 }
 
 impl Default for ImportOptions {
@@ -58,6 +62,7 @@ impl Default for ImportOptions {
             conflict: ImportConflict::Error,
             apply_permissions: true,
             skip_appledouble: true,
+            line_endings: LineEndings::Keep,
         }
     }
 }
@@ -92,6 +97,8 @@ pub struct ImportStats {
     pub hardlinks_copied: u64,
     /// GNU tar 1.11 `@@MaNgLeD.N` members restored to the long names their `N` entry records.
     pub mangled_renamed: u64,
+    /// Text files whose line endings the conversion changed ([`ImportOptions::line_endings`]).
+    pub line_endings_converted: u64,
 }
 
 impl ImportStats {
@@ -116,6 +123,7 @@ impl ImportStats {
             gunzipped,
             hardlinks_copied,
             mangled_renamed,
+            line_endings_converted,
         } = other;
         self.files += files;
         self.dirs_created += dirs_created;
@@ -133,6 +141,7 @@ impl ImportStats {
         self.gunzipped += gunzipped;
         self.hardlinks_copied += hardlinks_copied;
         self.mangled_renamed += mangled_renamed;
+        self.line_endings_converted += line_endings_converted;
     }
 }
 
@@ -156,6 +165,9 @@ pub struct ImportPreflight {
     /// that can cheaply stat their source fill this in; it is what sizing a
     /// fresh volume to fit the content keys off.
     pub total_bytes: u64,
+    /// Files in the tree whose line endings the import will change; `total_bytes` has their
+    /// converted size (members of expanded archives are sized too, but not counted here).
+    pub line_endings: u64,
 }
 
 impl ImportPreflight {
@@ -212,6 +224,20 @@ pub enum ImportItem<'a> {
     },
     /// Hardlinks, char/block devices, fifos, sockets — not representable.
     Unsupported,
+}
+
+/// `src` converted into an unlinked, rewound temp file (so a large file never sits in memory),
+/// its length, and whether any line ending changed.
+fn spool_converted(
+    src: impl Read,
+    mode: LineEndings,
+) -> std::io::Result<(std::fs::File, u64, bool)> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = tempfile::tempfile()?;
+    let mut conv = LineEndingReader::new(src, mode);
+    let len = std::io::copy(&mut conv, &mut file)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok((file, len, conv.changed()))
 }
 
 /// True when `name` is a macOS AppleDouble sidecar (`._something`).
@@ -440,6 +466,25 @@ impl Importer {
                     create_opts.os_creator = imp.creator_code;
                     create_opts.finder_flags = imp.finder_flags;
                 }
+                // A text file under a line-ending conversion goes in through a temp file, since
+                // its converted length has to be known before `create_file`.
+                let mut spool = None;
+                let mut head_reader;
+                let (data, size): (&mut dyn Read, u64) = if opts.line_endings == LineEndings::Keep {
+                    (data, size)
+                } else {
+                    let head = read_head(data).map_err(|e| anyhow!("reading {display}: {e}"))?;
+                    if converts(opts.line_endings, name, &head) {
+                        let src = std::io::Cursor::new(head).chain(data);
+                        let (file, len, changed) = spool_converted(src, opts.line_endings)
+                            .map_err(|e| anyhow!("converting {display}: {e}"))?;
+                        self.stats.line_endings_converted += u64::from(changed);
+                        (spool.insert(file), len)
+                    } else {
+                        head_reader = std::io::Cursor::new(head).chain(data);
+                        (&mut head_reader, size)
+                    }
+                };
                 efs.create_file(&parent, name, data, size, &create_opts)
                     .map_err(|e| anyhow!("create_file {display}: {e}"))?;
                 self.dir_children

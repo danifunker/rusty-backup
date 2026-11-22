@@ -9,7 +9,8 @@
 #   case:S[,S]   rb-regress run cases whose ID contains S (see cases/**.toml ids)
 #   emu:S        regress-emulators.sh scenarios whose ID contains S (emulator/cases.txt)
 #   lib:F        cargo test --lib, filtered to test paths containing F
-#   test:T       cargo test --test T (an integration target under tests/)
+#   test:T       integration tests: `cargo test --test integration -- T::` for a module of
+#                tests/integration/, or `--test T` for doc_parity / ui_scenarios
 #   front:N      the front-end's own tests (gtk4, appkit, win32), where this host can build it
 #   check:N      boundaries (scripts/check-boundaries.sh), docparity (tests/doc_parity.rs),
 #                matrix (scripts/check-platform-matrix.py), runner (rb-regress tests + clippy)

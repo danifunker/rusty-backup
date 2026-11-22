@@ -16,7 +16,7 @@
 //! on-disk structures (byte order, JIB layout, journal-header checksum) — which
 //! the synthetic unit tests in `src/fs/hfsplus_journal.rs` can't by themselves.
 //!
-//! Run with: cargo test --test hfsplus_journal_e2e
+//! Run with: cargo test --test integration fs_e2e_suite::hfsplus_journal_e2e::
 
 use byteorder::{BigEndian, ByteOrder};
 use std::io::{Cursor, Read};

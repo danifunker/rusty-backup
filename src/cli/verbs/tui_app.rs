@@ -2031,6 +2031,7 @@ impl App {
                         no_permissions: false,
                         include_appledouble: false,
                         exclude_appledouble: false,
+                        line_endings: Default::default(),
                     })
                 }
             },

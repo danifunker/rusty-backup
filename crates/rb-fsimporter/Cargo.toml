@@ -1,6 +1,6 @@
 [package]
 name = "rb-fsimporter"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -26,7 +26,7 @@ rust173-polyfill = ["disk-core/rust173-polyfill", "fs-tar/rust173-polyfill", "fs
 [dependencies]
 anyhow = "1"
 disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
-fs-tar = { path = "../fs-tar", version = "0.2", default-features = false, features = ["zip"] }
+fs-tar = { path = "../fs-tar", version = "0.3", default-features = false, features = ["zip"] }
 fs-mac = { path = "../fs-mac", version = "0.2", default-features = false, features = ["codecs"], optional = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
@@ -35,3 +35,4 @@ fs-pc = { path = "../fs-pc", version = "0.2", default-features = false, features
 tempfile = "3"
 tar = "0.4"
 bzip2 = ">=0.5.2, <0.7"
+zip = { version = ">=2.4.2, <10", default-features = false }

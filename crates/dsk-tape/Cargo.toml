@@ -1,6 +1,6 @@
 [package]
 name = "dsk-tape"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -28,6 +28,6 @@ log = "0.4"
 # Edits rebuild the tape into a temp file beside the original.
 tempfile = "3"
 arc-mac = { path = "../arc-mac", version = "0.3", optional = true }
-fs-tar = { path = "../fs-tar", version = "0.2", default-features = false, features = ["mem-archive"], optional = true }
+fs-tar = { path = "../fs-tar", version = "0.3", default-features = false, features = ["mem-archive"], optional = true }
 fs-unix = { path = "../fs-unix", version = "0.3", default-features = false, features = ["ufs"], optional = true }
 tar = { version = "0.4", optional = true }

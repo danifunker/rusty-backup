@@ -95,6 +95,10 @@ pub struct NewSgiHddArgs {
     )]
     pub exclude_appledouble: bool,
 
+    /// Convert text files' line endings as they go in: keep (default), unix, mac or dos.
+    #[arg(long = "line-endings", value_name = "MODE", default_value = "keep", value_parser = super::import::parse_line_endings)]
+    pub line_endings: fs_tar::line_endings::LineEndings,
+
     /// Volume label (EFS keeps up to 6 bytes, XFS 12; longer is truncated). Defaults to
     /// `rusty`.
     #[arg(long, default_value = "rusty")]
@@ -300,6 +304,7 @@ fn import_options(args: &NewSgiHddArgs) -> crate::fs::dir_import::DirImportOptio
             args.no_permissions,
             args.include_appledouble,
             args.flatten_folders,
+            args.line_endings,
         ),
         expand_archives: args.expand_archives,
         flatten_archives: args.flatten_folders,

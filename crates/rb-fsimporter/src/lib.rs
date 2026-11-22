@@ -49,6 +49,7 @@ pub use fs_tar::import_sink::{
 pub use disk_core::entry::FileEntry;
 pub use disk_core::filesystem::EditableFilesystem;
 pub use fs_tar::import_sink::ImportStats;
+pub use fs_tar::line_endings::LineEndings;
 
 /// What a GUI (or any caller) supplies to watch and stop an import.
 pub trait Host {
@@ -238,10 +239,32 @@ fn gunzip_target(host: &Path, file_name: &str) -> Option<String> {
     gunzipped_name(file_name).filter(|_| is_gzip_file(host))
 }
 
-/// Decompressed length of a (possibly multi-member) gzip file. The trailer's
-/// ISIZE is only the length mod 4 GiB, so the stream is counted instead.
-fn gunzipped_len(path: &Path) -> Result<u64> {
-    Ok(gunzip_scan(path)?.0)
+/// Decompressed length of a (possibly multi-member) gzip file, as `name` converts under `mode`,
+/// and whether it converts. The trailer's ISIZE is only mod 4 GiB, so the stream is counted.
+fn gunzipped_len(path: &Path, name: &str, mode: LineEndings) -> Result<(u64, bool)> {
+    let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut dec = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(f));
+    fs_tar::line_endings::imported_len(mode, name, &mut dec)
+        .with_context(|| format!("decompressing {}", path.display()))
+}
+
+/// The name a host file lands under with `--expand-gunzip`, when that applies to it.
+fn gunzip_name(e: &HostEntry, opts: &DirImportOptions) -> Option<String> {
+    opts.expand_gunzip
+        .then(|| e.comps.last().and_then(|n| gunzip_target(&e.host, n)))
+        .flatten()
+}
+
+/// What a plain host file imports as: its size, or its converted size when the line-ending
+/// option converts it (which reads the file); and whether it converts.
+fn host_file_len(e: &HostEntry, size: u64, mode: LineEndings) -> Result<(u64, bool)> {
+    if mode == LineEndings::Keep {
+        return Ok((size, false));
+    }
+    let name = e.comps.last().map(String::as_str).unwrap_or("");
+    let mut f = File::open(&e.host).with_context(|| format!("opening {}", e.host.display()))?;
+    fs_tar::line_endings::imported_len(mode, name, &mut f)
+        .with_context(|| format!("reading {}", e.host.display()))
 }
 
 /// Decompressed length plus the original file's mtime from the gzip header (0 means unset).
@@ -310,15 +333,17 @@ fn expansion(
 
 /// `(files, dirs, bytes)` the archive expands to, per flavor; `None` for an image with no
 /// browsable volume, which is copied in as a file.
+/// Tar and zip members are sized as `mode` converts them; Mac archives and images are not.
 fn measure_expanded(
     flavor: ArchiveFlavor,
     path: &Path,
+    mode: LineEndings,
     x: Option<&dyn Expander>,
 ) -> Result<Option<(u64, u64, u64)>> {
     match flavor {
-        ArchiveFlavor::Tar => fs_tar::tar_import::measure_tar_expanded(path).map(Some),
+        ArchiveFlavor::Tar => fs_tar::tar_import::measure_tar_expanded_with(path, mode).map(Some),
         ArchiveFlavor::Mac => expander(x)?.measure_mac_archive(path).map(Some),
-        ArchiveFlavor::Zip => fs_tar::zip_import::measure_zip_expanded(path).map(Some),
+        ArchiveFlavor::Zip => fs_tar::zip_import::measure_zip_expanded_with(path, mode).map(Some),
         ArchiveFlavor::DiskImage => expander(x)?.measure_image(path),
     }
 }
@@ -869,8 +894,9 @@ pub fn preflight_dir_with(
                 }
             }
             HostKind::File { size } => {
+                let mode = opts.shared.line_endings;
                 let expanded = match expansion(&e.host, opts, x) {
-                    Some(flavor) => measure_expanded(flavor, &e.host, x)?,
+                    Some(flavor) => measure_expanded(flavor, &e.host, mode, x)?,
                     None => None,
                 };
                 if let Some((f, d, b)) = expanded {
@@ -880,17 +906,16 @@ pub fn preflight_dir_with(
                     // then it shares the one that already exists.
                     pf.dirs += d + u64::from(!opts.flatten_archives);
                     pf.total_bytes += b;
-                } else if opts.expand_gunzip
-                    && e.comps
-                        .last()
-                        .and_then(|n| gunzip_target(&e.host, n))
-                        .is_some()
-                {
+                } else if let Some(name) = gunzip_name(&e, opts) {
+                    let (len, converted) = gunzipped_len(&e.host, &name, mode)?;
                     pf.files += 1;
-                    pf.total_bytes += gunzipped_len(&e.host)?;
+                    pf.total_bytes += len;
+                    pf.line_endings += u64::from(converted);
                 } else {
+                    let (len, converted) = host_file_len(&e, size, mode)?;
                     pf.files += 1;
-                    pf.total_bytes += size;
+                    pf.total_bytes += len;
+                    pf.line_endings += u64::from(converted);
                 }
             }
             HostKind::Other => pf.other_unsupported += 1,
@@ -950,25 +975,21 @@ pub fn measure_dir_with(
         match e.kind {
             HostKind::Dir => dirs += 1,
             HostKind::File { size } => {
+                let mode = opts.shared.line_endings;
                 let expanded = match expansion(&e.host, opts, x) {
-                    Some(flavor) => measure_expanded(flavor, &e.host, x)?,
+                    Some(flavor) => measure_expanded(flavor, &e.host, mode, x)?,
                     None => None,
                 };
                 if let Some((f, d, b)) = expanded {
                     files += f;
                     dirs += d + u64::from(!flatten);
                     bytes += b;
-                } else if opts.expand_gunzip
-                    && e.comps
-                        .last()
-                        .and_then(|n| gunzip_target(&e.host, n))
-                        .is_some()
-                {
+                } else if let Some(name) = gunzip_name(&e, opts) {
                     files += 1;
-                    bytes += gunzipped_len(&e.host)?;
+                    bytes += gunzipped_len(&e.host, &name, mode)?.0;
                 } else {
                     files += 1;
-                    bytes += size;
+                    bytes += host_file_len(&e, size, mode)?.0;
                 }
             }
             _ => {}
@@ -1261,6 +1282,131 @@ mod tests {
         let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
         enc.write_all(data).unwrap();
         enc.finish().unwrap();
+    }
+
+    /// Every file under `dir` in the volume, by name, with its bytes.
+    fn read_all(
+        fs: &mut fs_pc::fat::FatFilesystem<std::io::Cursor<Vec<u8>>>,
+        dir: &FileEntry,
+    ) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        for e in fs.list_directory(dir).unwrap() {
+            if e.is_directory() {
+                for (k, v) in read_all(fs, &e) {
+                    out.insert(format!("{}/{k}", e.name), v);
+                }
+            } else {
+                out.insert(e.name.clone(), fs.read_file(&e, usize::MAX).unwrap());
+            }
+        }
+        out
+    }
+
+    /// The `--line-endings unix` import: text converts, binaries and archives copied as files
+    /// do not, members of expanded archives do, and every measure agrees with what landed.
+    #[test]
+    fn line_endings_convert_text_files_only_and_measure_what_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("crlf.txt"), b"one\r\ntwo\r\n").unwrap();
+        std::fs::write(src.join("cr.txt"), b"mac\rlines\r").unwrap();
+        std::fs::write(src.join("lf.txt"), b"unix\nlines\n").unwrap();
+        std::fs::write(src.join("mixed.txt"), b"a\r\nb\nc\rd\r\n").unwrap();
+        std::fs::write(src.join("empty.txt"), b"").unwrap();
+        // A CRLF across the 8 KiB sniff block and the converter's 64 KiB buffer.
+        let mut big = vec![b'x'; 8191];
+        big.extend_from_slice(b"\r\n");
+        big.resize(65535, b'y');
+        big.extend_from_slice(b"\r\nend\r\n");
+        std::fs::write(src.join("big.txt"), &big).unwrap();
+        let bin = b"\x00\x01\r\n\xff\r\n\x00".repeat(100);
+        std::fs::write(src.join("bin.dat"), &bin).unwrap();
+        // Archives: one expanded (tar.gz and zip), one plain tar copied in as a file.
+        write_tgz(&src.join("pkg.tgz"), &[("readme.txt", b"tar\r\ntext\r\n")]);
+        let mut plain = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(6);
+        h.set_mode(0o644);
+        h.set_cksum();
+        plain
+            .append_data(&mut h, "x.txt", &b"x\r\ny\r\n"[..])
+            .unwrap();
+        let plain = plain.into_inner().unwrap();
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let zopts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        z.start_file("note.txt", zopts).unwrap();
+        std::io::Write::write_all(&mut z, b"zip\r\ntext\r\n").unwrap();
+        std::fs::write(src.join("bundle.zip"), z.finish().unwrap().into_inner()).unwrap();
+
+        let opts = DirImportOptions {
+            shared: ImportOptions {
+                line_endings: LineEndings::Unix,
+                ..Default::default()
+            },
+            expand_archives: true,
+            ..Default::default()
+        };
+        // The plain tar sits apart so expansion leaves it alone: imported as a file.
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("plain.tar"), &plain).unwrap();
+
+        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(blank_fat()), 0).unwrap();
+        let root = Filesystem::root(&mut fs).unwrap();
+        let pf = preflight_dir(&fs, &src, &opts).unwrap();
+        let (_, _, measured) = measure_dir_for(&src, &opts).unwrap();
+        let stats = import_dir(&mut fs, &root, &src, &opts, &|_| {}).unwrap();
+        let plain_stats = import_dir(
+            &mut fs,
+            &root,
+            &other,
+            &DirImportOptions {
+                shared: ImportOptions {
+                    line_endings: LineEndings::Unix,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &|_| {},
+        )
+        .unwrap();
+
+        let got = read_all(&mut fs, &root);
+        assert_eq!(got["crlf.txt"], b"one\ntwo\n");
+        assert_eq!(got["cr.txt"], b"mac\rlines\r");
+        assert_eq!(got["lf.txt"], b"unix\nlines\n");
+        assert_eq!(got["mixed.txt"], b"a\nb\nc\rd\n");
+        assert_eq!(got["empty.txt"], b"");
+        let mut want = vec![b'x'; 8191];
+        want.push(b'\n');
+        want.resize(65534, b'y');
+        want.extend_from_slice(b"\nend\n");
+        assert_eq!(got["big.txt"], want);
+        assert_eq!(got["bin.dat"], bin, "a binary file is untouched");
+        assert_eq!(got["pkg/readme.txt"], b"tar\ntext\n");
+        assert_eq!(got["bundle/note.txt"], b"zip\ntext\n");
+        assert_eq!(
+            got["plain.tar"], plain,
+            "an archive copied as a file is untouched"
+        );
+        assert_eq!(plain_stats.line_endings_converted, 0);
+
+        // Changed: crlf, mixed and big, plus the two archive members (cr, lf and empty are not).
+        assert_eq!(stats.line_endings_converted, 5);
+        assert_eq!(
+            pf.line_endings, 3,
+            "the preflight counts the tree's own changed files"
+        );
+        let written: u64 = got
+            .iter()
+            .filter(|(k, _)| k.as_str() != "plain.tar")
+            .map(|(_, v)| v.len() as u64)
+            .sum();
+        assert_eq!(stats.total_bytes, written);
+        assert_eq!(pf.total_bytes, written, "the preflight sizes what lands");
+        assert_eq!(measured, written, "the measure sizes what lands");
     }
 
     fn root_names(fs: &mut fs_pc::fat::FatFilesystem<std::io::Cursor<Vec<u8>>>) -> Vec<String> {

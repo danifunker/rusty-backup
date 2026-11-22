@@ -27,6 +27,7 @@ use crate::cli::logging::log_stderr;
 use crate::cli::resolve::{resolve_partition_rw_forced, FsDispatchOverride};
 use crate::fs::dir_import::{import_dir, DirImportOptions};
 use fs_tar::import_sink::{ImportConflict, ImportOptions, ImportStats};
+use fs_tar::line_endings::LineEndings;
 
 #[derive(Debug, Args)]
 pub struct ImportArgs {
@@ -102,8 +103,18 @@ pub struct ImportArgs {
     #[arg(long = "exclude-appledouble", conflicts_with = "include_appledouble")]
     pub exclude_appledouble: bool,
 
+    /// Convert text files' line endings as they go in: keep (default), unix (CRLF to LF), mac
+    /// (to CR) or dos (LF to CRLF). Binary files and archives copied as files are left as they are.
+    #[arg(long = "line-endings", value_name = "MODE", default_value = "keep", value_parser = parse_line_endings)]
+    pub line_endings: LineEndings,
+
     #[command(flatten)]
     pub fs_override: FsDispatchOverride,
+}
+
+/// clap parser for `--line-endings`.
+pub(crate) fn parse_line_endings(s: &str) -> Result<LineEndings, String> {
+    LineEndings::parse(s).ok_or_else(|| format!("'{s}' is not keep, unix, mac or dos"))
 }
 
 /// Build the shared import options from the conflict/permission flags.
@@ -120,6 +131,7 @@ pub(crate) fn shared_options(
     no_permissions: bool,
     include_appledouble: bool,
     flatten: bool,
+    line_endings: LineEndings,
 ) -> ImportOptions {
     ImportOptions {
         conflict: match (force, skip_existing) {
@@ -130,6 +142,7 @@ pub(crate) fn shared_options(
         },
         apply_permissions: !no_permissions,
         skip_appledouble: !include_appledouble,
+        line_endings,
     }
 }
 
@@ -174,6 +187,7 @@ pub fn run(args: ImportArgs) -> Result<()> {
             args.no_permissions,
             args.include_appledouble,
             args.flatten_folders,
+            args.line_endings,
         ),
         expand_archives: args.expand_archives,
         flatten_archives: args.flatten_folders,
@@ -215,6 +229,12 @@ pub(crate) fn summarize(dir: &std::path::Path, dest: &str, stats: &ImportStats, 
         log_stderr(format!(
             "  {} GNU tar long name(s) restored from @@MaNgLeD placeholders",
             stats.mangled_renamed
+        ));
+    }
+    if stats.line_endings_converted > 0 {
+        log_stderr(format!(
+            "  {} text file(s) had their line endings converted",
+            stats.line_endings_converted
         ));
     }
     if stats.gunzipped > 0 {

@@ -19,7 +19,7 @@
 //! - AHDI P0 (GEM FAT12):  HELLO.TXT (22 B) + SUB/NESTED.TXT (21 B)
 //! - AHDI P1 (BGM FAT16):  HELLO.TXT (22 B) + SUB/NESTED.TXT (21 B)
 //!
-//! Run with: cargo test --test atarist_e2e
+//! Run with: cargo test --test integration fs_e2e_suite::atarist_e2e::
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 

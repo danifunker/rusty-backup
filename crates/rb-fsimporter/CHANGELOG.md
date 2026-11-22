@@ -3,6 +3,14 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.2.0
+
+- Line-ending conversion for text files: `ImportOptions::line_endings` (re-exported
+  `LineEndings`: `Keep` by default, `Unix`, `Mac`, `Dos`), counted in
+  `ImportStats::line_endings_converted`. Preflight and measure report the converted sizes.
+- Needs fs-tar 0.3 (`ImportOptions` and `ImportStats` gained a field, a breaking change for
+  struct literals).
+
 ## 0.1.0
 
 First release. Moved out of rusty-backup's `src/fs/dir_import.rs`, with:

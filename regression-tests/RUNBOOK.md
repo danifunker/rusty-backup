@@ -331,7 +331,7 @@ quieter blind spot.
   [COMMAND-COVERAGE.md](COMMAND-COVERAGE.md) is the live figure. `serve` and
   `write` remain genuinely uncovered — `serve` needs a daemon lifecycle the
   case schema cannot drive (its integration tests live in
-  `tests/remote_filesystem.rs` instead), and `write` needs a hardware
+  `tests/integration/remote_filesystem.rs` instead), and `write` needs a hardware
   allowlist that does not exist.
 - **Tier 4 has no cases**, and tiers 6-7 deliberately do not use the case
   schema — oracles are declared in `data/oracles.toml` and executed by

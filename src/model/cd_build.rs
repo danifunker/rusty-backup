@@ -162,6 +162,7 @@ pub fn import_options(layout: CdLayout, import: &CdImport) -> DirImportOptions {
             },
             apply_permissions: layout.keeps_permissions() && !import.no_permissions,
             skip_appledouble: !import.include_appledouble || import.ignore_appledouble,
+            line_endings: fs_tar::line_endings::LineEndings::Keep,
         },
         expand_archives: import.expand_archives,
         flatten_archives: flatten,

@@ -62,7 +62,7 @@ image". The rule above settles it.
   MBR/GPT/APM as-is behaviour is unchanged and is a separate decision (see
   "Decisions for the user").
 - Pinned by `run_via_staging_round_trip_superfloppy_no_resize`,
-  `tests/superfloppy_compression.rs::superfloppy_chd_is_one_whole_disk_container`,
+  `tests/integration/superfloppy_compression.rs::superfloppy_chd_is_one_whole_disk_container`,
   and `regression-tests/cases/tier5/roundtrip-partitionless.toml` (floppy,
   300 MB HFV, 500 MB SFS HDF). `roundtrip.format.chd` in
   `tier5/roundtrip.toml` was already a superfloppy CHD round trip and still
@@ -138,7 +138,7 @@ stream stops short of, on all three restore paths.
   `--format zstd`. X68k works per-partition with zstd, and its
   resize-on-restore works through the X68k arm of
   `reconstruct_disk_from_backup` (pinned by
-  `tests/resize_suite/x68000_resize.rs`, which does not use CHD). Delete the
+  `tests/integration/resize_suite/x68000_resize.rs`, which does not use CHD). Delete the
   two-line comment above the split-size check that describes the leak.
 - **0b. Refuse `backup` of a `.dsd` in every format.** Its restore already
   fails ("no MBR data available", `src/rbformats/mod.rs`, the MBR fallback
@@ -356,7 +356,7 @@ size and codecs; `GDDD` geometry is derived from the size inside
 
 ```bash
 cargo test --lib
-cargo test --test superfloppy_compression
+cargo test --test integration superfloppy_compression::
 scripts/preflight.sh
 ./regression-tests/runner/target/release/rb-regress run --tiers 5 --filter roundtrip
 ./regression-tests/runner/target/release/rb-regress run --tiers 5 --filter chd.

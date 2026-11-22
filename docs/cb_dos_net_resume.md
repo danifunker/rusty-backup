@@ -214,7 +214,7 @@ polish.
   The pre-commit hook runs `cargo fmt` + `clippy --all-targets -D warnings` on Rust
   changes (no Rust staged → it skips). New files need an explicit `git add`.
 - **Build.** Host: `cargo build --bin rb-cli`; `cargo test --lib` (2093+ tests) +
-  `cargo test --test remote_filesystem --features remote family_b` (the 4 PUT /
+  `cargo test --test integration remote_filesystem:: --features remote family_b` (the 4 PUT /
   resume / GET loopback tests). The DOS tool: `make -C crusty-backup crustybk` — it
   now links zlib + lz4 + WATT-32, so run all three fetches once
   (`deps/fetch-zlib.sh`, `deps/fetch-lz4.sh`, `net/fetch-watt32.sh`). Networked

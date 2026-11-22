@@ -30,12 +30,12 @@ bare-FS-device (superfloppy) remote path is only lightly exercised.
 ## Constraints (unchanged)
 - **GUI is COMPILE-VERIFY ONLY in the agent env** (no display). Put confidence in
   headless loopback tests (`serve_on` + `RemoteConnection`/`RemoteBlockReader` in
-  `tests/remote_filesystem.rs`); lean on the user for interactive checks.
+  `tests/integration/remote_filesystem.rs`); lean on the user for interactive checks.
 - `remote` is feature-gated: gate model/GUI remote code with
   `#[cfg(feature = "remote")]`.
 - Pre-commit runs `cargo fmt` + `cargo check` + `clippy --all-targets -D warnings`
   — **NOT tests**. Run the full `cargo test` before committing (the FAT32 bug
-  slipped past lib+remote tests but broke `tests/filesystem_e2e.rs`).
+  slipped past lib+remote tests but broke `tests/integration/filesystem_e2e.rs`).
 - Lib must build without the feature
   (`cargo build --lib --no-default-features --features pure-zstd`) and the slim
   CLI too (`cargo build --bin rb-cli --no-default-features --features pure-zstd`).
@@ -115,7 +115,7 @@ caller to pass `is_device: false` (it inspects an image).
    the chosen `partition_target_sizes` are still assembled and passed.
 
 ### Verification
-- **Headless:** extend `tests/remote_filesystem.rs` — connect over loopback, then
+- **Headless:** extend `tests/integration/remote_filesystem.rs` — connect over loopback, then
   drive `min_size_runner::spawn` with `MinSizeSource::Remote { is_device: false }`
   against a served FAT/HFS image and assert it returns a min size (and frag for
   HFS). This proves the runner path end to end over the wire. (The *device*
@@ -144,7 +144,7 @@ engine has a superfloppy path (`backup/mod.rs` ~655, 720, 930, 1370, 1690, 1809;
 `backup/sizes.rs:76`). So the plumbing should already work.
 
 ### What to exercise / polish
-1. **Headless:** add a loopback test in `tests/remote_filesystem.rs` that serves a
+1. **Headless:** add a loopback test in `tests/integration/remote_filesystem.rs` that serves a
    **bare FAT superfloppy image** (e.g. `fat::create_blank_fat` + a file, served
    as an image with `is_device=false`) and runs `run_backup_from(BackupSource::
    Remote { is_device: false, .. })`, asserting the captured partition is
