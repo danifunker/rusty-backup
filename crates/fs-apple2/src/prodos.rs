@@ -2114,7 +2114,20 @@ fn list_prodos_directory<R: Read + Seek>(
                 fe.modified_unix = modified_unix;
                 result.push(fe);
             } else {
-                // Regular file: seedling (1), sapling (2), or tree (3).
+                // A forked file's directory EOF is its 512-byte key block; report the data fork.
+                let eof = if type_nibble == 5 {
+                    let mut ek = [0u8; 8];
+                    reader
+                        .seek(SeekFrom::Start(
+                            partition_offset + key_pointer as u64 * BLOCK_SIZE,
+                        ))
+                        .map_err(FilesystemError::Io)?;
+                    reader.read_exact(&mut ek).map_err(FilesystemError::Io)?;
+                    u32::from_le_bytes([ek[5], ek[6], ek[7], 0])
+                } else {
+                    eof
+                };
+                // Regular file: seedling (1), sapling (2), tree (3), or forked (5).
                 let mut fe = FileEntry::new_file(name, path, eof as u64, key_pointer as u64);
                 fe.modified = modified;
                 fe.modified_unix = modified_unix;
