@@ -74,7 +74,11 @@ fn open(path: &Path) -> Result<zip::ZipArchive<BufReader<File>>> {
         .with_context(|| format!("reading {} as ZIP", path.display()))
 }
 
-fn plan<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>) -> Result<Plan> {
+/// With `take_sidecars` false (skip_appledouble off), `._` files are ordinary members.
+fn plan<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    take_sidecars: bool,
+) -> Result<Plan> {
     let mut members = Vec::new();
     let mut sidecars = Vec::new();
     for index in 0..zip.len() {
@@ -87,8 +91,9 @@ fn plan<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>) -> Result<Plan> {
             // Empty names, `..` and absolute paths are never written.
             _ => continue,
         };
-        let leaf_is_sidecar =
-            comps.last().is_some_and(|l| is_appledouble(l.as_str())) && !zf.is_dir();
+        let leaf_is_sidecar = take_sidecars
+            && comps.last().is_some_and(|l| is_appledouble(l.as_str()))
+            && !zf.is_dir();
         if comps[0] == MACOSX_DIR {
             if leaf_is_sidecar {
                 sidecars.push((primary_of(&comps[1..]), index, zf.size()));
@@ -215,7 +220,7 @@ pub fn import_zip_from_path_into(
     progress: &dyn Fn(&ImportStats),
 ) -> Result<ImportStats> {
     let mut zip = open(path)?;
-    let plan = plan(&mut zip)?;
+    let plan = plan(&mut zip, opts.skip_appledouble)?;
     let mut sink = Importer::new(dest);
     sink.implicit_dir_times = crate::tar_import::archive_times(path);
     let mut forks = read_forks(&mut zip, &plan.sidecars, &mut sink.stats)?;
@@ -280,7 +285,7 @@ pub fn import_zip_from_path_into(
 /// `(files, dirs, content bytes)` the archive expands to, from its central directory alone.
 pub fn measure_zip_expanded(path: &Path) -> Result<(u64, u64, u64)> {
     let mut zip = open(path)?;
-    let plan = plan(&mut zip)?;
+    let plan = plan(&mut zip, true)?;
     let mut totals = (0u64, 0u64, 0u64);
     for m in &plan.members {
         match m.kind {

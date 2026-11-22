@@ -285,7 +285,8 @@ pub(crate) fn open_tar_stream(path: &Path) -> Result<Box<dyn Read>> {
     let n = file.read(&mut magic).unwrap_or(0);
     file.seek(SeekFrom::Start(0)).context("rewind archive")?;
     Ok(if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
-        Box::new(flate2::read::GzDecoder::new(file))
+        // Multi-member: `cat a.gz b.gz` and pigz write several gzip members.
+        Box::new(flate2::read::MultiGzDecoder::new(file))
     } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
         Box::new(crate::zstd_compat::decoder(file).context("init zstd decoder")?)
     } else if n >= 4 && &magic[..3] == b"BZh" && (b'1'..=b'9').contains(&magic[3]) {
@@ -507,7 +508,11 @@ fn import_tar_inner<R: Read>(
         // this point — traversal guarding, mkdir -p, conflict policy, attr
         // inheritance — is identical for a host-directory import, so it lives
         // in `import_sink` rather than here.
-        if etype.is_file() && comps.last().map(|c| is_appledouble(c)).unwrap_or(false) {
+        // With skip_appledouble off a `._` file is an ordinary file, as the preflight counts it.
+        if opts.skip_appledouble
+            && etype.is_file()
+            && comps.last().map(|c| is_appledouble(c)).unwrap_or(false)
+        {
             let mut bytes = Vec::new();
             if entry.size() <= MAX_SIDECAR_BYTES {
                 entry
