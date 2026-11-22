@@ -153,6 +153,31 @@ pub fn parse_dir_entry(buf: &[u8; 32], dpb: &Dpb) -> CpmDirEntry {
     }
 }
 
+/// Write `de` back over the bytes it was read from: an unchanged entry keeps them exactly (SFCB
+/// dates, label mode bits), and a changed one keeps the f1'-f8' attribute bits of its name.
+fn encode_dir_entry_onto(base: &[u8; 32], de: &CpmDirEntry, dpb: &Dpb) -> [u8; 32] {
+    let old = parse_dir_entry(base, dpb);
+    let unchanged = old.user == de.user
+        && old.name == de.name
+        && old.ext == de.ext
+        && old.attrs == de.attrs
+        && old.extent == de.extent
+        && old.record_count == de.record_count
+        && old.byte_count == de.byte_count
+        && old.block_ptrs == de.block_ptrs;
+    if unchanged {
+        return *base;
+    }
+    let mut out = encode_dir_entry(de, dpb);
+    // Live entries keep the name's interface attributes; a deleted one keeps its old bytes.
+    if de.user != 0xE5 && old.user != 0xE5 && old.name == de.name {
+        for i in 1..9 {
+            out[i] |= base[i] & 0x80;
+        }
+    }
+    out
+}
+
 /// Serialize a directory entry to 32 bytes for write-back.
 fn encode_dir_entry(de: &CpmDirEntry, dpb: &Dpb) -> [u8; 32] {
     let mut buf = [0u8; 32];
@@ -233,7 +258,11 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
     ) -> Result<Self, FilesystemError> {
         let dir_bytes = read_directory(&mut reader, partition_offset, &dpb)?;
         let mut entries = Vec::with_capacity(dir_bytes.len() / 32);
-        for chunk in dir_bytes.chunks_exact(32) {
+        // CP/M reads drm+1 entries; anything past them in the directory blocks isn't one.
+        for chunk in dir_bytes
+            .chunks_exact(32)
+            .take(dpb.max_dir_entries() as usize)
+        {
             let arr: &[u8; 32] = chunk.try_into().unwrap();
             entries.push(parse_dir_entry(arr, &dpb));
         }
@@ -286,10 +315,11 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
             let mut total: u64 = 0;
             let last_idx = exts.len() - 1;
             for (i, e) in exts.iter().enumerate() {
+                let records = entry_records(e, self.dpb.exm);
                 if i == last_idx && e.byte_count != 0 {
-                    total += (e.record_count.saturating_sub(1) as u64) * 128 + e.byte_count as u64;
+                    total += records.saturating_sub(1) * 128 + e.byte_count as u64;
                 } else {
-                    total += e.record_count as u64 * 128;
+                    total += records * 128;
                 }
             }
             out.push(CpmFileGroup {
@@ -326,10 +356,11 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
             // to extent.record_count * 128. The very last extent uses
             // byte_count (CP/M-3) for the trailing trim when non-zero.
             let is_last = Some(ext.extent) == last_extent_num;
+            let records = entry_records(ext, self.dpb.exm);
             let bytes_in_ext = if is_last && ext.byte_count != 0 {
-                (ext.record_count.saturating_sub(1) as u64) * 128 + ext.byte_count as u64
+                records.saturating_sub(1) * 128 + ext.byte_count as u64
             } else {
-                ext.record_count as u64 * 128
+                records * 128
             };
             let mut remaining = bytes_in_ext;
             for &ptr in &ext.block_ptrs {
@@ -378,6 +409,13 @@ impl CpmFileGroup {
             format!("{n}.{e}")
         }
     }
+}
+
+/// Records one directory entry covers. With an extent mask (EXM) an entry spans several
+/// 16 KiB logical extents: the low EXM bits of its extent number count the full ones before
+/// the last, which holds `rc` records.
+fn entry_records(e: &CpmDirEntry, exm: u8) -> u64 {
+    (e.extent as u64 & exm as u64) * 128 + e.record_count as u64
 }
 
 /// Read the directory bytes from disk based on the DPB's al0/al1 bitmap.
@@ -452,8 +490,13 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
             if e.user == 0x20 || e.user == 0x21 {
                 continue;
             }
-            if e.user >= 16 {
-                invalid.push(i); // not a user area, label, SFCB, or 0xE5
+            // 16..31 are CP/M 3 password entries or ZSDOS / P2DOS user areas: in use, so never
+            // "repaired" away. Only bytes past 0x21 (other than 0xE5) are garbage.
+            if e.user > 0x21 {
+                invalid.push(i);
+                continue;
+            }
+            if e.user >= 16 && !e.owns_blocks() {
                 continue;
             }
             files.insert((e.user, e.name.clone(), e.ext.clone()));
@@ -719,15 +762,16 @@ impl<R: Read + Write + Seek + Send> CpmFilesystem<R> {
     /// Re-pack the entries Vec back into directory bytes and write to disk.
     fn dir_write_back(&mut self) -> Result<(), FilesystemError> {
         // Recompute the directory byte buffer from the entries Vec.
-        let mut new_bytes = vec![0xE5u8; self.dir_bytes_cache.len()];
+        let mut new_bytes = self.dir_bytes_cache.clone();
         for (i, e) in self.entries.iter().enumerate() {
-            let bytes = encode_dir_entry(e, &self.dpb);
             let off = i * 32;
             if off + 32 > new_bytes.len() {
                 return Err(FilesystemError::InvalidData(
                     "directory full: more entries than DPB.drm".into(),
                 ));
             }
+            let base: [u8; 32] = new_bytes[off..off + 32].try_into().expect("32 bytes");
+            let bytes = encode_dir_entry_onto(&base, e, &self.dpb);
             new_bytes[off..off + 32].copy_from_slice(&bytes);
         }
         self.dir_bytes_cache = new_bytes.clone();
@@ -838,9 +882,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
         let total_records = payload.len().div_ceil(128) as u32;
         let bytes_in_last_record = (payload.len() % 128) as u8;
 
-        // Allocate blocks.
+        // Allocate blocks (none for an empty file, which still gets its one entry).
         let bs = self.dpb.block_size();
-        let blocks_needed = payload.len().div_ceil(bs).max(1);
+        let blocks_needed = payload.len().div_ceil(bs);
         let free = self.free_blocks();
         if free.len() < blocks_needed {
             return Err(FilesystemError::InvalidData(format!(
@@ -849,12 +893,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
             )));
         }
         let picked: Vec<u16> = free.into_iter().take(blocks_needed).collect();
-
-        // Write data into those blocks.
-        if !payload.is_empty() {
-            // Treat payload as a single contiguous write across picked blocks.
-            self.write_blocks(&picked, &payload)?;
-        }
 
         // Build directory extents. Each extent holds 16 or 8 block
         // pointers, but Rc is capped at 128 records per extent. For
@@ -865,8 +903,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
         let records_per_extent_via_ptrs = ptrs_per_ext as u32 * records_per_block;
         let records_per_extent = records_per_extent_via_ptrs.min(128);
 
-        // Find a free entry slot to extend / push into.
-        let max_entries = self.dpb.max_dir_entries() as usize;
+        // The directory is what its al0/al1 blocks hold, even if drm claims more (CPM-007).
+        let max_entries =
+            (self.dpb.max_dir_entries() as usize).min(self.dir_bytes_cache.len() / 32);
         if self.entries.len() < max_entries {
             self.entries.resize(
                 max_entries,
@@ -887,11 +926,27 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
             );
         }
 
+        // Every extent needs a slot: check them all before any data is written (CPM-009).
+        let extents_needed = (total_records.div_ceil(records_per_extent) as usize).max(1);
+        let free_slots = self.entries.iter().filter(|e| e.is_free_slot()).count();
+        if free_slots < extents_needed {
+            return Err(FilesystemError::DiskFull(format!(
+                "CP/M directory full: {name} needs {extents_needed} entries, {free_slots} free"
+            )));
+        }
+        if !payload.is_empty() {
+            // Treat payload as a single contiguous write across picked blocks.
+            self.write_blocks(&picked, &payload)?;
+        }
+
         let mut placed = 0usize;
         let mut records_left = total_records;
         let mut block_cursor = 0usize;
         let mut ext_idx: u16 = 0;
-        while records_left > 0 {
+        // An empty file is one entry with no records.
+        let mut first = true;
+        while records_left > 0 || first {
+            first = false;
             let slot = self.entries.iter().position(|e| e.is_free_slot());
             let Some(idx) = slot else {
                 return Err(FilesystemError::InvalidData(

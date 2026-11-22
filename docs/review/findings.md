@@ -522,10 +522,10 @@ Review by a separate agent, 2026-11-21, read-only.
 | DVM-008 | S2 | plausible | qcow2.rs `open`, `allocate_cluster` | Unaligned file length gives unaligned new clusters and wrong refcounts. | fixed (f8e6b89b) |
 | DVM-009 | S4 | confirmed | vmdk.rs, lib.rs, qemu_img_test.rs | Test-only public fn; helpers duplicated with src/rbformats. | open |
 | TAR-001 | S1 | plausible | tar_import.rs `NormalizedTar::fill` | Data blocks counted from the ustar size only: pax sizes / GNU sparse headers make data be rewritten as headers (silent corruption). | fixed (8126d65f) |
-| TAR-002 | S2 | confirmed | tar_import.rs; zip_import.rs `plan` | `skip_appledouble=false` ignored: `._` files always consumed; preflight disagrees. | open |
-| TAR-003 | S2 | confirmed | mem_archive.rs | Small compressed archives inflated fully into RAM uncapped; indexed path fills disk; zip capacity from declared size. | open |
-| TAR-004 | S2 | plausible | tar_import.rs `open_tar_stream` | Multi-member .tar.gz imports only the first member. | open |
-| TAR-005 | S2 | plausible | tar_export.rs `walk` | Export recursion has no depth / visited guard. | open |
+| TAR-002 | S2 | confirmed | tar_import.rs; zip_import.rs `plan` | `skip_appledouble=false` ignored: `._` files always consumed; preflight disagrees. | fixed (69648efe) |
+| TAR-003 | S2 | confirmed | mem_archive.rs | Small compressed archives inflated fully into RAM uncapped; indexed path fills disk; zip capacity from declared size. | fixed (69648efe) |
+| TAR-004 | S2 | plausible | tar_import.rs `open_tar_stream` | Multi-member .tar.gz imports only the first member. | fixed (69648efe) |
+| TAR-005 | S2 | plausible | tar_export.rs `walk` | Export recursion has no depth / visited guard. | fixed (69648efe) |
 | TAR-006 | S4 | confirmed | import_sink.rs, tar_export.rs, mem_archive.rs, zstd_compat.rs, zip_import.rs | Stats merge drops a field; stale docs; pure-zstd can't browse .tar.zst; duplicate date code. | open |
 
 ## crates/fs-cpm
