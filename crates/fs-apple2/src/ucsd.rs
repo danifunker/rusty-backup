@@ -612,7 +612,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for UcsdFilesystem<R> {
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "UCSD p-System is a flat filesystem — no subdirectories".into(),
+            "UCSD p-System is a flat filesystem - no subdirectories".into(),
         ))
     }
 

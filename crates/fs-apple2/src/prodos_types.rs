@@ -128,11 +128,18 @@ fn build_table() -> ProdosTypeTable {
     let embedded = parse_json(EMBEDDED_JSON);
     let merged = if let Some(path) = user_config_path() {
         match std::fs::read_to_string(&path) {
-            Ok(user_text) => {
-                let overlay = parse_json(&user_text);
-                merge_raw(embedded, overlay)
+            Ok(user_text) => match serde_json::from_str::<RawFile>(&user_text) {
+                Ok(overlay) => merge_raw(embedded, overlay),
+                Err(e) => {
+                    log::warn!("ignoring {}: not valid JSON ({e})", path.display());
+                    embedded
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => embedded,
+            Err(e) => {
+                log::warn!("ignoring {}: {e}", path.display());
+                embedded
             }
-            Err(_) => embedded,
         }
     } else {
         embedded

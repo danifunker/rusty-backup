@@ -756,7 +756,7 @@ impl<R: Read + Seek + Send> AppleDosFilesystem<R> {
             warnings.push(FsckIssue {
                 code: "AppleDosBootReserved".into(),
                 message: format!(
-                    "{leaked_boot} sector(s) on tracks 0-2 are allocated but unreferenced — \
+                    "{leaked_boot} sector(s) on tracks 0-2 are allocated but unreferenced - \
                      the DOS 3.3 boot image; left as-is"
                 ),
                 repairable: false,
@@ -893,7 +893,7 @@ impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
             }
         }
         Err(FilesystemError::InvalidData(
-            "DOS 3.3 volume full — no free sectors outside track 17".into(),
+            "DOS 3.3 volume full - no free sectors outside track 17".into(),
         ))
     }
 
@@ -924,7 +924,7 @@ impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
             sector = cat[0x02];
         }
         Err(FilesystemError::InvalidData(
-            "DOS 3.3 catalog full — no free entry slot in the 15-sector catalog chain".into(),
+            "DOS 3.3 catalog full - no free entry slot in the 15-sector catalog chain".into(),
         ))
     }
 
@@ -1176,7 +1176,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AppleDosFilesystem<R>
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "DOS 3.3 is flat — no subdirectories".into(),
+            "DOS 3.3 is flat - no subdirectories".into(),
         ))
     }
 

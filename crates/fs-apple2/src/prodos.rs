@@ -1261,20 +1261,20 @@ fn make_prodos_datetime_now() -> (u16, u16) {
 fn validate_prodos_name(name: &str, what: &str) -> Result<String, FilesystemError> {
     if name.is_empty() {
         return Err(FilesystemError::InvalidData(format!(
-            "{what} is empty — pick a non-blank name"
+            "{what} is empty - pick a non-blank name"
         )));
     }
     let upper = name.to_ascii_uppercase();
     let bytes = upper.as_bytes();
     if bytes.len() > 15 {
         return Err(FilesystemError::InvalidData(format!(
-            "{what} is too long ({} chars); ProDOS allows up to 15 — shorten it",
+            "{what} is too long ({} chars); ProDOS allows up to 15 - shorten it",
             bytes.len()
         )));
     }
     if !bytes[0].is_ascii_alphabetic() {
         return Err(FilesystemError::InvalidData(format!(
-            "{what} starts with '{}' — ProDOS requires the first character to be a letter \
+            "{what} starts with '{}' - ProDOS requires the first character to be a letter \
              (A-Z); change it to begin with a letter",
             upper.chars().next().unwrap_or('?')
         )));
@@ -1283,7 +1283,7 @@ fn validate_prodos_name(name: &str, what: &str) -> Result<String, FilesystemErro
         if !b.is_ascii_alphanumeric() && b != b'.' {
             let c = upper.chars().nth(i).unwrap_or('?');
             return Err(FilesystemError::InvalidData(format!(
-                "{what} contains '{c}' — ProDOS allows only letters (A-Z), digits (0-9), \
+                "{what} contains '{c}' - ProDOS allows only letters (A-Z), digits (0-9), \
                  and '.' (spaces and most punctuation are not allowed)"
             )));
         }

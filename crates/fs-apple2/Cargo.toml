@@ -23,6 +23,7 @@ rust173-polyfill = ["disk-core/rust173-polyfill"]
 disk-core = { path = "../disk-core", version = "0.3", features = ["fs"] }
 # `sector_order` (always built) reports open errors through anyhow.
 anyhow = "1"
+log = "0.4"
 # ProDOS file-type table: embedded JSON plus an optional user override file.
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
