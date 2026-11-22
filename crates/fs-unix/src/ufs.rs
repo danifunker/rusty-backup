@@ -1,4 +1,4 @@
-//! UFS1 / UFS2 (Berkeley Fast Filesystem) read-only support.
+//! UFS1 / UFS2 (Berkeley Fast Filesystem): read, edit and check.
 //!
 //! Implements the [`Filesystem`] trait far enough to detect a UFS partition,
 //! surface its on-disk version, label, and total/used/free sizes in the

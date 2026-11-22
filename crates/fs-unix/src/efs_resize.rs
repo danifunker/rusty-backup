@@ -609,12 +609,8 @@ pub fn shrink_efs_conservative<R: Read + Write + Seek>(
 /// inodes are reassigned in ascending old-inum order to the lowest
 /// free slots 3, 4, 5, ...
 ///
-/// **Hardlinks**: EFS does not support multi-link semantics (each
-/// inum is referenced from exactly one dirent), so the inum→inum
-/// mapping is unambiguously 1:1. We assert per inode at most one
-/// dirent reference; if a hardlink is encountered, the renumbering
-/// pass falls back to a conservative shrink with a warning rather
-/// than risking dangling references.
+/// **Hard links** need no special case: every dirent naming an old inum,
+/// however many there are, is rewritten through the same old-to-new map.
 ///
 /// Runs Phase-2 fsck both BEFORE the renumber pass (to refuse on a
 /// corrupt source) and AFTER, before the new superblock is sealed.
