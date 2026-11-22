@@ -394,23 +394,41 @@ pub fn import_tar_from_path_into(
 /// its headers without extracting. Feeds `--size auto`, where the archive's
 /// own compressed size is a badly wrong estimate of what it costs in the image.
 pub fn measure_tar_expanded(path: &Path) -> Result<(u64, u64, u64)> {
-    fn tally<R: Read>(archive: R) -> Result<(u64, u64, u64)> {
+    measure_tar_expanded_with(path, crate::line_endings::LineEndings::Keep)
+}
+
+/// [`measure_tar_expanded`] with text members sized as `mode` converts them, which reads them.
+pub fn measure_tar_expanded_with(
+    path: &Path,
+    mode: crate::line_endings::LineEndings,
+) -> Result<(u64, u64, u64)> {
+    let tally = |archive: Box<dyn Read>| -> Result<(u64, u64, u64)> {
         let mut files = 0u64;
         let mut dirs = 0u64;
         let mut bytes = 0u64;
         let mut ar = tar::Archive::new(NormalizedTar::new(archive));
         for entry in ar.entries().context("reading tar entries")? {
-            let entry = entry.context("reading tar entry")?;
+            let mut entry = entry.context("reading tar entry")?;
             let etype = entry_kind(&entry);
             if etype.is_dir() {
                 dirs += 1;
+            } else if etype.is_file() && mode != crate::line_endings::LineEndings::Keep {
+                files += 1;
+                let name = entry
+                    .path()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_default();
+                bytes += crate::line_endings::imported_len(mode, &name, &mut entry)
+                    .context("reading a tar member")?
+                    .0;
             } else if etype.is_file() {
                 files += 1;
                 bytes += entry.size();
             }
         }
         Ok((files, dirs, bytes))
-    }
+    };
 
     tally(open_tar_stream(path)?)
 }
@@ -442,6 +460,7 @@ fn import_tar_inner<R: Read>(
         conflict: ImportConflict::Overwrite,
         apply_permissions: opts.apply_permissions,
         skip_appledouble: opts.skip_appledouble,
+        line_endings: opts.line_endings,
     };
     let mut ar = tar::Archive::new(NormalizedTar::new(archive));
 

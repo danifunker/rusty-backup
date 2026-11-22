@@ -284,12 +284,28 @@ pub fn import_zip_from_path_into(
 
 /// `(files, dirs, content bytes)` the archive expands to, from its central directory alone.
 pub fn measure_zip_expanded(path: &Path) -> Result<(u64, u64, u64)> {
+    measure_zip_expanded_with(path, crate::line_endings::LineEndings::Keep)
+}
+
+/// [`measure_zip_expanded`] with text members sized as `mode` converts them, which reads them.
+pub fn measure_zip_expanded_with(
+    path: &Path,
+    mode: crate::line_endings::LineEndings,
+) -> Result<(u64, u64, u64)> {
     let mut zip = open(path)?;
     let plan = plan(&mut zip, true)?;
     let mut totals = (0u64, 0u64, 0u64);
     for m in &plan.members {
         match m.kind {
             Kind::Dir => totals.1 += 1,
+            Kind::File if mode != crate::line_endings::LineEndings::Keep => {
+                totals.0 += 1;
+                let name = m.comps.last().map(String::as_str).unwrap_or("");
+                let mut data = zip.by_index(m.index).context("reading a ZIP member")?;
+                totals.2 += crate::line_endings::imported_len(mode, name, &mut data)
+                    .context("reading a ZIP member")?
+                    .0;
+            }
             Kind::File => {
                 totals.0 += 1;
                 totals.2 += m.size;

@@ -56,6 +56,10 @@ pub struct UntarArgs {
     #[arg(long = "include-appledouble")]
     pub include_appledouble: bool,
 
+    /// Convert text files' line endings as they go in: keep (default), unix, mac or dos.
+    #[arg(long = "line-endings", value_name = "MODE", default_value = "keep", value_parser = super::import::parse_line_endings)]
+    pub line_endings: fs_tar::line_endings::LineEndings,
+
     #[command(flatten)]
     pub fs_override: FsDispatchOverride,
 }
@@ -92,6 +96,7 @@ pub fn run(args: UntarArgs) -> Result<()> {
         conflict,
         apply_permissions: !args.no_permissions,
         skip_appledouble: !args.include_appledouble,
+        line_endings: args.line_endings,
     };
 
     let progress = |s: &TarImportStats| {

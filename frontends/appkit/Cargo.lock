@@ -1132,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-tape"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arc-mac",
  "disk-core",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "fs-tar"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bzip2 0.6.1",
@@ -3295,7 +3295,7 @@ dependencies = [
 
 [[package]]
 name = "rb-fsimporter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "disk-core",

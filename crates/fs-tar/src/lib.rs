@@ -5,6 +5,7 @@
 //!   symlinks and raw (non-UTF-8) names where the target can hold them.
 //! - [`import_sink`]: the write half every "import a tree" flow shares (conflict policy,
 //!   `mkdir -p`, attribute inheritance); a host-folder importer can push into it too.
+//! - [`line_endings`]: the optional text-file line-ending conversion the sink applies.
 //!
 //! - [`mem_archive`] (feature `mem-archive`): browse a tar (and, with `zip`, a ZIP) as a read-only
 //!   filesystem, held in memory or indexed in place.
@@ -17,6 +18,7 @@
 #![allow(clippy::incompatible_msrv)]
 
 pub mod import_sink;
+pub mod line_endings;
 #[cfg(feature = "mem-archive")]
 pub mod mem_archive;
 pub mod tar_export;

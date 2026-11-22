@@ -29,6 +29,7 @@ mod cli_cpm_floppy;
 mod cli_dragon;
 mod cli_export;
 mod cli_hfs;
+mod cli_line_endings;
 mod cli_literal_paths;
 mod cli_macplus_appleii;
 mod cli_native_slots;
