@@ -98,21 +98,41 @@ impl ImportStats {
     /// Fold a nested import's tally into this one. Used when an archive is
     /// expanded mid-walk: its contents belong in the parent import's totals.
     pub fn merge(&mut self, other: &ImportStats) {
-        self.files += other.files;
-        self.dirs_created += other.dirs_created;
-        self.symlinks += other.symlinks;
-        self.symlinks_skipped += other.symlinks_skipped;
-        self.skipped_existing += other.skipped_existing;
-        self.overwritten += other.overwritten;
-        self.perms_applied += other.perms_applied;
-        self.appledouble_skipped += other.appledouble_skipped;
-        self.invalid_names_skipped += other.invalid_names_skipped;
-        self.other_skipped += other.other_skipped;
-        self.total_bytes += other.total_bytes;
-        self.archives_expanded += other.archives_expanded;
-        self.gunzipped += other.gunzipped;
-        self.hardlinks_copied += other.hardlinks_copied;
-        self.mangled_renamed += other.mangled_renamed;
+        // Destructured so a new field cannot be left out of the sum.
+        let ImportStats {
+            files,
+            dirs_created,
+            symlinks,
+            symlinks_skipped,
+            skipped_existing,
+            overwritten,
+            perms_applied,
+            appledouble_skipped,
+            appledouble_paired,
+            invalid_names_skipped,
+            other_skipped,
+            total_bytes,
+            archives_expanded,
+            gunzipped,
+            hardlinks_copied,
+            mangled_renamed,
+        } = other;
+        self.files += files;
+        self.dirs_created += dirs_created;
+        self.symlinks += symlinks;
+        self.symlinks_skipped += symlinks_skipped;
+        self.skipped_existing += skipped_existing;
+        self.overwritten += overwritten;
+        self.perms_applied += perms_applied;
+        self.appledouble_skipped += appledouble_skipped;
+        self.appledouble_paired += appledouble_paired;
+        self.invalid_names_skipped += invalid_names_skipped;
+        self.other_skipped += other_skipped;
+        self.total_bytes += total_bytes;
+        self.archives_expanded += archives_expanded;
+        self.gunzipped += gunzipped;
+        self.hardlinks_copied += hardlinks_copied;
+        self.mangled_renamed += mangled_renamed;
     }
 }
 

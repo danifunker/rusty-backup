@@ -498,8 +498,8 @@ Review by a separate agent, 2026-11-21, read-only.
 | DAP-001 | S2 | confirmed | woz.rs data-field decoders | WOZ sector checksums never checked (3.5" eats a checksum nibble as data); missing 5.25" sectors zeroed silently. | fixed (3de2eee2) |
 | DAP-002 | S2 | plausible | woz.rs | `bit_count * 2` from the TRK descriptor overflows. | fixed (3de2eee2) |
 | DAP-003 | S2 | plausible | dc42.rs `encode_dc42_with_tags`; dart.rs | Tag checksum range, format byte and disk_format look off-spec; tagged DARTs all named "Lisa". | fixed (3de2eee2) |
-| DAP-004 | S4 | confirmed | dc42.rs | Disk names UTF-8 instead of Mac Roman. | open |
-| DAP-005 | S4 | plausible | woz_write.rs `FORMAT_35_SSDD` | 400K format byte disagrees with dc42.rs; 3.5" WOZ marked Apple ][. | open |
+| DAP-004 | S4 | confirmed | dc42.rs | Disk names UTF-8 instead of Mac Roman. | fixed (27379918) |
+| DAP-005 | S4 | plausible | woz_write.rs `FORMAT_35_SSDD` | 400K format byte disagrees with dc42.rs; 3.5" WOZ marked Apple ][. | fixed (27379918) |
 | DAP-006 | S4 | confirmed | woz.rs, moof.rs | Duplicate readers, extra TRKS copy, WOZ CRC unchecked, dead code. | open |
 
 ## crates/fs-squashfs, crates/dsk-vm, crates/fs-tar
