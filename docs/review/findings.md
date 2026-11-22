@@ -612,14 +612,14 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 | HPF-011 | S2 | confirmed | hpfs.rs `open` | `bitmap_dir + s` overflow; root fnode not range-checked. | fixed (9f89a11a) |
 | HPF-012 | S4 | confirmed | hpfs.rs `is_name_long` | Tests the dot, not the character: some long names stored as short. | fixed (9f89a11a) |
 | HPF-013 | S4 | confirmed | hpfs.rs `alloc_dnode` | Dead branch. | fixed (9f89a11a) |
-| APF-001 | S2 | confirmed | fs-apfs apfs.rs `open_with_passphrase` | Only volume 0 is browsable; a failing volume is skipped silently. | open |
-| APF-002 | S2 | confirmed | apfs.rs `unlock_active_volume` | Only the first KEK tried: other users' passwords / the recovery key fail. | open |
-| APF-003 | S2 | confirmed | apfs.rs `load_omap`, `build_catalog` | No visited set: self-pointing index nodes grow the stack Vec to ~8 GB. | open |
-| APF-004 | S2 | confirmed | apfs.rs `read_block`, `stream_phys` | Physical addresses unchecked against block_count; products overflow. | open |
-| APF-005 | S2 | confirmed | apfs.rs `stream_extents` | 64 GiB cap truncates larger files silently with Ok. | open |
-| APF-006 | S2 | confirmed | apfs.rs `parse_kek_blob`; apfs_crypto.rs | PBKDF2 iterations from the keybag unbounded (hour-long hang). | open |
-| APF-007 | S2 | confirmed | apfs.rs `der_children` | DER length add overflows on 32-bit: panic. | open |
-| APF-008 | S2 | plausible | apfs.rs `stream_phys` | XTS tweak from the physical block, not the extent's crypto_id. | open |
+| APF-001 | S2 | confirmed | fs-apfs apfs.rs `open_with_passphrase` | Only volume 0 is browsable; a failing volume is skipped silently. | partly (42f7a075): skipped volumes reported; choosing another volume to browse still open |
+| APF-002 | S2 | confirmed | apfs.rs `unlock_active_volume` | Only the first KEK tried: other users' passwords / the recovery key fail. | fixed (42f7a075) |
+| APF-003 | S2 | confirmed | apfs.rs `load_omap`, `build_catalog` | No visited set: self-pointing index nodes grow the stack Vec to ~8 GB. | fixed (42f7a075) |
+| APF-004 | S2 | confirmed | apfs.rs `read_block`, `stream_phys` | Physical addresses unchecked against block_count; products overflow. | fixed (42f7a075) |
+| APF-005 | S2 | confirmed | apfs.rs `stream_extents` | 64 GiB cap truncates larger files silently with Ok. | fixed (42f7a075) |
+| APF-006 | S2 | confirmed | apfs.rs `parse_kek_blob`; apfs_crypto.rs | PBKDF2 iterations from the keybag unbounded (hour-long hang). | fixed (42f7a075) |
+| APF-007 | S2 | confirmed | apfs.rs `der_children` | DER length add overflows on 32-bit: panic. | fixed (42f7a075) |
+| APF-008 | S2 | plausible | apfs.rs `stream_phys` | XTS tweak from the physical block, not the extent's crypto_id. | no change (42f7a075): the FileVault fixture needs the physical-sector tweak |
 | APF-009 | S3 | plausible | apfs.rs `build_catalog` | Whole catalog / omap flattened into HashMaps on first browse. | open |
 | QNX-001 | S2 | confirmed | fs-qnx qnx4.rs `extents` | Self-linked empty extent block loops forever. | fixed (172f817a) |
 | QNX-002 | S2 | confirmed | qnx4.rs `open` | Volume sized to the end of the reader (whole disk for MBR partitions). | fixed (172f817a) |

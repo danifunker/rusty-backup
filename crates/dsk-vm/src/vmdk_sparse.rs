@@ -105,6 +105,14 @@ impl VmdkSparseHeader {
                 num_gtes_per_gt
             );
         }
+        // VMware writes 128-sector grains and 512-entry tables; far larger values would make
+        // each grain or grain-table buffer gigabytes.
+        if grain_size_sectors > 2048 || num_gtes_per_gt > 4096 {
+            bail!(
+                "VMDK sparse: grain size {grain_size_sectors} sectors / {num_gtes_per_gt} \
+                 entries per table is past what any VMDK writer produces"
+            );
+        }
         if flags & (FLAG_COMPRESSED | FLAG_MARKERS) != 0 {
             bail!(
                 "VMDK sparse: compressed/marker grains (streamOptimized) are \

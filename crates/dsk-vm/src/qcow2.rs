@@ -290,7 +290,8 @@ impl<R: Read + Seek> Qcow2Reader<R> {
             refcount_table_offset,
             refcount_table_capacity,
             free_clusters: None,
-            host_end: total_len,
+            // New clusters must start on a cluster boundary, whatever the file length.
+            host_end: total_len.div_ceil(cluster_size) * cluster_size,
             snapshot_count,
             unclean,
         })
@@ -757,7 +758,22 @@ pub fn export_qcow2(
     let refcount_table_offset = l1_offset + l1_bytes_padded;
     // refcount_order = 4 → 2 bytes per entry → cluster_size/2 entries per block.
     let refcounts_per_block = cluster_size / 2;
-    let data_start = refcount_table_offset + cluster_size;
+    // Size the refcount table for the worst case (every guest cluster written), or at small
+    // cluster sizes it would run into the first L2 table.
+    let prefix = refcount_table_offset / cluster_size;
+    let mut rt_clusters = 1u64;
+    loop {
+        let worst = prefix + rt_clusters + l1_size + num_guest_clusters;
+        let blocks = worst.div_ceil(refcounts_per_block) + 1;
+        let need = (blocks * 8).div_ceil(cluster_size).max(1);
+        if need <= rt_clusters {
+            break;
+        }
+        rt_clusters = need;
+    }
+    let rt_clusters_u32 = u32::try_from(rt_clusters)
+        .map_err(|_| anyhow::anyhow!("QCOW2 export: disk too large for the refcount table"))?;
+    let data_start = refcount_table_offset + rt_clusters * cluster_size;
 
     // Zero-fill the reserved prefix so unused L1 slots / refcount-table entries
     // read as 0 (= "no allocation") rather than uninitialised tempfile garbage.
@@ -891,7 +907,7 @@ pub fn export_qcow2(
         l1_size as u32,
         l1_offset,
         refcount_table_offset,
-        1,
+        rt_clusters_u32,
     );
     out.write_all(&header)
         .context("failed to write QCOW2 header")?;
@@ -1274,6 +1290,28 @@ mod tests {
             &|| false,
         )
         .unwrap();
+        assert_qcow2_round_trips(out, &src);
+    }
+
+    #[test]
+    fn a_dense_disk_past_one_refcount_table_cluster_round_trips() {
+        // 512-byte clusters: one refcount-table cluster covers only 8 MiB of host file.
+        let disk_size = 12u64 << 20;
+        let src = make_pattern(disk_size as usize);
+        let mut out = Cursor::new(Vec::new());
+        export_qcow2(
+            &mut Cursor::new(&src),
+            &mut out,
+            disk_size,
+            9,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.qcow2");
+        std::fs::write(&path, out.get_ref()).unwrap();
+        crate::qemu_img_test::qemu_img_check(&path).unwrap();
         assert_qcow2_round_trips(out, &src);
     }
 

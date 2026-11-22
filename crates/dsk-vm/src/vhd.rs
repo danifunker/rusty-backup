@@ -279,11 +279,16 @@ impl<R: Read + Seek> DynamicVhdReader<R> {
         let table_offset = u64::from_be_bytes(header[16..24].try_into().unwrap());
         let max_table_entries = u32::from_be_bytes(header[28..32].try_into().unwrap()) as usize;
         let block_size = u32::from_be_bytes(header[32..36].try_into().unwrap()) as u64;
-        if block_size == 0 || !block_size.is_multiple_of(512) {
+        // Writers use 512 KiB-2 MiB blocks; a block of gigabytes is a corrupt header.
+        if block_size == 0 || !block_size.is_multiple_of(512) || block_size > 256 << 20 {
             bail!("invalid dynamic VHD block size {block_size}");
         }
-        if table_offset + (max_table_entries as u64) * 4 > total_len {
+        let bat_end = table_offset.checked_add(max_table_entries as u64 * 4);
+        if !matches!(bat_end, Some(end) if end <= total_len) {
             bail!("BAT extends past end of file");
+        }
+        if (max_table_entries as u64).saturating_mul(block_size) < disk_size {
+            bail!("dynamic VHD BAT has {max_table_entries} entries, too few for {disk_size} bytes");
         }
 
         // BAT: one big-endian u32 per block.
@@ -306,7 +311,8 @@ impl<R: Read + Seek> DynamicVhdReader<R> {
             bitmap_size,
             bat,
             table_offset,
-            host_end: total_len - 512,
+            // New blocks go on a sector boundary, or BAT sector numbers would point short of them.
+            host_end: (total_len - 512).div_ceil(512) * 512,
             footer,
             pos: 0,
         })
@@ -403,7 +409,13 @@ impl<R: Read + Write + Seek> Write for DynamicVhdReader<R> {
             .min(remaining_in_block)
             .min(remaining_in_disk) as usize;
 
-        if self.bat[block_index] == BAT_UNUSED {
+        let Some(&entry) = self.bat.get(block_index) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "dynamic VHD BAT does not cover this offset",
+            ));
+        };
+        if entry == BAT_UNUSED {
             self.allocate_block(block_index)?;
         }
 
@@ -426,17 +438,27 @@ impl<R: Read + Write + Seek> DynamicVhdReader<R> {
     /// re-emit the trailing footer at the new EOF.
     fn allocate_block(&mut self, block_index: usize) -> std::io::Result<()> {
         let new_host = self.host_end;
+        let new_entry = u32::try_from(new_host / 512).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "dynamic VHD would grow past what a 32-bit BAT can address",
+            )
+        })?;
         // Overwrite the old footer with the new block's bitmap.
         self.inner.seek(SeekFrom::Start(new_host))?;
         let bitmap = vec![0xFFu8; self.bitmap_size as usize];
         self.inner.write_all(&bitmap)?;
         // Then a fully-zero block; subsequent partial writes update the parts
         // that the caller actually wants to change.
-        let zeros = vec![0u8; self.block_size as usize];
-        self.inner.write_all(&zeros)?;
+        let zeros = vec![0u8; self.block_size.min(1 << 20) as usize];
+        let mut left = self.block_size;
+        while left > 0 {
+            let n = left.min(zeros.len() as u64) as usize;
+            self.inner.write_all(&zeros[..n])?;
+            left -= n as u64;
+        }
 
         // Patch the BAT (on disk and in memory).
-        let new_entry = (new_host / 512) as u32;
         self.bat[block_index] = new_entry;
         self.inner
             .seek(SeekFrom::Start(self.table_offset + block_index as u64 * 4))?;
