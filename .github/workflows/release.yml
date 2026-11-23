@@ -1716,6 +1716,8 @@ jobs:
     env:
       ANYLINUX_REF: refs/heads/main
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+      # The pkgforge scripts call the GitHub API; anonymous calls hit the shared-runner rate limit.
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v6
 
