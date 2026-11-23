@@ -496,10 +496,11 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install dependencies
+        timeout-minutes: 25
         if: ${{ !matrix.focal }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake libasound2-dev libssl-dev pkg-config liblzma-dev zstd
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" update
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y cmake libasound2-dev libssl-dev pkg-config liblzma-dev zstd
 
       - name: Test and build rb-cli
         if: ${{ !matrix.focal }}
@@ -569,9 +570,10 @@ jobs:
           targets: armv7-unknown-linux-gnueabihf
 
       - name: Install armv7 binutils (host-side strip + objdump)
+        timeout-minutes: 25
         run: |
-          sudo apt-get update
-          sudo apt-get install -y binutils-arm-linux-gnueabihf file
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" update
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y binutils-arm-linux-gnueabihf file
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -781,9 +783,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install GCC cross-linker + binutils (host-side link + strip + objdump)
+        timeout-minutes: 25
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-${{ matrix.gnu_prefix }} binutils-${{ matrix.gnu_prefix }} file
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" update
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y gcc-${{ matrix.gnu_prefix }} binutils-${{ matrix.gnu_prefix }} file
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -1028,9 +1031,10 @@ jobs:
         run: sudo chown -R "$(id -u):$(id -g)" buildroot/output
 
       - name: Install media tooling (PXE initrd extract + GRUB floppy)
+        timeout-minutes: 25
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xorriso grub-pc-bin mtools
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" update
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y xorriso grub-pc-bin mtools
 
       - name: Package PXE network-boot bundle
         run: sh buildroot/package-pxe.sh "${ARCH}-${VER}"
@@ -1123,10 +1127,11 @@ jobs:
       # Everything else it needs is in the seed. Building the toolchain here instead would
       # cost ~40 minutes and put us at the mercy of whichever Debian release just went EOL.
       - name: Install what the cross GCC links against
+        timeout-minutes: 25
         if: steps.gate.outputs.run == 'true'
         run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" update -qq
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y -qq --no-install-recommends \
             libgmp10 libmpfr6 libmpc3 zlib1g file rsync python3 patch make
 
       # The seed is the cross toolchain, its sysroot, mrustc and both prebuilt standard
@@ -1433,9 +1438,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install dependencies
+        timeout-minutes: 25
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake libgtk-4-dev libadwaita-1-dev libssl-dev pkg-config liblzma-dev libasound2-dev rpm zstd desktop-file-utils libarchive-tools fakeroot
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" update
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y cmake libgtk-4-dev libadwaita-1-dev libssl-dev pkg-config liblzma-dev libasound2-dev rpm zstd desktop-file-utils libarchive-tools fakeroot
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -1459,7 +1465,7 @@ jobs:
       - name: GUI regression suite over AT-SPI
         if: matrix.arch == 'x64'
         run: |
-          sudo apt-get install -y xvfb xdotool at-spi2-core python3-gi gir1.2-atspi-2.0 dosfstools mtools
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y xvfb xdotool at-spi2-core python3-gi gir1.2-atspi-2.0 dosfstools mtools
           dbus-run-session -- xvfb-run -a -s "-screen 0 1600x2300x24" \
             ../../scripts/gtk4-gui-suite.sh "$PWD/target/release/rusty-backup-gtk"
       - name: Install packaging tools
@@ -1558,7 +1564,7 @@ jobs:
           # apt-get update exits 0 when every fetch fails, so check the riscv64 lists
           # loaded and retry: a mirror or DNS outage otherwise surfaces as "no glib".
           for try in 1 2 3 4 5; do
-            sudo apt-get update -o Acquire::Retries=3 || true
+            APT_TRIES=1 "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" update || true
             if apt-cache madison libglib2.0-dev:riscv64 | grep -q riscv64; then break; fi
             if [ "$try" = 5 ]; then
               echo "::error::ports.ubuntu.com gave no riscv64 package lists after 5 tries: a mirror or DNS outage"
@@ -1569,6 +1575,7 @@ jobs:
           done
 
       - name: Install riscv64 cross toolchain + GTK4/libadwaita sysroot
+        timeout-minutes: 30
         run: |
           set -euxo pipefail
           # The release libglib2.0-dev-bin depends on python3-packaging, which
@@ -1577,7 +1584,7 @@ jobs:
           # apt demands an (uninstallable) python3-packaging:riscv64. A Rust
           # cross-build never runs glib's python dev tools (glib-mkenums,
           # gdbus-codegen), so stand in a riscv64 stub that Provides it.
-          sudo apt-get install -y equivs
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y equivs
           cat > /tmp/glib-py-stub.ctl <<'CTL'
           Section: misc
           Priority: optional
@@ -1627,7 +1634,7 @@ jobs:
             exit 1
           fi
           echo "glib for the riscv64 sysroot: $glib"
-          sudo apt-get install -y --allow-downgrades $pkgs "libglib2.0-0t64:amd64=$glib"
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y --allow-downgrades $pkgs "libglib2.0-0t64:amd64=$glib"
 
       - name: Build
         working-directory: frontends/gtk4
@@ -1643,8 +1650,9 @@ jobs:
           riscv64-linux-gnu-objdump -p "$ELF" | grep -E 'NEEDED' || true
 
       - name: Install cargo packaging tools
+        timeout-minutes: 25
         run: |
-          sudo apt-get install -y dpkg-dev rpm zstd
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y dpkg-dev rpm zstd
           for crate in cargo-deb cargo-generate-rpm; do
             for attempt in 1 2 3; do
               if env -u PKG_CONFIG_LIBDIR -u PKG_CONFIG_SYSROOT_DIR -u PKG_CONFIG_ALLOW_CROSS \
@@ -2201,9 +2209,10 @@ jobs:
           components: ${{ matrix.prebuilt == 'yes' && '' || 'rust-src' }}
 
       - name: Install cross linker + binutils
+        timeout-minutes: 25
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt }} binutils file
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" update
+          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y ${{ matrix.apt }} binutils file
 
       - name: Point cargo at the cross-linker
         # Self-contained musl targets bundle libc+CRT; the GNU cross-gcc only
