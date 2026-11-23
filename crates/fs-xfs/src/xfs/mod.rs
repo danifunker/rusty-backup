@@ -29,6 +29,8 @@ pub mod fsck;
 pub mod inobt_repair;
 pub mod inode;
 pub mod inode_repair;
+pub mod log;
+pub mod log_replay;
 pub mod repair;
 pub mod sb;
 pub mod symlink;
@@ -55,6 +57,16 @@ use types::{DiFormat, DirFormat};
 
 const SECTOR: u64 = 512;
 
+/// `sb_pquotino` at offset 232 of a v5 superblock sector; 0 on v4, where project quotas
+/// share the group-quota inode.
+fn pquotino_of(sb: &XfsSuperblock, sector: &[u8]) -> u64 {
+    if sb.is_v5() {
+        BigEndian::read_u64(&sector[232..240])
+    } else {
+        0
+    }
+}
+
 /// 1 MiB streaming chunk size — matches the rest of the codebase.
 const STREAM_CHUNK: usize = 1024 * 1024;
 
@@ -66,6 +78,10 @@ pub struct XfsFilesystem<R: Read + Seek + Send> {
     dir_format: DirFormat,
     label: String,
     fs_type_name: &'static str,
+    /// The log's state, scanned on the first edit ([`Self::log_state`]).
+    log: Option<log::LogState>,
+    /// `sb_pquotino` (v5 only), the project-quota inode; kept here so the superblock struct is unchanged.
+    pquotino: u64,
 }
 
 impl<R: Read + Seek + Send> XfsFilesystem<R> {
@@ -119,6 +135,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         ));
 
         let label = sb.label();
+        let pquotino = pquotino_of(&sb, &sector);
         Ok(XfsFilesystem {
             reader,
             partition_offset,
@@ -126,6 +143,8 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             dir_format,
             label,
             fs_type_name,
+            log: None,
+            pquotino,
         })
     }
 
@@ -446,6 +465,42 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             check_bmbt_header(&block, Some(0), self.sb.is_v5())?;
         }
         Ok(out)
+    }
+
+    /// Re-read the superblock after something rewrote it under us (log replay or discard).
+    pub(crate) fn reload_superblock(&mut self) -> Result<(), FilesystemError> {
+        let mut sector = [0u8; SECTOR as usize];
+        read_at_aligned(&mut self.reader, self.partition_offset, SECTOR, &mut sector)?;
+        let sb = XfsSuperblock::parse(&sector)?;
+        sb.validate_geometry()?;
+        self.dir_format = sb.dir_format();
+        self.label = sb.label();
+        self.pquotino = pquotino_of(&sb, &sector);
+        self.sb = sb;
+        self.log = None;
+        Ok(())
+    }
+
+    /// The superblock-referenced inodes the connectivity check treats as roots, the v5
+    /// project-quota inode included.
+    pub(crate) fn internal_inodes(&self) -> Vec<u64> {
+        let mut v = self.sb.internal_inodes();
+        if self.pquotino != 0 && self.pquotino != u64::MAX && !v.contains(&self.pquotino) {
+            v.push(self.pquotino);
+        }
+        v
+    }
+
+    /// Whether the internal log is clean; read once, then cached.
+    pub fn log_state(&mut self) -> Result<log::LogState, FilesystemError> {
+        if self.log.is_none() {
+            self.log = Some(log::log_state(
+                &mut self.reader,
+                self.partition_offset,
+                &self.sb,
+            )?);
+        }
+        Ok(self.log.clone().expect("set above"))
     }
 
     /// Read the bytes of one filesystem block at `fsblock` into `out`.

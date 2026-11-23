@@ -3,6 +3,12 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.2.1
+
+### Added
+- `CompactAffsReader::new_sized`, for an AFFS partition that is not last on its RDB disk: the
+  root block sits at the partition's midpoint, so the length has to be known (AMI-014).
+
 ## 0.2.0
 
 ### Changed

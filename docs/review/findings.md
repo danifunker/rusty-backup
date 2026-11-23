@@ -253,7 +253,7 @@ magic on v5, skips attribute forks and does not cross-check finobt / rmapbt.
 | XFS-009 | S1 | confirmed | edit.rs `sf_insert_entry`; dir_repair.rs | Editor and R6 do not check `dir_format`: on a dir1 volume (IRIX 6.2 / 6.4) they write dir2 layout into dir1 forks. | fixed (a5dc5563) |
 | XFS-010 | S1 | confirmed | edit.rs `sf_insert_entry` | A parent with `i8count > 0` gets a 4-byte inumber appended, so the fork misparses. | fixed (a5dc5563) |
 | XFS-011 | S1 | plausible | sb.rs; edit.rs; fsck.rs | Sparse inode chunks are not refused: the slot claim can place an inode in a hole. Confirm with `mkfs.xfs -i sparse=1`, fragment, create, `xfs_repair -n`. | fixed (a5dc5563) |
-| XFS-012 | S1 | plausible | edit.rs, repair.rs | No clean-log check before editing or repairing; recovery would replay over our writes. Confirm: shut down with a pending transaction, edit, mount. | deferred (needs a log-head scan; README says to edit only cleanly unmounted volumes) |
+| XFS-012 | S1 | plausible | edit.rs, repair.rs | No clean-log check before editing or repairing; recovery would replay over our writes. Confirm: shut down with a pending transaction, edit, mount. | fixed (this branch): edits, chmod and chown refuse a volume whose log head is not the unmount record; fsck reports it and repair replays the log first (`log_replay.rs`) |
 | XFS-013 | S2 | confirmed | sb.rs `parse` | Superblock geometry unchecked: v5 with 128-byte inodes panics on a slice, large `dirblklog` shift-panics or allocates 2 GiB, `dblocks < (agcount-1)*agblocks` underflows (R2 loops ~2^64); unknown v5 incompat bits accepted. | fixed (a5dc5563) |
 | XFS-014 | S2 | confirmed | xfs/mod.rs `walk_bmbt`, `collect_bmbt_blocks` | A bmbt leaf whose `rightsib` is itself loops forever and grows a Vec until OOM. | fixed (a5dc5563) |
 | XFS-015 | S2 | confirmed | freespace_rebuild.rs `InUseMap::new`; inobt_repair.rs | R2 / R3 allocate a `Vec<bool>` of `dblocks` with no cap: 1 GiB for 4 TiB, abort on a hostile `dblocks`. | fixed (a5dc5563) |
@@ -283,7 +283,7 @@ excluded. No reference C sources opened.
 | AMI-011 | S2 | confirmed | affs_common.rs `read_bstr` vs affs.rs `write_bstr`; pfs3.rs; sfs.rs | Names read as Latin-1 / lossy UTF-8 but written as UTF-8: AFFS hashes the wrong bytes (NotFound on delete / rename of a non-ASCII name, duplicates on create). | fixed (0360cf79) |
 | AMI-012 | S2 | confirmed | affs.rs, pfs3.rs, sfs.rs, pfs3_clone.rs chain / tree walks | Hash chains, extension chains, anode chains, SFS BNodes and the PFS3 clone walk have no cycle or depth cap: self-links hang or overflow the stack. | fixed (0360cf79) |
 | AMI-013 | S2 | confirmed | pfs3_clone.rs `clone_pfs3_volume`; pfs3.rs `do_create_file` | Clone stages all data in memory and syncs once: peak RAM is the volume's used data. Single-file creates hold the whole file (S3). | fixed (0360cf79) |
-| AMI-014 | S2 | confirmed | affs.rs `CompactAffsReader::new` | Uses `open` not `open_sized`: on an RDB disk the root search fails or the compact size covers the following partitions. | deferred (needs the partition size threaded through compact_partition_reader) |
+| AMI-014 | S2 | confirmed | affs.rs `CompactAffsReader::new` | Uses `open` not `open_sized`: on an RDB disk the root search fails or the compact size covers the following partitions. | fixed (this branch): backup compaction and sizing pass the partition length to CompactAffsReader::new_sized |
 | AMI-015 | S2 | confirmed | sfs.rs `list_directory`, `create_file` | SFS drops protection, comment and dates on read and ignores them on write; softlinks list as empty files; no volume label. | fixed (0360cf79) |
 | AMI-016 | S4 | confirmed | affs.rs, sfs.rs, pfs3.rs, *_fsck.rs | Duplicates (`sync_metadata` / `flush_metadata`, `fs_type` / `fs_type_label`, `fold`, fsck helpers x3); stale comments; `create_days` read from 0x1A4 (root alteration date). | partly fixed (0360cf79): create date offset; duplicates left |
 
@@ -374,7 +374,7 @@ drivers are merged.
 | UNX-003 | S1 | confirmed | ext.rs `add_dir_entry`, `try_insert_dir_entry` | htree (dir_index) directories not handled: the first insert overwrites `dx_root_info`; leaf inserts ignore hash order. | fixed (72c94099) |
 | UNX-004 | S1 | confirmed | ext.rs `open`, `build_relocation_map` | No incompat / ro_compat gate: meta_bg, RECOVER (unreplayed journal), bigalloc, inline_data all edited wrongly. | fixed (72c94099) |
 | UNX-005 | S1 | confirmed | ufs.rs, jfs.rs, efs.rs directory / inode writes | On-disk pointers never checked against the volume size: edits can write into the next partition. | fixed (48ac3f30) |
-| UNX-006 | S1 | confirmed | ufs.rs `free_inode_blocks`, `free_frag_run` | Freeing trusts pointers: panics past the CG, frees CG headers / inode tables, frees cross-linked blocks. | partly fixed (f55f13c6): runs past the CG and double frees refused; the metadata-area check is left out (the CG layout of our own test volumes does not match the reviewer's model) |
+| UNX-006 | S1 | confirmed | ufs.rs `free_inode_blocks`, `free_frag_run` | Freeing trusts pointers: panics past the CG, frees CG headers / inode tables, frees cross-linked blocks. | fixed (this branch): frees that overlap a CG's superblock copy, CG header or inode table (and CG 0's boot area) are refused; the synthetic test volume now reserves its metadata as newfs does |
 | UNX-007 | S1 | confirmed | efs.rs directory code, efs_fsck.rs, efs_resize.rs | Indirect-extent directories (numextents > 12) treated as direct: insert overwrites an index block, listing shows empty, repair double-links. | fixed (72c94099) |
 | UNX-008 | S1 | confirmed | efs_v1.rs `allocate_inode`, `dir_insert` | Dirents hold a u16 inum but inodes above 65,535 are handed out: the entry points at the wrong inode. | fixed (72c94099) |
 | UNX-009 | S1 | confirmed | bfs_fsck.rs `check_inode`, `repair_bfs` | Double-indirect and indirect map blocks never claimed: repair frees them. | fixed (48ac3f30) |
@@ -426,7 +426,7 @@ drivers are merged.
 | UNX-055 | S3 | confirmed | btrfs.rs `list_directory` | `Err(_) => continue` drops children silently. | fixed (4fb60164) |
 | UNX-056 | S3 | confirmed | jfs.rs, jfs_fsck.rs | `≥`, `⇒`, `—` in user-visible messages. | fixed (5694446c) |
 | UNX-057 | S3 | confirmed | bfs_write.rs, ofs_write.rs, ofs.rs | Whole-source `read_to_end`; OFS buffers a whole extent. | fixed (58e7a44e) |
-| UNX-058 | S4 | confirmed | bfs_write.rs, minix.rs, vxfs.rs | Each allocation rereads the whole bitmap; VxFS bmap rereads indirects per block. | deferred (cached bitmaps across three drivers: a performance change of its own) |
+| UNX-058 | S4 | confirmed | bfs_write.rs, minix.rs, vxfs.rs | Each allocation rereads the whole bitmap; VxFS bmap rereads indirects per block. | fixed (this branch): BFS and minix cache their bitmaps (BFS writes back only changed blocks; minix resumes each search past the last zone); VxFS keeps the last indirect extent it read |
 | UNX-059 | S4 | confirmed | efs_fsck.rs, efs_v1_fsck.rs, jfs_fsck.rs, ufs_fsck.rs (+ fs-xfs) | Five copies of the fsck `Builder`; belongs in `disk_core::fsck`. | deferred (moving the fsck Builder into disk_core touches five drivers and fs-xfs) |
 | UNX-060 | S4 | confirmed | ufs.rs, efs.rs | Full 27-field `FileEntry` literals (DC-008 class). | deferred (FileEntry constructors: the DC-008 refactor, across drivers) |
 | UNX-061 | S4 | confirmed | lib.rs, ufs.rs, efs_resize.rs, ext_format.rs | Stale docs (ofs GPL note, UFS scope, shrink hard-link claim, batch-builder caller). | fixed (705602dc) |
@@ -526,7 +526,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | TAR-003 | S2 | confirmed | mem_archive.rs | Small compressed archives inflated fully into RAM uncapped; indexed path fills disk; zip capacity from declared size. | fixed (69648efe) |
 | TAR-004 | S2 | plausible | tar_import.rs `open_tar_stream` | Multi-member .tar.gz imports only the first member. | fixed (69648efe) |
 | TAR-005 | S2 | plausible | tar_export.rs `walk` | Export recursion has no depth / visited guard. | fixed (69648efe) |
-| TAR-006 | S4 | confirmed | import_sink.rs, tar_export.rs, mem_archive.rs, zstd_compat.rs, zip_import.rs | Stats merge drops a field; stale docs; pure-zstd can't browse .tar.zst; duplicate date code. | partly fixed (b0a05a07: stats merge; docs, zstd browse and date code still open) |
+| TAR-006 | S4 | confirmed | import_sink.rs, tar_export.rs, mem_archive.rs, zstd_compat.rs, zip_import.rs | Stats merge drops a field; stale docs; pure-zstd can't browse .tar.zst; duplicate date code. | partly fixed (b0a05a07, this branch): stats merge; pure-zstd builds browse .tar.zst; stale docs and duplicate date code still open |
 
 ## crates/fs-cpm
 
@@ -538,7 +538,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | CPM-002 | S2 | confirmed | cpm.rs `analyze`, `run_repair` | fsck calls user >= 16 entries invalid and repair deletes them (password entries, ZSDOS files). | fixed (6cd952f5) |
 | CPM-003 | S2 | confirmed | cpm.rs `encode_dir_entry`, `dir_write_back` | Every write-back re-encodes all slots lossily: SFCB dates, label mode flags and f1'-f4' attributes are lost. | fixed (6cd952f5) |
 | CPM-004 | S2 | confirmed | cpm.rs `collect_files`, `read_group` | EXM ignored: on exm > 0 presets (EINSTEIN, SVI328, MULTICOMP) files over 16 KB list short and read truncated. | fixed (6cd952f5) |
-| CPM-005 | S1 | confirmed | cpm.rs `create_file` | Writer ignores EXM too: real CP/M sees a different file than we wrote. | mitigated (13054e1c): writes refused on exm > 0 presets until EXM is implemented |
+| CPM-005 | S1 | confirmed | cpm.rs `create_file` | Writer ignores EXM too: real CP/M sees a different file than we wrote. | fixed (this branch): the writer lays entries out per EXM (extent byte = last logical extent, record count of that one); the refusal is gone |
 | CPM-006 | S1 | confirmed | cpm_diskdefs.rs `ZX_PLUS3`, `SVI328_CPM` | Data area runs past the disk geometry: allocations and blank images go past the image end. | fixed (13054e1c): allocation clamped to the blocks the image holds; preset values left as they are |
 | CPM-007 | S2 | confirmed | cpm_diskdefs.rs `ALTAIR_CF`, `SVI328_CPM`; cpm.rs | Directory size from al0/al1 disagrees with drm: ALTAIR_CF creates always fail at sync after writing data. | fixed (6cd952f5) |
 | CPM-008 | S1 | confirmed | cpm.rs list / find / delete / rename | User number dropped from name handling: same-named files in two users collide; delete removes both. | fixed (13054e1c) |
@@ -546,8 +546,8 @@ Review by a separate agent, 2026-11-21, read-only.
 | CPM-010 | S2 | plausible | cpm_diskdefs.rs `ALTAIR_8IN`; cpm.rs | No sector skew: ibm-3740 images (skew 6) read garbled. | open: needs a skewed 8-inch sample |
 | CPM-011 | S3 | confirmed | cpm.rs `validate_cpm_name` | Wildcard / separator characters accepted in names. | fixed (9bd44acf) |
 | CPM-012 | S3 | confirmed | cpm.rs | Non-ASCII glyphs in user-visible errors. | fixed (9bd44acf) |
-| CPM-013 | S3 | confirmed | cpm.rs `read_file`, `create_file` | Whole-file buffering (DC-006 for this crate; largest preset 4 MiB). | deferred (bounded by the volume, 4 MiB at most; streaming waits on the shared driver change, DC-006) |
-| CPM-014 | S4 | confirmed | cpm.rs, cpm_diskdefs.rs | Dead locals and unread DPB fields; `tracks` documented as a bounds check but unused. | partly fixed (562d5948: tracks doc; dead locals still open) |
+| CPM-013 | S3 | confirmed | cpm.rs `read_file`, `create_file` | Whole-file buffering (DC-006 for this crate; largest preset 4 MiB). | fixed (this branch): create_file streams into its blocks and write_file_to streams out, one block at a time; read_file fills only up to max_bytes |
+| CPM-014 | S4 | confirmed | cpm.rs, cpm_diskdefs.rs | Dead locals and unread DPB fields; `tracks` documented as a bounds check but unused. | fixed (this branch): dead locals gone; tracks documented; cks / psh / phm stay as descriptive preset data |
 
 ## crates/dsk-dmg, dsk-clonezilla, dsk-floppy, dsk-flux, dsk-imz, dsk-tape
 
@@ -612,7 +612,7 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 | HPF-011 | S2 | confirmed | hpfs.rs `open` | `bitmap_dir + s` overflow; root fnode not range-checked. | fixed (9f89a11a) |
 | HPF-012 | S4 | confirmed | hpfs.rs `is_name_long` | Tests the dot, not the character: some long names stored as short. | fixed (9f89a11a) |
 | HPF-013 | S4 | confirmed | hpfs.rs `alloc_dnode` | Dead branch. | fixed (9f89a11a) |
-| APF-001 | S2 | confirmed | fs-apfs apfs.rs `open_with_passphrase` | Only volume 0 is browsable; a failing volume is skipped silently. | partly (42f7a075): skipped volumes reported; choosing another volume to browse still open |
+| APF-001 | S2 | confirmed | fs-apfs apfs.rs `open_with_passphrase` | Only volume 0 is browsable; a failing volume is skipped silently. | fixed (this branch): a multi-volume container's root lists one folder per volume; a password unlocks every encrypted volume it opens |
 | APF-002 | S2 | confirmed | apfs.rs `unlock_active_volume` | Only the first KEK tried: other users' passwords / the recovery key fail. | fixed (42f7a075) |
 | APF-003 | S2 | confirmed | apfs.rs `load_omap`, `build_catalog` | No visited set: self-pointing index nodes grow the stack Vec to ~8 GB. | fixed (42f7a075) |
 | APF-004 | S2 | confirmed | apfs.rs `read_block`, `stream_phys` | Physical addresses unchecked against block_count; products overflow. | fixed (42f7a075) |

@@ -404,6 +404,10 @@ pub struct MinixFilesystem<R: Read + Seek> {
     /// Allocated data zones, counted from the zone bitmap at open. Used by the
     /// `&self` `used_size`; refreshed by the edit path when writes land.
     used_zones: u32,
+    /// The zone bitmap, read on the first allocation and kept in step with the disk (UNX-058).
+    pub(crate) zmap: Option<Vec<u8>>,
+    /// Where the next zone search starts: just past the last zone handed out.
+    zone_hint: usize,
 }
 
 impl<R: Read + Seek> MinixFilesystem<R> {
@@ -424,6 +428,8 @@ impl<R: Read + Seek> MinixFilesystem<R> {
             sb,
             fs_type,
             used_zones: 0,
+            zmap: None,
+            zone_hint: 1,
         };
         fs.used_zones = fs.used_data_zones()?;
         Ok(fs)
@@ -1017,16 +1023,26 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
 
     /// Allocate a free data zone (zmap bit clear) and mark it used.
     fn alloc_zone(&mut self) -> Result<u32, FilesystemError> {
-        let bmap = self.read_zone_bitmap()?;
+        let mut bmap = match self.zmap.take() {
+            Some(b) => b,
+            None => self.read_zone_bitmap()?,
+        };
         let max_bit = (self.sb.zones - self.sb.firstdatazone) as usize;
-        for bit in 1..=max_bit {
-            if !bit_set(&bmap, bit) {
-                self.set_bitmap_bit(self.zmap_start(), bit, true)?;
+        let hint = self.zone_hint.clamp(1, max_bit.max(1));
+        let found = (hint..=max_bit)
+            .chain(1..hint)
+            .find(|&bit| !bit_set(&bmap, bit));
+        let result = match found {
+            Some(bit) => self.set_bitmap_bit(self.zmap_start(), bit, true).map(|()| {
+                bmap[bit / 8] |= 1 << (bit % 8);
                 self.used_zones += 1;
-                return Ok(self.sb.firstdatazone + bit as u32 - 1);
-            }
-        }
-        Err(FilesystemError::DiskFull("no free Minix zones".into()))
+                self.zone_hint = bit + 1;
+                self.sb.firstdatazone + bit as u32 - 1
+            }),
+            None => Err(FilesystemError::DiskFull("no free Minix zones".into())),
+        };
+        self.zmap = Some(bmap);
+        result
     }
 
     fn free_zone(&mut self, zno: u32) -> Result<(), FilesystemError> {
@@ -1035,6 +1051,10 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
         }
         let bit = (zno - self.sb.firstdatazone + 1) as usize;
         self.set_bitmap_bit(self.zmap_start(), bit, false)?;
+        if let Some(b) = self.zmap.as_mut().and_then(|m| m.get_mut(bit / 8)) {
+            *b &= !(1 << (bit % 8));
+        }
+        self.zone_hint = self.zone_hint.min(bit);
         self.used_zones = self.used_zones.saturating_sub(1);
         Ok(())
     }

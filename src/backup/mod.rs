@@ -2109,24 +2109,26 @@ fn run_backup_inner(
                         let clone2 = factory
                             .open()
                             .context("failed to open source for compaction")?;
-                        fs::compact_partition_reader(
+                        fs::compact_partition_reader_sized(
                             BufReader::new(clone2),
                             part_offset,
                             part.partition_type_byte,
                             part.partition_type_string.as_deref(),
                             config.keep_swap,
+                            Some(part.size_bytes),
                         )
                         .map(|(r, _)| r)
                         .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?
                     }
                 }
             } else {
-                fs::compact_partition_reader(
+                fs::compact_partition_reader_sized(
                     BufReader::new(clone),
                     part_offset,
                     part.partition_type_byte,
                     part.partition_type_string.as_deref(),
                     config.keep_swap,
+                    Some(part.size_bytes),
                 )
                 .map(|(r, _)| r)
                 .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?

@@ -1027,13 +1027,35 @@ pub fn try_compact_partition_reader<R: Read + Seek + Send + 'static>(
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Result<(Box<dyn Read + Send>, CompactResult), String> {
+    try_compact_partition_reader_sized(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+        None,
+    )
+}
+
+/// [`try_compact_partition_reader`] with the partition's length (see
+/// [`compact_partition_reader_sized`]).
+pub fn try_compact_partition_reader_sized<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    partition_size: Option<u64>,
+) -> Result<(Box<dyn Read + Send>, CompactResult), String> {
     if let Some(type_str) = partition_type_string {
-        return compact_partition_reader_by_string(reader, partition_offset, type_str, true)
-            .and_then(|opt| {
-                opt.ok_or_else(|| {
-                    format!("unsupported: APM type '{type_str}' has no compact reader")
-                })
-            });
+        return compact_partition_reader_by_string(
+            reader,
+            partition_offset,
+            type_str,
+            true,
+            partition_size,
+        )
+        .and_then(|opt| {
+            opt.ok_or_else(|| format!("unsupported: APM type '{type_str}' has no compact reader"))
+        });
     }
     // Used for size estimation; swap content doesn't affect the packed size, so
     // keep_swap=true (no need to walk for swap files here).
@@ -1128,10 +1150,36 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
     partition_type_string: Option<&str>,
     keep_swap: bool,
 ) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    compact_partition_reader_sized(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+        keep_swap,
+        None,
+    )
+}
+
+/// [`compact_partition_reader`] that knows the partition's length; AFFS needs it, since its root
+/// block sits at the volume's midpoint and a partition not last on its disk ends early.
+pub fn compact_partition_reader_sized<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    keep_swap: bool,
+    partition_size: Option<u64>,
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
-        return compact_partition_reader_by_string(reader, partition_offset, type_str, keep_swap)
-            .unwrap_or(None);
+        return compact_partition_reader_by_string(
+            reader,
+            partition_offset,
+            type_str,
+            keep_swap,
+            partition_size,
+        )
+        .unwrap_or(None);
     }
     match partition_type {
         0x01 | 0x04 | 0x06 | 0x0E | 0x11 | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
@@ -3254,6 +3302,7 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
     partition_offset: u64,
     type_str: &str,
     keep_swap: bool,
+    partition_size: Option<u64>,
 ) -> Result<Option<(Box<dyn Read + Send>, CompactResult)>, String> {
     match type_str {
         "Apple_HFS" | "48465300-0000-11AA-AA11-00306543ECAC" => {
@@ -3321,9 +3370,10 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
         }
         s if is_amiga_dos_type(s) => {
             let (compact, info) =
-                affs::CompactAffsReader::new(reader, partition_offset).map_err(|e| {
-                    format!("CompactAffsReader::new failed at offset {partition_offset}: {e}")
-                })?;
+                affs::CompactAffsReader::new_sized(reader, partition_offset, partition_size)
+                    .map_err(|e| {
+                        format!("CompactAffsReader::new failed at offset {partition_offset}: {e}")
+                    })?;
             Ok(Some((Box::new(compact), info)))
         }
         s if is_amiga_pfs3_type(s) => {

@@ -361,14 +361,15 @@ fn build_inode_chunk(l: &Layout, sb: &XfsSuperblock) -> Vec<u8> {
 
 /// The clean-unmount log record `mkfs.xfs` writes at the head of the log: a
 /// 512-byte `xlog_rec_header` plus one 512-byte unmount transaction.
-fn build_log_head(uuid: &[u8; 16]) -> Vec<u8> {
+pub(crate) fn build_log_head(uuid: &[u8; 16], cycle: u32) -> Vec<u8> {
     let mut b = vec![0u8; 1024];
+    let lsn = u64::from(cycle) << 32;
     BigEndian::write_u32(&mut b[0..4], 0xFEED_BABE); // h_magicno
-    BigEndian::write_u32(&mut b[4..8], 1); // h_cycle
+    BigEndian::write_u32(&mut b[4..8], cycle); // h_cycle
     BigEndian::write_u32(&mut b[8..12], 2); // h_version
     BigEndian::write_u32(&mut b[12..16], 512); // h_len
-    BigEndian::write_u64(&mut b[16..24], 1 << 32); // h_lsn = cycle 1, block 0
-    BigEndian::write_u64(&mut b[24..32], 1 << 32); // h_tail_lsn
+    BigEndian::write_u64(&mut b[16..24], lsn); // h_lsn = this cycle, block 0
+    BigEndian::write_u64(&mut b[24..32], lsn); // h_tail_lsn
     BigEndian::write_u32(&mut b[36..40], u32::MAX); // h_prev_block
     BigEndian::write_u32(&mut b[40..44], 1); // h_num_logops
     BigEndian::write_u32(&mut b[300..304], 1); // h_fmt = XLOG_FMT_LINUX_LE
@@ -378,7 +379,7 @@ fn build_log_head(uuid: &[u8; 16]) -> Vec<u8> {
     // The op header's first word is displaced by the per-512-byte cycle stamp,
     // which parks the original in h_cycle_data[0].
     BigEndian::write_u32(&mut b[44..48], UNMOUNT_TID);
-    BigEndian::write_u32(&mut b[512..516], 1);
+    BigEndian::write_u32(&mut b[512..516], cycle);
     BigEndian::write_u32(&mut b[516..520], 8); // oh_len
     b[520] = 0xAA; // oh_clientid = XFS_LOG
     b[521] = 0x20; // oh_flags = XLOG_UNMOUNT_TRANS
@@ -472,7 +473,7 @@ pub fn write_blank_xfs<W: Write + Seek>(
             )?;
         }
         if agno == l.log_agno {
-            put(ag_base + l.log_agbno as u64 * bs, &build_log_head(&uuid))?;
+            put(ag_base + l.log_agbno as u64 * bs, &build_log_head(&uuid, 1))?;
         }
     }
 

@@ -478,6 +478,8 @@ impl<R: Read + Write + Seek + Send> VxfsEditor<R> {
     }
 
     fn write_phys(&mut self, block: u64, within: u64, data: &[u8]) -> Result<(), FilesystemError> {
+        // The write may land on an indirect extent the mapper cached.
+        self.fs.indirect_cache = None;
         let at = self.fs.offset + block * self.fs.bsize + within;
         self.fs.reader.seek(SeekFrom::Start(at))?;
         self.fs.reader.write_all(data)?;

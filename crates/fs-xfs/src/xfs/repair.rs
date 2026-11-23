@@ -23,6 +23,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use byteorder::{BigEndian, ByteOrder};
 
 use super::ag::{XfsAgf, XfsAgi};
+use super::log_replay::{replay_log, zero_log, ReplayOutcome};
 use super::sb::XfsSuperblock;
 use super::{read_at_aligned, XfsFilesystem};
 use disk_core::entry::FileEntry;
@@ -256,10 +257,91 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
 impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Refuse any change to a volume whose features the editor does not maintain.
-    fn ensure_editable(&self) -> Result<(), FilesystemError> {
-        match self.superblock().edit_blocker() {
-            Some(why) => Err(FilesystemError::Unsupported(why)),
-            None => Ok(()),
+    fn ensure_editable(&mut self) -> Result<(), FilesystemError> {
+        if let Some(why) = self.superblock().edit_blocker() {
+            return Err(FilesystemError::Unsupported(why));
+        }
+        self.ensure_log_clean()
+    }
+
+    /// Replay a dirty log, as a mount would; `None` when it was already clean.
+    fn replay_dirty_log(&mut self) -> Result<Option<RepairReport>, FilesystemError> {
+        if !matches!(self.log_state()?, super::log::LogState::Dirty { .. }) {
+            return Ok(None);
+        }
+        let sb = self.superblock().clone();
+        let r = match replay_log(&mut self.reader, self.partition_offset, &sb)? {
+            ReplayOutcome::Clean => {
+                self.log = Some(super::log::LogState::Clean);
+                return Ok(None);
+            }
+            ReplayOutcome::Unrecoverable(why) => {
+                return Err(FilesystemError::Unsupported(format!(
+                    "this XFS was not cleanly unmounted and its log cannot be replayed ({why}); \
+                     discarding the log (`rb-cli fsck --repair --discard-log`, or xfs_repair -L) \
+                     makes it usable but loses the changes the log holds"
+                )))
+            }
+            ReplayOutcome::Replayed(r) => r,
+        };
+        self.reader.flush()?;
+        self.reload_superblock()?;
+        let mut fix = format!(
+            "log: replayed {} committed transactions ({} buffers, {} inodes, {} inode chunks)",
+            r.transactions, r.buffers, r.inodes, r.inode_chunks
+        );
+        if r.quotas > 0 {
+            fix.push_str(&format!(", {} quota records", r.quotas));
+        }
+        if r.quota_recount {
+            fix.push_str("; quotas will be recounted on the next quota mount");
+        }
+        if r.incomplete > 0 {
+            fix.push_str(&format!(
+                "; dropped {} that never committed, as a mount does",
+                r.incomplete
+            ));
+        }
+        let mut report = RepairReport {
+            fixes_applied: vec![fix],
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        };
+        if r.unfinished_frees > 0 {
+            let line = format!("log: {} unfinished extent frees", r.unfinished_frees);
+            if self.superblock().edit_blocker().is_some() {
+                // No free-space rebuild runs on this volume, so those blocks stay leaked.
+                report.unrepairable_count += 1;
+                report.fixes_failed.push(format!(
+                    "{line}: their blocks stay allocated until xfs_repair rebuilds the free space"
+                ));
+            } else {
+                report
+                    .fixes_applied
+                    .push(format!("{line} left to the free-space rebuild"));
+            }
+        }
+        Ok(Some(report))
+    }
+
+    /// Throw the log away (`xfs_repair -L`), losing every change it holds that is not on disk.
+    pub fn discard_log(&mut self) -> Result<(), FilesystemError> {
+        let sb = self.superblock().clone();
+        zero_log(&mut self.reader, self.partition_offset, &sb)?;
+        self.reader.flush()?;
+        self.reload_superblock()
+    }
+
+    /// Refuse to write while the log holds transactions a mount would replay over our changes.
+    fn ensure_log_clean(&mut self) -> Result<(), FilesystemError> {
+        match self.log_state()? {
+            super::log::LogState::Dirty { head_lsn } => Err(FilesystemError::Unsupported(format!(
+                "this XFS was not cleanly unmounted (log head at cycle {}, block {}); mount it \
+                 or run xfs_repair on its own system first, or the replay would undo edits",
+                head_lsn >> 32,
+                head_lsn & 0xFFFF_FFFF
+            ))),
+            _ => Ok(()),
         }
     }
 }
@@ -333,6 +415,20 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
     }
 
     fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        // A dirty log is replayed first: it needs none of the editor's features.
+        let replayed = self.replay_dirty_log()?;
+        if let Some(why) = self.superblock().edit_blocker() {
+            return match replayed {
+                Some(mut report) => {
+                    report.unrepairable_count += 1;
+                    report
+                        .fixes_failed
+                        .push(format!("further checks and repairs skipped: {why}"));
+                    Ok(report)
+                }
+                None => Err(FilesystemError::Unsupported(why)),
+            };
+        }
         self.ensure_editable()?;
         // Order matters: R4 (secondary-superblock geometry) → R4b (AGF/AGI
         // summary counters) → R3 (inobt free-mask/freecount repair) → R5
@@ -344,6 +440,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         // `sb_fdblocks` by summing every AGF's freeblks. Each phase is gated
         // hard and is a no-op on a clean volume.
         let mut report = self.run_repair()?;
+        if let Some(r) = replayed {
+            report.fixes_applied.splice(0..0, r.fixes_applied);
+            // A mount frees what was deleted while open at the crash; so do we, before R2.
+            let freed = self.free_unlinked_inodes()?;
+            if freed > 0 {
+                report.fixes_applied.push(format!(
+                    "log: freed {freed} inodes deleted while still open, as a mount does"
+                ));
+            }
+        }
         let summaries = self.run_repair_summaries()?;
         report.fixes_applied.extend(summaries.fixes_applied);
         report.fixes_failed.extend(summaries.fixes_failed);
@@ -386,6 +492,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
 
     fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
         // Only the inode core changes, so the feature gate in `ensure_editable` does not apply.
+        self.ensure_log_clean()?;
         // di_mode is a big-endian u16 at offset 2 of the dinode core.
         // `write_inode_region` re-stamps the v5 CRC for us.
         let sb = self.superblock().clone();
@@ -400,6 +507,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
 
     fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
         // Inode core only, like `set_permissions`; no tree the gated features cover is touched.
+        self.ensure_log_clean()?;
         // di_uid / di_gid are big-endian u32s at offsets 8 and 12 — XFS
         // has carried 32-bit ids since v1, so no width check is needed.
         let sb = self.superblock().clone();
