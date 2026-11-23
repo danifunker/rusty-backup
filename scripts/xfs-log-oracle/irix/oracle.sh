@@ -1,7 +1,9 @@
 #!/bin/sh
 # usage: oracle.sh BOOTDISK TESTDISK OUTPREFIX — boot IRIX from BOOTDISK with TESTDISK as unit 3,
 # check it, mount it, list it, unmount it
-R=$(cd "$(dirname "$0")" && pwd); boot=$1; disk=$2; out=$3
+R=$(cd "$(dirname "$0")" && pwd)
+abs() { case "$1" in /*) echo "$1" ;; *) echo "$PWD/$1" ;; esac; }
+boot=$(abs "$1"); disk=$(abs "$2"); out=$(abs "$3")
 (cd $R && ./launch.sh "$boot" "$disk" > $R/iris-stdout.log 2>&1 &)
 $R/ci status --wait-ready 120 >/dev/null 2>&1; $R/ci start >/dev/null 2>&1
 timeout 1200 $R/ci boot >/dev/null 2>&1; timeout 300 $R/ci login >/dev/null 2>&1

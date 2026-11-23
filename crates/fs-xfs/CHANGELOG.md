@@ -18,8 +18,8 @@ All notable changes to this crate are documented here. This project follows
   inodes, a higher `di_lsn` on v3), rather than rolling the inode back. IRIX flushes inodes
   with changes it never logged.
 - The clean log written after a replay or a discard keeps the old log's record version,
-  `h_fmt` / UUID / `h_size` fields and payload byte order, so IRIX accepts it: a v1 log stays
-  v1.
+  `h_fmt`, UUID and payload byte order, so IRIX accepts it: a v1 log stays v1. A v2 clean
+  record always says a 32 KiB log buffer, whatever size the old log used.
 
 Validated under the IRIS emulator against IRIX 6.5.22 itself: on a volume made by IRIX's own
 mkfs and crashed mid-workload, the replayed volume mounts on IRIX with no log recovery, IRIX's

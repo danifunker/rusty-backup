@@ -65,10 +65,11 @@ recovery.
    with their done items (the id at offset 8 of both), and refuses anything it cannot finish:
    a malformed item,
    unfinished rmap, refcount, bmap, attr or exchange intents, unknown item types, a missing,
-   torn or out-of-sequence record between the tail and the head. A record that runs past the
-   end of the log has its wrapped sectors stamped with the next cycle, which is expected. (the walk must start at the
-   tail's LSN and climb to the head's), more uncommitted data than the log's size or 1 GiB, and a log holding record headers
-   but no complete record (damaged, not clean). A refused log is left untouched.
+   torn or out-of-sequence record between the tail and the head (the walk must start at the
+   tail's LSN and climb to the head's), more uncommitted data than the log's size or 1 GiB,
+   and a log holding record headers but no complete record (damaged, not clean). A refused
+   log is left untouched. A record that runs past the end of the log has its wrapped sectors
+   stamped with the next cycle, which is expected, not a torn write.
 4. **Second pass.** Items are applied in commit order:
    - **Buffers.** Each run of set bits in the 128-byte-chunk map takes the next region. A
      buffer cancelled later in the log is skipped. An `INODE_BUF` item updates only the
