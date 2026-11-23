@@ -226,7 +226,7 @@ pub fn inspect_source(
             if !remote && crate::cli::optical_hint::is_browsable_optical(path) {
                 return Ok(Inspected::Optical(path.to_path_buf()));
             }
-            if !remote && crate::model::mac_archive_read::is_archive_file(path) {
+            if !remote && !is_device && crate::model::mac_archive_read::is_archive_file(path) {
                 return Ok(Inspected::Archive(path.to_path_buf()));
             }
             return Err(no_table(req, e));

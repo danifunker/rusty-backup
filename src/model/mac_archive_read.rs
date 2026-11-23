@@ -27,13 +27,21 @@ pub struct ArchiveRead {
     pub archive: StuffItArchive,
 }
 
-/// Whether the host file at `path` holds a Mac archive, judged by its content (MacBinary,
-/// StuffIt, BinHex, ...), whatever its extension; a failed read counts as "not one".
+/// Largest file a content sniff hands to the Archives tab, which reads the whole file.
+pub const OPEN_AS_ARCHIVE_LIMIT: u64 = 1 << 30;
+
+/// Whether the host file at `path` *is* a Mac archive (MacBinary, StuffIt, BinHex, ...),
+/// judged by content whatever its extension. Only kinds anchored at its start count, so a
+/// disk image merely holding an archive somewhere is not taken for one (issue #127).
 pub fn is_archive_file(path: &std::path::Path) -> bool {
     use std::io::Read;
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
+    match file.metadata() {
+        Ok(m) if m.is_file() && m.len() <= OPEN_AS_ARCHIVE_LIMIT => {}
+        _ => return false,
+    }
     let mut head = Vec::new();
     if file
         .take(SNIFF_LIMIT as u64)
@@ -42,7 +50,22 @@ pub fn is_archive_file(path: &std::path::Path) -> bool {
     {
         return false;
     }
-    detect_mac_archive(&head).is_some()
+    match detect_mac_archive(&head) {
+        // The BinHex banner and a SEA's signature are found by scanning, so they must lead.
+        Some(
+            MacArchiveKind::BinHexSingleFile
+            | MacArchiveKind::BinHexOverSit
+            | MacArchiveKind::BinHexOverSea
+            | MacArchiveKind::BinHexOverCompactPro,
+        ) => {
+            let banner = b"(This file must be converted with BinHex";
+            head[..head.len().min(4096)]
+                .windows(banner.len())
+                .any(|w| w == banner)
+        }
+        Some(MacArchiveKind::Sea) | None => false,
+        Some(_) => true,
+    }
 }
 
 /// Whether the start of `entry` is a Mac archive; a failed read counts as "not one".

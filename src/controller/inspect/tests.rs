@@ -152,10 +152,8 @@ fn a_macbinary_bin_that_is_no_disk_goes_to_the_archives_tab() {
     let path = dir.path().join("Future_Patch.bin");
     std::fs::write(&path, bin).unwrap();
     let mut ctl = controller();
-    ctl.apply(InspectAction::Open(InspectSource::Image {
-        path: path.clone(),
-        temp: None,
-    }));
+    // Explorer's Open With and a drop both arrive as an image file to prepare first.
+    ctl.apply(InspectAction::Open(InspectSource::ImageFile(path.clone())));
     settle(&mut ctl);
     // Opening any source also closes the browse view; the archive goes to the Archives tab.
     let reqs = ctl.take_requests();
@@ -179,6 +177,27 @@ fn a_macbinary_bin_that_is_no_disk_goes_to_the_archives_tab() {
         .take_log()
         .iter()
         .any(|(_, m)| m.contains("Inspect failed")));
+
+    // A table-less image merely holding a BinHex file 1 MiB in is not taken for an archive,
+    // though the raw detector does find the BinHex in it.
+    let hqx = fs_mac::binhex::build_binhex(&fs_mac::binhex::BinHexFile {
+        name: "ReadMe".into(),
+        type_code: *b"TEXT",
+        creator_code: *b"ttxt",
+        flags: 0,
+        data_fork: b"hello".to_vec(),
+        resource_fork: Vec::new(),
+    });
+    let mut buried = vec![0x0Au8; 2 << 20];
+    buried[1 << 20..(1 << 20) + hqx.len()].copy_from_slice(hqx.as_bytes());
+    assert!(arc_mac::detect::detect_mac_archive(&buried).is_some());
+    let disk = dir.path().join("disc.bin");
+    std::fs::write(&disk, &buried).unwrap();
+    assert!(!crate::model::mac_archive_read::is_archive_file(&disk));
+    // The same BinHex at the start of a file is one.
+    let lone = dir.path().join("readme.hqx.bin");
+    std::fs::write(&lone, hqx.as_bytes()).unwrap();
+    assert!(crate::model::mac_archive_read::is_archive_file(&lone));
 }
 
 #[test]
