@@ -110,6 +110,13 @@ pub fn run(args: InspectArgs) -> Result<()> {
             let base = anyhow::anyhow!("detecting partition table: {e}");
             if crate::cli::optical_hint::is_nkit_image(&args.image) {
                 crate::cli::optical_hint::with_nkit_hint(base, &args.image)
+            } else if crate::model::mac_archive_read::is_archive_file(&args.image) {
+                // A MacBinary `.bin` (issue #127) or another Mac archive, not a disk image.
+                let p = args.image.display();
+                anyhow::anyhow!(
+                    "{base}\n\nThis is a classic Mac archive, not a disk image; use the archive \
+                     verbs instead:\n  rb-cli archive list {p}\n  rb-cli archive extract {p} DIR"
+                )
             } else {
                 crate::cli::optical_hint::with_optical_hint(base, &args.image)
             }

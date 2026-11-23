@@ -132,6 +132,55 @@ fn a_mac_archive_goes_to_the_archives_tab_and_changes_nothing() {
     assert!(matches!(&reqs[..], [HostRequest::OpenArchive(p)] if *p == sit));
 }
 
+/// Issue #127: a double-clicked `.bin` that is MacBinary, not a disk, opens in the Archives tab.
+#[test]
+fn a_macbinary_bin_that_is_no_disk_goes_to_the_archives_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    let dates = fs_mac::resource_fork::MacFileDates {
+        created: 2_900_000_000,
+        modified: 2_900_000_000,
+    };
+    let data: Vec<u8> = (0..70_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let bin = fs_mac::resource_fork::build_macbinary(
+        "Future Patch",
+        b"APPL",
+        b"VSPT",
+        dates,
+        &data,
+        &[0x5A; 600],
+    );
+    let path = dir.path().join("Future_Patch.bin");
+    std::fs::write(&path, bin).unwrap();
+    let mut ctl = controller();
+    ctl.apply(InspectAction::Open(InspectSource::Image {
+        path: path.clone(),
+        temp: None,
+    }));
+    settle(&mut ctl);
+    // Opening any source also closes the browse view; the archive goes to the Archives tab.
+    let reqs = ctl.take_requests();
+    assert!(reqs
+        .iter()
+        .any(|r| matches!(r, HostRequest::OpenArchive(p) if *p == path)));
+
+    // A .bin that is neither a disk, a disc nor an archive still fails in Inspect.
+    let junk = dir.path().join("junk.bin");
+    std::fs::write(&junk, vec![0x0Au8; 130_048]).unwrap();
+    ctl.apply(InspectAction::Open(InspectSource::Image {
+        path: junk,
+        temp: None,
+    }));
+    settle(&mut ctl);
+    let reqs = ctl.take_requests();
+    assert!(!reqs
+        .iter()
+        .any(|r| matches!(r, HostRequest::OpenArchive(_) | HostRequest::OpenOptical(_))));
+    assert!(ctl
+        .take_log()
+        .iter()
+        .any(|(_, m)| m.contains("Inspect failed")));
+}
+
 #[test]
 fn closing_a_backup_tells_the_host_and_a_missing_folder_reports_an_error() {
     let dir = tempfile::tempdir().unwrap();

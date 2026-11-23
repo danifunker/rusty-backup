@@ -27,6 +27,24 @@ pub struct ArchiveRead {
     pub archive: StuffItArchive,
 }
 
+/// Whether the host file at `path` holds a Mac archive, judged by its content (MacBinary,
+/// StuffIt, BinHex, ...), whatever its extension; a failed read counts as "not one".
+pub fn is_archive_file(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::new();
+    if file
+        .take(SNIFF_LIMIT as u64)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return false;
+    }
+    detect_mac_archive(&head).is_some()
+}
+
 /// Whether the start of `entry` is a Mac archive; a failed read counts as "not one".
 pub fn sniff(fs: &mut dyn Filesystem, entry: &FileEntry) -> Option<MacArchiveKind> {
     let bytes = fs.read_file(entry, SNIFF_LIMIT).ok()?;
