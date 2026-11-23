@@ -29,8 +29,8 @@ const HEADER_MAGIC: u32 = 0xFEED_BABE;
 const CYCLE_SLOTS: usize = 64;
 const HEADER_CYCLE_SIZE: u32 = 32 * 1024;
 const MAX_RECORD_BYTES: u32 = 256 * 1024;
-/// Cap on the bytes of uncommitted transactions held while walking.
-const MAX_OPEN_BYTES: usize = 256 << 20;
+/// Cap on the bytes of uncommitted transactions held while walking (no more than the log).
+const MAX_OPEN_BYTES: u64 = 1 << 30;
 /// Largest buffer a log item may name: 1 MiB, past any XFS metadata block.
 const MAX_BUF_SECTORS: u64 = 2048;
 const INODES_PER_CHUNK: u64 = 64;
@@ -270,15 +270,30 @@ fn read_record<R: Read + Seek>(
 }
 
 /// The newest complete record: the highest-LSN header whose sectors all carry its cycle.
-fn find_head<R: Read + Seek>(dev: &mut R, log: &Log) -> Result<Option<Record>, FilesystemError> {
+fn find_head<R: Read + Seek>(dev: &mut R, log: &Log) -> Result<Head, FilesystemError> {
     let mut found = scan_headers(dev, log)?;
     found.sort_unstable_by(|a, b| b.cmp(a));
+    let newest = found.first().map(|&(lsn, _)| lsn);
     for (_, blk) in found {
         if let Some(r) = read_record(dev, log, blk)? {
-            return Ok(Some(r));
+            return Ok(Head::Record(Box::new(r)));
         }
     }
-    Ok(None)
+    Ok(match newest {
+        Some(lsn) => Head::Garbled { newest_lsn: lsn },
+        None => Head::Blank,
+    })
+}
+
+/// What the head search found.
+enum Head {
+    Record(Box<Record>),
+    /// Headers exist but none is a complete record: the log is damaged, not clean.
+    Garbled {
+        newest_lsn: u64,
+    },
+    /// No headers at all: a log that was never written.
+    Blank,
 }
 
 /// Every block that looks like a record header, as (LSN, block).
@@ -390,7 +405,7 @@ fn walk<R: Read + Seek>(
             };
             if len > 0 {
                 open_bytes += len;
-                if open_bytes > MAX_OPEN_BYTES {
+                if open_bytes as u64 > MAX_OPEN_BYTES.min(log.bbs * BB) {
                     return Err(corrupt(
                         "XFS log holds more uncommitted data than a replay will buffer".into(),
                     ));
@@ -624,7 +639,13 @@ fn check_icreate(it: &Item<'_>, g: &Geo) -> Result<(), String> {
     );
     let (isize, length) = (u64::from(be32(f, 16)), u64::from(be32(f, 20)));
     let chunk = (INODES_PER_CHUNK * g.isize as u64).max(g.blocksize);
+    let daddr = ag
+        .checked_mul(g.agblocks)
+        .and_then(|b| b.checked_add(agbno))
+        .and_then(|b| b.checked_mul(g.blocksize / BB));
+    // The last AG is shorter than `agblocks`, so the volume bound is checked too.
     let ok = ag < g.agcount
+        && daddr.is_some_and(|d| g.inside(d, length.saturating_mul(g.blocksize)))
         && length > 0
         && agbno + length <= g.agblocks
         && isize == g.isize as u64
@@ -1089,8 +1110,14 @@ fn plan<R: Read + Seek>(
     if sb.logstart == 0 {
         return Ok(Plan::Clean);
     }
-    let Some(head) = find_head(dev, log)? else {
-        return Ok(Plan::Clean);
+    let head = match find_head(dev, log)? {
+        Head::Record(r) => *r,
+        Head::Blank => return Ok(Plan::Clean),
+        Head::Garbled { .. } => {
+            return Ok(Plan::Unrecoverable(
+                "the log has record headers but no complete record".into(),
+            ))
+        }
     };
     // An unmount record is written after everything reached the disk, whatever its tail says.
     if is_unmount(&head) {
@@ -1149,7 +1176,10 @@ pub(crate) fn head_state<R: Read + Seek>(
     }
     let log = Log::new(partition_offset, sb);
     Ok(match find_head(dev, &log)? {
-        Some(h) if !is_unmount(&h) => LogState::Dirty { head_lsn: h.lsn },
+        Head::Record(h) if !is_unmount(&h) => LogState::Dirty { head_lsn: h.lsn },
+        Head::Garbled { newest_lsn } => LogState::Dirty {
+            head_lsn: newest_lsn,
+        },
         _ => LogState::Clean,
     })
 }
@@ -1819,5 +1849,54 @@ mod tests {
         f.extend_from_slice(&1u16.to_le_bytes());
         f.resize(30, 0);
         refused_untouched(vec![f], "inode log item is 30 bytes");
+    }
+
+    /// Headers that never form a complete record mean a damaged log, not a clean one.
+    #[test]
+    fn a_log_of_only_broken_headers_is_unrecoverable_not_clean() {
+        let (mut img, sb) = blank();
+        let start =
+            fsblock_to_partition_byte(sb.logstart, sb.agblocks, sb.agblklog, sb.blocksize) as usize;
+        img[start + 8..start + 12].copy_from_slice(&7u32.to_be_bytes()); // no such version
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert!(matches!(
+            fs.log_state().unwrap(),
+            crate::xfs::log::LogState::Dirty { .. }
+        ));
+        assert_eq!(fs.run_fsck().unwrap().errors[0].code, "LogUnrecoverable");
+        fs.discard_log().unwrap();
+        assert_eq!(fs.log_state().unwrap(), crate::xfs::log::LogState::Clean);
+    }
+
+    /// The last AG can be shorter than `agblocks`; an inode chunk past the volume's end is refused.
+    #[test]
+    fn an_inode_create_past_the_end_of_a_short_last_ag_is_refused() {
+        let (mut img, mut sb) = blank();
+        let last = u64::from(sb.agcount - 1);
+        let agbno = sb.agblocks - 16;
+        sb.dblocks = last * u64::from(sb.agblocks) + u64::from(agbno) + 4;
+        let mut f = Vec::new();
+        f.extend_from_slice(&LI_ICREATE.to_le_bytes());
+        f.extend_from_slice(&1u16.to_le_bytes());
+        let blocks = 64 * u32::from(sb.inodesize) / sb.blocksize;
+        for v in [last as u32, agbno, 64, u32::from(sb.inodesize), blocks, 1] {
+            f.extend_from_slice(&v.to_be_bytes());
+        }
+        put_record(
+            &mut img,
+            &sb,
+            2,
+            &[
+                (3, OP_START, vec![]),
+                (3, 0, trans_header(3, 1)),
+                (3, 0, f),
+                (3, OP_COMMIT, vec![]),
+            ],
+        );
+        let mut dev = Cursor::new(img);
+        match replay_log(&mut dev, 0, &sb).unwrap() {
+            ReplayOutcome::Unrecoverable(m) => assert!(m.contains("inode chunk"), "{m}"),
+            other => panic!("{other:?}"),
+        }
     }
 }

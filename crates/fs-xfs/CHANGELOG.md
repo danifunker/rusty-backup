@@ -18,7 +18,7 @@ All notable changes to this crate are documented here. This project follows
   (`xfs_repair -L`) is the explicit way out. Every item is validated (sizes, region counts,
   dirty maps, write targets inside the volume, LSN order from tail to head) before anything is
   written, so a malformed or hostile log is refused untouched rather than half applied or a
-  panic. Written from the public format document and black-box output only; see
+  panic. A log holding record headers but no complete record is reported damaged, not clean. Written from the public format document and black-box output only; see
   `docs/xfs_log_replay.md`.
 
 ### Fixed

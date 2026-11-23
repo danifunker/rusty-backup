@@ -49,7 +49,8 @@ values, so these were pinned by matching raw log bytes against `xfs_logprint`:
    a malformed item,
    unfinished rmap, refcount, bmap, attr or exchange intents, unknown item types, a missing,
    torn or out-of-sequence record between the tail and the head (the walk must start at the
-   tail's LSN and climb to the head's), and more than 256 MiB of uncommitted data. A refused log is left untouched.
+   tail's LSN and climb to the head's), more uncommitted data than the log's size or 1 GiB, and a log holding record headers
+   but no complete record (damaged, not clean). A refused log is left untouched.
 4. **Second pass.** Items are applied in commit order:
    - **Buffers.** Each run of set bits in the 128-byte-chunk map takes the next region. A
      buffer cancelled later in the log is skipped. An `INODE_BUF` item updates only the
