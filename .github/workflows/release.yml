@@ -1438,10 +1438,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install dependencies
-        timeout-minutes: 25
+        # GTK's ~50 MB of packages took 6 minutes on a slow mirror, so each try gets 10.
+        timeout-minutes: 40
         run: |
           "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" update
-          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y cmake libgtk-4-dev libadwaita-1-dev libssl-dev pkg-config liblzma-dev libasound2-dev rpm zstd desktop-file-utils libarchive-tools fakeroot
+          APT_TRY_SECONDS=600 "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y cmake libgtk-4-dev libadwaita-1-dev libssl-dev pkg-config liblzma-dev libasound2-dev rpm zstd desktop-file-utils libarchive-tools fakeroot
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -1575,7 +1576,7 @@ jobs:
           done
 
       - name: Install riscv64 cross toolchain + GTK4/libadwaita sysroot
-        timeout-minutes: 30
+        timeout-minutes: 50
         run: |
           set -euxo pipefail
           # The release libglib2.0-dev-bin depends on python3-packaging, which
@@ -1634,7 +1635,7 @@ jobs:
             exit 1
           fi
           echo "glib for the riscv64 sysroot: $glib"
-          "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y --allow-downgrades $pkgs "libglib2.0-0t64:amd64=$glib"
+          APT_TRY_SECONDS=600 "$GITHUB_WORKSPACE/scripts/ci/apt-retry.sh" install -y --allow-downgrades $pkgs "libglib2.0-0t64:amd64=$glib"
 
       - name: Build
         working-directory: frontends/gtk4
