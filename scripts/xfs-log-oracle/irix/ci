@@ -1,0 +1,3 @@
+#!/bin/sh
+# iris-ci against the machine launch.sh started in this folder.
+exec "${IRIS_BIN:?set IRIS_BIN}/iris-ci" --socket "$(cd "$(dirname "$0")" && pwd)/iris.sock" "$@"

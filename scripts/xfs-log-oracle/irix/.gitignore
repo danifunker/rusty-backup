@@ -1,0 +1,8 @@
+boot.raw
+test.raw
+scratch.raw
+nvram.bin
+console.log
+iris-stdout.log
+iris.sock
+*.txt

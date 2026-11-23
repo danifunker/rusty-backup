@@ -3,6 +3,30 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.2.2
+
+### Fixed
+- Logs written by IRIX replay. IRIX 6.5 writes version-1 records with `h_fmt` 0, which were
+  read as little-endian, so `check_log` refused them ("item 0x5254 is missing regions").
+  Each transaction's byte order now comes from its `TRAN` header magic, and an `h_fmt` of 0
+  counts as big-endian. IRIX's item layouts (56-byte inode items, buffer items, EFI / EFD)
+  were checked against real IRIX 6.5 logs and match the format document, big-endian.
+- A record that runs past the end of the log was taken for a torn write, so a log that had
+  wrapped mid-record (on IRIX or Linux) could not be replayed. Sectors past the end carry the
+  next cycle's stamp, and are now expected to.
+- An inode item is skipped when the copy on disk is newer (a higher `di_flushiter` on v1 / v2
+  inodes, a higher `di_lsn` on v3), rather than rolling the inode back. IRIX flushes inodes
+  with changes it never logged.
+- The clean log written after a replay or a discard keeps the old log's record version,
+  `h_fmt` / UUID / `h_size` fields and payload byte order, so IRIX accepts it: a v1 log stays
+  v1.
+
+Validated under the IRIS emulator against IRIX 6.5.22 itself: on a volume made by IRIX's own
+mkfs and crashed mid-workload, the replayed volume mounts on IRIX with no log recovery, IRIX's
+`xfs_repair -n` is clean, and every entry's inode number, mode, owner, size, mtime and
+checksum match IRIX's own recovery of the same disk. An IRIX root disk replayed this way boots
+with no log recovery.
+
 ## 0.2.1
 
 ### Added
