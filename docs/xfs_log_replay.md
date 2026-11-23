@@ -3,7 +3,8 @@
 `crates/fs-xfs/src/xfs/log_replay.rs` recovers an XFS volume that was not cleanly unmounted,
 the way a Linux or IRIX mount would. fsck reports the dirty log. Repair replays it before any
 other pass. `rb-cli fsck --repair --discard-log` (`XfsFilesystem::discard_log`) throws away a
-log that cannot be replayed, like `xfs_repair -L`.
+log that cannot be replayed, like `xfs_repair -L`; it refuses a log that is clean or that
+`--repair` can replay.
 
 ## Clean room
 
@@ -37,11 +38,18 @@ values, so these were pinned by matching raw log bytes against `xfs_logprint`:
    the end of the log, and undoes the cycle stamps from `h_cycle_data` (continued in
    extended headers past 32 KiB). Operations are grouped by transaction id, and a `WAS_CONT`
    operation extends the previous region. A transaction is applied when its commit record
-   arrives. Transactions with no commit by the head are dropped, as a mount drops them.
-3. **First pass (no writes).** Counts buffer cancellations, pairs intents with their done
-   items (the id at offset 8 of both), and refuses anything it cannot finish:
-   unfinished rmap, refcount, bmap, attr or exchange intents, unknown item types, and a
-   missing or torn record between the tail and the head. A refused log is left untouched.
+   arrives. Transactions with no commit by the head are dropped, as a mount drops them. A
+   header is only taken as a record if its data sectors fit its cycle-data slots and `h_size`
+   is at most 256 KiB.
+3. **First pass (no writes).** Validates every item completely, so that the second pass can
+   fail only on I/O: format sizes, region counts, dirty-map runs inside their buffer, the
+   inode core's length and version, inode-create items naming one chunk inside an AG, and
+   every write target inside the volume. It also counts buffer cancellations, pairs intents
+   with their done items (the id at offset 8 of both), and refuses anything it cannot finish:
+   a malformed item,
+   unfinished rmap, refcount, bmap, attr or exchange intents, unknown item types, a missing,
+   torn or out-of-sequence record between the tail and the head (the walk must start at the
+   tail's LSN and climb to the head's), and more than 256 MiB of uncommitted data. A refused log is left untouched.
 4. **Second pass.** Items are applied in commit order:
    - **Buffers.** Each run of set bits in the 128-byte-chunk map takes the next region. A
      buffer cancelled later in the log is skipped. An `INODE_BUF` item updates only the
@@ -72,8 +80,8 @@ values, so these were pinned by matching raw log bytes against `xfs_logprint`:
 5. **Finish.** The lazy superblock counters (`sb_icount`, `sb_ifree`, `sb_fdblocks`) are
    summed from the AG headers, as a mount does (the "checked" flags are cleared too when
    quotas need a recount). The log is then rewritten as one unmount
-   record at block 0 with cycle *c*+1 (*c* being the old head's cycle, so no v5 metadata
-   LSN is ahead of the log), and every other sector is stamped with cycle *c*.
+   record at block 0 with cycle *c*+1 (*c* being the old head's cycle, or for a discard the
+   highest cycle any header claims, so no v5 metadata LSN is ahead of the log), and every other sector is stamped with cycle *c*.
    `xfs_repair` needs that stamp to find the head.
 
 After a replay, repair also frees the inodes on the AGI unlinked lists (files deleted while

@@ -952,6 +952,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
             // Directory entries are written only after this, so a short source leaves no file.
             self.write_blocks_from(&picked, data, data_len)?;
         }
+        // A source longer than `data_len` is refused, as before streaming, not cut short.
+        if data.read(&mut [0u8; 1])? > 0 {
+            return Err(FilesystemError::InvalidData(format!(
+                "{name}: the source holds more than the {data_len} bytes declared"
+            )));
+        }
 
         let mut records_left = total_records;
         let mut block_cursor = 0usize;
@@ -1440,6 +1446,28 @@ mod tests {
         assert!(fs.list_directory(&root).unwrap().is_empty());
         // 180 blocks - 2 directory blocks (al0 = 0xC0) = 178 free.
         assert_eq!(fs.free_blocks().len(), 178);
+    }
+
+    #[test]
+    fn a_source_longer_than_declared_is_refused() {
+        use crate::cpm_diskdefs::EINSTEIN;
+        let mut fs =
+            CpmFilesystem::open_with_dpb(Cursor::new(create_blank(EINSTEIN)), 0, EINSTEIN).unwrap();
+        let root = fs.root().unwrap();
+        let data = vec![7u8; 300];
+        for declared in [0u64, 200] {
+            let err = fs
+                .create_file(
+                    &root,
+                    "LONG.DAT",
+                    &mut &data[..],
+                    declared,
+                    &Default::default(),
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("more than"), "{err}");
+        }
+        assert!(fs.list_directory(&root).unwrap().is_empty());
     }
 
     /// EXM 1 (Einstein): an entry covers two logical extents, its extent byte names the last one

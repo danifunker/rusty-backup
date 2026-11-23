@@ -28,3 +28,30 @@ mod split_backup_roundtrip;
 mod superfloppy_compression;
 mod timestamp_preservation;
 mod wave2_dispatch_e2e;
+
+/// Decode a zstd fixture into `out`, seeking over all-zero runs so the file stays sparse.
+pub(crate) fn decode_sparse(src: std::fs::File, out: &mut std::fs::File) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut dec = zstd::stream::read::Decoder::new(src).unwrap();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut len = 0u64;
+    loop {
+        let mut n = 0;
+        while n < buf.len() {
+            match dec.read(&mut buf[n..]).unwrap() {
+                0 => break,
+                k => n += k,
+            }
+        }
+        if n == 0 {
+            break;
+        }
+        if buf[..n].iter().all(|&b| b == 0) {
+            out.seek(SeekFrom::Current(n as i64)).unwrap();
+        } else {
+            out.write_all(&buf[..n]).unwrap();
+        }
+        len += n as u64;
+    }
+    out.set_len(len).unwrap();
+}

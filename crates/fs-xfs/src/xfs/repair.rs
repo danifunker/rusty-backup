@@ -308,10 +308,18 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             unrepairable_count: 0,
         };
         if r.unfinished_frees > 0 {
-            report.fixes_applied.push(format!(
-                "log: {} unfinished extent frees left to the free-space rebuild",
-                r.unfinished_frees
-            ));
+            let line = format!("log: {} unfinished extent frees", r.unfinished_frees);
+            if self.superblock().edit_blocker().is_some() {
+                // No free-space rebuild runs on this volume, so those blocks stay leaked.
+                report.unrepairable_count += 1;
+                report.fixes_failed.push(format!(
+                    "{line}: their blocks stay allocated until xfs_repair rebuilds the free space"
+                ));
+            } else {
+                report
+                    .fixes_applied
+                    .push(format!("{line} left to the free-space rebuild"));
+            }
         }
         Ok(Some(report))
     }

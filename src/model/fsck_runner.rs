@@ -9,13 +9,13 @@
 use std::fs::OpenOptions;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::fs::{open_editable_filesystem, open_filesystem, FsckResult, RepairReport};
 use crate::model::source_reader::{is_chd_path, open_read};
 
-/// Throw away the internal log of the XFS volume at `offset` (`xfs_repair -L`), for a log no
-/// repair can replay. Every change the log holds that had not reached the disk is lost.
+/// Throw away the internal log of the XFS volume at `offset` (`xfs_repair -L`); refused unless
+/// no repair can replay it. Every change the log holds that had not reached the disk is lost.
 pub fn discard_xfs_log<R: std::io::Read + std::io::Write + std::io::Seek>(
     reader: &mut R,
     offset: u64,
@@ -25,6 +25,18 @@ pub fn discard_xfs_log<R: std::io::Read + std::io::Write + std::io::Seek>(
     reader.read_exact(&mut sector)?;
     let sb = fs_xfs::xfs::sb::XfsSuperblock::parse(&sector)
         .map_err(|e| anyhow!("--discard-log works on XFS volumes only: {e}"))?;
+    use fs_xfs::xfs::log_replay::{check_log, LogCheck};
+    if sb.logstart == 0 {
+        bail!("this XFS keeps its log on another device; there is no internal log to discard");
+    }
+    match check_log(reader, offset, &sb).map_err(|e| anyhow!("reading the XFS log: {e}"))? {
+        LogCheck::Clean => bail!("the XFS log is already clean; there is nothing to discard"),
+        LogCheck::Replayable { .. } => bail!(
+            "the XFS log can be replayed, which keeps its changes: run `fsck --repair` without \
+             --discard-log"
+        ),
+        LogCheck::Unrecoverable(_) => {}
+    }
     fs_xfs::xfs::log_replay::zero_log(reader, offset, &sb)
         .map_err(|e| anyhow!("discarding the XFS log: {e}"))?;
     reader.flush()?;

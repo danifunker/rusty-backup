@@ -17,7 +17,7 @@ fn dirty_image(dir: &Path) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sgi/xfs_v4_dirty_log.img.zst");
     let img = dir.join("dirty.img");
     let mut out = std::fs::File::create(&img).unwrap();
-    zstd::stream::copy_decode(std::fs::File::open(src).unwrap(), &mut out).unwrap();
+    crate::decode_sparse(std::fs::File::open(src).unwrap(), &mut out);
     img
 }
 
@@ -33,6 +33,12 @@ fn fsck_replays_a_dirty_xfs_log() {
 
     let lone = cli(&["fsck", "--discard-log", img_s]);
     assert!(!lone.status.success(), "--discard-log needs --repair");
+
+    // A log that can be replayed is never thrown away.
+    let discard = cli(&["fsck", "--repair", "--discard-log", img_s]);
+    assert!(!discard.status.success());
+    assert!(String::from_utf8_lossy(&discard.stderr).contains("can be replayed"));
+    assert!(String::from_utf8_lossy(&cli(&["fsck", img_s]).stdout).contains("[LogDirty]"));
 
     let repair = cli(&["fsck", "--repair", img_s]);
     let out = String::from_utf8_lossy(&repair.stdout);

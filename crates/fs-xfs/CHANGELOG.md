@@ -15,10 +15,15 @@ All notable changes to this crate are documented here. This project follows
   turned off later in the log, clears the "quotas checked" flags so the next quota mount
   recounts, as does discarding the log. A log it cannot finish (unfinished rmap / refcount / bmap / attr intents, a
   torn record before the head) is left untouched and reported; `XfsFilesystem::discard_log`
-  (`xfs_repair -L`) is the explicit way out. Written from the public format document and
-  black-box output only; see `docs/xfs_log_replay.md`.
+  (`xfs_repair -L`) is the explicit way out. Every item is validated (sizes, region counts,
+  dirty maps, write targets inside the volume, LSN order from tail to head) before anything is
+  written, so a malformed or hostile log is refused untouched rather than half applied or a
+  panic. Written from the public format document and black-box output only; see
+  `docs/xfs_log_replay.md`.
 
 ### Fixed
+- `log_state` finds the head as replay does (skipping a torn newest record), so edits and
+  repair agree on whether the log is clean.
 - The v5 project-quota inode (`sb_pquotino`) counts as a superblock root, so fsck no longer
   reports it as an orphan and repair no longer moves it to lost+found.
 - Edits, repair, chmod and chown refuse a volume whose log was not cleanly unmounted (the head

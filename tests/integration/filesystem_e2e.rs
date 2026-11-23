@@ -3667,7 +3667,7 @@ fn apfs_multi_volume_container_browses_every_volume() {
     // which a 32-bit test process could not hold.
     let mut img = tempfile::tempfile().expect("temp file");
     let src = std::fs::File::open("tests/fixtures/test_apfs_multivolume.img.zst").expect("fixture");
-    zstd::stream::copy_decode(src, &mut img).expect("decode fixture");
+    crate::decode_sparse(src, &mut img);
     let mut fs = fs_apfs::apfs::ApfsFilesystem::open(img, 0).expect("open APFS");
     let root = fs.root().expect("root");
     let vols = fs.list_directory(&root).expect("list root");
