@@ -290,6 +290,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             "log: replayed {} committed transactions ({} buffers, {} inodes, {} inode chunks)",
             r.transactions, r.buffers, r.inodes, r.inode_chunks
         );
+        if r.quotas > 0 {
+            fix.push_str(&format!(", {} quota records", r.quotas));
+        }
+        if r.quota_recount {
+            fix.push_str("; quotas will be recounted on the next quota mount");
+        }
         if r.incomplete > 0 {
             fix.push_str(&format!(
                 "; dropped {} that never committed, as a mount does",

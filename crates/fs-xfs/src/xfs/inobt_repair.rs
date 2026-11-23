@@ -94,7 +94,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             return Ok(report);
         }
 
-        let internal: HashSet<u64> = sb.internal_inodes().into_iter().collect();
+        let internal: HashSet<u64> = self.internal_inodes().into_iter().collect();
         let sectsize = sb.sectsize as u64;
         let agblocks = sb.agblocks as u64;
         let blocksize = sb.blocksize as u64;
@@ -776,7 +776,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let blocksize = sb.blocksize as u64;
         let sectsize = sb.sectsize as u64;
         let mut map = InUseMap::new(sb.dblocks)?;
-        let internal: HashSet<u64> = sb.internal_inodes().into_iter().collect();
+        let internal: HashSet<u64> = self.internal_inodes().into_iter().collect();
         let blocks_per_chunk =
             ((XFS_INODES_PER_CHUNK as u64) * sb.inodesize as u64).div_ceil(blocksize);
         let header_blocks = (4 * sectsize).div_ceil(blocksize).max(1);

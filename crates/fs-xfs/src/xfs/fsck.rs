@@ -170,7 +170,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         check_superblock_geometry(&sb, &mut b);
         let ag_headers = self.check_ag_headers(&sb, &mut b);
         let allocated = self.check_allocations(&sb, &ag_headers, &mut b);
-        self.check_connectivity(&sb, &allocated, &mut b);
+        self.check_connectivity(&allocated, &mut b);
 
         Ok(b.finish())
     }
@@ -725,12 +725,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// reachable inode. Any allocated inode not reached is an orphan
     /// (repairable: R7 will reconnect it into lost+found). Directory entries
     /// pointing at inodes the inobt didn't mark allocated are dangling.
-    fn check_connectivity(
-        &mut self,
-        sb: &XfsSuperblock,
-        allocated: &HashSet<u64>,
-        b: &mut Builder,
-    ) {
+    fn check_connectivity(&mut self, allocated: &HashSet<u64>, b: &mut Builder) {
         if allocated.is_empty() {
             // Phase 2 was skipped or found nothing; orphan analysis needs the
             // allocated set, so there's nothing to compare against.
@@ -749,7 +744,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         // Seed the superblock-referenced internal inodes (root + realtime
         // bitmap/summary + quota inodes). They're allocated but reached only
         // via the superblock, not the directory tree.
-        for ino in sb.internal_inodes() {
+        for ino in self.internal_inodes() {
             reachable.insert(ino);
         }
         let mut queue = vec![root];

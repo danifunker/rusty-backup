@@ -1,0 +1,6 @@
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
+for m in $(cat /mods/order); do insmod /mods/$m.ko; done
+mkdir -p /newroot; mount -t 9p -o trans=virtio,version=9p2000.L,msize=262144 root /newroot || sh
+exec switch_root /newroot /bin/sh -c 'mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev; mount -t tmpfs tmp /tmp; modprobe xfs; modprobe loop; sh /w/vmjob.sh > /w/vmjob.out 2>&1; sync; echo o > /proc/sysrq-trigger'

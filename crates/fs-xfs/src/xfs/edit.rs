@@ -2690,7 +2690,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         // directory can't be listed the reachable set is incomplete, so abort
         // (reconnecting then would wrongly relink genuinely-reachable inodes).
         use std::collections::HashSet;
-        let mut reachable: HashSet<u64> = sb.internal_inodes().into_iter().collect();
+        let mut reachable: HashSet<u64> = self.internal_inodes().into_iter().collect();
         reachable.insert(root.location);
         let mut visited: HashSet<u64> = HashSet::new();
         let mut queue = vec![root.clone()];

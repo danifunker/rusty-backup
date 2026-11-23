@@ -7,8 +7,8 @@
 //!
 //! The walk runs twice over the records from the tail to the head. The first pass writes
 //! nothing: it collects buffer cancellations and intent / done pairs, and refuses a log holding
-//! anything this module cannot finish (quota items, unfinished rmap / refcount / bmap / attr /
-//! exchange intents). The second pass applies each transaction when its commit record arrives.
+//! anything this module cannot finish (unfinished rmap / refcount / bmap / attr / exchange
+//! intents). The second pass applies each transaction when its commit record arrives.
 //! Only open transactions are held in memory. Unfinished extent-free intents are reported, not
 //! applied: the blocks they name are left allocated but unowned, which the repair that follows
 //! (the free-space rebuild) returns to the free space.
@@ -49,6 +49,20 @@ const LI_RT_EFD: u16 = 0x124b;
 
 const BLF_INODE_BUF: u16 = 0x1;
 const BLF_CANCEL: u16 = 0x2;
+/// Quota-buffer flags (user, project, group); see `quota_kind`.
+const BLF_DQUOT_BUFS: u16 = 0x4 | 0x8 | 0x10;
+
+/// `sb_qflags` accounting bits for user, project and group quotas, and every "checked" bit.
+const QF_UACCT: u16 = 0x1;
+const QF_PACCT: u16 = 0x8;
+const QF_GACCT: u16 = 0x40;
+const QF_ALL_CHKD: u16 = 0x4 | 0x20 | 0x100 | 0x400;
+/// `xfs_dqblk` size on v5, with its CRC and LSN offsets.
+const DQBLK_V5: usize = 136;
+const DQ_CRC: usize = 108;
+const DQ_LSN: usize = 112;
+/// Size of the logged `xfs_disk_dquot`.
+const DISK_DQUOT: usize = 104;
 const BLF_CHUNK: usize = 128;
 
 const ILOG_CORE: u32 = 0x1;
@@ -84,6 +98,11 @@ pub struct ReplayReport {
     pub inode_chunks: usize,
     /// Extent-free intents with no done record: blocks the repair's free-space rebuild reclaims.
     pub unfinished_frees: usize,
+    /// Quota records written back.
+    pub quotas: usize,
+    /// Quota items not replayed (malformed, or for a quota turned off later in the log); the
+    /// "checked" flags are cleared instead, so the next quota mount recounts usage.
+    pub quota_recount: bool,
 }
 
 /// What [`replay_log`] found.
@@ -423,6 +442,33 @@ struct Survey {
     done: HashSet<(u16, u64)>,
     problem: Option<String>,
     transactions: usize,
+    /// `sb_qflags` accounting bits of quotas a quota-off item turned off.
+    quota_off: u16,
+    /// A quota item this module cannot read: replay none of them and force a recount.
+    quota_unreadable: bool,
+}
+
+/// The `sb_qflags` accounting bit a quota buffer item (by `blf_flags`) belongs to.
+fn quota_buf_kind(blf_flags: u16) -> u16 {
+    match blf_flags & BLF_DQUOT_BUFS {
+        0x4 => QF_UACCT,
+        0x8 => QF_PACCT,
+        0x10 => QF_GACCT,
+        _ => 0,
+    }
+}
+
+/// The accounting bit a logged dquot (by `d_flags`) belongs to, or `None` if it is not one.
+fn quota_kind(dq: &[u8]) -> Option<u16> {
+    if dq.len() < DISK_DQUOT || dq[0..2] != *b"DQ" {
+        return None;
+    }
+    match dq[3] & 0x7 {
+        1 => Some(QF_UACCT),
+        2 => Some(QF_PACCT),
+        4 => Some(QF_GACCT),
+        _ => None,
+    }
 }
 
 fn buf_key(f: &[u8], en: En) -> BufKey {
@@ -453,10 +499,18 @@ fn survey(t: &Trans, en: En, s: &mut Survey) -> Result<(), FilesystemError> {
                     s.done.insert((it.kind, id));
                 }
             }
-            LI_DQUOT | LI_QUOTAOFF => {
-                s.problem.get_or_insert_with(|| {
-                    "the log holds quota updates, which this tool does not replay".into()
-                });
+            LI_DQUOT => {
+                if f.len() < 24 || it.regions.get(1).and_then(|r| quota_kind(r)).is_none() {
+                    s.quota_unreadable = true;
+                }
+            }
+            LI_QUOTAOFF => {
+                // qf_flags holds the accounting bits being turned off.
+                s.quota_off |= if f.len() >= 8 {
+                    en.u32(f, 4) as u16
+                } else {
+                    u16::MAX
+                };
             }
             k if intent_name(k).is_some() => {
                 if let Some(id) = item_id(f, en) {
@@ -526,6 +580,14 @@ fn restamp_v5_block(b: &mut [u8], lsn: u64) {
     if b.len() < 64 {
         return;
     }
+    if b[0..2] == *b"DQ" {
+        for dq in b.chunks_mut(DQBLK_V5) {
+            if dq.len() == DQBLK_V5 && dq[0..2] == *b"DQ" {
+                restamp_dqblk(dq, lsn);
+            }
+        }
+        return;
+    }
     let m32 = be32(b, 0);
     let (lsn_off, crc_off) = match &m32.to_be_bytes() {
         b"XFSB" => (240, 224),
@@ -549,6 +611,34 @@ fn restamp_v5_block(b: &mut [u8], lsn: u64) {
     };
     b[lsn_off..lsn_off + 8].copy_from_slice(&lsn.to_be_bytes());
     stamp_crc(&mut b[..span], crc_off);
+}
+
+/// Set a v5 quota record's LSN and checksum.
+fn restamp_dqblk(dq: &mut [u8], lsn: u64) {
+    dq[DQ_LSN..DQ_LSN + 8].copy_from_slice(&lsn.to_be_bytes());
+    stamp_crc(&mut dq[..DQBLK_V5], DQ_CRC);
+}
+
+/// Write a logged quota record back into its dquot block.
+fn apply_dquot<D: Read + Write + Seek>(
+    dev: &mut D,
+    g: &Geo,
+    it: &Item<'_>,
+    en: En,
+    lsn: u64,
+) -> Result<(), FilesystemError> {
+    let f = &it.regions[0];
+    let dq = &it.regions[1][..DISK_DQUOT];
+    let at = g.byte(en.u64(f, 8)) + u64::from(en.u32(f, 20));
+    if g.v5 {
+        let mut rec = read_exact_at(dev, at, DQBLK_V5)?;
+        rec[..DISK_DQUOT].copy_from_slice(dq);
+        restamp_dqblk(&mut rec, lsn);
+        write_at(dev, at, &rec)?;
+    } else {
+        write_at(dev, at, dq)?;
+    }
+    Ok(())
 }
 
 /// Restamp every v3 inode in an inode-cluster buffer.
@@ -922,6 +1012,13 @@ pub fn replay_log<D: Read + Write + Seek>(
         ..ReplayReport::default()
     };
     let mut cancels = s.cancels;
+    // Quota items of a quota turned off later, or any at all if one is unreadable, are skipped.
+    let quota_skip = if s.quota_unreadable {
+        u16::MAX
+    } else {
+        s.quota_off
+    };
+    report.quota_recount = s.quota_unreadable || s.quota_off != 0;
     let cancelled_at =
         |c: &HashMap<BufKey, u32>, daddr: u64| c.iter().any(|(k, n)| *n > 0 && k.0 == daddr);
     let (records, incomplete) = walk(dev, &log, &head, |dev, t, en| {
@@ -939,6 +1036,8 @@ pub fn replay_log<D: Read + Write + Seek>(
                         report.cancelled += 1;
                     } else if cancels.get(&key).copied().unwrap_or(0) > 0 {
                         report.cancelled += 1;
+                    } else if quota_buf_kind(en.u16(f, 4)) & quota_skip != 0 {
+                        // A quota buffer for a quota whose records are not replayed.
                     } else {
                         apply_buffer(dev, &g, &it, en, lsn)?;
                         report.buffers += 1;
@@ -966,6 +1065,13 @@ pub fn replay_log<D: Read + Write + Seek>(
                         report.inode_chunks += 1;
                     }
                 }
+                LI_DQUOT => {
+                    let kind = it.regions.get(1).and_then(|r| quota_kind(r)).unwrap_or(0);
+                    if kind != 0 && kind & quota_skip == 0 {
+                        apply_dquot(dev, &g, &it, en, lsn)?;
+                        report.quotas += 1;
+                    }
+                }
                 _ => {}
             }
         }
@@ -975,6 +1081,9 @@ pub fn replay_log<D: Read + Write + Seek>(
     report.records = records;
     report.incomplete = incomplete;
     resync_sb_counters(dev, &g, sb)?;
+    if report.quota_recount {
+        clear_quota_checked(dev, &g, sb)?;
+    }
     write_clean_log(dev, &log, sb, head.lsn >> 32)?;
     Ok(ReplayOutcome::Replayed(report))
 }
@@ -990,7 +1099,10 @@ pub fn zero_log<D: Read + Write + Seek>(
     }
     let log = Log::new(partition_offset, sb);
     let cycle = find_head(dev, &log)?.map_or(0, |h| h.lsn >> 32);
-    resync_sb_counters(dev, &Geo::new(partition_offset, sb), sb)?;
+    let g = Geo::new(partition_offset, sb);
+    resync_sb_counters(dev, &g, sb)?;
+    // The quota records on disk need not match the files once the log is gone.
+    clear_quota_checked(dev, &g, sb)?;
     write_clean_log(dev, &log, sb, cycle)
 }
 
@@ -1027,6 +1139,23 @@ const SB_ICOUNT: usize = 128;
 const SB_IFREE: usize = 136;
 const SB_FDBLOCKS: usize = 144;
 const SB_CRC: usize = 224;
+const SB_QFLAGS: usize = 176;
+
+/// Clear every `sb_qflags` "checked" bit, so the next quota mount recounts usage.
+fn clear_quota_checked<D: Read + Write + Seek>(
+    dev: &mut D,
+    g: &Geo,
+    sb: &XfsSuperblock,
+) -> Result<(), FilesystemError> {
+    let mut p = read_exact_at(dev, g.off, usize::from(sb.sectsize))?;
+    let q = u16::from_be_bytes([p[SB_QFLAGS], p[SB_QFLAGS + 1]]) & !QF_ALL_CHKD;
+    p[SB_QFLAGS..SB_QFLAGS + 2].copy_from_slice(&q.to_be_bytes());
+    if g.v5 {
+        stamp_crc(&mut p, SB_CRC);
+    }
+    write_at(dev, g.off, &p)?;
+    Ok(())
+}
 
 /// Set `sb_icount`, `sb_ifree` and `sb_fdblocks` from the AG headers, as a mount does.
 fn resync_sb_counters<D: Read + Write + Seek>(
@@ -1284,8 +1413,46 @@ mod tests {
     }
 
     #[test]
-    fn a_log_with_quota_items_is_refused_untouched() {
+    fn a_log_with_an_unfinished_rmap_intent_is_refused_untouched() {
         let (mut img, sb) = blank();
+        let mut rui = Vec::new();
+        rui.extend_from_slice(&0x1240u16.to_le_bytes());
+        rui.extend_from_slice(&1u16.to_le_bytes());
+        rui.extend_from_slice(&1u32.to_le_bytes());
+        rui.extend_from_slice(&77u64.to_le_bytes());
+        rui.resize(48, 0);
+        put_record(
+            &mut img,
+            &sb,
+            2,
+            &[
+                (5, OP_START, vec![]),
+                (5, 0, trans_header(5, 1)),
+                (5, 0, rui),
+                (5, OP_COMMIT, vec![]),
+            ],
+        );
+        let before = img.clone();
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let res = fs.run_fsck().unwrap();
+        assert_eq!(res.errors[0].code, "LogUnrecoverable");
+        assert!(!res.repairable);
+        let err = fs.repair().unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be replayed") && err.contains("reverse-mapping"),
+            "{err}"
+        );
+        assert!(fs.reader.get_ref() == &before, "nothing may be written");
+
+        fs.discard_log().unwrap();
+        assert!(fs.run_fsck().unwrap().errors.is_empty());
+    }
+
+    /// A quota item this module cannot read is skipped, and the next quota mount recounts.
+    #[test]
+    fn an_unreadable_quota_item_forces_a_recount() {
+        let (mut img, sb) = blank();
+        img[SB_QFLAGS..SB_QFLAGS + 2].copy_from_slice(&0x7u16.to_be_bytes());
         let mut dq = Vec::new();
         dq.extend_from_slice(&LI_DQUOT.to_le_bytes());
         dq.extend_from_slice(&2u16.to_le_bytes());
@@ -1302,19 +1469,59 @@ mod tests {
                 (5, OP_COMMIT, vec![]),
             ],
         );
-        let before = img.clone();
-        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).unwrap();
-        let res = fs.run_fsck().unwrap();
-        assert_eq!(res.errors[0].code, "LogUnrecoverable");
-        assert!(!res.repairable);
-        let err = fs.repair().unwrap_err().to_string();
-        assert!(
-            err.contains("cannot be replayed") && err.contains("quota"),
-            "{err}"
+        let mut dev = Cursor::new(img);
+        let ReplayOutcome::Replayed(r) = replay_log(&mut dev, 0, &sb).unwrap() else {
+            panic!("not replayed");
+        };
+        assert!(r.quota_recount);
+        assert_eq!(r.quotas, 0);
+        let img = dev.into_inner();
+        assert_eq!(
+            u16::from_be_bytes([img[SB_QFLAGS], img[SB_QFLAGS + 1]]),
+            0x3
         );
-        assert!(fs.reader.get_ref() == &before, "nothing may be written");
+    }
 
-        fs.discard_log().unwrap();
+    /// Made on a quota-enabled mount: files created, chowned and deleted, and a limit set.
+    fn replays_quota(name: &str, quotas: usize, qflags: u16) {
+        let mut dev = dirty_fixture(name);
+        let mut sec = [0u8; 512];
+        dev.seek(SeekFrom::Start(0)).unwrap();
+        dev.read_exact(&mut sec).unwrap();
+        let sb = XfsSuperblock::parse(&sec).unwrap();
+        let ReplayOutcome::Replayed(r) = replay_log(&mut dev, 0, &sb).unwrap() else {
+            panic!("not replayed");
+        };
+        assert_eq!((r.quotas, r.quota_recount), (quotas, false));
+        // User 1002's record (block 384 + 1632 on v5): 40 blocks used, a 1 MiB soft limit.
+        let at = if sb.versionnum & 0xF == 5 {
+            384 * 512 + 1632
+        } else {
+            0
+        };
+        if at != 0 {
+            let rec = read_exact_at(&mut dev, at, DQBLK_V5).unwrap();
+            assert_eq!(be32(&rec, 4), 1002);
+            assert_eq!(be64(&rec, 16), 256);
+            assert_eq!(be64(&rec, 40), 40);
+            assert!(super::super::v5_crc::crc_valid(&rec, DQ_CRC));
+        }
+        let sec = read_exact_at(&mut dev, 0, 512).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([sec[SB_QFLAGS], sec[SB_QFLAGS + 1]]),
+            qflags
+        );
+        let mut fs = XfsFilesystem::open(dev, 0).unwrap();
         assert!(fs.run_fsck().unwrap().errors.is_empty());
+    }
+
+    #[test]
+    fn v5_quota_records_replay_like_the_kernel() {
+        replays_quota("xfs_v5_dirty_log_quota.img.zst", 18, 0x7cf);
+    }
+
+    #[test]
+    fn v4_quota_records_replay_like_the_kernel() {
+        replays_quota("xfs_v4_dirty_log_quota.img.zst", 8, 0x77);
     }
 }

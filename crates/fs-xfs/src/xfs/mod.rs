@@ -57,6 +57,16 @@ use types::{DiFormat, DirFormat};
 
 const SECTOR: u64 = 512;
 
+/// `sb_pquotino` at offset 232 of a v5 superblock sector; 0 on v4, where project quotas
+/// share the group-quota inode.
+fn pquotino_of(sb: &XfsSuperblock, sector: &[u8]) -> u64 {
+    if sb.is_v5() {
+        BigEndian::read_u64(&sector[232..240])
+    } else {
+        0
+    }
+}
+
 /// 1 MiB streaming chunk size — matches the rest of the codebase.
 const STREAM_CHUNK: usize = 1024 * 1024;
 
@@ -70,6 +80,8 @@ pub struct XfsFilesystem<R: Read + Seek + Send> {
     fs_type_name: &'static str,
     /// The log's state, scanned on the first edit ([`Self::log_state`]).
     log: Option<log::LogState>,
+    /// `sb_pquotino` (v5 only), the project-quota inode; kept here so the superblock struct is unchanged.
+    pquotino: u64,
 }
 
 impl<R: Read + Seek + Send> XfsFilesystem<R> {
@@ -123,6 +135,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         ));
 
         let label = sb.label();
+        let pquotino = pquotino_of(&sb, &sector);
         Ok(XfsFilesystem {
             reader,
             partition_offset,
@@ -131,6 +144,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             label,
             fs_type_name,
             log: None,
+            pquotino,
         })
     }
 
@@ -461,9 +475,20 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         sb.validate_geometry()?;
         self.dir_format = sb.dir_format();
         self.label = sb.label();
+        self.pquotino = pquotino_of(&sb, &sector);
         self.sb = sb;
         self.log = None;
         Ok(())
+    }
+
+    /// The superblock-referenced inodes the connectivity check treats as roots, the v5
+    /// project-quota inode included.
+    pub(crate) fn internal_inodes(&self) -> Vec<u64> {
+        let mut v = self.sb.internal_inodes();
+        if self.pquotino != 0 && self.pquotino != u64::MAX && !v.contains(&self.pquotino) {
+            v.push(self.pquotino);
+        }
+        v
     }
 
     /// Whether the internal log is clean; read once, then cached.
