@@ -28,6 +28,23 @@ values, so these were pinned by matching raw log bytes against `xfs_logprint`:
 | `ilf_fields` | CORE 0x1, DDATA 0x2, DEXT 0x4, DBROOT 0x8, DEV 0x10, UUID 0x20, ADATA 0x40, AEXT 0x80, ABROOT 0x100 |
 | `h_fmt` | 1 little-endian Linux, 2 big-endian Linux, 3 big-endian IRIX |
 
+## IRIX logs
+
+IRIX 6.5 writes version-1 records (one 512-byte header, up to 32 KiB of data) and leaves
+`h_fmt`, `h_fs_uuid` and `h_size` zero, and its items are big-endian, as IRIX's MIPS hosts
+are. Every transaction's byte order is therefore read from its own `TRAN` header magic, which
+only matches one way round; `h_fmt` is the fallback, with 0 taken as big-endian. The item
+layouts were checked against real IRIX 6.5 logs: inode items are the 56-byte 64-bit format,
+buffer items carry a 64-bit `blkno` and a dirty map, EFI / EFD use 64-bit extents, and the
+inode core is the 96-byte v2 core already in on-disk order. IRIX never unmounts `/` cleanly at
+shutdown, so every IRIX root disk comes back with a short pending log (root-directory
+timestamp updates) that the next boot replays.
+
+IRIX's own unmount record is a v1 record of 32 bytes whose one op (client `0xAA`, flags
+`0x20`) holds the 20 bytes `Unmount filesystem--`; the clean log written here keeps the old
+log's version, zero trailer and big-endian `0x556e` payload, which IRIX 6.5.22 mounts with no
+recovery.
+
 ## What replay does
 
 1. **Find the head.** The head is the record header with the highest LSN whose own block
@@ -49,13 +66,18 @@ values, so these were pinned by matching raw log bytes against `xfs_logprint`:
    a malformed item,
    unfinished rmap, refcount, bmap, attr or exchange intents, unknown item types, a missing,
    torn or out-of-sequence record between the tail and the head (the walk must start at the
-   tail's LSN and climb to the head's), more uncommitted data than the log's size or 1 GiB, and a log holding record headers
-   but no complete record (damaged, not clean). A refused log is left untouched.
+   tail's LSN and climb to the head's), more uncommitted data than the log's size or 1 GiB,
+   and a log holding record headers but no complete record (damaged, not clean). A refused
+   log is left untouched. A record that runs past the end of the log has its wrapped sectors
+   stamped with the next cycle, which is expected, not a torn write.
 4. **Second pass.** Items are applied in commit order:
    - **Buffers.** Each run of set bits in the 128-byte-chunk map takes the next region. A
      buffer cancelled later in the log is skipped. An `INODE_BUF` item updates only the
      `di_next_unlinked` fields. On v5, blocks are restamped by magic: LSN plus CRC.
-   - **Inodes.** The logged core is host-endian. Each field is swapped to big-endian;
+   - **Inodes.** An item is skipped when the disk copy is newer: a higher `di_flushiter`
+     (mod 2^16) on a v1 / v2 inode, or a higher `di_lsn` on a v3 one. IRIX flushes inodes
+     with changes it never logged, so replaying an older core would roll them back.
+     The logged core is host-endian. Each field is swapped to big-endian;
      timestamps are one 64-bit count with bigtime (`di_flags2` bit 3) and two 32-bit halves
      otherwise. The on-disk `di_next_unlinked` is kept. Forks are copied in place. A btree
      root is logged as an in-memory long-format block (72-byte v5 header, 24-byte v4), with
@@ -125,6 +147,18 @@ a v5 volume with user, group and project quotas and a v4 volume with user and gr
 (files created, chowned and deleted, a limit set, then a crash), our replay leaves
 `xfs_repair -n` clean, the kernel mounts with no quotacheck, and `xfs_quota report -ugbin`,
 the tree and every MD5 match the kernel's recovery (`xfs_v{4,5}_dirty_log_quota.img.zst`).
+
+IRIX logs are checked against IRIX 6.5.22 itself, run under the IRIS emulator
+(`scripts/xfs-log-oracle/irix/`). A 128 MB XFS made by IRIX's `mkfs`, given a workload (400
+creates, 250 deletes, a 2.5 MB file emptied, a hard link, a symlink, a chown, a rename, nested
+directories) and stopped mid-flight with the emulator killed, has a 1292-transaction log that
+wraps past the end of the log mid-record. IRIX mounting a copy recovers it; our replay of
+another copy mounts on IRIX with no recovery, IRIX's `xfs_repair -n` is clean before and after,
+and `ls -ldni` and `sum -r` of every entry are identical to IRIX's result. An IRIX 6.5 Indy root
+disk replayed by us boots with no recovery line in `/var/adm/SYSLOG`. The fixtures are
+`xfs_irix65_dirty_log.img.zst` (with IRIX's recovery of it, `xfs_irix65_recovered.img.zst`)
+and `xfs_irix65_root_log.img.zst` (the root disk with only its superblock, AG headers, root
+inode cluster and log kept).
 
 ## Not done
 

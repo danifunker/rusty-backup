@@ -1,0 +1,20 @@
+headless    = true
+no_audio    = true
+banks       = [128, 128, 0, 0]
+[scsi.1]
+path    = "boot.raw"
+cdrom   = false
+overlay = false
+write_cache = false
+[scsi.2]
+path    = "scratch.raw"
+cdrom   = false
+overlay = false
+write_cache = false
+scratch = true
+size_mb = 256
+[scsi.3]
+path    = "test.raw"
+cdrom   = false
+overlay = false
+write_cache = false

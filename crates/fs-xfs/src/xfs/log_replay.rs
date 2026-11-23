@@ -21,7 +21,7 @@ use disk_core::filesystem::FilesystemError;
 use super::ag::{XfsAgf, XfsAgi};
 use super::bmap::fsblock_to_partition_byte;
 use super::sb::XfsSuperblock;
-use super::v5_crc::stamp_crc;
+use super::v5_crc::{stamp_crc, XFS_LSN_NULL};
 
 const BB: u64 = 512;
 const HEADER_MAGIC: u32 = 0xFEED_BABE;
@@ -99,6 +99,7 @@ pub struct ReplayReport {
     pub buffers: usize,
     /// Buffer writes skipped because the blocks were freed later in the log.
     pub cancelled: usize,
+    /// Inode items applied; one whose disk copy is newer (flush count or LSN) is skipped.
     pub inodes: usize,
     pub inode_chunks: usize,
     /// Extent-free intents with no done record: blocks the repair's free-space rebuild reclaims.
@@ -245,11 +246,19 @@ fn read_record<R: Read + Seek>(
         let hb = &headers[hdr * BB as usize..(hdr + 1) * BB as usize];
         // Slot data starts at h_cycle_data (44) in the first header, after xh_cycle (4) in the rest.
         let base = if hdr == 0 { 44 } else { 4 };
-        if hdr > 0 && be32(hb, 0) != cycle {
+        // A sector past the end of the log carries the next pass's cycle: records wrap.
+        let pass = |phys: u64| {
+            if phys >= log.bbs {
+                cycle.wrapping_add(1)
+            } else {
+                cycle
+            }
+        };
+        if hdr > 0 && be32(hb, 0) != pass(blk + hdr as u64) {
             return Ok(None);
         }
         let s = &mut data[i * BB as usize..i * BB as usize + 4];
-        if be32(s, 0) != cycle {
+        if be32(s, 0) != pass(blk + header_bbs + i as u64) {
             return Ok(None); // a sector from an older pass: the write never finished
         }
         s.copy_from_slice(&hb[base + 4 * slot..base + 4 * slot + 4]);
@@ -260,9 +269,10 @@ fn read_record<R: Read + Seek>(
         lsn: be64(&h, 16),
         tail_lsn: be64(&h, 24),
         num_ops: be32(&h, 40),
-        // h_fmt: 1 little-endian Linux, 2 big-endian Linux, 3 big-endian IRIX.
+        // h_fmt: 1 little-endian Linux, 2 big-endian Linux, 3 big-endian IRIX; IRIX's v1
+        // records leave it 0. Only a fallback: each transaction's TRAN magic decides.
         en: En {
-            big: matches!(be32(&h, 300), 2 | 3),
+            big: matches!(be32(&h, 300), 0 | 2 | 3),
         },
         data,
         next: (blk + header_bbs + data_bbs) % log.bbs,
@@ -332,6 +342,18 @@ struct Trans {
     regions: Vec<Vec<u8>>,
     /// LSN of the record holding the start operation.
     lsn: u64,
+}
+
+/// A transaction's byte order, read from its `TRAN` header magic; `fallback` (from `h_fmt`)
+/// only when the magic matches neither way round.
+fn trans_order(t: &Trans, fallback: En) -> En {
+    match t.regions.first() {
+        Some(r) if r.len() >= 4 && be32(r, 0) == TRANS_MAGIC => En { big: true },
+        Some(r) if r.len() >= 4 && u32::from_le_bytes([r[0], r[1], r[2], r[3]]) == TRANS_MAGIC => {
+            En { big: false }
+        }
+        _ => fallback,
+    }
 }
 
 /// Walk the records from the tail to `head`, handing each committed transaction to `on_commit`.
@@ -419,7 +441,7 @@ fn walk<R: Read + Seek>(
             if flags & OP_COMMIT != 0 {
                 let t = open.remove(&tid).expect("present");
                 open_bytes -= t.regions.iter().map(Vec::len).sum::<usize>();
-                on_commit(dev, &t, rec.en)?;
+                on_commit(dev, &t, trans_order(&t, rec.en))?;
             }
         }
         if rec.blk == head.blk {
@@ -997,13 +1019,31 @@ fn put_fork(fork: &mut [u8], logged: &[u8], broot: bool, hdr: usize) {
     fork[dst..dst + 8 * n].copy_from_slice(&logged[src..src + 8 * n]);
 }
 
+/// Whether the inode on disk is newer than a logged core, so replaying it would roll it back:
+/// v1 / v2 inodes compare `di_flushiter` (mod 2^16), v3 inodes `di_lsn`.
+fn disk_inode_is_newer(disk: &[u8], logged: &[u8], en: En, lsn: u64) -> bool {
+    if disk[0..2] != *b"IN" {
+        return false;
+    }
+    if disk[4] == 3 {
+        let d = be64(disk, DI_LSN);
+        return d != XFS_LSN_NULL && d > lsn;
+    }
+    if logged.len() < 32 || logged[4] == 3 {
+        return false;
+    }
+    let on_disk = u16::from_be_bytes([disk[30], disk[31]]);
+    (on_disk.wrapping_sub(en.u16(logged, 30)) as i16) > 0
+}
+
+/// Apply an inode item; `false` when the disk already holds a newer copy and it is skipped.
 fn apply_inode<D: Read + Write + Seek>(
     dev: &mut D,
     g: &Geo,
     it: &Item<'_>,
     en: En,
     lsn: u64,
-) -> Result<(), FilesystemError> {
+) -> Result<bool, FilesystemError> {
     let f = &it.regions[0];
     // The 32-bit format lacks ilf_pad, so everything after ilf_dsize sits 4 bytes earlier.
     let Some((_, u_o, blk_o, boff_o)) = inode_offsets(f) else {
@@ -1014,6 +1054,9 @@ fn apply_inode<D: Read + Write + Seek>(
     let boff = en.u32(f, boff_o) as u64;
     let at = g.byte(blkno) + boff;
     let mut ino = read_exact_at(dev, at, g.isize)?;
+    if fields & ILOG_CORE != 0 && disk_inode_is_newer(&ino, &it.regions[1], en, lsn) {
+        return Ok(false);
+    }
     let mut next = 1usize;
     let mut take = || {
         let r = it.regions.get(next);
@@ -1057,7 +1100,7 @@ fn apply_inode<D: Read + Write + Seek>(
         stamp_crc(&mut ino, DI_CRC);
     }
     write_at(dev, at, &ino)?;
-    Ok(())
+    Ok(true)
 }
 
 fn apply_icreate<D: Read + Write + Seek>(
@@ -1263,8 +1306,9 @@ pub fn replay_log<D: Read + Write + Seek>(
                     if cancelled_at(&cancels, en.u64(f, blk_o)) {
                         report.cancelled += 1;
                     } else {
-                        apply_inode(dev, &g, &it, en, lsn)?;
-                        report.inodes += 1;
+                        if apply_inode(dev, &g, &it, en, lsn)? {
+                            report.inodes += 1;
+                        }
                     }
                 }
                 LI_ICREATE => {
@@ -1298,7 +1342,8 @@ pub fn replay_log<D: Read + Write + Seek>(
     if report.quota_recount {
         clear_quota_checked(dev, &g, sb)?;
     }
-    write_clean_log(dev, &log, sb, head.lsn >> 32)?;
+    let shape = LogShape::of(dev, &log, sb, Some(head.blk));
+    write_clean_log(dev, &log, &shape, head.lsn >> 32)?;
     Ok(ReplayOutcome::Replayed(report))
 }
 
@@ -1313,16 +1358,58 @@ pub fn zero_log<D: Read + Write + Seek>(
     }
     let log = Log::new(partition_offset, sb);
     // The newest cycle any header claims, complete or not: a garbled log is what this is for.
-    let cycle = scan_headers(dev, &log)?
-        .iter()
-        .map(|(lsn, _)| lsn >> 32)
-        .max()
-        .unwrap_or(0);
+    let newest = scan_headers(dev, &log)?.into_iter().max();
+    let cycle = newest.map_or(0, |(lsn, _)| lsn >> 32);
+    let shape = LogShape::of(dev, &log, sb, newest.map(|(_, blk)| blk));
     let g = Geo::new(partition_offset, sb);
     resync_sb_counters(dev, &g, sb)?;
     // The quota records on disk need not match the files once the log is gone.
     clear_quota_checked(dev, &g, sb)?;
-    write_clean_log(dev, &log, sb, cycle)
+    write_clean_log(dev, &log, &shape, cycle)
+}
+
+/// How the old log wrote its records, so the clean one written in its place looks the same.
+struct LogShape {
+    /// `h_version`: 1 or 2.
+    version: u32,
+    /// `h_fmt`, `h_fs_uuid` and `h_size` (header bytes 300..324); IRIX's v1 records leave
+    /// them zero, and a v2 clean record always says 32 KiB.
+    trailer: [u8; 24],
+    /// Byte order of the unmount record's host-endian payload.
+    big: bool,
+}
+
+impl LogShape {
+    /// Taken from the header sector at `blk` if it is one, else what this volume implies.
+    fn of<R: Read + Seek>(dev: &mut R, log: &Log, sb: &XfsSuperblock, blk: Option<u64>) -> Self {
+        let v2 = sb.versionnum & 0xF == 5 || sb.versionnum & 0x0400 != 0;
+        let version = if v2 { 2 } else { 1 };
+        let hdr = blk.and_then(|b| log.read(dev, b, 1).ok());
+        let usable =
+            |h: &Vec<u8>| be32(h, 0) == HEADER_MAGIC && be32(h, 8) == version && be32(h, 300) <= 3;
+        if let Some(h) = hdr.filter(usable) {
+            let mut trailer = [0u8; 24];
+            trailer.copy_from_slice(&h[300..324]);
+            if version == 2 {
+                // The clean record is one header sector, whatever log buffer size the old one used.
+                trailer[20..24].copy_from_slice(&HEADER_CYCLE_SIZE.to_be_bytes());
+            }
+            return LogShape {
+                version,
+                big: matches!(be32(&h, 300), 0 | 2 | 3),
+                trailer,
+            };
+        }
+        let mut trailer = [0u8; 24];
+        trailer[0..4].copy_from_slice(&1u32.to_be_bytes()); // XLOG_FMT_LINUX_LE
+        trailer[4..20].copy_from_slice(&sb.sb_uuid);
+        trailer[20..24].copy_from_slice(&HEADER_CYCLE_SIZE.to_be_bytes());
+        LogShape {
+            version,
+            trailer,
+            big: false,
+        }
+    }
 }
 
 /// Rewrite the log as one unmount record at its start, a cycle past the old head so no v5
@@ -1330,7 +1417,7 @@ pub fn zero_log<D: Read + Write + Seek>(
 fn write_clean_log<D: Write + Seek>(
     dev: &mut D,
     log: &Log,
-    sb: &XfsSuperblock,
+    shape: &LogShape,
     old_cycle: u64,
 ) -> Result<(), FilesystemError> {
     let cycle = (old_cycle + 1).min(u64::from(u32::MAX)) as u32;
@@ -1348,7 +1435,16 @@ fn write_clean_log<D: Write + Seek>(
         dev.write_all(&fill[..n])?;
         done += n as u64;
     }
-    let head = super::format::build_log_head(&sb.sb_uuid, cycle);
+    let mut head = super::format::build_log_head(&[0; 16], cycle);
+    head[8..12].copy_from_slice(&shape.version.to_be_bytes());
+    head[300..324].copy_from_slice(&shape.trailer);
+    // The unmount payload's XLOG_UNMOUNT_TYPE (0x556e) is host-endian, like every item.
+    let kind: [u8; 2] = if shape.big {
+        [0x55, 0x6e]
+    } else {
+        [0x6e, 0x55]
+    };
+    head[524..526].copy_from_slice(&kind);
     write_at(dev, log.start, &head)?;
     Ok(())
 }
@@ -1897,6 +1993,165 @@ mod tests {
         match replay_log(&mut dev, 0, &sb).unwrap() {
             ReplayOutcome::Unrecoverable(m) => assert!(m.contains("inode chunk"), "{m}"),
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// An IRIX 6.5 Indy root disk (kept: superblock, AG headers, the root inode's cluster and
+    /// the log): big-endian items in v1 records with `h_fmt` 0, two pending root-inode updates.
+    #[test]
+    fn an_irix_root_log_replays_big_endian() {
+        let mut dev = dirty_fixture("xfs_irix65_root_log.img.zst");
+        let sb = XfsSuperblock::parse(&read_exact_at(&mut dev, 0, 512).unwrap()).unwrap();
+        assert_eq!(
+            check_log(&mut dev, 0, &sb).unwrap(),
+            LogCheck::Replayable { transactions: 2 }
+        );
+        let root_before = read_exact_at(&mut dev, 64 * 512, 256).unwrap();
+        let ReplayOutcome::Replayed(r) = replay_log(&mut dev, 0, &sb).unwrap() else {
+            panic!("not replayed");
+        };
+        // The older core is skipped (the disk's flush count is newer); the newer equals the disk.
+        assert_eq!((r.transactions, r.inodes), (2, 1));
+        assert_eq!(read_exact_at(&mut dev, 64 * 512, 256).unwrap(), root_before);
+        assert_eq!(check_log(&mut dev, 0, &sb).unwrap(), LogCheck::Clean);
+        // The clean record keeps the log's shape: v1, IRIX's zero trailer, big-endian payload.
+        let log = Log::new(0, &sb);
+        let h = log.read(&mut dev, 0, 2).unwrap();
+        assert_eq!(be32(&h, 8), 1);
+        assert!(h[300..324].iter().all(|&b| b == 0));
+        assert_eq!(h[524..526], [0x55, 0x6e]);
+    }
+
+    /// Every entry under `dir`, recursively, as comparable facts plus file contents.
+    fn tree<R: Read + Seek + Send>(
+        fs: &mut XfsFilesystem<R>,
+        dir: &FileEntry,
+        out: &mut Vec<String>,
+    ) {
+        for e in fs.list_directory(dir).unwrap() {
+            let mut line = format!(
+                "{} {:?} ino={} mode={:?} uid={:?} gid={:?} size={} mtime={:?}",
+                e.path, e.entry_type, e.location, e.mode, e.uid, e.gid, e.size, e.modified_unix
+            );
+            match e.entry_type {
+                EntryType::Directory => {
+                    out.push(line);
+                    tree(fs, &e, out);
+                }
+                EntryType::File => {
+                    let data = fs.read_file(&e, e.size as usize).unwrap();
+                    line.push_str(&format!(" data={:x?}", &data[..data.len().min(32)]));
+                    line.push_str(&format!(
+                        " sum={}",
+                        data.iter().map(|&b| u64::from(b)).sum::<u64>()
+                    ));
+                    out.push(line);
+                }
+                _ => {
+                    line.push_str(&format!(" target={:?}", e.symlink_target));
+                    out.push(line);
+                }
+            }
+        }
+    }
+
+    /// A 128 MB XFS made by IRIX 6.5's own mkfs, crashed mid-workload under the IRIS emulator,
+    /// and the same disk after IRIX mounted it (its own log recovery) and unmounted it.
+    #[test]
+    fn an_irix_crash_log_replays_like_irix() {
+        let mut fs = XfsFilesystem::open(dirty_fixture("xfs_irix65_dirty_log.img.zst"), 0).unwrap();
+        let before = fs.run_fsck().unwrap();
+        assert_eq!(before.errors[0].code, "LogDirty");
+        assert!(
+            before.errors[0].message.contains("1292 committed"),
+            "{:?}",
+            before.errors
+        );
+        let report = fs.repair().unwrap();
+        assert!(
+            report.fixes_applied[0].starts_with("log: replayed 1292"),
+            "{report:?}"
+        );
+        assert!(fs.run_fsck().unwrap().errors.is_empty());
+
+        let mut irix =
+            XfsFilesystem::open(dirty_fixture("xfs_irix65_recovered.img.zst"), 0).unwrap();
+        let (mut ours, mut theirs) = (Vec::new(), Vec::new());
+        let root = fs.root().unwrap();
+        tree(&mut fs, &root, &mut ours);
+        let root = irix.root().unwrap();
+        tree(&mut irix, &root, &mut theirs);
+        assert_eq!(ours.len(), 163);
+        assert_eq!(ours, theirs);
+    }
+
+    /// A log written with 256 KiB log buffers (`logbsize=256k`): the clean record must still
+    /// read as one header sector, or the log looks damaged afterwards (review of 0.2.2).
+    #[test]
+    fn a_large_log_buffer_size_is_not_copied_into_the_clean_record() {
+        let (mut img, sb) = blank();
+        let start =
+            fsblock_to_partition_byte(sb.logstart, sb.agblocks, sb.agblklog, sb.blocksize) as usize;
+        img[start + 320..start + 324].copy_from_slice(&(256u32 * 1024).to_be_bytes());
+        let mut dev = Cursor::new(img);
+        zero_log(&mut dev, 0, &sb).unwrap();
+        assert_eq!(check_log(&mut dev, 0, &sb).unwrap(), LogCheck::Clean);
+        let h = read_exact_at(&mut dev, start as u64, 512).unwrap();
+        assert_eq!(be32(&h, 320), HEADER_CYCLE_SIZE);
+    }
+
+    /// An inode item older than the inode on disk is skipped; a newer one is applied. Written
+    /// big-endian, as IRIX writes it, so the logged core is the on-disk core.
+    #[test]
+    fn an_inode_item_older_than_the_disk_is_not_replayed() {
+        for (disk_lsn, applied) in [(9u64 << 32, false), (1u64 << 32, true)] {
+            let (mut img, sb) = blank();
+            let at = crate::xfs::inode::inode_byte_offset(
+                sb.rootino,
+                sb.agblocks,
+                sb.agblklog,
+                sb.inopblog,
+                sb.blocksize,
+                sb.inodesize,
+            ) as usize;
+            img[at + DI_LSN..at + DI_LSN + 8].copy_from_slice(&disk_lsn.to_be_bytes());
+            let mut core = img[at..at + 176].to_vec();
+            core[2..4].copy_from_slice(&0o40700u16.to_be_bytes()); // drwx------
+            let mut f = vec![0u8; 56];
+            f[0..2].copy_from_slice(&LI_INODE.to_be_bytes());
+            f[2..4].copy_from_slice(&2u16.to_be_bytes());
+            f[4..8].copy_from_slice(&ILOG_CORE.to_be_bytes());
+            f[16..24].copy_from_slice(&sb.rootino.to_be_bytes());
+            f[40..48].copy_from_slice(&((at / 512) as u64).to_be_bytes());
+            f[48..52].copy_from_slice(&16u32.to_be_bytes());
+            f[52..56].copy_from_slice(&((at % 512) as u32).to_be_bytes());
+            let tran: Vec<u8> = [TRANS_MAGIC, 1, 3, 1]
+                .iter()
+                .flat_map(|v| v.to_be_bytes())
+                .collect();
+            put_record(
+                &mut img,
+                &sb,
+                2,
+                &[
+                    (3, OP_START, vec![]),
+                    (3, 0, tran),
+                    (3, 0, f),
+                    (3, 0, core),
+                    (3, OP_COMMIT, vec![]),
+                ],
+            );
+            let mut dev = Cursor::new(img);
+            let ReplayOutcome::Replayed(r) = replay_log(&mut dev, 0, &sb).unwrap() else {
+                panic!("not replayed");
+            };
+            assert_eq!(r.inodes, usize::from(applied));
+            let mode = u16::from_be_bytes(
+                read_exact_at(&mut dev, at as u64 + 2, 2).unwrap()[..]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(mode == 0o40700, applied, "disk LSN {disk_lsn:x}");
         }
     }
 }
