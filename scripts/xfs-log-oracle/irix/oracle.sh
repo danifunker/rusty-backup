@@ -1,7 +1,8 @@
 #!/bin/sh
-# usage: oracle.sh TESTDISK OUTPREFIX — boot IRIX with TESTDISK as unit 3, check, mount, list, unmount
-R=$(cd "$(dirname "$0")" && pwd); disk=$1; out=$2
-(cd $R && ./launch.sh $R/boot-dirty.raw "$disk" > $R/iris-stdout.log 2>&1 &)
+# usage: oracle.sh BOOTDISK TESTDISK OUTPREFIX — boot IRIX from BOOTDISK with TESTDISK as unit 3,
+# check it, mount it, list it, unmount it
+R=$(cd "$(dirname "$0")" && pwd); boot=$1; disk=$2; out=$3
+(cd $R && ./launch.sh "$boot" "$disk" > $R/iris-stdout.log 2>&1 &)
 $R/ci status --wait-ready 120 >/dev/null 2>&1; $R/ci start >/dev/null 2>&1
 timeout 1200 $R/ci boot >/dev/null 2>&1; timeout 300 $R/ci login >/dev/null 2>&1
 $R/ci run 'xfs_repair -n /dev/rdsk/dks0d3s0 2>&1 | tail -4' > $out.repair-before.txt 2>&1

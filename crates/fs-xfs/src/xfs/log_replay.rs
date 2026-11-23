@@ -1368,14 +1368,12 @@ pub fn zero_log<D: Read + Write + Seek>(
     write_clean_log(dev, &log, &shape, cycle)
 }
 
-/// Rewrite the log as one unmount record at its start, a cycle past the old head so no v5
-/// metadata LSN is ahead of the log.
 /// How the old log wrote its records, so the clean one written in its place looks the same.
 struct LogShape {
     /// `h_version`: 1 or 2.
     version: u32,
     /// `h_fmt`, `h_fs_uuid` and `h_size` (header bytes 300..324); IRIX's v1 records leave
-    /// them zero.
+    /// them zero, and a v2 clean record always says 32 KiB.
     trailer: [u8; 24],
     /// Byte order of the unmount record's host-endian payload.
     big: bool,
@@ -1387,9 +1385,15 @@ impl LogShape {
         let v2 = sb.versionnum & 0xF == 5 || sb.versionnum & 0x0400 != 0;
         let version = if v2 { 2 } else { 1 };
         let hdr = blk.and_then(|b| log.read(dev, b, 1).ok());
-        if let Some(h) = hdr.filter(|h| be32(h, 0) == HEADER_MAGIC && be32(h, 8) == version) {
+        let usable =
+            |h: &Vec<u8>| be32(h, 0) == HEADER_MAGIC && be32(h, 8) == version && be32(h, 300) <= 3;
+        if let Some(h) = hdr.filter(usable) {
             let mut trailer = [0u8; 24];
             trailer.copy_from_slice(&h[300..324]);
+            if version == 2 {
+                // The clean record is one header sector, whatever log buffer size the old one used.
+                trailer[20..24].copy_from_slice(&HEADER_CYCLE_SIZE.to_be_bytes());
+            }
             return LogShape {
                 version,
                 big: matches!(be32(&h, 300), 0 | 2 | 3),
@@ -1408,6 +1412,8 @@ impl LogShape {
     }
 }
 
+/// Rewrite the log as one unmount record at its start, a cycle past the old head so no v5
+/// metadata LSN is ahead of the log.
 fn write_clean_log<D: Write + Seek>(
     dev: &mut D,
     log: &Log,
@@ -2077,5 +2083,75 @@ mod tests {
         tree(&mut irix, &root, &mut theirs);
         assert_eq!(ours.len(), 163);
         assert_eq!(ours, theirs);
+    }
+
+    /// A log written with 256 KiB log buffers (`logbsize=256k`): the clean record must still
+    /// read as one header sector, or the log looks damaged afterwards (review of 0.2.2).
+    #[test]
+    fn a_large_log_buffer_size_is_not_copied_into_the_clean_record() {
+        let (mut img, sb) = blank();
+        let start =
+            fsblock_to_partition_byte(sb.logstart, sb.agblocks, sb.agblklog, sb.blocksize) as usize;
+        img[start + 320..start + 324].copy_from_slice(&(256u32 * 1024).to_be_bytes());
+        let mut dev = Cursor::new(img);
+        zero_log(&mut dev, 0, &sb).unwrap();
+        assert_eq!(check_log(&mut dev, 0, &sb).unwrap(), LogCheck::Clean);
+        let h = read_exact_at(&mut dev, start as u64, 512).unwrap();
+        assert_eq!(be32(&h, 320), HEADER_CYCLE_SIZE);
+    }
+
+    /// An inode item older than the inode on disk is skipped; a newer one is applied. Written
+    /// big-endian, as IRIX writes it, so the logged core is the on-disk core.
+    #[test]
+    fn an_inode_item_older_than_the_disk_is_not_replayed() {
+        for (disk_lsn, applied) in [(9u64 << 32, false), (1u64 << 32, true)] {
+            let (mut img, sb) = blank();
+            let at = crate::xfs::inode::inode_byte_offset(
+                sb.rootino,
+                sb.agblocks,
+                sb.agblklog,
+                sb.inopblog,
+                sb.blocksize,
+                sb.inodesize,
+            ) as usize;
+            img[at + DI_LSN..at + DI_LSN + 8].copy_from_slice(&disk_lsn.to_be_bytes());
+            let mut core = img[at..at + 176].to_vec();
+            core[2..4].copy_from_slice(&0o40700u16.to_be_bytes()); // drwx------
+            let mut f = vec![0u8; 56];
+            f[0..2].copy_from_slice(&LI_INODE.to_be_bytes());
+            f[2..4].copy_from_slice(&2u16.to_be_bytes());
+            f[4..8].copy_from_slice(&ILOG_CORE.to_be_bytes());
+            f[16..24].copy_from_slice(&sb.rootino.to_be_bytes());
+            f[40..48].copy_from_slice(&((at / 512) as u64).to_be_bytes());
+            f[48..52].copy_from_slice(&16u32.to_be_bytes());
+            f[52..56].copy_from_slice(&((at % 512) as u32).to_be_bytes());
+            let tran: Vec<u8> = [TRANS_MAGIC, 1, 3, 1]
+                .iter()
+                .flat_map(|v| v.to_be_bytes())
+                .collect();
+            put_record(
+                &mut img,
+                &sb,
+                2,
+                &[
+                    (3, OP_START, vec![]),
+                    (3, 0, tran),
+                    (3, 0, f),
+                    (3, 0, core),
+                    (3, OP_COMMIT, vec![]),
+                ],
+            );
+            let mut dev = Cursor::new(img);
+            let ReplayOutcome::Replayed(r) = replay_log(&mut dev, 0, &sb).unwrap() else {
+                panic!("not replayed");
+            };
+            assert_eq!(r.inodes, usize::from(applied));
+            let mode = u16::from_be_bytes(
+                read_exact_at(&mut dev, at as u64 + 2, 2).unwrap()[..]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(mode == 0o40700, applied, "disk LSN {disk_lsn:x}");
+        }
     }
 }

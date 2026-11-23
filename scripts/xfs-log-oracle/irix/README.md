@@ -9,7 +9,7 @@ Indy disk as a raw image.
   a scratch disk as SCSI 2 and TESTDISK as SCSI 3 (IRIX: `dks0d3`). Every disk's write cache
   is off, so killing the emulator loses nothing IRIX was told was written.
 - `ci ARGS` runs `iris-ci` against that machine.
-- `oracle.sh TESTDISK OUTPREFIX` boots IRIX with TESTDISK as unit 3, runs IRIX's
+- `oracle.sh BOOTDISK TESTDISK OUTPREFIX` boots IRIX from BOOTDISK with TESTDISK as unit 3, runs IRIX's
   `xfs_repair -n` on it, mounts it on `/t` (counting SYSLOG's "XFS recovery" lines before and
   after), records `ls -ldni` and `sum -r` of every entry, unmounts it, runs `xfs_repair -n`
   again and shuts IRIX down. Compare the outputs of an IRIX-recovered copy and our replayed
