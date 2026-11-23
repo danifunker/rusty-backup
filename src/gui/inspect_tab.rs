@@ -115,7 +115,7 @@ impl InspectTab {
         std::mem::take(&mut self.close_backup_requested)
     }
 
-    /// A Mac archive picked in the source dropdown, for the Archives tab.
+    /// A Mac archive picked in the source dropdown or found by content, for the Archives tab.
     pub fn take_open_archive_request(&mut self) -> Option<PathBuf> {
         self.pending_open_archive.take()
     }

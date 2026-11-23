@@ -6,7 +6,9 @@
 //! label on an APM disk, the real filesystem behind an MBR / GPT Linux type, the HFS allocation block
 //! size, volume labels (FAT, AFFS, PFS3, SFS) and cheap minimum sizes (expensive ones come back
 //! deferred). A table-less image that is a browsable optical disc comes back as
-//! [`Inspected::Optical`] so the shell can hand it to the Optical tab.
+//! [`Inspected::Optical`] so the shell can hand it to the Optical tab, and a file that is no disk
+//! but a classic Mac archive (a MacBinary `.bin`, say) as [`Inspected::Archive`], for the
+//! Archives tab: whatever opens a file (a double-click, a drop) lands where it can be read.
 
 use std::collections::HashMap;
 use std::io::{BufReader, Seek, SeekFrom};
@@ -92,6 +94,8 @@ pub enum Inspected {
     Disk(Box<InspectOutcome>),
     /// No partition table, but an optical disc the Optical tab can browse.
     Optical(PathBuf),
+    /// No partition table and no disc, but a Mac archive the Archives tab can open.
+    Archive(PathBuf),
 }
 
 /// The label a streamed container shows for its extension.
@@ -221,6 +225,9 @@ pub fn inspect_source(
         Err(e) => {
             if !remote && crate::cli::optical_hint::is_browsable_optical(path) {
                 return Ok(Inspected::Optical(path.to_path_buf()));
+            }
+            if !remote && !is_device && crate::model::mac_archive_read::is_archive_file(path) {
+                return Ok(Inspected::Archive(path.to_path_buf()));
             }
             return Err(no_table(req, e));
         }

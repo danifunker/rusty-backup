@@ -175,6 +175,13 @@ impl InspectController {
                     ));
                     self.requests.push(super::HostRequest::OpenOptical(path));
                 }
+                Ok(Inspected::Archive(path)) => {
+                    self.info(format!(
+                        "{} is a Mac archive - opening the Archives tab.",
+                        path.display()
+                    ));
+                    self.requests.push(super::HostRequest::OpenArchive(path));
+                }
                 Err(err) => {
                     let msg = format!("Inspect failed: {err}");
                     self.error(msg.as_str());
