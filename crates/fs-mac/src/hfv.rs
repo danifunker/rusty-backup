@@ -151,6 +151,28 @@ where
     clone_hfs_at(source, target, 0, target_size, block_size, volume_name)
 }
 
+/// Stream a blank flat HFV image into `target` at `at_offset`, the streaming twin of
+/// [`build_blank_hfv`]; returns its length. The caller sizes the file, as for
+/// [`crate::hfs::write_blank_hfs_into`].
+pub fn write_blank_hfv_into<W: Write + Seek>(
+    target: &mut W,
+    at_offset: u64,
+    size_bytes: u64,
+    block_size: u32,
+    volume_name: &str,
+) -> Result<u64, FilesystemError> {
+    validate_hfv_target(size_bytes, HfvVolumeKind::Hfs)?;
+    crate::hfs::write_blank_hfs_sized_into(
+        target,
+        at_offset,
+        size_bytes,
+        block_size,
+        volume_name,
+        0,
+        0,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +202,24 @@ mod tests {
         let bs = suggest_block_size(HFV_MAX_BYTES);
         assert!(max_volume_for_block_size(bs) >= HFV_MAX_BYTES);
         assert_eq!(bs, crate::hfs::HFS_MAX_BLOCK_SIZE);
+    }
+
+    #[test]
+    fn streamed_and_in_memory_blank_hfv_match() {
+        let bs = suggest_block_size(16 * MIB);
+        let mut streamed = Cursor::new(Vec::new());
+        let len = write_blank_hfv_into(&mut streamed, 0, 16 * MIB, bs, "Twin").unwrap();
+        let mut streamed = streamed.into_inner();
+        streamed.resize(len as usize, 0);
+        let in_ram = build_blank_hfv(16 * MIB, bs, "Twin").unwrap();
+        assert_eq!(streamed.len(), in_ram.len());
+        let mut a = HfsFilesystem::open(Cursor::new(streamed), 0).unwrap();
+        let mut b = HfsFilesystem::open(Cursor::new(in_ram), 0).unwrap();
+        assert_eq!(a.volume_label(), Some("Twin"));
+        assert_eq!(a.total_size(), b.total_size());
+        assert_eq!(a.used_size(), b.used_size());
+        assert!(a.fsck().unwrap().is_clean());
+        assert!(b.fsck().unwrap().is_clean());
     }
 
     #[test]

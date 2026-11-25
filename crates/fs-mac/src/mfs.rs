@@ -1567,9 +1567,22 @@ fn mfs_blank_geometry(size_bytes: u64) -> Result<MfsBlankGeom, FilesystemError> 
 /// as do larger sizes up to the 12-bit-map ceiling. The result round-trips
 /// through [`MfsFilesystem::open`] and accepts files via `EditableFilesystem`.
 pub fn create_blank_mfs(size_bytes: u64, name: &str) -> Result<Vec<u8>, FilesystemError> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    write_blank_mfs_into(&mut out, 0, size_bytes, name)?;
+    Ok(out.into_inner())
+}
+
+/// Stream a blank MFS volume of `size_bytes` into `target` at `at_offset`; returns its length.
+/// Only the boot blocks and MDB are written, so memory stays one sector whatever the size.
+pub fn write_blank_mfs_into<W: Write + Seek>(
+    target: &mut W,
+    at_offset: u64,
+    size_bytes: u64,
+    name: &str,
+) -> Result<u64, FilesystemError> {
     let g = mfs_blank_geometry(size_bytes)?;
     let total_bytes = g.total_sectors * 512;
-    let mut disk = vec![0u8; total_bytes as usize];
+    let mut mdb = [0u8; 512];
 
     // Clump size: 8 allocation blocks, capped at the data region so it stays
     // meaningful on tiny volumes. Cosmetic (the allocator works in blocks), but
@@ -1577,7 +1590,6 @@ pub fn create_blank_mfs(size_bytes: u64, name: &str) -> Result<Vec<u8>, Filesyst
     let data_bytes = g.num_alloc_blocks as u32 * g.alloc_block_size;
     let clump = (g.alloc_block_size.saturating_mul(8)).min(data_bytes.max(g.alloc_block_size));
 
-    let mdb = &mut disk[MDB_OFFSET as usize..MDB_OFFSET as usize + 512];
     BigEndian::write_u16(&mut mdb[0..2], MFS_SIGNATURE);
     // Create / last-backup dates left 0 (Mac epoch); real Mac OS restamps them.
     BigEndian::write_u16(&mut mdb[10..12], 0); // attributes
@@ -1596,10 +1608,17 @@ pub fn create_blank_mfs(size_bytes: u64, name: &str) -> Result<Vec<u8>, Filesyst
     mdb[36] = name_len as u8;
     mdb[37..37 + name_len].copy_from_slice(&name_bytes[..name_len]);
 
-    // The allocation map (byte 64 of the MDB, straddling into later sectors)
-    // and the directory sectors are all-free / all-zero, which the surrounding
-    // zero-fill already provides.
-    Ok(disk)
+    // Everything before the first allocation block is zeroed (the allocation map, which
+    // straddles from the MDB into later sectors, and the directory are all-free when zero).
+    let front = g.first_alloc_block_sector as u64 * 512;
+    target.seek(SeekFrom::Start(at_offset))?;
+    disk_core::zeros::write_zeros(target, front)?;
+    target.seek(SeekFrom::Start(at_offset + MDB_OFFSET))?;
+    target.write_all(&mdb)?;
+    // Write the final byte so the image has its full length without the caller sizing it.
+    target.seek(SeekFrom::Start(at_offset + total_bytes - 1))?;
+    target.write_all(&[0])?;
+    Ok(total_bytes)
 }
 
 #[cfg(test)]
@@ -2046,6 +2065,19 @@ mod tests {
             "blank 400K should fsck clean: {:?}",
             res.errors
         );
+    }
+
+    #[test]
+    fn a_streamed_blank_volume_overwrites_old_metadata() {
+        // A reused target holds garbage where the map and directory go; they must come out free.
+        let mut target = Cursor::new(vec![0xFFu8; MFS_400K_BYTES as usize]);
+        let len = write_blank_mfs_into(&mut target, 0, MFS_400K_BYTES, "Reused").unwrap();
+        assert_eq!(len, MFS_400K_BYTES);
+        let mut fs = MfsFilesystem::open(target, 0).unwrap();
+        assert_eq!(fs.volume_label(), Some("Reused"));
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        assert!(fs.fsck().unwrap().unwrap().is_clean());
     }
 
     #[test]
