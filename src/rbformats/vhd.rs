@@ -11,9 +11,7 @@ use anyhow::{bail, Context, Result};
 use super::{decompress_members_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
 use crate::fs::{patch_hidden_sectors_for, resize_filesystem_for};
-use part_tables::mbr::{
-    build_ebr_chain, parse_ebr_chain, patch_mbr_entries, LogicalPartitionInfo, Mbr,
-};
+use part_tables::mbr::{build_ebr_chain, parse_ebr_chain, patch_mbr_entries, Mbr};
 use part_tables::PartitionSizeOverride;
 
 // The VHD format itself lives in the `dsk-vm` crate; this file keeps the backup export.
@@ -206,100 +204,81 @@ struct VhdEbrResult {
 /// When any logical partition is resized, repacks them contiguously.
 ///
 /// Returns `None` if the source has no extended partition or its EBR cannot be
-/// parsed (non-fatal: the export continues without updated EBR in that case).
+/// parsed (non-fatal: the export continues without updated EBR in that case). A chain
+/// that parses but cannot be rebuilt stops the export, as it stops a restore (PR-002).
 fn rebuild_vhd_ebr_chain(
     source_mbr: &[u8; 512],
     source: &mut (impl Read + Seek),
     partition_sizes: &[PartitionSizeOverride],
     log_cb: &mut impl FnMut(&str),
-) -> Option<VhdEbrResult> {
+) -> Result<Option<VhdEbrResult>> {
     // Find the extended container entry in the source MBR.
-    let mbr = Mbr::parse(source_mbr).ok()?;
-    let extended_entry = mbr
+    let Ok(mbr) = Mbr::parse(source_mbr) else {
+        return Ok(None);
+    };
+    let Some(extended_entry) = mbr
         .entries
         .iter()
-        .find(|e| e.is_extended() && !e.is_empty())?;
+        .find(|e| e.is_extended() && !e.is_empty())
+    else {
+        return Ok(None);
+    };
     let extended_start_lba = extended_entry.start_lba;
 
     // Parse the source EBR chain to get current logical partition info
     // (positions and partition types).
     let source_logicals = match parse_ebr_chain(source, extended_start_lba) {
         Ok(v) if !v.is_empty() => v,
-        Ok(_) => return None, // empty chain — nothing to update
+        Ok(_) => return Ok(None), // empty chain — nothing to update
         Err(e) => {
             log_cb(&format!("Warning: could not parse source EBR chain: {e}"));
-            return None;
+            return Ok(None);
         }
     };
 
-    // Check if any logical partition is resized
-    let any_resized = source_logicals.iter().any(|src| {
-        partition_sizes
-            .iter()
-            .find(|ps| ps.start_lba == src.start_lba as u64)
-            .map(|ps| ps.export_size != src.total_sectors as u64 * 512)
-            .unwrap_or(false)
-    });
-
-    // Build updated LogicalPartitionInfo entries.  When any logical is resized,
-    // repack them contiguously (first keeps position, rest packed with 1-sector
-    // EBR gap) — same algorithm as build_restore_ebr_chain in restore/mod.rs.
-    let mut logical_infos: Vec<LogicalPartitionInfo> = Vec::with_capacity(source_logicals.len());
-    let mut logical_remap: Vec<(u64, u64)> = Vec::with_capacity(source_logicals.len());
-    let mut next_lba: u32 = 0;
-
-    for (i, src) in source_logicals.iter().enumerate() {
-        let new_sectors = partition_sizes
-            .iter()
-            .find(|ps| ps.start_lba == src.start_lba as u64)
-            .map(|ps| (ps.export_size / 512) as u32)
-            .unwrap_or(src.total_sectors);
-
-        let start_lba = if i == 0 {
-            // First logical: keep original position
-            src.start_lba
-        } else if any_resized {
-            // Pack right after previous partition, leaving 1 sector for EBR
-            next_lba + 1
-        } else {
-            src.start_lba
-        };
-
-        next_lba = start_lba + new_sectors;
-
-        if start_lba != src.start_lba {
-            logical_remap.push((src.start_lba as u64, start_lba as u64));
-        }
-
-        logical_infos.push(LogicalPartitionInfo {
-            start_lba,
-            total_sectors: new_sectors,
+    // Sizes come from overrides matched by start, as on a raw source; the repack is restore's.
+    let items: Vec<crate::restore::LogicalPlanItem> = source_logicals
+        .iter()
+        .map(|src| crate::restore::LogicalPlanItem {
+            start_lba: src.start_lba,
+            original_bytes: src.total_sectors as u64 * 512,
+            new_bytes: partition_sizes
+                .iter()
+                .find(|ps| ps.start_lba == src.start_lba as u64)
+                .map(|ps| ps.export_size)
+                .unwrap_or(src.total_sectors as u64 * 512),
             partition_type: src.partition_type,
-        });
-    }
+        })
+        .collect();
+    let logical_infos = crate::restore::pack_logical_partitions(&items);
+    let logical_remap: Vec<(u64, u64)> = source_logicals
+        .iter()
+        .zip(&logical_infos)
+        .filter(|(src, info)| info.start_lba != src.start_lba)
+        .map(|(src, info)| (src.start_lba as u64, info.start_lba as u64))
+        .collect();
+    let next_lba = logical_infos
+        .last()
+        .map_or(0, |l| l.start_lba + l.total_sectors);
 
     let last_end_lba = next_lba;
     let new_extended_total_sectors = last_end_lba - extended_start_lba;
 
-    let ebr_sectors = match build_ebr_chain(extended_start_lba, &logical_infos) {
-        Ok(v) => v,
-        Err(e) => {
-            log_cb(&format!("Warning: could not rebuild the EBR chain: {e}"));
-            return None;
-        }
-    };
+    // Dropping the chain would leave the logical partitions pointing at their old places.
+    let ebr_sectors = build_ebr_chain(extended_start_lba, &logical_infos)
+        .context("rebuilding the EBR chain for the logical partitions")?;
     log_cb(&format!(
         "Rebuilt {} EBR sector(s) for logical partitions (extended container at LBA {}, new total_sectors {})",
         ebr_sectors.len(),
         extended_start_lba,
         new_extended_total_sectors,
     ));
-    Some(VhdEbrResult {
+    Ok(Some(VhdEbrResult {
         ebr_sectors,
         logical_remap,
         new_extended_total_sectors,
         extended_start_lba,
-    })
+    }))
 }
 
 /// Export a whole disk image as a Fixed VHD file.
@@ -628,7 +607,7 @@ pub fn export_whole_disk_vhd(
 
             // Build repacked EBR chain before writing so we know new positions.
             let ebr_result =
-                rebuild_vhd_ebr_chain(&mbr_buf, &mut reader, partition_sizes, &mut log_cb);
+                rebuild_vhd_ebr_chain(&mbr_buf, &mut reader, partition_sizes, &mut log_cb)?;
 
             // Build a remap from original start_lba to new start_lba for logicals.
             let logical_remap: std::collections::HashMap<u64, u64> = ebr_result
