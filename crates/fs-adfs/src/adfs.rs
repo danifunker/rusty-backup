@@ -2648,15 +2648,23 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         };
         // Old-map D-format: free the contiguous run, then persist the old map.
         if self.old_map.is_some() {
-            let removed = self.remove_dir_entry(parent_indaddr, &entry.name)?;
-            let start = removed.indirect_disc_addr;
-            let n = (removed.file_length.max(1) as u64).div_ceil(OLD_MAP_ADDR_UNIT) as u32;
+            let start = entry.location as u32;
+            if start == 0 && !entry.is_directory() && entry.size == 0 {
+                self.remove_dir_entry(parent_indaddr, &entry.name)?;
+                return Ok(());
+            }
+            // Refuse before the entry goes, so a refusal leaves the directory as it was.
             if start <= OLD_MAP_ROOT_ADDR {
                 return Err(FilesystemError::InvalidData(format!(
                     "ADFS: refused to free reserved disc address {start}"
                 )));
             }
-            self.old_map.as_mut().unwrap().free_run(start, n);
+            let removed = self.remove_dir_entry(parent_indaddr, &entry.name)?;
+            let n = (removed.file_length.max(1) as u64).div_ceil(OLD_MAP_ADDR_UNIT) as u32;
+            self.old_map
+                .as_mut()
+                .unwrap()
+                .free_run(removed.indirect_disc_addr, n);
             self.write_old_map()?;
             return Ok(());
         }
@@ -3045,6 +3053,28 @@ mod tests {
         assert_eq!(entries[0].name, "HELLO");
         let data = fs.read_file(&entries[0], usize::MAX).unwrap();
         assert_eq!(&data, b"D-format contiguous file content");
+    }
+
+    #[test]
+    fn dformat_delete_of_an_empty_or_reserved_entry_keeps_the_directory_honest() {
+        // Point HELLO at disc address `addr` with length `len`, then try to delete it.
+        let delete = |addr: u32, len: u32| {
+            let mut disk = build_dformat_with_one_file();
+            let e = 1024 + DIR_SMALL_HEADER;
+            LittleEndian::write_u32(&mut disk[e + 18..e + 22], len);
+            disk[e + 22..e + 25].copy_from_slice(&addr.to_le_bytes()[..3]);
+            let mut fs = AdfsFilesystem::open(Cursor::new(disk), 0).unwrap();
+            let root = fs.root().unwrap();
+            let hello = fs.list_directory(&root).unwrap().remove(0);
+            let res = fs.delete_entry(&root, &hello);
+            (res, fs.list_directory(&root).unwrap().len())
+        };
+        let (res, left) = delete(0, 0);
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(left, 0);
+        let (res, left) = delete(2, 32);
+        assert!(res.is_err());
+        assert_eq!(left, 1, "a refused delete must leave the entry");
     }
 
     #[test]

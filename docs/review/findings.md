@@ -602,7 +602,7 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 | ADF-012 | S2 | plausible | adfs.rs | Free runs / sectors not bounded by the partition; overlapping runs accepted. | fixed (a1f98e4a) |
 | ADF-013 | S3 | confirmed | adfs.rs `AdfsFsm::read` | Zone load sized by on-disk count (128 MiB); every edit rewrites all zones; quadratic copy. | fixed (a1f98e4a) |
 | ADF-014 | S3 | confirmed | adfs.rs | Map written before data / entry (leaks on failure); no duplicate-name check. | fixed (a1f98e4a) |
-| ADF-015 | S3 | confirmed | adfs.rs `run_fsck`, `delete_entry` | An empty file stored with disc address 0 (as RISC OS writes it) was reported as a dangling reference, and deleting it was refused as a reserved fragment. Seen on a real Archimedes demo disc. | fixed (this branch) |
+| ADF-015 | S3 | confirmed | adfs.rs `run_fsck`, `delete_entry` | An empty file stored with disc address 0 (as RISC OS writes it) was reported as a dangling reference, and deleting it was refused as a reserved fragment. On old-map discs the refusal came after the entry was already removed. Seen on a real Archimedes demo disc. | fixed (this branch) |
 | HPF-001 | S1 | confirmed | fs-hpfs hpfs.rs `fix_up_ptrs` etc. | Edit paths follow unchecked dnode pointers and write 2 KiB through an unchecked `write_sectors`. | fixed (2d2f9c3d) |
 | HPF-002 | S2 | confirmed | hpfs.rs `add_dirent` etc. | Dirent walks don't check `len` / `first_free`: infinite loop, panic. | fixed (2d2f9c3d) |
 | HPF-003 | S1 | confirmed | hpfs.rs `flush_bitmaps`, `open` | A bad bitmap pointer is kept: freeing writes 2 KiB to sector 0 or past the partition. | fixed (2d2f9c3d) |
