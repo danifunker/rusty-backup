@@ -235,6 +235,14 @@ pub(crate) fn parse_header(reader: &mut impl Read) -> Result<PartcloneHeader> {
     reader
         .read_exact(&mut magic)
         .context("failed to read partclone magic")?;
+    // A v1 image (partclone 0.2.x, before about 2018) runs its filesystem name on from the
+    // unterminated magic, so it fails the v2 compare; name it rather than call it no image.
+    if magic[..15] == PARTCLONE_MAGIC[..15] && magic[15] != 0 {
+        bail!(
+            "this is a partclone v1 image (written by partclone 0.2.x, before about 2018), \
+             which is not supported; restore it with partclone and back it up again"
+        );
+    }
     if &magic != PARTCLONE_MAGIC {
         bail!(
             "not a partclone image (magic: {:?})",
@@ -250,10 +258,17 @@ pub(crate) fn parse_header(reader: &mut impl Read) -> Result<PartcloneHeader> {
     let mut fmt_version = [0u8; 4];
     reader.read_exact(&mut fmt_version)?;
     let version = String::from_utf8_lossy(&fmt_version).to_string();
+    if version != "0002" {
+        bail!("partclone image format {version:?} is not supported (only \"0002\" is)");
+    }
 
     // Endianess: 2 bytes (0xC0DE = little-endian, 0xDEC0 = big-endian)
-    let mut _endian = [0u8; 2];
-    reader.read_exact(&mut _endian)?;
+    let mut endian = [0u8; 2];
+    reader.read_exact(&mut endian)?;
+    // Every field below is read little-endian, as a little-endian host writes them.
+    if u16::from_le_bytes(endian) != 0xC0DE {
+        bail!("this partclone image was written on a big-endian machine, which is not supported");
+    }
 
     // --- file_system_info_v2 (52 bytes) ---
 
@@ -636,6 +651,30 @@ pub fn read_partclone_header(files: &[PathBuf]) -> Result<PartcloneHeader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first 48 bytes of a real v1 image, made by partclone 0.2.86 (Ubuntu 16.04).
+    const V1_HEAD: &[u8] = b"partclone-imageEXTFS\0\0\0\0\0\0\0\0\0\0\x30\x30\x30\x31\0\0\0\x04\0\0\0\0\0\x01\0\0\0\0\0\x40\0\0\0\0\0\0\x96\x02\0\0\0\0\0\0";
+
+    #[test]
+    fn a_v1_image_is_refused_by_name() {
+        let err = parse_header(&mut &V1_HEAD[..]).unwrap_err().to_string();
+        assert!(err.contains("partclone v1 image"), "{err}");
+    }
+
+    #[test]
+    fn a_big_endian_or_unknown_version_image_is_refused() {
+        let mut head = PARTCLONE_MAGIC.to_vec();
+        head.extend_from_slice(b"0.3.23\0\0\0\0\0\0\0\0");
+        let mut be = head.clone();
+        be.extend_from_slice(b"0002\xC0\xDE");
+        be.resize(200, 0);
+        let err = parse_header(&mut &be[..]).unwrap_err().to_string();
+        assert!(err.contains("big-endian"), "{err}");
+        head.extend_from_slice(b"0003\xDE\xC0");
+        head.resize(200, 0);
+        let err = parse_header(&mut &head[..]).unwrap_err().to_string();
+        assert!(err.contains("\"0003\""), "{err}");
+    }
 
     #[test]
     fn test_bitmap_v2() {

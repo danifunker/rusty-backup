@@ -21,20 +21,9 @@ use anyhow::{Context, Result};
 pub(crate) const CHUNK_SIZE: usize = 256 * 1024;
 
 /// Whether every byte of `data` is zero.
-pub(crate) fn is_all_zeros(data: &[u8]) -> bool {
-    data.iter().all(|&b| b == 0)
-}
+pub(crate) use disk_core::zeros::is_all_zeros;
 
 /// Write `count` zero bytes to `writer`.
 pub(crate) fn write_zeros(writer: &mut impl Write, count: u64) -> Result<()> {
-    let zeros = vec![0u8; CHUNK_SIZE];
-    let mut remaining = count;
-    while remaining > 0 {
-        let n = (remaining as usize).min(CHUNK_SIZE);
-        writer
-            .write_all(&zeros[..n])
-            .context("failed to write zeros")?;
-        remaining -= n as u64;
-    }
-    Ok(())
+    disk_core::zeros::write_zeros(writer, count).context("failed to write zeros")
 }

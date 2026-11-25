@@ -13,9 +13,9 @@
 //! **v1 scope.** Data fork only — HFS/HFS+ resource forks are dropped (and
 //! counted). Real symlinks are preserved (unlike `get`, which degrades them
 //! to text files). Unix mode/uid/gid are carried when the source FS provides
-//! them; otherwise sane defaults (0644 file / 0755 dir / 0777 symlink). File
-//! mtimes are not yet preserved across all FS families, so entries are
-//! stamped epoch-0 for now.
+//! them; otherwise sane defaults (0644 file / 0755 dir / 0777 symlink). Each
+//! entry carries the source's modification time, or epoch 0 where the source
+//! filesystem records none.
 //!
 //! Shared by the CLI `tar` verb and the GUI "Export to .tar.gz…" action.
 

@@ -112,16 +112,10 @@ fn plan<R: Read + std::io::Seek>(
         } else {
             Kind::File
         };
-        let mtime = zf.last_modified().and_then(|d| {
-            unix_seconds(
-                d.year(),
-                d.month(),
-                d.day(),
-                d.hour(),
-                d.minute(),
-                d.second(),
-            )
-        });
+        // A zip timestamp is a DOS date and time, read as UTC.
+        let mtime = zf
+            .last_modified()
+            .and_then(|d| disk_core::times::dos_datetime_to_unix(d.datepart(), d.timepart()));
         members.push(Member {
             index,
             comps,
@@ -141,27 +135,6 @@ fn primary_of(sidecar: &[String]) -> Vec<String> {
         *last = last[2..].to_string();
     }
     p
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's `days_from_civil`).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-/// A zip timestamp as Unix seconds, read as UTC; `None` for the DOS "no date" value.
-fn unix_seconds(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Option<u64> {
-    if month == 0 || day == 0 {
-        return None;
-    }
-    let days = days_from_civil(i64::from(year), i64::from(month), i64::from(day));
-    let secs = days * 86400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
-    u64::try_from(secs).ok().filter(|s| *s > 0)
 }
 
 fn overrides(m: &Member, apply: bool) -> AttrOverrides {
@@ -326,9 +299,13 @@ mod tests {
 
     #[test]
     fn zip_dates_read_as_utc() {
-        assert_eq!(unix_seconds(1970, 1, 1, 0, 0, 1), Some(1));
-        assert_eq!(unix_seconds(2000, 3, 1, 12, 0, 0), Some(951_912_000));
-        assert_eq!(unix_seconds(1980, 0, 0, 0, 0, 0), None);
+        let at =
+            |d: zip::DateTime| disk_core::times::dos_datetime_to_unix(d.datepart(), d.timepart());
+        let noon = zip::DateTime::from_date_and_time(2000, 3, 1, 12, 0, 0).unwrap();
+        assert_eq!(at(noon), Some(951_912_000));
+        let first = zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 2).unwrap();
+        assert_eq!(at(first), Some(315_532_802));
+        assert_eq!(disk_core::times::dos_datetime_to_unix(0, 0), None);
     }
 
     /// A Finder-style zip: a folder, a file whose fork rides in `__MACOSX`, and a symlink.

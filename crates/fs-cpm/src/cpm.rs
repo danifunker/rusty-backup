@@ -269,9 +269,7 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
         let image_len = reader
             .seek(SeekFrom::End(0))?
             .saturating_sub(partition_offset);
-        let reserved = dpb.off as u64 * dpb.spt as u64 * 128;
-        let fit = image_len.saturating_sub(reserved) / (dpb.block_size() as u64).max(1);
-        let usable_blocks = dpb.total_blocks().min(fit.min(u64::from(u32::MAX)) as u32);
+        let usable_blocks = blocks_that_fit(&dpb, image_len);
         Ok(CpmFilesystem {
             reader,
             partition_offset,
@@ -282,14 +280,9 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
         })
     }
 
-    /// Byte offset of allocation block `b` within the volume (after
-    /// the reserved-track skip).
-    fn block_byte_offset(&self, b: u16) -> u64 {
-        let reserved = self.dpb.off as u64 * self.dpb.spt as u64 * 128;
-        // Each block is `block_size` bytes; the data area starts at the
-        // first non-reserved logical record. block 0 starts at the first
-        // record of the data area.
-        reserved + b as u64 * self.dpb.block_size() as u64
+    /// Read allocation block `b` (its first `buf.len()` bytes).
+    fn read_block(&mut self, b: u16, buf: &mut [u8]) -> Result<(), FilesystemError> {
+        read_block_at(&mut self.reader, self.partition_offset, &self.dpb, b, buf)
     }
 
     /// Read all 32-byte records that make up the directory and group
@@ -381,10 +374,8 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
                 if copied >= limit {
                     return Ok(copied);
                 }
-                let off = self.partition_offset + self.block_byte_offset(ptr);
-                self.reader.seek(SeekFrom::Start(off))?;
                 let want = (bs as u64).min(remaining).min(limit - copied) as usize;
-                self.reader.read_exact(&mut buf[..want])?;
+                self.read_block(ptr, &mut buf[..want])?;
                 out.write_all(&buf[..want])?;
                 copied += want as u64;
                 remaining -= want as u64;
@@ -434,20 +425,70 @@ fn read_directory<R: Read + Seek>(
     // `off × spt × 128`. The old formula's extra `(sector_size / 128)`
     // factor double-counted for sector_size > 128 (e.g. PCW 512-B sectors
     // landed the directory at 4× the correct byte offset).
-    let reserved = dpb.off as u64 * dpb.spt as u64 * 128;
-    let bs = dpb.block_size() as u64;
+    let bs = dpb.block_size();
     let mut out = Vec::new();
     let bitmap = ((dpb.al0 as u16) << 8) | dpb.al1 as u16;
     for b in 0..16 {
         if bitmap & (0x8000 >> b) != 0 {
-            let off = partition_offset + reserved + b as u64 * bs;
-            reader.seek(SeekFrom::Start(off))?;
-            let mut buf = vec![0u8; bs as usize];
-            reader.read_exact(&mut buf)?;
+            let mut buf = vec![0u8; bs];
+            read_block_at(reader, partition_offset, dpb, b, &mut buf)?;
             out.extend_from_slice(&buf);
         }
     }
     Ok(out)
+}
+
+/// How many allocation blocks lie wholly inside an image of `image_len` bytes.
+fn blocks_that_fit(dpb: &Dpb, image_len: u64) -> u32 {
+    if super::cpm_diskdefs::skew_table(dpb).is_none() {
+        let reserved = dpb.off as u64 * dpb.spt as u64 * 128;
+        let fit = image_len.saturating_sub(reserved) / (dpb.block_size() as u64).max(1);
+        return dpb.total_blocks().min(fit.min(u64::from(u32::MAX)) as u32);
+    }
+    // Skewed records are scattered over the track, so a block fits only if every one does.
+    let bs = dpb.block_size();
+    (0..dpb.total_blocks())
+        .take_while(|&b| {
+            block_spans(dpb, b as u16, bs)
+                .iter()
+                .all(|(at, r)| at + r.len() as u64 <= image_len)
+        })
+        .count() as u32
+}
+
+/// Where the first `len` bytes of allocation block `b` lie, as (offset within the volume,
+/// range of the block's bytes): one span, or one per 128-byte record on a skewed preset.
+fn block_spans(dpb: &Dpb, b: u16, len: usize) -> Vec<(u64, std::ops::Range<usize>)> {
+    let spt = dpb.spt as u64;
+    let reserved = dpb.off as u64 * spt * 128;
+    let Some(skew) = super::cpm_diskdefs::skew_table(dpb) else {
+        return vec![(reserved + b as u64 * dpb.block_size() as u64, 0..len)];
+    };
+    let first = b as u64 * dpb.records_per_block() as u64;
+    (0..len.div_ceil(128))
+        .map(|i| {
+            // Record `rec` of the data area: its track, then the sector the skew puts it in.
+            let rec = first + i as u64;
+            let sector = u64::from(skew[(rec % spt) as usize] - 1);
+            let at = reserved + (rec / spt * spt + sector) * 128;
+            (at, i * 128..len.min((i + 1) * 128))
+        })
+        .collect()
+}
+
+/// Read the first `buf.len()` bytes of allocation block `b`, through the preset's skew.
+fn read_block_at<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    dpb: &Dpb,
+    b: u16,
+    buf: &mut [u8],
+) -> Result<(), FilesystemError> {
+    for (at, range) in block_spans(dpb, b, buf.len()) {
+        reader.seek(SeekFrom::Start(partition_offset + at))?;
+        reader.read_exact(&mut buf[range])?;
+    }
+    Ok(())
 }
 
 // ─────────────────────────── fsck (check + repair) ───────────────────────────
@@ -761,6 +802,16 @@ impl<R: Read + Write + Seek + Send> CpmFilesystem<R> {
         (0..total).filter(|&i| !used[i as usize]).collect()
     }
 
+    /// Write `buf` as the start of allocation block `b`.
+    fn write_block(&mut self, b: u16, buf: &[u8]) -> Result<(), FilesystemError> {
+        let (part, dpb) = (self.partition_offset, self.dpb);
+        for (at, range) in block_spans(&dpb, b, buf.len()) {
+            self.reader.seek(SeekFrom::Start(part + at))?;
+            self.reader.write_all(&buf[range])?;
+        }
+        Ok(())
+    }
+
     /// Write data into the named extent's block pointers.
     /// Copy `len` bytes of `data` into the blocks `ptrs`, one block at a time, zero-padding the last.
     fn write_blocks_from(
@@ -779,9 +830,7 @@ impl<R: Read + Write + Seek + Send> CpmFilesystem<R> {
             let want = (bs as u64).min(left) as usize;
             chunk.fill(0);
             data.read_exact(&mut chunk[..want])?;
-            let abs = self.partition_offset + self.block_byte_offset(ptr);
-            self.reader.seek(SeekFrom::Start(abs))?;
-            self.reader.write_all(&chunk)?;
+            self.write_block(ptr, &chunk)?;
             left -= want as u64;
         }
         Ok(())
@@ -804,27 +853,20 @@ impl<R: Read + Write + Seek + Send> CpmFilesystem<R> {
         }
         self.dir_bytes_cache = new_bytes.clone();
         // Write back to the blocks indicated by al0/al1.
-        let reserved = self.dpb.off as u64 * self.dpb.spt as u64 * 128;
-        let bs = self.dpb.block_size() as u64;
+        let bs = self.dpb.block_size();
         let bitmap = ((self.dpb.al0 as u16) << 8) | self.dpb.al1 as u16;
-        let mut written: u64 = 0;
+        let mut written = 0usize;
         for b in 0..16 {
             if bitmap & (0x8000 >> b) != 0 {
-                let off = self.partition_offset + reserved + b as u64 * bs;
-                let want = (bs as usize).min(new_bytes.len() - written as usize);
+                let want = bs.min(new_bytes.len() - written);
                 if want == 0 {
                     break;
                 }
-                self.reader.seek(SeekFrom::Start(off))?;
-                self.reader
-                    .write_all(&new_bytes[written as usize..written as usize + want])?;
-                // Pad rest of this directory block with 0xE5 to keep
-                // CP/M's "deleted" marker convention.
-                if want < bs as usize {
-                    let pad = vec![0xE5u8; bs as usize - want];
-                    self.reader.write_all(&pad)?;
-                }
-                written += want as u64;
+                // Pad the rest of the block with 0xE5, CP/M's "deleted" marker.
+                let mut block = vec![0xE5u8; bs];
+                block[..want].copy_from_slice(&new_bytes[written..written + want]);
+                self.write_block(b, &block)?;
+                written += want;
             }
         }
         Ok(())
@@ -1171,7 +1213,17 @@ pub fn create_blank(dpb: Dpb) -> Vec<u8> {
 
 /// The length of a blank disk: its reserved tracks and data area.
 fn blank_size(dpb: &Dpb) -> u64 {
-    dpb.off as u64 * dpb.spt as u64 * 128 + dpb.data_bytes()
+    dpb.off as u64 * dpb.spt as u64 * 128 + data_area_bytes(dpb)
+}
+
+/// Bytes the data area takes on disk: whole tracks on a skewed preset, whose last blocks'
+/// records are scattered over the full final track.
+fn data_area_bytes(dpb: &Dpb) -> u64 {
+    if super::cpm_diskdefs::skew_table(dpb).is_none() {
+        return dpb.data_bytes();
+    }
+    let track = dpb.spt as u64 * 128;
+    dpb.data_bytes().div_ceil(track) * track
 }
 
 /// The streaming form of [`create_blank`]: fills the disk with 0xE5 at `at_offset`, 64 KiB at a
@@ -1468,6 +1520,50 @@ mod tests {
             assert!(err.to_string().contains("more than"), "{err}");
         }
         assert!(fs.list_directory(&root).unwrap().is_empty());
+    }
+
+    /// CPM-010: on IBM 3740 a block's records sit where the skew-6 table puts them, and what is
+    /// written there reads back; `altair_8in`, the same geometry unskewed, stays sequential.
+    #[test]
+    fn ibm_3740_writes_and_reads_through_its_sector_skew() {
+        use crate::cpm_diskdefs::IBM_3740;
+        let dpb = IBM_3740;
+        let mut fs = CpmFilesystem::open_with_dpb(Cursor::new(create_blank(dpb)), 0, dpb).unwrap();
+        let root = fs.root().unwrap();
+        let data: Vec<u8> = (0..1024u32).map(|i| (i / 128) as u8 + 0x40).collect();
+        fs.create_file(&root, "SKEW.DAT", &mut &data[..], 1024, &Default::default())
+            .unwrap();
+        fs.sync_metadata().unwrap();
+        let img = fs.reader.into_inner();
+        // Block 2 starts at data record 16: track 2 + 0, logical record 16 -> sector 20.
+        let track = 26 * 128;
+        let at = 2 * track + (20 - 1) * 128;
+        assert!(
+            img[at..at + 128].iter().all(|&b| b == 0x40),
+            "record 16 not in sector 20"
+        );
+        let mut fs = CpmFilesystem::open_with_dpb(Cursor::new(img), 0, dpb).unwrap();
+        let root = fs.root().unwrap();
+        let entry = fs.list_directory(&root).unwrap().remove(0);
+        assert_eq!(fs.read_file(&entry, 4096).unwrap(), data);
+        assert!(crate::cpm_diskdefs::skew_table(&crate::cpm_diskdefs::ALTAIR_8IN).is_none());
+    }
+
+    /// A blank IBM 3740 disk is the full 77 x 26 x 128 bytes, and its last block, scattered by the
+    /// skew over the final track, reads and writes without growing the image.
+    #[test]
+    fn a_blank_ibm_3740_disk_holds_its_last_block() {
+        use crate::cpm_diskdefs::IBM_3740;
+        let img = create_blank(IBM_3740);
+        assert_eq!(img.len(), 256_256);
+        let mut fs = CpmFilesystem::open_with_dpb(Cursor::new(img), 0, IBM_3740).unwrap();
+        assert_eq!(fs.usable_blocks, IBM_3740.total_blocks());
+        let last = IBM_3740.dsm;
+        fs.write_block(last, &[0x5A; 1024]).unwrap();
+        let mut back = [0u8; 1024];
+        fs.read_block(last, &mut back).unwrap();
+        assert_eq!(back, [0x5A; 1024]);
+        assert_eq!(fs.reader.get_ref().len(), 256_256);
     }
 
     /// EXM 1 (Einstein): an entry covers two logical extents, its extent byte names the last one

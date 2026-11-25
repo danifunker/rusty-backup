@@ -3,6 +3,14 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.2.2
+
+### Changed
+- The AFFS, PFS3 and SFS checkers share one issue constructor, issue bucket, allocation bit
+  set and free-map comparison; AFFS `fs_type` / `sync_metadata` and name folding reuse
+  `fs_type_label`, `flush_metadata` and `affs_common`'s case folding (AMI-016). No behaviour
+  change.
+
 ## 0.2.1
 
 ### Added

@@ -56,12 +56,7 @@ impl AffsFsckCode {
 }
 
 fn issue(code: AffsFsckCode, message: impl Into<String>, repairable: bool) -> FsckIssue {
-    FsckIssue {
-        code: code.as_str().to_string(),
-        message: message.into(),
-        repairable,
-        debug: false,
-    }
+    crate::fsck_common::issue(code.as_str(), message, repairable)
 }
 
 /// Reachable-block walk result. Used both by `check` and by `repair` so the

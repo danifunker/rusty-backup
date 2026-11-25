@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "disk-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1798,7 +1798,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "dsk-apple"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -1809,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-clonezilla"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-ghost"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "disk-core",
@@ -1904,7 +1904,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-vm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "disk-core",
@@ -2451,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "fs-8bit"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "fs-adfs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "byteorder",
  "disk-core",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "fs-amiga"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2500,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "fs-cpm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "disk-core",
 ]
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "fs-squashfs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "disk-core",
  "flate2",
@@ -2568,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "fs-tar"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "bzip2 0.6.1",
@@ -2601,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "fs-xerox"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "disk-core",
  "flate2",
@@ -5276,7 +5276,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qnx2fs"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "disk-core",

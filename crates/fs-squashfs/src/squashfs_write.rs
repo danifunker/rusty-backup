@@ -67,11 +67,8 @@ const DIR_TYPE_SOCKET: u16 = 7;
 
 /// Superblock flag bits.
 ///
-/// The three "uncompressed X" flags are never set: we attempt compression on
-/// every block and fall back to storing that *individual* block verbatim (the
-/// per-block header bit), which is strictly better than declaring a whole
-/// category incompressible. They are named here because the flag word is only
-/// legible alongside the bits it doesn't set.
+/// The "uncompressed X" flags are never set (each block falls back on its own), so they aren't
+/// defined; `FLAG_DUPLICATES` is set as `mksquashfs` sets it, though no duplicates are found.
 const FLAG_NO_FRAGMENTS: u16 = 0x0010;
 const FLAG_DUPLICATES: u16 = 0x0040;
 const FLAG_NO_XATTRS: u16 = 0x0200;

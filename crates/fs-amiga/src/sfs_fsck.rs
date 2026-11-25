@@ -32,6 +32,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
+use crate::fsck_common::{diff_against_free, BitSet};
 use crate::sfs::{SfsChildKind, SfsFilesystem};
 use disk_core::filesystem::FilesystemError;
 use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
@@ -61,41 +62,7 @@ impl SfsFsckCode {
 }
 
 fn issue(code: SfsFsckCode, message: impl Into<String>, repairable: bool) -> FsckIssue {
-    FsckIssue {
-        code: code.as_str().to_string(),
-        message: message.into(),
-        repairable,
-        debug: false,
-    }
-}
-
-/// A compact bit set (one bit per block, LSB-first per byte); `set = allocated`.
-struct BitSet {
-    bits: Vec<u8>,
-    len: u32,
-}
-
-impl BitSet {
-    fn new(len: u32) -> Self {
-        Self {
-            bits: vec![0u8; (len as usize).div_ceil(8)],
-            len,
-        }
-    }
-    fn set(&mut self, idx: u32) {
-        if idx < self.len {
-            self.bits[(idx / 8) as usize] |= 1u8 << (idx % 8);
-        }
-    }
-    fn get(&self, idx: u32) -> bool {
-        idx < self.len && (self.bits[(idx / 8) as usize] >> (idx % 8)) & 1 == 1
-    }
-    fn count_set(&self) -> u32 {
-        self.bits.iter().map(|b| b.count_ones()).sum()
-    }
-    fn as_bytes(&self) -> &[u8] {
-        &self.bits
-    }
+    crate::fsck_common::issue(code.as_str(), message, repairable)
 }
 
 /// Result of the reachability walk, shared by `check` and `repair`.
@@ -358,26 +325,6 @@ fn analyze<R: std::io::Read + std::io::Seek>(
     Ok(walk)
 }
 
-/// Compute `(missing, extra)` between an observed allocation set and the
-/// on-disk **free** bitmap (`stored_free` bit set = free).
-fn diff_against_free(observed: &BitSet, stored_free: &[u8], len: u32) -> (u32, u32) {
-    let mut missing = 0u32;
-    let mut extra = 0u32;
-    for idx in 0..len {
-        let obs_alloc = observed.get(idx);
-        let sto_free = stored_free
-            .get((idx / 8) as usize)
-            .map(|b| (b >> (idx % 8)) & 1 == 1)
-            .unwrap_or(false);
-        match (obs_alloc, !sto_free) {
-            (true, false) => missing += 1,
-            (false, true) => extra += 1,
-            _ => {}
-        }
-    }
-    (missing, extra)
-}
-
 /// Run a non-mutating filesystem check against `fs`.
 pub fn check_sfs<R: std::io::Read + std::io::Seek + Send>(
     fs: &mut SfsFilesystem<R>,
@@ -512,15 +459,5 @@ pub fn repair_sfs<R: std::io::Read + std::io::Write + std::io::Seek + Send>(
 /// Turn a bucket of structural findings into `FsckIssue` errors, capping the
 /// count so a pathologically corrupt volume can't produce an unbounded list.
 fn push_bucket(errors: &mut Vec<FsckIssue>, code: SfsFsckCode, msgs: &[String]) {
-    const CAP: usize = 32;
-    for msg in msgs.iter().take(CAP) {
-        errors.push(issue(code, msg.clone(), false));
-    }
-    if msgs.len() > CAP {
-        errors.push(issue(
-            code,
-            format!("... and {} more", msgs.len() - CAP),
-            false,
-        ));
-    }
+    crate::fsck_common::push_bucket(errors, code.as_str(), msgs);
 }

@@ -3365,6 +3365,11 @@ impl GhoFileAwareEntry {
         self.attr & 0x10 != 0 && self.attr != 0x0F
     }
 
+    /// The volume label: kept in the tree, but it is not a file.
+    pub fn is_volume_label(&self) -> bool {
+        self.attr & 0x08 != 0 && self.attr != 0x0F
+    }
+
     pub fn display_name(&self) -> &str {
         self.long_name.as_deref().unwrap_or(&self.short_name)
     }
@@ -3385,7 +3390,17 @@ impl GhoFileAwareTree {
             .filter(move |e| e.parent_cluster == dir_cluster)
     }
     pub fn file_count(&self) -> usize {
-        self.entries.iter().filter(|e| !e.is_directory()).count()
+        self.entries
+            .iter()
+            .filter(|e| !e.is_directory() && !e.is_volume_label())
+            .count()
+    }
+
+    /// The root directory's volume label, which the rebuilt FAT carries as its label.
+    pub fn volume_label(&self) -> Option<&str> {
+        self.children_of(self.root_cluster)
+            .find(|e| e.is_volume_label())
+            .map(|e| e.short_name.as_str())
     }
     pub fn dir_count(&self) -> usize {
         self.entries.iter().filter(|e| e.is_directory()).count()
@@ -3513,6 +3528,14 @@ pub fn walk_file_aware_tree<R: Read + Seek>(
             lfn_buf.clear();
 
             let is_dir = entry.is_directory();
+            // A label is 11 characters with no dot, not an 8.3 name.
+            let short = if entry.is_volume_label() {
+                String::from_utf8_lossy(&entry.fat_entry[..11])
+                    .trim_end()
+                    .to_string()
+            } else {
+                short
+            };
             tree.entries.push(GhoFileAwareEntry {
                 source_cluster: entry.first_cluster(),
                 parent_cluster: if is_dir { 0 } else { current_dir },
@@ -3527,6 +3550,9 @@ pub fn walk_file_aware_tree<R: Read + Seek>(
             if is_dir {
                 pending_dir = Some(idx);
                 pending_file = None;
+            } else if entry.is_volume_label() {
+                pending_file = None;
+                pending_dir = None;
             } else {
                 pending_file = Some(idx);
                 pending_dir = None;
@@ -3960,7 +3986,7 @@ fn build_virtual_fat_image(
 
     let bps = layout.bytes_per_sector as u64;
     let mut sink = SparseSink::new(size, bps);
-    write_blank_fat_metadata_to_sink(&mut sink, &layout, None)
+    write_blank_fat_metadata_to_sink(&mut sink, &layout, tree.volume_label())
         .context("writing blank FAT metadata into sparse sink")?;
 
     let mut fs = FatFilesystem::open(&mut sink, 0).context("opening sparse FAT image for emit")?;
@@ -4007,6 +4033,9 @@ fn build_virtual_fat_image(
         let child_idxs = child_idxs.clone();
         for idx in child_idxs {
             let entry = &tree.entries[idx];
+            if entry.is_volume_label() {
+                continue;
+            }
             let Some(name) = choose_emit_name(entry) else {
                 continue;
             };
@@ -4144,7 +4173,7 @@ pub fn emit_file_aware_fat_image_to_sink<R: Read + Seek, S: Read + Write + Seek 
         sink.write_all(&chunk[..n])?;
         remaining -= n as u64;
     }
-    write_blank_fat_metadata_to_sink(sink, &layout, None)
+    write_blank_fat_metadata_to_sink(sink, &layout, tree.volume_label())
         .context("formatting blank FAT for emit")?;
     sink.flush()?;
     sink.seek(SeekFrom::Start(0))?;
@@ -4188,6 +4217,9 @@ pub fn emit_file_aware_fat_image_to_sink<R: Read + Seek, S: Read + Write + Seek 
         let child_idxs = child_idxs.clone();
         for idx in child_idxs {
             let entry = &tree.entries[idx];
+            if entry.is_volume_label() {
+                continue;
+            }
             let Some(name) = choose_emit_name(entry) else {
                 result
                     .skipped

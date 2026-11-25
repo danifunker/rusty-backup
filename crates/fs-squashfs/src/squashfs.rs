@@ -532,6 +532,33 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
         Ok(out)
     }
 
+    /// The bytes of a table of `count` fixed-size entries (fragment, ID, xattr ID): an index of
+    /// 64-bit pointers at `index_at` to the metadata blocks that hold whole entries.
+    fn read_table(
+        &mut self,
+        index_at: u64,
+        count: usize,
+        entry: usize,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        let per_block = 8192 / entry;
+        let index_count = count.div_ceil(per_block);
+        let mut index = vec![0u8; index_count * 8];
+        self.reader
+            .seek(SeekFrom::Start(self.offset + index_at))
+            .map_err(FilesystemError::Io)?;
+        self.reader
+            .read_exact(&mut index)
+            .map_err(FilesystemError::Io)?;
+        let mut out = Vec::with_capacity(count.saturating_mul(entry).min(1 << 20));
+        for i in 0..index_count {
+            let (block, _) = self.read_metadata_block(u64le(&index, i * 8))?;
+            let room = count.saturating_mul(entry) - out.len();
+            let whole = block.len() / entry * entry;
+            out.extend_from_slice(&block[..whole.min(room)]);
+        }
+        Ok(out)
+    }
+
     /// The fragment table is a list of 16-byte entries, reached through a table
     /// of 64-bit pointers to the metadata blocks holding them.
     fn load_fragment_table(&mut self) -> Result<(), FilesystemError> {
@@ -540,30 +567,14 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             return Ok(());
         }
 
-        // Each metadata block holds 8192/16 = 512 fragment entries.
-        let index_count = count.div_ceil(512);
-        let mut index = vec![0u8; index_count * 8];
-        self.reader
-            .seek(SeekFrom::Start(self.offset + self.sb.fragment_table_start))
-            .map_err(FilesystemError::Io)?;
-        self.reader
-            .read_exact(&mut index)
-            .map_err(FilesystemError::Io)?;
-
-        let mut entries = Vec::with_capacity(count.min(1 << 16));
-        for i in 0..index_count {
-            let block_start = u64le(&index, i * 8);
-            let (block, _) = self.read_metadata_block(block_start)?;
-            let mut off = 0;
-            while off + 16 <= block.len() && entries.len() < count {
-                entries.push(FragmentEntry {
-                    start: u64le(&block, off),
-                    size: u32le(&block, off + 8),
-                });
-                off += 16;
-            }
-        }
-        self.fragments = entries;
+        let table = self.read_table(self.sb.fragment_table_start, count, 16)?;
+        self.fragments = table
+            .chunks_exact(16)
+            .map(|e| FragmentEntry {
+                start: u64le(e, 0),
+                size: u32le(e, 8),
+            })
+            .collect();
         Ok(())
     }
 
@@ -576,27 +587,8 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             return Ok(());
         }
 
-        // 8192 / 4 = 2048 IDs per metadata block.
-        let index_count = count.div_ceil(2048);
-        let mut index = vec![0u8; index_count * 8];
-        self.reader
-            .seek(SeekFrom::Start(self.offset + self.sb.id_table_start))
-            .map_err(FilesystemError::Io)?;
-        self.reader
-            .read_exact(&mut index)
-            .map_err(FilesystemError::Io)?;
-
-        let mut ids = Vec::with_capacity(count.min(1 << 16));
-        for i in 0..index_count {
-            let block_start = u64le(&index, i * 8);
-            let (block, _) = self.read_metadata_block(block_start)?;
-            let mut off = 0;
-            while off + 4 <= block.len() && ids.len() < count {
-                ids.push(u32le(&block, off));
-                off += 4;
-            }
-        }
-        self.ids = ids;
+        let table = self.read_table(self.sb.id_table_start, count, 4)?;
+        self.ids = table.chunks_exact(4).map(|e| u32le(e, 0)).collect();
         Ok(())
     }
 
@@ -631,29 +623,16 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             return Ok(());
         }
 
-        // 8192 / 16 = 512 ID entries per metadata block. The index sits
-        // immediately after the header.
-        let index_count = count.div_ceil(512);
-        let mut index = vec![0u8; index_count * 8];
-        self.reader
-            .read_exact(&mut index)
-            .map_err(FilesystemError::Io)?;
-
-        let mut entries = Vec::with_capacity(count.min(1 << 16));
-        for i in 0..index_count {
-            let block_start = u64le(&index, i * 8);
-            let (block, _) = self.read_metadata_block(block_start)?;
-            let mut off = 0;
-            while off + 16 <= block.len() && entries.len() < count {
-                entries.push(XattrIdEntry {
-                    xattr_ref: u64le(&block, off),
-                    count: u32le(&block, off + 8),
-                    size: u32le(&block, off + 12),
-                });
-                off += 16;
-            }
-        }
-        self.xattr_ids = entries;
+        // The index sits immediately after the 16-byte header.
+        let table = self.read_table(table + 16, count, 16)?;
+        self.xattr_ids = table
+            .chunks_exact(16)
+            .map(|e| XattrIdEntry {
+                xattr_ref: u64le(e, 0),
+                count: u32le(e, 8),
+                size: u32le(e, 12),
+            })
+            .collect();
         Ok(())
     }
 

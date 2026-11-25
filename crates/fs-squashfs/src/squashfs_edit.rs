@@ -647,6 +647,7 @@ impl<RW: Read + Write + Seek + Send> Filesystem for SquashfsEditor<RW> {
             .ok_or_else(|| FilesystemError::NotFound(entry.path.clone()))?;
         match &node.kind {
             BuildKind::File(FileContent::Bytes(b)) => Ok(b[..b.len().min(max_bytes)].to_vec()),
+            BuildKind::File(FileContent::Shared(b)) => Ok(b[..b.len().min(max_bytes)].to_vec()),
             BuildKind::File(FileContent::HostFile { path, .. }) => {
                 let f = std::fs::File::open(path).map_err(FilesystemError::Io)?;
                 let mut out = Vec::new();
@@ -661,6 +662,34 @@ impl<RW: Read + Write + Seek + Send> Filesystem for SquashfsEditor<RW> {
                 entry.path
             ))),
         }
+    }
+
+    // A host file is streamed, never loaded whole (DC-006); in-memory content is written as is.
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        let node = self
+            .node_at(&entry.path)
+            .ok_or_else(|| FilesystemError::NotFound(entry.path.clone()))?;
+        let bytes: &[u8] = match &node.kind {
+            BuildKind::File(FileContent::HostFile { path, .. }) => {
+                let mut f = std::fs::File::open(path).map_err(FilesystemError::Io)?;
+                return Ok(std::io::copy(&mut f, writer)?);
+            }
+            BuildKind::File(FileContent::Bytes(b)) => b,
+            BuildKind::File(FileContent::Shared(b)) => b,
+            BuildKind::Symlink(target) => target.as_bytes(),
+            _ => {
+                return Err(FilesystemError::InvalidData(format!(
+                    "squashfs: {} is not a regular file",
+                    entry.path
+                )))
+            }
+        };
+        writer.write_all(bytes)?;
+        Ok(bytes.len() as u64)
     }
 
     fn volume_label(&self) -> Option<&str> {
@@ -1040,6 +1069,29 @@ mod tests {
 
     fn open_editor(bytes: Vec<u8>) -> SquashfsEditor<Cursor<Vec<u8>>> {
         SquashfsEditor::open(Cursor::new(bytes), 0).expect("open editor")
+    }
+
+    /// A hard-linked file, loaded into the editor as shared content, reads and streams.
+    #[test]
+    fn hard_linked_files_read_in_the_editor() {
+        let data = std::sync::Arc::new(b"shared\n".to_vec());
+        let link = |name: &str| {
+            let mut n = BuildNode::file(name, 0o644, Vec::new());
+            n.kind = BuildKind::File(FileContent::Shared(data.clone()));
+            n.link_group = Some(1);
+            n
+        };
+        let tree = BuildNode::dir("", 0o755, vec![link("a"), link("b")]);
+        let mut cur = Cursor::new(Vec::new());
+        write_squashfs(&mut cur, &tree, &BuildOptions::default()).expect("write");
+        let mut fs = open_editor(cur.into_inner());
+        let root = fs.root().unwrap();
+        for e in fs.list_directory(&root).unwrap() {
+            assert_eq!(fs.read_file(&e, 100).unwrap(), b"shared\n", "{}", e.name);
+            let mut streamed = Vec::new();
+            fs.write_file_to(&e, &mut streamed).unwrap();
+            assert_eq!(streamed, b"shared\n");
+        }
     }
 
     /// Incompressible bytes, so a size-budget test measures the budget rather
@@ -1661,6 +1713,9 @@ mod tests {
             .find(|e| e.name == "hello.txt")
             .unwrap();
         assert_eq!(fs.read_file(&hello, 100).unwrap(), b"hi\n");
+        let mut streamed = Vec::new();
+        assert_eq!(fs.write_file_to(&hello, &mut streamed).unwrap(), 3);
+        assert_eq!(streamed, b"hi\n");
         assert_eq!(
             hello.mode.map(|m| m & 0o7777),
             Some(0o600),

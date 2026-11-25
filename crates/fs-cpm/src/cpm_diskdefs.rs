@@ -212,6 +212,38 @@ pub const ALTAIR_8IN: Dpb = Dpb {
     tracks: 77,
 };
 
+/// IBM 3740 8" SSSD, the standard CP/M interchange floppy (cpmtools `ibm-3740`): the
+/// `altair_8in` geometry with the BIOS's sector skew of 6 (see [`skew_table`]).
+pub const IBM_3740: Dpb = Dpb {
+    name: "ibm_3740",
+    spt: 26,
+    bsh: 3,
+    blm: 7,
+    exm: 0,
+    dsm: 242,
+    drm: 63,
+    al0: 0xC0,
+    al1: 0x00,
+    cks: 16,
+    off: 2,
+    psh: 0,
+    phm: 0,
+    sector_size: 128,
+    tracks: 77,
+};
+
+/// IBM 3740's sector skew: logical record `r` of a track is physical sector `TABLE[r]` (1-based).
+const IBM_3740_SKEW: [u8; 26] = [
+    1, 7, 13, 19, 25, 5, 11, 17, 23, 3, 9, 15, 21, 2, 8, 14, 20, 26, 6, 12, 18, 24, 4, 10, 16, 22,
+];
+
+/// The sector translation a preset's BIOS applies to data tracks, or `None` when records lie in
+/// sector order. Kept beside [`Dpb`] rather than in it so the struct stays as published.
+pub fn skew_table(dpb: &Dpb) -> Option<&'static [u8]> {
+    (dpb.name == IBM_3740.name && dpb.spt as usize == IBM_3740_SKEW.len())
+        .then_some(&IBM_3740_SKEW[..])
+}
+
 /// Altair 8800 CF disk (Altair-Z80 era). Sectorized as 512 B in 8 MB
 /// chunks; the MiSTer Altair8800 core supports IDE-style CF images.
 pub const ALTAIR_CF: Dpb = Dpb {
@@ -279,6 +311,7 @@ pub const ALL_PRESETS: &[Dpb] = &[
     EINSTEIN,
     SVI328_CPM,
     ALTAIR_8IN,
+    IBM_3740,
     ALTAIR_CF,
     MULTICOMP,
     ZX_PLUS3,

@@ -941,6 +941,11 @@ pub struct AdfsDirEntry {
     pub attrs: u8,
 }
 
+/// RISC OS stores an empty file with disc address 0: it holds no fragment, so nothing to check.
+fn is_unallocated_empty_file(e: &AdfsDirEntry) -> bool {
+    !e.is_directory() && e.file_length == 0 && e.indirect_disc_addr >> 8 == 0
+}
+
 impl AdfsDirEntry {
     pub fn is_directory(&self) -> bool {
         self.attrs & 0x08 != 0
@@ -1230,6 +1235,10 @@ impl<R: Read + Seek + Send> AdfsFilesystem<R> {
                 }
             };
             for e in entries {
+                if is_unallocated_empty_file(&e) {
+                    files += 1;
+                    continue;
+                }
                 referenced.insert(e.indirect_disc_addr >> 8);
                 let resolves = self
                     .fsm
@@ -2639,15 +2648,23 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         };
         // Old-map D-format: free the contiguous run, then persist the old map.
         if self.old_map.is_some() {
-            let removed = self.remove_dir_entry(parent_indaddr, &entry.name)?;
-            let start = removed.indirect_disc_addr;
-            let n = (removed.file_length.max(1) as u64).div_ceil(OLD_MAP_ADDR_UNIT) as u32;
+            let start = entry.location as u32;
+            if start == 0 && !entry.is_directory() && entry.size == 0 {
+                self.remove_dir_entry(parent_indaddr, &entry.name)?;
+                return Ok(());
+            }
+            // Refuse before the entry goes, so a refusal leaves the directory as it was.
             if start <= OLD_MAP_ROOT_ADDR {
                 return Err(FilesystemError::InvalidData(format!(
                     "ADFS: refused to free reserved disc address {start}"
                 )));
             }
-            self.old_map.as_mut().unwrap().free_run(start, n);
+            let removed = self.remove_dir_entry(parent_indaddr, &entry.name)?;
+            let n = (removed.file_length.max(1) as u64).div_ceil(OLD_MAP_ADDR_UNIT) as u32;
+            self.old_map
+                .as_mut()
+                .unwrap()
+                .free_run(removed.indirect_disc_addr, n);
             self.write_old_map()?;
             return Ok(());
         }
@@ -2656,6 +2673,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         // unreadable (ADF-002).
         let indaddr = entry.location as u32;
         let frag_id = indaddr >> 8;
+        // An empty file with no fragment owns nothing in the map: only its entry goes.
+        if frag_id == 0 && !entry.is_directory() && entry.size == 0 {
+            self.remove_dir_entry(parent_indaddr, &entry.name)?;
+            return Ok(());
+        }
         if frag_id <= ADFS_ROOT_FRAG {
             return Err(FilesystemError::InvalidData(format!(
                 "ADFS: refused to free reserved frag id {frag_id}"
@@ -3034,6 +3056,28 @@ mod tests {
     }
 
     #[test]
+    fn dformat_delete_of_an_empty_or_reserved_entry_keeps_the_directory_honest() {
+        // Point HELLO at disc address `addr` with length `len`, then try to delete it.
+        let delete = |addr: u32, len: u32| {
+            let mut disk = build_dformat_with_one_file();
+            let e = 1024 + DIR_SMALL_HEADER;
+            LittleEndian::write_u32(&mut disk[e + 18..e + 22], len);
+            disk[e + 22..e + 25].copy_from_slice(&addr.to_le_bytes()[..3]);
+            let mut fs = AdfsFilesystem::open(Cursor::new(disk), 0).unwrap();
+            let root = fs.root().unwrap();
+            let hello = fs.list_directory(&root).unwrap().remove(0);
+            let res = fs.delete_entry(&root, &hello);
+            (res, fs.list_directory(&root).unwrap().len())
+        };
+        let (res, left) = delete(0, 0);
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(left, 0);
+        let (res, left) = delete(2, 32);
+        assert!(res.is_err());
+        assert_eq!(left, 1, "a refused delete must leave the entry");
+    }
+
+    #[test]
     fn dformat_write_create_delete_round_trip() {
         let mut cur = Cursor::new(build_dformat_with_one_file());
         let free_before;
@@ -3201,6 +3245,36 @@ mod tests {
             res.errors
         );
         assert_eq!(res.stats.files_checked, 1);
+    }
+
+    #[test]
+    fn an_empty_file_at_disc_address_zero_is_clean_and_deletable() {
+        // RISC OS writes empty files this way (seen on a real Archimedes demo disc).
+        let mut cur = Cursor::new(create_blank_adfs("D"));
+        {
+            let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.disc_record.root;
+            let entry = AdfsDirEntry {
+                name: "EMPTY".into(),
+                load_addr: 0xFFFFFFFF,
+                exec_addr: 0,
+                file_length: 0,
+                indirect_disc_addr: 0,
+                attrs: 0x03,
+            };
+            fs.insert_dir_entry(root, &entry).unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(res.is_clean(), "empty file flagged: {:?}", res.errors);
+        assert_eq!(res.stats.files_checked, 1);
+        let root = fs.root().unwrap();
+        let file = fs.list_directory(&root).unwrap().remove(0);
+        assert!(fs.read_file(&file, usize::MAX).unwrap().is_empty());
+        fs.delete_entry(&root, &file).unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        assert!(fs.fsck().unwrap().unwrap().is_clean());
     }
 
     #[test]

@@ -2358,6 +2358,10 @@ jobs:
       - build-gtk4-appimage
     runs-on: ubuntu-24.04
     steps:
+      # Only the page generator (scripts/ci/release-downloads.sh); the artifacts come next.
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: scripts/ci
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         # v8.0.1 bundles a dep that calls Buffer(), so Node 24 prints DEP0005 on
@@ -2388,132 +2392,9 @@ jobs:
       - name: Generate downloads table
         env:
           VER: ${{ needs.generate-version.outputs.version }}
+        # One row per downloadable file, grouped by OS; warns (never fails) on a missing asset.
         run: |
-          TAG="v${VER}"
-          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
-          # Stable, version-independent URL for the MiSTer Downloader database:
-          # the `latest` alias always resolves to the newest non-prerelease, so
-          # users add this db_url once and pick up every future build.
-          DB_URL="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/rusty-backup.json.zip"
-          # Warn (don't fail) if an expected asset is missing — surfaces a
-          # matrix change without blocking the release.
-          for f in \
-            "Rusty-Backup-Win32-Setup-windows-x64-${VER}.exe" "Rusty-Backup-Win32-windows-x64-${VER}.zip" \
-            "Rusty-Backup-Win32-Setup-windows-x86-${VER}.exe" "Rusty-Backup-Win32-windows-x86-${VER}.zip" \
-            "Rusty-Backup-Win32-Setup-windows-arm64-${VER}.exe" "Rusty-Backup-Win32-windows-arm64-${VER}.zip" \
-            "Rusty-Backup-AppKit-macos-arm64-${VER}.dmg" "Rusty-Backup-AppKit-macos-x64-${VER}.dmg" \
-            "rb-cli-windows-x64-${VER}.zip" "rb-cli-windows-x86-${VER}.zip" \
-            "rb-cli-macos-arm64-${VER}.zip" "rb-cli-macos-x64-${VER}.zip" \
-            "rb-cli-linux-x64-${VER}.tar.gz" "rb-cli-linux-arm64-${VER}.tar.gz" \
-            "rb-cli-mini-armv7-linux-${VER}.tar.gz" \
-            "rb-cli-linux-ppc64-${VER}.tar.gz" "rb-cli-linux-ppc32-${VER}.tar.gz" \
-            "rb-cli-linux-riscv64-${VER}.tar.gz" "rb-cli-windows-arm64-${VER}.zip" \
-            "rb-cli-macos-vintage-x64-${VER}.zip" "Rusty-Backup-Cocoa-macos-vintage-x64-${VER}.dmg" \
-            "rb-cli-win7-x64-${VER}.zip" "rb-cli-win7-x86-${VER}.zip" \
-            "rb-cli-linux-musl-x64-${VER}.tar.gz" "rb-cli-linux-musl-arm64-${VER}.tar.gz" \
-            "rb-cli-linux-musl-i586-${VER}.tar.gz" "rb-cli-linux-musl-i686-${VER}.tar.gz" \
-            "rb-cli-linux-musl-ppc64-${VER}.tar.gz" "rb-cli-linux-musl-ppc32-${VER}.tar.gz" \
-            "rb-cli-mini-armv7" "rb-daemon.sh" "rusty-backup.json.zip" \
-            "rusty-backup-appliance-i586-${VER}.iso" "rusty-backup-appliance-i686-${VER}.iso" \
-            "rusty-backup-appliance-pxe-i586-${VER}.tar.gz" "rusty-backup-appliance-pxe-i686-${VER}.tar.gz" \
-            "rusty-backup-grub-floppy-i586-${VER}.img" "rusty-backup-grub-floppy-i686-${VER}.img" \
-            "cbdos-freedos-${VER}.img" "cbdos-${VER}.iso" \
-            "Rusty-Backup-GTK-linux-x64-${VER}.AppImage" "Rusty-Backup-GTK-linux-x64-${VER}.deb" \
-            "Rusty-Backup-GTK-linux-x64-${VER}.rpm" "Rusty-Backup-GTK-linux-x64-${VER}.pkg.tar.zst" \
-            "Rusty-Backup-GTK-linux-arm64-${VER}.AppImage" "Rusty-Backup-GTK-linux-arm64-${VER}.deb" \
-            "Rusty-Backup-GTK-linux-arm64-${VER}.rpm" "Rusty-Backup-GTK-linux-arm64-${VER}.pkg.tar.zst" \
-            "Rusty-Backup-GTK-linux-riscv64-${VER}.deb" "Rusty-Backup-GTK-linux-riscv64-${VER}.rpm" \
-            "Rusty-Backup-GTK-linux-riscv64-${VER}.tar.gz"; do
-            [ -f "release-files/${f}" ] || echo "::warning::expected release asset missing: ${f}"
-          done
-
-          cat > DOWNLOADS.md <<EOF
-          ## Downloads
-
-          **Most people want:** Windows -> **x64 installer** · Mac -> **Apple Silicon** or **Intel** \`.dmg\` · Linux -> **x64 AppImage** (GTK4).
-
-          | Platform | Architecture | App | Command line (\`rb-cli\`) |
-          |---|---|---|---|
-          | **Windows 11 / 10** | x64 (64-bit) | [Installer](${BASE}/Rusty-Backup-Win32-Setup-windows-x64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-Win32-windows-x64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-x64-${VER}.zip) |
-          | **Windows 10** | x86 (32-bit) | [Installer](${BASE}/Rusty-Backup-Win32-Setup-windows-x86-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-Win32-windows-x86-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-x86-${VER}.zip) |
-          | **Windows 11** | ARM64 (AArch64) | [Installer](${BASE}/Rusty-Backup-Win32-Setup-windows-arm64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-Win32-windows-arm64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-arm64-${VER}.zip) |
-          | **macOS 10.13+** | Apple Silicon (arm64) | [.dmg](${BASE}/Rusty-Backup-AppKit-macos-arm64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-arm64-${VER}.zip) |
-          | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/Rusty-Backup-AppKit-macos-x64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-x64-${VER}.zip) |
-          | **Linux** | x64 | GTK4 app, below | [rb-cli](${BASE}/rb-cli-linux-x64-${VER}.tar.gz) |
-          | **Linux** | arm64 | GTK4 app, below | [rb-cli](${BASE}/rb-cli-linux-arm64-${VER}.tar.gz) |
-          | **Linux** | RISC-V 64-bit (\`riscv64gc\`) | GTK4 app, below | [rb-cli](${BASE}/rb-cli-linux-riscv64-${VER}.tar.gz) |
-          | **MiSTer FPGA** (Cortex-A9, glibc 2.31) | armv7 hardfloat | _(no GUI for this target)_ | [rb-cli-mini](${BASE}/rb-cli-mini-armv7-linux-${VER}.tar.gz) |
-
-          <sub>**Windows:** the native Win32 app; x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** the native AppKit app; requires 10.13 High Sierra or later. · **Linux \`rb-cli\`:** x64 is built on Ubuntu 20.04 (**glibc 2.31**: Ubuntu 20.04+, Debian 11+, Fedora 32+, RHEL 9+), arm64 and RISC-V 64 on Ubuntu 24.04 (**glibc 2.39**); for older systems use the static musl build further down. · **MiSTer FPGA:** \`rb-cli-mini\` is a slim \`rb-cli\` cross-compiled for the MiSTer's armv7 hardfloat Intel Cyclone V SoC against Ubuntu 20.04 glibc 2.31 — same baseline as the MiSTer Buildroot rootfs and the upstream \`libchdman-rs\` armv7 prebuilt. CHD, optical and the full-screen \`rb-cli tui\` terminal UI are in. Drop it onto the SD at \`/media/fat/Scripts/rb-cli\`. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
-
-          ### Linux GTK4 app
-
-          The native GNOME-style app (GTK4 + libadwaita), installed as \`rusty-backup-gtk\`. The **AppImage** bundles GTK4 and runs on older distributions; the packages need GTK >= 4.14 and libadwaita >= 1.5 (Ubuntu 24.04+, Debian 13, Fedora 40+).
-
-          | Platform | Architecture | GTK4 app |
-          |---|---|---|
-          | **Linux** | x64 | [AppImage](${BASE}/Rusty-Backup-GTK-linux-x64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-GTK-linux-x64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-GTK-linux-x64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-GTK-linux-x64-${VER}.pkg.tar.zst) |
-          | **Linux** | arm64 | [AppImage](${BASE}/Rusty-Backup-GTK-linux-arm64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-GTK-linux-arm64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-GTK-linux-arm64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-GTK-linux-arm64-${VER}.pkg.tar.zst) |
-          | **Linux** | RISC-V 64-bit (\`riscv64gc\`) | [deb](${BASE}/Rusty-Backup-GTK-linux-riscv64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-GTK-linux-riscv64-${VER}.rpm) · [tar.gz](${BASE}/Rusty-Backup-GTK-linux-riscv64-${VER}.tar.gz) |
-
-          ### Command-line (\`rb-cli\`) for other CPU architectures
-
-          No desktop GUI on these — they ship the headless **\`rb-cli\` only**, built from the all-pure-Rust slim feature set (no CHD/optical; \`.zst\` / \`.raw\` / \`.vhd\` / \`.img\` and every filesystem still work). The full-screen \`rb-cli tui\` terminal UI is included. Big-endian PowerPC is fully supported — the on-disk parsers use explicit endianness throughout, so a G5 or G4 reads the same images as an x64 box.
-
-          | Platform | Architecture | Command line (\`rb-cli\`) |
-          |---|---|---|
-          | **Linux** (glibc >= 2.39) | PowerPC 64-bit, big-endian (G5 / POWER) | [rb-cli](${BASE}/rb-cli-linux-ppc64-${VER}.tar.gz) |
-          | **Linux** (glibc >= 2.39) | PowerPC 32-bit, big-endian (G3 / G4) | [rb-cli](${BASE}/rb-cli-linux-ppc32-${VER}.tar.gz) |
-
-          <sub>These PowerPC builds need **glibc 2.39** (Ubuntu 24.04), like the arm64 \`rb-cli\` (the x64 one needs 2.31), and each download contains a single \`rb-cli\` executable.</sub>
-
-          ### Older operating systems (\`rb-cli\`, headless)
-
-          For vintage Intel Macs and Windows 7-era PCs the desktop GUI can't reach, the headless **\`rb-cli\`** — including its full-screen \`rb-cli tui\` terminal UI — is built with an older Rust toolchain that still targets those OSes. Slim feature set (no CHD / physical optical), but every filesystem, \`.zst\` / \`.raw\` / \`.vhd\` / \`.img\`, backup/restore, and the TUI all work.
-
-          | Platform | Architecture | Command line (\`rb-cli\`) |
-          |---|---|---|
-          | **macOS 10.7 – 10.11** (Lion → El Capitan) | Intel x64 | [rb-cli](${BASE}/rb-cli-macos-vintage-x64-${VER}.zip); the desktop app (preview): [Rusty Backup.app](${BASE}/Rusty-Backup-Cocoa-macos-vintage-x64-${VER}.dmg) |
-          | **Windows 7 / 8 / 8.1** | x64 | [rb-cli](${BASE}/rb-cli-win7-x64-${VER}.zip) |
-          | **Windows 7 / 8 / 8.1** | x86 (32-bit) | [rb-cli](${BASE}/rb-cli-win7-x86-${VER}.zip) |
-          | **Any Linux** (static musl — *any* glibc / distro age, with CHD) | x64 | [rb-cli](${BASE}/rb-cli-linux-musl-x64-${VER}.tar.gz) |
-          | **Any Linux** (static musl, with CHD) | arm64 | [rb-cli](${BASE}/rb-cli-linux-musl-arm64-${VER}.tar.gz) |
-          | **Old 32-bit x86 Linux** (static musl) | i586 (Pentium+) | [rb-cli](${BASE}/rb-cli-linux-musl-i586-${VER}.tar.gz) |
-          | **Old 32-bit x86 Linux** (static musl) | i686 (Pentium Pro+) | [rb-cli](${BASE}/rb-cli-linux-musl-i686-${VER}.tar.gz) |
-          | **PowerPC Linux** (static musl — *any* glibc, incl. old distros) | ppc64 (G5 / POWER, big-endian) | [rb-cli](${BASE}/rb-cli-linux-musl-ppc64-${VER}.tar.gz) |
-          | **PowerPC Linux** (static musl — *any* glibc) | ppc32 (G3 / G4, big-endian) | [rb-cli](${BASE}/rb-cli-linux-musl-ppc32-${VER}.tar.gz) |
-          | **Mac OS X 10.4 – 10.5** (Tiger / Leopard) | PowerPC (G3 / G4 / G5) | [Downloads on the wiki →](https://github.com/${GITHUB_REPOSITORY}/wiki/PPC-Download) |
-
-          <sub>**macOS / Windows** are built with **Rust 1.73** — the last toolchain that still targets macOS 10.7 and Windows 7. The single macOS artifact runs on **10.7 through 10.11** (a 10.7-minimum binary loads on any newer macOS too). · **macOS:** ad-hoc signed, not notarized — run \`xattr -dr com.apple.quarantine ./rb-cli\` on first launch. · **Windows:** the CRT is statically linked, so it runs on a stock Windows 7 with no Universal CRT (KB2999226) update. 32-bit \`x86\` also covers the last 32-bit-only Win7 machines. · **Linux (musl):** fully-static binaries with **zero** dynamic dependencies — drop one on any Linux and it just runs, no matter how old the glibc (unlike the glibc \`rb-cli\` above, which needs glibc 2.31 on x64 and 2.39 on arm64). The x64 and arm64 builds read and write CHD; the 32-bit and PowerPC ones don't. Covers modern x64/arm64 plus **vintage** arches: 32-bit x86 (**i586** = Pentium/MMX/K6/Cyrix and up, **i686** = Pentium Pro and up) and big-endian **PowerPC** (**ppc64** = G5/POWER, **ppc32** = G3/G4) — ideal for an old Mac or PC running Linux. These same binaries also ship inside the Buildroot appliance ISO; here they're standalone. (ppc32 is a best-effort leg — a Rust tier-3 target built from std source.) · **Mac OS X on PowerPC** (Tiger / Leopard, the real Mac OS — not Linux) is built on separate hardware with an mrustc-bootstrapped toolchain, so it is **not** part of this release and updates less often than everything above. Its downloads live on the [PPC Download wiki page](https://github.com/${GITHUB_REPOSITORY}/wiki/PPC-Download).</sub>
-
-          ### Install on a MiSTer FPGA (one line, auto-updating)
-
-          MiSTer users don't need the tarball: add Rusty Backup to the **MiSTer Downloader** as a custom database and it installs (and keeps itself updated) from the Scripts/Update menu. Add this section to \`/media/fat/downloader.ini\` on the SD card:
-
-          \`\`\`ini
-          [danifunker/rusty-backup]
-          db_url = '${DB_URL}'
-          \`\`\`
-
-          Then run **Scripts > update** (or **Downloader**) on the MiSTer. It drops \`rb-cli\` and \`rb-daemon.sh\` into \`/media/fat/Scripts\`. Open **rb-daemon** from the Scripts menu to start the network daemon and enable it on boot. The \`db_url\` points at the \`latest\` release, so each future Downloader run picks up new builds automatically. (Prefer to do it by hand? The \`rb-cli-mini-...tar.gz\` above still works via its bundled \`install.sh\`.)
-
-          ### Boot the vintage machine itself (Linux appliance)
-
-          For 486/Pentium-class boxes too old to run the desktop app — boot the rusty-backup backup/restore menu straight on the metal (VGA monitor or serial console), with a broad vintage NIC / SCSI / IDE driver set baked in.
-
-          Pick **i586** unless you know your box is a Pentium Pro or newer: i586 runs on i586 *and* i686 (Pentium / MMX / K6 / Cyrix / 5x86 / Vortex86-ITX-Llama and up); i686 is a touch faster but needs a Pentium-Pro-class CPU. A true 486 uses **cb-dos**.
-
-          | Artifact | Boots from | Notes |
-          |---|---|---|
-          | **Appliance ISO** — [i586](${BASE}/rusty-backup-appliance-i586-${VER}.iso) · [i686](${BASE}/rusty-backup-appliance-i686-${VER}.iso) | CD-ROM **or** USB / CF (\`dd\` the same file on) | The workhorse hybrid image. |
-          | **PXE bundle** — [i586](${BASE}/rusty-backup-appliance-pxe-i586-${VER}.tar.gz) · [i686](${BASE}/rusty-backup-appliance-pxe-i686-${VER}.tar.gz) | the network (TFTP / PXE) | A diskless backup *station*. |
-          | **GRUB boot floppy** — [i586](${BASE}/rusty-backup-grub-floppy-i586-${VER}.img) · [i686](${BASE}/rusty-backup-grub-floppy-i686-${VER}.img) | a floppy that then loads the appliance off the CD | For pre-El-Torito BIOSes that can't boot a CD directly. |
-          | **cb-dos** ([floppy](${BASE}/cbdos-freedos-${VER}.img) · [CD](${BASE}/cbdos-${VER}.iso)) | a FreeDOS floppy or CD | The DOS-native lane (no Linux) for a true 486, or any box where even a minimal Linux is too heavy. |
-
-          <sub>Which cards work and how to add more: [\`docs/appliance_hardware_support.md\`](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/appliance_hardware_support.md). cb-dos background: [\`docs/cb_dos.md\`](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/cb_dos.md).</sub>
-
-          ---
-          EOF
+          scripts/ci/release-downloads.sh "$VER" "$GITHUB_REPOSITORY" release-files > DOWNLOADS.md
           echo "----- generated DOWNLOADS.md -----"
           cat DOWNLOADS.md
 
