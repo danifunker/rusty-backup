@@ -151,9 +151,8 @@ where
     clone_hfs_at(source, target, 0, target_size, block_size, volume_name)
 }
 
-/// Stream a blank flat HFV image into `target` at `at_offset`, the streaming twin of
-/// [`build_blank_hfv`]; returns its length. The caller sizes the file, as for
-/// [`crate::hfs::write_blank_hfs_into`].
+/// [`build_blank_hfv`] streamed into `target` at `at_offset`; returns its length. The caller
+/// sizes the file, as for [`crate::hfs::write_blank_hfs_into`].
 pub fn write_blank_hfv_into<W: Write + Seek>(
     target: &mut W,
     at_offset: u64,

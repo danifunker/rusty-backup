@@ -800,9 +800,8 @@ pub(crate) struct LogicalPlanItem {
     pub(crate) partition_type: u8,
 }
 
-/// Place logical partitions, in start order. The first keeps its place so the extended entry
-/// still points at it; when any changes size the rest pack after it, one EBR sector apart,
-/// instead of keeping stale starts that leave gaps (shared by restore and VHD export, PR-002).
+/// Place logical partitions in start order: the first stays (the extended entry points at it);
+/// once any resizes, the rest pack one EBR sector apart. Shared by restore and VHD export.
 pub(crate) fn pack_logical_partitions(items: &[LogicalPlanItem]) -> Vec<LogicalPartitionInfo> {
     let any_resized = items.iter().any(|it| it.new_bytes != it.original_bytes);
     let mut next_lba: u32 = 0;

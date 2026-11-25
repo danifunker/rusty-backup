@@ -3328,13 +3328,23 @@ fn wrapped_hfsplus_compact_reader<R: Read + Seek + Send + 'static>(
         .seek(SeekFrom::Start(inner_end))
         .and_then(|_| reader.read_exact(&mut tail))
         .map_err(|e| format!("reading the HFS wrapper after its HFS+ volume: {e}"))?;
+    let extent = info.inner_size;
     let (compact, info) = CompactHfsPlusReader::new(reader, inner_offset)
         .map_err(|e| format!("CompactHfsPlusReader::new failed at offset {inner_offset}: {e}"))?;
-    let shell = (head.len() + tail.len()) as u64;
+    if info.original_size > extent {
+        return Err(format!(
+            "wrapped HFS+ volume ({} bytes) is larger than its embedded extent ({extent})",
+            info.original_size
+        ));
+    }
+    // A volume shorter than its extent is padded, so the tail lands where the wrapper puts it.
+    let pad = extent - info.original_size;
+    let shell = (head.len() + tail.len()) as u64 + pad;
     Ok(Some((
         Box::new(
             std::io::Cursor::new(head)
                 .chain(compact)
+                .chain(std::io::repeat(0).take(pad))
                 .chain(std::io::Cursor::new(tail)),
         ),
         CompactResult {

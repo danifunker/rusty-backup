@@ -185,6 +185,65 @@ fn toc_names(toc: &[u8], volume: usize) -> Vec<String> {
     names
 }
 
+/// SunOS tar records a hard link's target size but stores no data; zero such sizes (and
+/// restamp the checksum) when the next block is a header, as fs-tar does for in-memory tars.
+fn zero_link_sizes(f: &mut std::fs::File) -> Result<(), FilesystemError> {
+    let len = f.metadata()?.len();
+    let mut at = 0u64;
+    let mut pair = [0u8; 1024];
+    while at + 1024 <= len {
+        f.seek(SeekFrom::Start(at))?;
+        f.read_exact(&mut pair)?;
+        if !is_tar_header(&pair[..512]) {
+            break;
+        }
+        let field = String::from_utf8_lossy(&pair[124..136]).into_owned();
+        let size = u64::from_str_radix(field.trim_matches(|c: char| c == '\0' || c == ' '), 8)
+            .unwrap_or(0);
+        if matches!(pair[156], b'1' | b'2') && size > 0 && is_tar_header(&pair[512..]) {
+            let h = &mut pair[..512];
+            h[124..136].copy_from_slice(b"00000000000\0");
+            let sum: u32 = h[..148]
+                .iter()
+                .chain(&[b' '; 8])
+                .chain(&h[156..])
+                .map(|&b| b as u32)
+                .sum();
+            h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+            f.seek(SeekFrom::Start(at))?;
+            f.write_all(&pair[..512])?;
+            at += 512;
+            continue;
+        }
+        at += 512 + size.div_ceil(512) * 512;
+    }
+    Ok(())
+}
+
+/// Exactly `left` bytes of `inner`, failing if it ends sooner (as `read_exact` did).
+struct Exact<R> {
+    inner: R,
+    left: u64,
+}
+
+impl<R: Read> Read for Exact<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Ok(0);
+        }
+        let want = buf.len().min(self.left.min(usize::MAX as u64) as usize);
+        let n = self.inner.read(&mut buf[..want])?;
+        if n == 0 && want > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Sun tape: the image ends inside a tape file",
+            ));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
 /// A writer keeping only the first block written to it.
 struct Head(Vec<u8>);
 
@@ -317,10 +376,13 @@ impl<R: Read + Seek + Send> TapeFilesystem<R> {
         Ok(())
     }
 
-    /// A reader over `len` bytes of the image at `start`.
-    fn region(&mut self, start: u64, len: u64) -> Result<std::io::Take<&mut R>, FilesystemError> {
+    /// A reader over `len` bytes of the image at `start`; an image that ends first is an error.
+    fn region(&mut self, start: u64, len: u64) -> Result<Exact<&mut R>, FilesystemError> {
         self.reader.seek(SeekFrom::Start(self.offset + start))?;
-        Ok((&mut self.reader).take(len))
+        Ok(Exact {
+            inner: &mut self.reader,
+            left: len,
+        })
     }
 
     fn read_range(&mut self, start: u64, len: u64) -> Result<Vec<u8>, FilesystemError> {
@@ -367,6 +429,7 @@ impl<R: Read + Seek + Send> TapeFilesystem<R> {
                     } else {
                         std::io::copy(&mut src, spool.as_file_mut())?;
                     }
+                    zero_link_sizes(spool.as_file_mut())?;
                     spool.as_file_mut().flush()?;
                     let fs = fs_tar::mem_archive::open_path(spool.path(), label)?;
                     self.spools.push(spool);
@@ -537,6 +600,49 @@ mod tests {
         }
         img.extend_from_slice(&body);
         img
+    }
+
+    #[test]
+    fn a_tape_file_cut_short_by_the_image_end_is_an_error() {
+        // One 20 KB text file (past the 16 KB probe), its last 1000 bytes missing from the image.
+        let mut img = vec![0u8; 512];
+        img[0..8].copy_from_slice(MAGIC);
+        img[8..12].copy_from_slice(&1u32.to_be_bytes());
+        img[12..16].copy_from_slice(&1u32.to_be_bytes());
+        img[16..20].copy_from_slice(&1u32.to_be_bytes());
+        img[20..24].copy_from_slice(&1u32.to_be_bytes());
+        img[24..28].copy_from_slice(&(1u32 + 40).to_be_bytes());
+        img.extend(std::iter::repeat(b'x').take(40 * 512 - 1000));
+        let mut fs = TapeFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().unwrap();
+        let text = fs.list_directory(&root).unwrap().remove(0);
+        let mut out = Vec::new();
+        assert!(fs.write_file_to(&text, &mut out).is_err());
+    }
+
+    #[test]
+    fn a_sunos_hard_link_size_is_zeroed_in_a_spooled_tar() {
+        // SunOS writes a link's target size with no data; the next block is the next header.
+        let mut tar = tar_member("a", b"data");
+        let mut link = tar::Header::new_old();
+        link.set_path("b").unwrap();
+        link.set_entry_type(tar::EntryType::Link);
+        link.set_link_name("a").unwrap();
+        link.set_size(4);
+        link.set_cksum();
+        let end = tar.len() - 1024;
+        tar.truncate(end);
+        tar.extend_from_slice(link.as_bytes());
+        tar.extend_from_slice(&tar_member("c", b"more"));
+        let mut f = tempfile::tempfile().unwrap();
+        f.write_all(&tar).unwrap();
+        zero_link_sizes(&mut f).unwrap();
+        let mut back = Vec::new();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.read_to_end(&mut back).unwrap();
+        let h = &back[end..end + 512];
+        assert_eq!(&h[124..135], b"00000000000");
+        assert!(is_tar_header(h), "checksum restamped");
     }
 
     #[test]
