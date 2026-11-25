@@ -353,15 +353,17 @@ where
     dst.write_all(&bitmap)?;
     written += bitmap_len;
 
-    // ---------- Wrapper alloc blocks [0, embed_start) — verbatim ----------
+    // ---------- Wrapper alloc blocks [0, embed_start): its B-trees, bad-block run resized ----------
     let pre_embed_bytes = (info.embed_start_block as u64) * outer_bs;
     if pre_embed_bytes > 0 {
-        copy_from_source(
-            reader,
-            info.partition_offset + alloc_start,
-            dst,
-            pre_embed_bytes,
-        )?;
+        let mut pre_embed = vec![0u8; pre_embed_bytes as usize];
+        reader.seek(SeekFrom::Start(info.partition_offset + alloc_start))?;
+        reader.read_exact(&mut pre_embed)?;
+        let mut source_mdb = [0u8; 512];
+        reader.seek(SeekFrom::Start(info.partition_offset + 1024))?;
+        reader.read_exact(&mut source_mdb)?;
+        resize_bad_block_run(&mut pre_embed, &source_mdb, plan)?;
+        dst.write_all(&pre_embed)?;
         written += pre_embed_bytes;
     }
 
@@ -424,6 +426,97 @@ fn patch_mdb_in_place(mdb: &mut [u8; 512], plan: &WrappedClonePlan) {
     BigEndian::write_u16(&mut mdb[128..130], plan.new_embed_block_count);
     // drEmbedExtent.startBlock @ 126 stays unchanged so the inner
     // landing offset within the wrapper doesn't move.
+}
+
+/// The wrapper's bad-block file (ID 5) covers the embedded volume so classic HFS never uses it;
+/// on a shrink its run must end with the new volume (MAC-016). Wrappers without one are left.
+fn resize_bad_block_run(
+    pre_embed: &mut [u8],
+    mdb: &[u8; 512],
+    plan: &WrappedClonePlan,
+) -> Result<(), WrappedCloneError> {
+    let bad = |m: String| WrappedCloneError::Filesystem(FilesystemError::InvalidData(m));
+    let bs = plan.info.al_block_size as usize;
+    // drXTExtRec: the extents file's three (start, count) runs, in wrapper alloc blocks.
+    let runs: Vec<(usize, usize)> = (0..3)
+        .map(|i| {
+            let o = 134 + 4 * i;
+            let start = BigEndian::read_u16(&mdb[o..o + 2]) as usize;
+            let count = BigEndian::read_u16(&mdb[o + 2..o + 4]) as usize;
+            (start * bs, count * bs)
+        })
+        .filter(|&(_, len)| len > 0)
+        .collect();
+    if runs.is_empty() {
+        return Ok(());
+    }
+    if runs.iter().any(|&(at, len)| at + len > pre_embed.len()) {
+        return Err(bad(
+            "wrapper extents file runs past the embedded volume".into()
+        ));
+    }
+    // Byte offset in `pre_embed` of extents-file byte `pos`.
+    let locate = |pos: usize| {
+        let mut base = 0;
+        for &(at, len) in &runs {
+            if pos < base + len {
+                return Some(at + pos - base);
+            }
+            base += len;
+        }
+        None
+    };
+    let file_len: usize = runs.iter().map(|&(_, len)| len).sum();
+    let head = locate(0).expect("a non-empty file has byte 0");
+    let node_size = BigEndian::read_u16(&pre_embed[head + 32..head + 34]) as usize;
+    if node_size < 512 || !node_size.is_power_of_two() || node_size > bs {
+        return Err(bad(format!("wrapper extents file node size {node_size}")));
+    }
+    let (old_count, new_count) = (plan.info.embed_block_count, plan.new_embed_block_count);
+    let embed_start = plan.info.embed_start_block;
+    for n in 0..file_len / node_size {
+        // A node never straddles a run: runs are whole alloc blocks, and nodes divide them.
+        let Some(at) = locate(n * node_size) else {
+            break;
+        };
+        let node = &mut pre_embed[at..at + node_size];
+        if node[8] != 0xFF {
+            continue; // not a leaf
+        }
+        let nrec = BigEndian::read_u16(&node[10..12]) as usize;
+        for r in 0..nrec.min(node_size / 2) {
+            let slot = node_size - 2 * (r + 1);
+            let o = BigEndian::read_u16(&node[slot..slot + 2]) as usize;
+            if o + 8 > node_size {
+                return Err(bad(format!(
+                    "wrapper extents node {n} record {r} offset {o}"
+                )));
+            }
+            let key_len = node[o] as usize;
+            let (fork, file_id) = (node[o + 1], BigEndian::read_u32(&node[o + 2..o + 6]));
+            let first_block = BigEndian::read_u16(&node[o + 6..o + 8]);
+            if file_id != 5 || fork != 0 || first_block != 0 {
+                continue;
+            }
+            let mut data = o + 1 + key_len;
+            data += data % 2;
+            if data + 12 > node_size {
+                return Err(bad("wrapper bad-block record is cut short".into()));
+            }
+            let start = BigEndian::read_u16(&node[data..data + 2]);
+            let count = BigEndian::read_u16(&node[data + 2..data + 4]);
+            let rest = &node[data + 4..data + 12];
+            if start != embed_start || count != old_count || rest.iter().any(|&b| b != 0) {
+                return Err(bad(format!(
+                    "wrapper bad-block run ({start}, {count}) is not the embedded volume \
+                     ({embed_start}, {old_count}); refusing to guess how to shrink it"
+                )));
+            }
+            BigEndian::write_u16(&mut node[data + 2..data + 4], new_count);
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 fn clear_bitmap_tail(bitmap: &mut [u8], new_total_blocks: u16) {
@@ -575,6 +668,27 @@ mod tests {
             img[bitmap_off + bit / 8] |= 0x80 >> (bit % 8);
         }
 
+        // As Mac OS 8.1 writes it: an extents B-tree in wrapper block 0 whose leaf holds the
+        // bad-block file (ID 5) covering the embedded volume.
+        if embed_start_block >= 1 && outer_al_block_size >= 1024 {
+            let xt = alloc_start_bytes as usize;
+            let mdb = &mut img[mdb_off..mdb_off + 512];
+            BigEndian::write_u32(&mut mdb[130..134], outer_al_block_size); // drXTFlSize
+            BigEndian::write_u16(&mut mdb[134..136], 0); // drXTExtRec[0].start
+            BigEndian::write_u16(&mut mdb[136..138], 1); // drXTExtRec[0].count
+            img[xt + 8] = 1; // node 0: header node
+            BigEndian::write_u16(&mut img[xt + 32..xt + 34], 512); // bthNodeSize
+            let leaf = xt + 512;
+            img[leaf + 8] = 0xFF; // node 1: leaf
+            BigEndian::write_u16(&mut img[leaf + 10..leaf + 12], 1);
+            let r = leaf + 14;
+            img[r] = 7; // key length
+            BigEndian::write_u32(&mut img[r + 2..r + 6], 5); // bad-block file
+            BigEndian::write_u16(&mut img[r + 8..r + 10], embed_start_block);
+            BigEndian::write_u16(&mut img[r + 10..r + 12], embed_block_count);
+            BigEndian::write_u16(&mut img[leaf + 510..leaf + 512], 14);
+        }
+
         // Inner HFS+ payload at the embedded extent.
         img[inner_offset as usize..(inner_offset + inner_size) as usize].copy_from_slice(&inner);
 
@@ -661,6 +775,27 @@ mod tests {
         let mut inner_cur = Cursor::new(out.as_slice());
         let _hfs = crate::hfsplus::HfsPlusFilesystem::open(&mut inner_cur, info2.inner_offset)
             .expect("inner HFS+ must be valid after wrapper shrink");
+        // The bad-block run ends where the shrunk volume does, not 7 MiB further (MAC-016).
+        let r = (info2.al_block_start_sector as usize) * 512 + 512 + 14;
+        assert_eq!(BigEndian::read_u16(&out[r + 8..r + 10]), 1);
+        assert_eq!(
+            BigEndian::read_u16(&out[r + 10..r + 12]),
+            plan.new_embed_block_count
+        );
+    }
+
+    #[test]
+    fn a_bad_block_run_that_is_not_the_embedded_volume_is_refused() {
+        let (mut img, partition_size) = build_wrapped_test_image(4096, 8 * 1024 * 1024, 4096, 1);
+        let mut cur = Cursor::new(img.clone());
+        let info = detect_wrapped_hfsplus(&mut cur, 0, partition_size).unwrap();
+        let r = (info.al_block_start_sector as usize) * 512 + 512 + 14;
+        BigEndian::write_u16(&mut img[r + 10..r + 12], 3);
+        let plan = plan_wrapped_clone(&info, 1024 * 1024).unwrap();
+        let mut out = Vec::new();
+        let err = stream_wrapped_defragmented_hfsplus(&mut Cursor::new(img), &plan, &mut out, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to guess"), "{err}");
     }
 
     #[test]

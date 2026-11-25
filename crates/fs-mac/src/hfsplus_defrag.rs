@@ -248,12 +248,21 @@ pub fn plan_defrag_layout(
     let catalog_blocks_exact: u32 = (catalog_bytes_needed / bs).try_into().unwrap_or(u32::MAX);
     // Floor at the source value so degenerate sources (extremely small
     // catalogs, e.g. fresh-formatted volumes) still get sensible space.
-    let catalog_blocks = catalog_blocks_exact.max(snapshot.volume.catalog_total_blocks);
+    // The target trees use NODE_SIZE nodes and need three at least; a small-block source's
+    // trees (Mac OS 8.1 formats small volumes with 1 KiB blocks) can be smaller than that.
+    let min_tree_blocks = ((3 * NODE_SIZE) as u32).div_ceil(block_size);
+    let catalog_blocks = catalog_blocks_exact
+        .max(snapshot.volume.catalog_total_blocks)
+        .max(min_tree_blocks);
 
-    let extents_blocks = snapshot.volume.extents_total_blocks;
-    let attributes_blocks = snapshot.volume.attributes_total_blocks;
+    let extents_blocks = snapshot.volume.extents_total_blocks.max(min_tree_blocks);
+    let attributes_blocks = match snapshot.volume.attributes_total_blocks {
+        0 => 0,
+        n => n.max(min_tree_blocks),
+    };
 
-    let bitmap_start: u32 = 1;
+    // Boot blocks plus the volume header fill bytes 0..1536: three 512-byte blocks, two 1 KiB.
+    let bitmap_start: u32 = 1536u32.div_ceil(block_size);
     let catalog_start = bitmap_start + bitmap_blocks;
     let extents_start = catalog_start + catalog_blocks;
     let attributes_start = extents_start + extents_blocks;
@@ -567,9 +576,8 @@ const NODE_SIZE: usize = 4096;
 /// directly into the compressor before streaming user-fork bytes.
 #[derive(Debug)]
 pub struct TargetMetadata {
-    /// The block-0 region: 1024 bytes of boot blocks (copied from
-    /// source) followed by the 512-byte primary VH at offset 1024 and
-    /// `block_size - 1024 - 512` bytes of trailing zero pad.
+    /// The head region (blocks `0..bitmap_start`): 1024 bytes of boot blocks from the
+    /// source, the 512-byte primary VH at offset 1024, then zero pad to a whole block.
     pub block_zero: Vec<u8>,
     /// Allocation bitmap, sized to `bitmap_blocks * block_size`.
     pub bitmap: Vec<u8>,
@@ -1059,7 +1067,7 @@ pub fn build_target_metadata(
 
     // Block-0 region: boot blocks (1024 from source) + primary VH (512)
     // + zero pad up to block_size.
-    let mut block_zero = vec![0u8; block_size_u];
+    let mut block_zero = vec![0u8; plan.bitmap_start as usize * block_size_u];
     block_zero[..1024].copy_from_slice(&snapshot.volume.boot_blocks);
     block_zero[1024..1536].copy_from_slice(&vh_bytes);
 
@@ -1139,7 +1147,7 @@ where
 
     // Block 0 — boot blocks + primary VH (already padded to block_size).
     writer.write_all(&meta.block_zero)?;
-    debug_assert_eq!(writer.bytes_written, bs);
+    debug_assert_eq!(writer.bytes_written, plan.bitmap_start as u64 * bs);
 
     // Bitmap, catalog, extents-overflow, attributes — back-to-back per
     // the planner's region layout (no gaps).
@@ -2044,7 +2052,7 @@ mod tests {
         let bs = plan.block_size as usize;
         let mut img = vec![0u8; target_size as usize];
         // Block 0.
-        img[..bs].copy_from_slice(&meta.block_zero);
+        img[..meta.block_zero.len()].copy_from_slice(&meta.block_zero);
         // Bitmap.
         let bitmap_off = plan.bitmap_start as usize * bs;
         img[bitmap_off..bitmap_off + meta.bitmap.len()].copy_from_slice(&meta.bitmap);
@@ -2120,7 +2128,7 @@ mod tests {
         // 22d; this test only exercises catalog correctness).
         let bs = plan.block_size as usize;
         let mut img = vec![0u8; target_size as usize];
-        img[..bs].copy_from_slice(&meta.block_zero);
+        img[..meta.block_zero.len()].copy_from_slice(&meta.block_zero);
         let bitmap_off = plan.bitmap_start as usize * bs;
         img[bitmap_off..bitmap_off + meta.bitmap.len()].copy_from_slice(&meta.bitmap);
         let catalog_off = plan.catalog_start as usize * bs;
@@ -2189,7 +2197,7 @@ mod tests {
         // Patch the target image and reopen.
         let bs = plan.block_size as usize;
         let mut img = vec![0u8; target_size as usize];
-        img[..bs].copy_from_slice(&meta.block_zero);
+        img[..meta.block_zero.len()].copy_from_slice(&meta.block_zero);
         let bo = plan.bitmap_start as usize * bs;
         img[bo..bo + meta.bitmap.len()].copy_from_slice(&meta.bitmap);
         let co = plan.catalog_start as usize * bs;
@@ -2604,6 +2612,41 @@ mod tests {
         let bytes = tgt.read_file(&b, usize::MAX).expect("read b.bin");
         assert_eq!(bytes.len(), 5000);
         assert!(bytes.iter().all(|&x| x == 0xCD));
+    }
+
+    /// Mac OS 8.1 formats small volumes with 1 KiB blocks, where the volume header sits in
+    /// block 1, not block 0; the clone used to overrun its one-block head.
+    #[test]
+    fn small_block_volumes_clone_with_their_whole_head_reserved() {
+        for bs in [512u32, 1024] {
+            let mut src_img = create_blank_hfsplus(8 * 1024 * 1024, bs, "Small", false);
+            {
+                let mut fs = HfsPlusFilesystem::open(Cursor::new(&mut src_img), 0).unwrap();
+                fs.prepare_for_edit().unwrap();
+                let root = fs.root().unwrap();
+                let body = vec![0x5Au8; 3000];
+                fs.create_file(
+                    &root,
+                    "f.bin",
+                    &mut Cursor::new(&body),
+                    body.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap();
+                fs.sync_metadata().unwrap();
+            }
+            let mut src = HfsPlusFilesystem::open(Cursor::new(&mut src_img), 0).unwrap();
+            let mut out = Vec::new();
+            stream_defragmented_hfsplus(&mut src, 4 * 1024 * 1024, &mut out, None)
+                .unwrap_or_else(|e| panic!("{bs}-byte blocks: {e}"));
+            assert_eq!(&out[1024..1026], b"H+", "{bs}-byte blocks: header at 1024");
+            let mut tgt = HfsPlusFilesystem::open(Cursor::new(out), 0).unwrap();
+            let root = tgt.root().unwrap();
+            let f = tgt.list_directory(&root).unwrap().remove(0);
+            assert_eq!(tgt.read_file(&f, usize::MAX).unwrap(), vec![0x5Au8; 3000]);
+            let res = tgt.fsck().expect("fsck runs").expect("fsck succeeds");
+            assert!(res.is_clean(), "{bs}-byte blocks: {:?}", res.errors);
+        }
     }
 
     /// Step 22e — full end-to-end engine fixture. Build a synthetic HFS+

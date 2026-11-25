@@ -5775,9 +5775,8 @@ fn build_blank_hfsplus_front(
     // node_size pinned at 4096 — Apple's default and what every existing
     // helper in this file assumes (compute_record_offsets, etc.).
     let node_size: usize = 4096;
-    let nodes_per_block: u32 = (node_size as u32 / block_size).max(1);
-    let blocks_per_node: u32 = (block_size / node_size as u32).max(1);
-    let _ = nodes_per_block;
+    // A 4 KiB node spans eight 512-byte blocks; blocks larger than a node hold one each.
+    let blocks_per_node: u32 = (node_size as u32 / block_size).max(1);
 
     // Size the catalog B-tree from the volume (docs/hfsplus_btree_growth_plan.md
     // §4c): HFS+ has no grow-on-full path, so a blank that reserved only the
@@ -5812,7 +5811,8 @@ fn build_blank_hfsplus_front(
     let bitmap_bytes = total_blocks.div_ceil(8) as u64;
     let bitmap_blocks = bitmap_bytes.div_ceil(bs) as u32;
 
-    let bitmap_start: u32 = 1;
+    // Boot blocks plus the volume header fill bytes 0..1536: three 512-byte blocks, two 1 KiB.
+    let bitmap_start: u32 = 1536u32.div_ceil(block_size);
     let extents_start: u32 = bitmap_start + bitmap_blocks;
     let catalog_start: u32 = extents_start + extents_btree_blocks;
     let reserved_blocks: u32 = catalog_start + catalog_btree_blocks;
@@ -6608,6 +6608,47 @@ mod tests {
 
     /// Apple stamps kBTBigKeysMask on every HFS+ tree and adds
     /// kBTVariableIndexKeysMask on the catalog and attributes trees; so do we.
+    #[test]
+    fn small_block_blanks_give_each_node_its_whole_size() {
+        // fsck_hfs rejected these ("Invalid B-tree header") when each 4 KiB node got one block.
+        for bs in [512u32, 1024] {
+            let img = create_blank_hfsplus(32 * 1024 * 1024, bs, "Small", false);
+            let vh = &img[1024..1536];
+            assert_eq!(&vh[0..2], b"H+");
+            // Catalog fork (VH 0x110): its logical size must cover every node of the tree.
+            let fork = 0x110;
+            let logical = BigEndian::read_u64(&vh[fork..fork + 8]);
+            let blocks = BigEndian::read_u32(&vh[fork + 12..fork + 16]) as u64;
+            assert_eq!(logical, blocks * bs as u64, "{bs}: catalog fork size");
+            let start = BigEndian::read_u32(&vh[fork + 16..fork + 20]) as usize * bs as usize;
+            let node_size = BigEndian::read_u16(&img[start + 32..start + 34]) as u64;
+            let nodes = BigEndian::read_u32(&img[start + 36..start + 40]) as u64;
+            assert_eq!(
+                nodes * node_size,
+                logical,
+                "{bs}: header's node count vs fork size"
+            );
+            let mut fs = HfsPlusFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+            fs.prepare_for_edit().unwrap();
+            let root = fs.root().unwrap();
+            for i in 0..40 {
+                let body = format!("file {i}");
+                fs.create_file(
+                    &root,
+                    &format!("f{i:02}"),
+                    &mut body.as_bytes(),
+                    body.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap();
+            }
+            fs.sync_metadata().unwrap();
+            assert_eq!(fs.list_directory(&root).unwrap().len(), 40);
+            let res = fs.fsck().unwrap().unwrap();
+            assert!(res.is_clean(), "{bs}-byte blocks: {:?}", res.errors);
+        }
+    }
+
     #[test]
     fn blank_btree_headers_carry_apples_attribute_bits() {
         let img = create_blank_hfsplus(16 * 1024 * 1024, 4096, "Attrs", false);
