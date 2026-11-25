@@ -1,17 +1,43 @@
-//! An editable tar archive held in memory, for rebuilding the tar sections of a tape.
+//! An editable tar archive, for rebuilding the tar sections of a tape.
 //!
 //! Members keep their original bytes (headers, any extension headers before them, data
 //! and padding) until they change, so an untouched member round-trips exactly, SunOS V7
 //! headers included. New and renamed members get V7 (pre-POSIX) headers, which every
 //! tar since 1979 reads; their names are limited to 99 bytes. The archive is written
 //! back with two zero blocks and padded to whole 10240-byte records, as `tar` does.
+//!
+//! Member bytes are byte ranges of a backing file, never copies in memory (TAP-001):
+//! [`TarSection::from_file`] indexes a tar on disk, [`TarSection::add_file_from`] adds a
+//! file's contents from one, and [`TarSection::write_to`] streams the rebuilt archive.
 
-use std::io::Cursor;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 
 use disk_core::filesystem::FilesystemError;
 
 const BLOCK: usize = 512;
 const RECORD: usize = 20 * BLOCK;
+
+/// Where a run of member bytes lives: `len` bytes at `at` in `file`.
+#[derive(Debug, Clone)]
+struct Span {
+    file: Arc<File>,
+    at: u64,
+    len: u64,
+}
+
+impl Span {
+    fn copy_to(&self, w: &mut dyn Write) -> Result<u64, FilesystemError> {
+        let mut f: &File = &self.file;
+        f.seek(SeekFrom::Start(self.at))?;
+        let n = std::io::copy(&mut f.take(self.len), w)?;
+        if n != self.len {
+            return Err(invalid("tar: backing file ended early".into()));
+        }
+        Ok(n)
+    }
+}
 
 /// One archive member.
 #[derive(Debug, Clone)]
@@ -20,8 +46,8 @@ struct Member {
     path: String,
     dir: bool,
     /// The member's original bytes; `None` once it has been changed or added.
-    raw: Option<Vec<u8>>,
-    data: Vec<u8>,
+    raw: Option<Span>,
+    data: Option<Span>,
     mode: u32,
     uid: u64,
     gid: u64,
@@ -38,7 +64,7 @@ pub struct TarSection {
     /// Whether the archive spells its names `./x` (SunOS install tapes do); new names follow suit.
     dot_prefix: bool,
     /// Raw bytes of root members (`./`), which have no path of their own but are kept on rebuild.
-    root_raw: Vec<u8>,
+    root_raw: Vec<Span>,
 }
 
 fn clean(path: &str) -> String {
@@ -49,26 +75,53 @@ fn invalid(msg: String) -> FilesystemError {
     FilesystemError::InvalidData(msg)
 }
 
+/// An anonymous temp file holding `bytes`.
+fn spool(bytes: &[u8]) -> Result<File, FilesystemError> {
+    let mut f = tempfile::tempfile()?;
+    f.write_all(bytes)?;
+    Ok(f)
+}
+
+/// Zero-pad a stream of `n` bytes so far to a multiple of `unit`; returns the bytes added.
+fn pad(w: &mut dyn Write, n: u64, unit: u64) -> Result<u64, FilesystemError> {
+    let add = n.div_ceil(unit) * unit - n;
+    disk_core::zeros::write_zeros(w, add)?;
+    Ok(add)
+}
+
 impl TarSection {
     /// Parse `bytes` (an uncompressed tar) into members.
     pub fn parse(bytes: &[u8]) -> Result<Self, FilesystemError> {
-        let mut archive = tar::Archive::new(Cursor::new(bytes));
+        Self::from_file(spool(bytes)?)
+    }
+
+    /// Index the uncompressed tar in `file`; members stay byte ranges of it.
+    pub fn from_file(file: File) -> Result<Self, FilesystemError> {
+        let file = Arc::new(file);
+        let file_len = file.metadata()?.len();
+        let span = |at: u64, end: u64| Span {
+            file: Arc::clone(&file),
+            at,
+            len: end.min(file_len).saturating_sub(at),
+        };
+        let mut reader: &File = &file;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut archive = tar::Archive::new(reader);
         let mut members = Vec::new();
         let mut root_raw = Vec::new();
         let mut dotted = 0usize;
-        let mut prev_end = 0usize;
+        let mut prev_end = 0u64;
         let entries = archive
             .entries()
             .map_err(|e| invalid(format!("tar: {e}")))?;
         for entry in entries {
-            let mut entry = entry.map_err(|e| invalid(format!("tar entry: {e}")))?;
+            let entry = entry.map_err(|e| invalid(format!("tar entry: {e}")))?;
             let header = entry.header().clone();
-            let size = entry.size() as usize;
-            let data_at = entry.raw_file_position() as usize;
-            let end = data_at + size.div_ceil(BLOCK) * BLOCK;
-            let raw = bytes
-                .get(prev_end..end.min(bytes.len()))
-                .map(<[u8]>::to_vec);
+            let size = entry.size();
+            let data_at = entry.raw_file_position();
+            let end = data_at + size.div_ceil(BLOCK as u64) * BLOCK as u64;
+            // As `bytes.get(prev_end..end.min(len))` did: `None` only when the range is inverted.
+            let raw = (prev_end <= end.min(file_len)).then(|| span(prev_end, end));
             prev_end = end;
             let path_bytes = entry.path_bytes().into_owned();
             if path_bytes.starts_with(b"./") {
@@ -77,12 +130,10 @@ impl TarSection {
             let path = clean(&String::from_utf8_lossy(&path_bytes));
             let kind = header.entry_type().as_byte();
             let dir = header.entry_type().is_dir() || path_bytes.last() == Some(&b'/');
-            let mut data = Vec::with_capacity(size);
-            std::io::Read::read_to_end(&mut entry, &mut data)
-                .map_err(|e| invalid(format!("tar read {path}: {e}")))?;
+            let data = Some(span(data_at, data_at + size));
             let link = entry.link_name_bytes().map(|l| l.into_owned());
             if path.is_empty() {
-                root_raw.extend_from_slice(raw.as_deref().unwrap_or(&[]));
+                root_raw.extend(raw);
                 continue;
             }
             members.push(Member {
@@ -108,10 +159,20 @@ impl TarSection {
 
     /// Serialize: original bytes for untouched members, V7 headers for the rest.
     pub fn to_bytes(&self) -> Result<Vec<u8>, FilesystemError> {
-        let mut out = self.root_raw.clone();
+        let mut out = Vec::new();
+        self.write_to(&mut out)?;
+        Ok(out)
+    }
+
+    /// Stream the rebuilt archive into `w`; returns its length.
+    pub fn write_to(&self, w: &mut dyn Write) -> Result<u64, FilesystemError> {
+        let mut n: u64 = 0;
+        for raw in &self.root_raw {
+            n += raw.copy_to(w)?;
+        }
         for m in &self.members {
             if let Some(raw) = &m.raw {
-                out.extend_from_slice(raw);
+                n += raw.copy_to(w)?;
                 continue;
             }
             let dot = if self.dot_prefix { "./" } else { "" };
@@ -138,20 +199,20 @@ impl TarSection {
                 }
                 h.as_old_mut().linkname[..link.len()].copy_from_slice(link);
             }
-            let body: &[u8] = if m.dir || m.link.is_some() {
-                &[][..]
-            } else {
-                m.data.as_slice()
-            };
-            h.set_size(body.len() as u64);
+            let body = m.data.as_ref().filter(|_| !m.dir && m.link.is_none());
+            h.set_size(body.map_or(0, |b| b.len));
             h.set_cksum();
-            out.extend_from_slice(h.as_bytes());
-            out.extend_from_slice(body);
-            out.resize(out.len().div_ceil(BLOCK) * BLOCK, 0);
+            w.write_all(h.as_bytes())?;
+            n += BLOCK as u64;
+            if let Some(b) = body {
+                n += b.copy_to(w)?;
+            }
+            n += pad(w, n, BLOCK as u64)?;
         }
-        out.extend_from_slice(&[0u8; 2 * BLOCK]);
-        out.resize(out.len().div_ceil(RECORD) * RECORD, 0);
-        Ok(out)
+        w.write_all(&[0u8; 2 * BLOCK])?;
+        n += 2 * BLOCK as u64;
+        n += pad(w, n, RECORD as u64)?;
+        Ok(n)
     }
 
     fn find(&self, path: &str) -> Option<usize> {
@@ -192,12 +253,32 @@ impl TarSection {
         gid: u64,
         mtime: u64,
     ) -> Result<(), FilesystemError> {
+        let len = data.len() as u64;
+        self.add_file_from(path, spool(&data)?, len, mode, uid, gid, mtime)
+    }
+
+    /// Add a regular file whose contents are the first `len` bytes of `file`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_file_from(
+        &mut self,
+        path: &str,
+        file: File,
+        len: u64,
+        mode: u32,
+        uid: u64,
+        gid: u64,
+        mtime: u64,
+    ) -> Result<(), FilesystemError> {
         self.check_new(path)?;
         self.members.push(Member {
             path: clean(path),
             dir: false,
             raw: None,
-            data,
+            data: Some(Span {
+                file: Arc::new(file),
+                at: 0,
+                len,
+            }),
             mode,
             uid,
             gid,
@@ -222,7 +303,7 @@ impl TarSection {
             path: clean(path),
             dir: true,
             raw: None,
-            data: Vec::new(),
+            data: None,
             mode,
             uid,
             gid,
@@ -302,6 +383,16 @@ impl TarSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    /// A member's contents, for assertions.
+    fn data(t: &TarSection, i: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(d) = &t.members[i].data {
+            d.copy_to(&mut out).unwrap();
+        }
+        out
+    }
 
     fn v7(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
@@ -367,7 +458,7 @@ mod tests {
         let again = TarSection::parse(&bytes).unwrap();
         let paths: Vec<&str> = again.members.iter().map(|m| m.path.as_str()).collect();
         assert_eq!(paths, ["etc/motd.old", "usr", "usr/new.txt"]);
-        assert_eq!(again.members[2].data, b"new");
+        assert_eq!(data(&again, 2), b"new");
     }
 
     #[test]

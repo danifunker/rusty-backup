@@ -1,8 +1,9 @@
 //! Editing Sun QIC tape images (`SUN2TAPE`): rebuild the whole tape, keep the original.
 //!
-//! A tape has no free space to allocate from, so editing works like SquashFS: every
-//! tape file is held in memory (a QIC cartridge is at most ~150 MB), an edit rewrites
-//! the one tape file it touches, and `sync_metadata` writes a new image. Tar sections
+//! A tape has no free space to allocate from, so editing works like SquashFS: an edit
+//! rewrites the one tape file it touches, and `sync_metadata` writes a new image.
+//! Untouched tape files stay byte ranges of the original image and edited ones live in
+//! temp files, so no tape file is held in memory whole (TAP-001). Tar sections
 //! are edited as member lists ([`crate::tar_section`]); `compress(1)`-ed ones are
 //! decompressed, edited and recompressed; the UFS miniroot goes through the UFS writer.
 //! Boot blocks, the table of contents and other plain tape files are copied as they are,
@@ -15,7 +16,8 @@
 //! Not verified on Sun hardware yet: the plan (docs/PLAN-hpux-writes.md, W4) is a Sun-2 /
 //! Sun-3 MiSTer core booting and listing an edited tape.
 
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::sun2tape::{TapeFileKind, TapeFilesystem};
@@ -28,18 +30,37 @@ use fs_unix::ufs::UfsFilesystem;
 
 const BLOCK: usize = 512;
 
+/// Where a tape file's bytes are.
+enum Body {
+    /// `len` bytes at `start` in the original image.
+    Original { start: u64, len: u64 },
+    /// An edited tape file, in a temp file of its own.
+    Spooled { file: File, len: u64 },
+}
+
+impl Body {
+    fn len(&self) -> u64 {
+        match self {
+            Body::Original { len, .. } | Body::Spooled { len, .. } => *len,
+        }
+    }
+}
+
 /// One tape file: where it sits in the table and its (possibly edited) bytes.
 struct TapeBody {
     volume: usize,
     /// Slot in the volume's table, so zero-length files between bodies keep their place.
     index: usize,
     kind: TapeFileKind,
-    bytes: Vec<u8>,
+    body: Body,
 }
 
 /// An editable `SUN2TAPE` image, rebuilt on sync.
 pub struct TapeEditor {
     path: PathBuf,
+    /// The original image, which untouched tape files are copied from.
+    source: File,
+    offset: u64,
     head: Vec<u8>,
     volumes: usize,
     /// Table slots per volume, counting zero-length files (which have no body).
@@ -47,7 +68,7 @@ pub struct TapeEditor {
     bodies: Vec<TapeBody>,
     /// Display node path of each tape file (`/NN-name` or `/volN/NN-name`).
     nodes: Vec<String>,
-    view: Option<TapeFilesystem<Cursor<Vec<u8>>>>,
+    view: Option<TapeFilesystem<File>>,
     dirty: bool,
 }
 
@@ -90,25 +111,29 @@ impl TapeEditor {
                 "Sun tape: edit a .qic as a standalone file (it is rebuilt and replaced)".into(),
             )
         })?;
+        let mut head = vec![0u8; BLOCK];
         reader.seek(SeekFrom::Start(offset))?;
-        let mut image = Vec::new();
-        reader.read_to_end(&mut image)?;
-        let view = TapeFilesystem::open(Cursor::new(image.clone()), 0)?;
-        let volumes = u32::from_be_bytes([image[12], image[13], image[14], image[15]]) as usize;
+        reader.read_exact(&mut head)?;
+        let source = File::open(path)?;
+        let image_len = source.metadata()?.len().saturating_sub(offset);
+        let view = TapeFilesystem::open(source.try_clone()?, offset)?;
+        let volumes = u32::from_be_bytes([head[12], head[13], head[14], head[15]]) as usize;
         let mut bodies = Vec::new();
         let mut nodes = Vec::new();
         for f in view.files() {
-            let end = (f.start + f.len) as usize;
+            if f.start + f.len > image_len {
+                return Err(FilesystemError::InvalidData(
+                    "Sun tape: file past the image".into(),
+                ));
+            }
             bodies.push(TapeBody {
                 volume: f.volume,
                 index: f.index,
                 kind: f.kind,
-                bytes: image
-                    .get(f.start as usize..end)
-                    .ok_or_else(|| {
-                        FilesystemError::InvalidData("Sun tape: file past the image".into())
-                    })?
-                    .to_vec(),
+                body: Body::Original {
+                    start: f.start,
+                    len: f.len,
+                },
             });
             nodes.push(if volumes > 1 {
                 format!("/vol{}/{}", f.volume + 1, f.name)
@@ -119,13 +144,15 @@ impl TapeEditor {
         let slots = (0..volumes)
             .map(|v| {
                 let w = (4 + 32 * v) * 4;
-                (u32::from_be_bytes([image[w], image[w + 1], image[w + 2], image[w + 3]]) as usize)
+                (u32::from_be_bytes([head[w], head[w + 1], head[w + 2], head[w + 3]]) as usize)
                     .min(crate::sun2tape::MAX_FILES)
             })
             .collect();
         Ok(Self {
             path: path.to_path_buf(),
-            head: image[..BLOCK].to_vec(),
+            source,
+            offset,
+            head,
             volumes,
             slots,
             bodies,
@@ -136,13 +163,21 @@ impl TapeEditor {
     }
 
     /// The whole tape: block 0's table rewritten for the current file sizes, then the files.
-    pub fn build_image(&self) -> Result<Vec<u8>, FilesystemError> {
+    pub fn build_image(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        self.write_image(&mut out)?;
+        Ok(out.into_inner())
+    }
+
+    /// Stream the rebuilt tape into `w`; returns its length.
+    pub fn write_image<W: Write + Seek>(&mut self, w: &mut W) -> Result<u64, FilesystemError> {
         let mut head = self.head.clone();
-        let mut out = vec![0u8; BLOCK];
+        let mut pos = BLOCK as u64;
+        w.seek(SeekFrom::Start(pos))?;
         let mut block = 1u32;
         for v in 0..self.volumes {
             let n = self.slots[v];
-            let w = 4 + 32 * v;
+            let wd = 4 + 32 * v;
             if n + 1 > 31 {
                 return Err(FilesystemError::InvalidData(
                     "Sun tape: too many files in a volume".into(),
@@ -151,25 +186,65 @@ impl TapeEditor {
             let mut put = |word: usize, value: u32| {
                 head[word * 4..word * 4 + 4].copy_from_slice(&value.to_be_bytes());
             };
-            put(w, n as u32);
-            put(w + 1, block);
+            put(wd, n as u32);
+            put(wd + 1, block);
             for k in 0..n {
-                let body = self.bodies.iter().find(|b| b.volume == v && b.index == k);
-                if let Some(f) = body {
-                    out.extend_from_slice(&f.bytes);
-                    out.resize(out.len().div_ceil(BLOCK) * BLOCK, 0);
+                let at = self
+                    .bodies
+                    .iter()
+                    .position(|b| b.volume == v && b.index == k);
+                if let Some(at) = at {
+                    pos += self.copy_body(at, w)?;
+                    let padded = pos.div_ceil(BLOCK as u64) * BLOCK as u64;
+                    disk_core::zeros::write_zeros(w, padded - pos)?;
+                    pos = padded;
                 }
-                block = (out.len() / BLOCK) as u32;
-                put(w + 2 + k, block);
+                block = (pos / BLOCK as u64) as u32;
+                put(wd + 2 + k, block);
             }
         }
-        out[..BLOCK].copy_from_slice(&head);
-        Ok(out)
+        w.seek(SeekFrom::Start(0))?;
+        w.write_all(&head)?;
+        w.seek(SeekFrom::Start(pos))?;
+        Ok(pos)
     }
 
-    fn view(&mut self) -> Result<&mut TapeFilesystem<Cursor<Vec<u8>>>, FilesystemError> {
+    /// Copy tape file `i`'s bytes into `w`.
+    fn copy_body(&mut self, i: usize, w: &mut dyn Write) -> Result<u64, FilesystemError> {
+        let (file, start, len) = match &mut self.bodies[i].body {
+            Body::Original { start, len } => (&mut self.source, self.offset + *start, *len),
+            Body::Spooled { file, len } => (file, 0, *len),
+        };
+        file.seek(SeekFrom::Start(start))?;
+        let n = std::io::copy(&mut file.take(len), w)?;
+        if n != len {
+            return Err(FilesystemError::InvalidData(
+                "Sun tape: a tape file ended early".into(),
+            ));
+        }
+        Ok(n)
+    }
+
+    /// Tape file `i`'s bytes in a temp file of their own (decompressed when `unpack`).
+    fn spool_body(&mut self, i: usize, unpack: bool) -> Result<File, FilesystemError> {
+        let mut raw = tempfile::tempfile()?;
+        self.copy_body(i, &mut raw)?;
+        raw.seek(SeekFrom::Start(0))?;
+        if !unpack {
+            return Ok(raw);
+        }
+        let mut plain = tempfile::tempfile()?;
+        arc_mac::stuffit_lzw::decompress_unix_z_to(&mut raw, &mut plain)
+            .map_err(|e| FilesystemError::InvalidData(format!("Sun tape: {e}")))?;
+        plain.seek(SeekFrom::Start(0))?;
+        Ok(plain)
+    }
+
+    fn view(&mut self) -> Result<&mut TapeFilesystem<File>, FilesystemError> {
         if self.view.is_none() {
-            self.view = Some(TapeFilesystem::open(Cursor::new(self.build_image()?), 0)?);
+            let mut image = tempfile::tempfile()?;
+            self.write_image(&mut image)?;
+            self.view = Some(TapeFilesystem::open(image, 0)?);
         }
         Ok(self.view.as_mut().expect("just built"))
     }
@@ -196,40 +271,42 @@ impl TapeEditor {
         &mut self,
         i: usize,
         tar: impl FnOnce(&mut TarSection) -> Result<(), FilesystemError>,
-        ufs: impl FnOnce(&mut UfsFilesystem<Cursor<Vec<u8>>>) -> Result<(), FilesystemError>,
+        ufs: impl FnOnce(&mut UfsFilesystem<File>) -> Result<(), FilesystemError>,
     ) -> Result<(), FilesystemError> {
-        let body = &mut self.bodies[i];
-        match body.kind {
+        let kind = self.bodies[i].kind;
+        let body = match kind {
             TapeFileKind::Tar | TapeFileKind::CompressedTar => {
-                let packed = body.kind == TapeFileKind::CompressedTar;
-                let plain = if packed {
-                    arc_mac::stuffit_lzw::decompress_unix_z(&body.bytes)
-                        .map_err(|e| FilesystemError::InvalidData(format!("Sun tape: {e}")))?
-                } else {
-                    body.bytes.clone()
-                };
-                let mut section = TarSection::parse(&plain)?;
+                let packed = kind == TapeFileKind::CompressedTar;
+                let mut section = TarSection::from_file(self.spool_body(i, packed)?)?;
                 tar(&mut section)?;
-                let rebuilt = section.to_bytes()?;
-                body.bytes = if packed {
-                    arc_mac::stuffit_lzw::compress_unix_z(&rebuilt)
-                } else {
-                    rebuilt
-                };
+                let mut rebuilt = tempfile::tempfile()?;
+                let mut len = section.write_to(&mut rebuilt)?;
+                if packed {
+                    rebuilt.seek(SeekFrom::Start(0))?;
+                    let mut z = tempfile::tempfile()?;
+                    len = arc_mac::stuffit_lzw::compress_unix_z_to(&mut rebuilt, &mut z)?;
+                    rebuilt = z;
+                }
+                Body::Spooled { file: rebuilt, len }
             }
             TapeFileKind::Ufs => {
-                let mut fs = UfsFilesystem::open(Cursor::new(std::mem::take(&mut body.bytes)), 0)?;
+                let len = self.bodies[i].body.len();
+                let mut fs = UfsFilesystem::open(self.spool_body(i, false)?, 0)?;
                 let r = ufs(&mut fs);
                 fs.sync_metadata()?;
-                body.bytes = fs.into_inner().into_inner();
                 r?;
+                Body::Spooled {
+                    file: fs.into_inner(),
+                    len,
+                }
             }
             _ => {
                 return Err(FilesystemError::Unsupported(
                     "Sun tape: only tar, compressed tar and UFS tape files can be edited".into(),
                 ))
             }
-        }
+        };
+        self.bodies[i].body = body;
         self.view = None;
         self.dirty = true;
         Ok(())
@@ -294,11 +371,7 @@ impl Filesystem for TapeEditor {
     }
 
     fn total_size(&self) -> u64 {
-        self.bodies
-            .iter()
-            .map(|b| b.bytes.len() as u64)
-            .sum::<u64>()
-            + BLOCK as u64
+        self.bodies.iter().map(|b| b.body.len()).sum::<u64>() + BLOCK as u64
     }
 
     fn used_size(&self) -> u64 {
@@ -324,19 +397,21 @@ impl EditableFilesystem for TapeEditor {
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         let (i, inner_parent) = self.locate(&parent.path)?;
-        let mut body = Vec::with_capacity(data_len as usize);
-        data.take(data_len).read_to_end(&mut body)?;
+        // Spooled once, then handed to whichever writer the tape file needs.
+        let mut spool = tempfile::tempfile()?;
+        let len = std::io::copy(&mut data.take(data_len), &mut spool)?;
+        spool.seek(SeekFrom::Start(0))?;
+        let mut for_ufs = spool.try_clone()?;
         let inner = format!("{}/{name}", inner_parent.trim_end_matches('/'));
         let mode = options.mode.unwrap_or(0o644) & 0o7777;
         let (uid, gid) = (options.uid.unwrap_or(0), options.gid.unwrap_or(0));
         let mtime = options.unix_times.and_then(|t| t.mtime).unwrap_or_else(now);
-        let ufs_body = body.clone();
         self.edit(
             i,
-            |t| t.add_file(&inner, body, mode, uid.into(), gid.into(), mtime),
+            |t| t.add_file_from(&inner, spool, len, mode, uid.into(), gid.into(), mtime),
             |u| {
                 let p = resolve(u, &inner_parent)?;
-                u.create_file(&p, name, &mut &ufs_body[..], ufs_body.len() as u64, options)
+                u.create_file(&p, name, &mut for_ufs, len, options)
                     .map(|_| ())
             },
         )?;
@@ -438,7 +513,6 @@ impl EditableFilesystem for TapeEditor {
         if !self.dirty {
             return Ok(());
         }
-        let image = self.build_image()?;
         let dir = self
             .path
             .parent()
@@ -447,7 +521,7 @@ impl EditableFilesystem for TapeEditor {
         let mut tmp = tempfile::Builder::new()
             .prefix(".rb-tape-")
             .tempfile_in(dir)?;
-        tmp.write_all(&image)?;
+        self.write_image(tmp.as_file_mut())?;
         tmp.as_file().sync_all()?;
         // A fresh temp file is 0600; the rebuilt tape keeps the original's permissions.
         if let Ok(meta) = std::fs::metadata(&self.path) {
@@ -469,6 +543,7 @@ impl EditableFilesystem for TapeEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn tar_member(name: &str, body: &[u8]) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
@@ -592,7 +667,8 @@ mod tests {
         img.extend_from_slice(&tar[..BLOCK]);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.qic");
-        let ed = TapeEditor::open(Cursor::new(img.clone()), 0, Some(&path)).unwrap();
+        std::fs::write(&path, &img).unwrap();
+        let mut ed = TapeEditor::open(Cursor::new(img.clone()), 0, Some(&path)).unwrap();
         assert_eq!(ed.build_image().unwrap()[..BLOCK], img[..BLOCK]);
     }
 

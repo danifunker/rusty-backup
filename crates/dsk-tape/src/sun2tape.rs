@@ -15,11 +15,11 @@
 //! names come from the tape's own XDR table of contents when it has one (SunOS
 //! install tapes do), else from the content type.
 //!
-//! Directory contents are decoded in memory on first access and cached; tape files
-//! are tens of megabytes at most.
+//! A tape file is spooled to a temp file the first time it is opened as a directory, so
+//! neither the tape nor a tape file is ever held in memory whole (TAP-001).
 
 use std::collections::HashMap;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::{Filesystem, FilesystemError};
@@ -185,6 +185,20 @@ fn toc_names(toc: &[u8], volume: usize) -> Vec<String> {
     names
 }
 
+/// A writer keeping only the first block written to it.
+struct Head(Vec<u8>);
+
+impl Write for Head {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let room = 512usize.saturating_sub(self.0.len());
+        self.0.extend_from_slice(&buf[..room.min(buf.len())]);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A `SUN2TAPE` image browsed as a read-only filesystem.
 pub struct TapeFilesystem<R: Read + Seek + Send> {
     reader: R,
@@ -192,6 +206,8 @@ pub struct TapeFilesystem<R: Read + Seek + Send> {
     files: Vec<TapeFile>,
     volumes: usize,
     opened: HashMap<usize, Box<dyn Filesystem>>,
+    /// Temp files behind opened tar children, kept for as long as the children read them.
+    spools: Vec<tempfile::NamedTempFile>,
 }
 
 impl<R: Read + Seek + Send> TapeFilesystem<R> {
@@ -234,6 +250,7 @@ impl<R: Read + Seek + Send> TapeFilesystem<R> {
             files,
             volumes,
             opened: HashMap::new(),
+            spools: Vec::new(),
         };
         fs.name_files()?;
         Ok(fs)
@@ -260,10 +277,14 @@ impl<R: Read + Seek + Send> TapeFilesystem<R> {
         for i in 0..self.files.len() {
             if self.files[i].kind == TapeFileKind::Compressed {
                 let f = self.files[i].clone();
-                let raw = self.read_range(f.start, f.len)?;
-                let tar = arc_mac::stuffit_lzw::decompress_unix_z(&raw)
-                    .map(|d| is_tar_header(&d))
-                    .unwrap_or(false);
+                // The whole stream is decoded, as a corrupt one is not a tar, but only its head kept.
+                let mut head = Head(Vec::new());
+                let tar = arc_mac::stuffit_lzw::decompress_unix_z_to(
+                    &mut self.region(f.start, f.len)?,
+                    &mut head,
+                )
+                .map(|_| is_tar_header(&head.0))
+                .unwrap_or(false);
                 if tar {
                     self.files[i].kind = TapeFileKind::CompressedTar;
                 }
@@ -294,6 +315,12 @@ impl<R: Read + Seek + Send> TapeFilesystem<R> {
             self.files[i].name = name;
         }
         Ok(())
+    }
+
+    /// A reader over `len` bytes of the image at `start`.
+    fn region(&mut self, start: u64, len: u64) -> Result<std::io::Take<&mut R>, FilesystemError> {
+        self.reader.seek(SeekFrom::Start(self.offset + start))?;
+        Ok((&mut self.reader).take(len))
     }
 
     fn read_range(&mut self, start: u64, len: u64) -> Result<Vec<u8>, FilesystemError> {
@@ -329,17 +356,26 @@ impl<R: Read + Seek + Send> TapeFilesystem<R> {
     fn child(&mut self, i: usize) -> Result<&mut Box<dyn Filesystem>, FilesystemError> {
         if !self.opened.contains_key(&i) {
             let f = self.files[i].clone();
-            let raw = self.read_range(f.start, f.len)?;
             let label = Some(f.name.clone());
             let fs: Box<dyn Filesystem> = match f.kind {
-                TapeFileKind::Tar => Box::new(fs_tar::mem_archive::open_tar(raw, label)?),
-                TapeFileKind::CompressedTar => {
-                    let tar = arc_mac::stuffit_lzw::decompress_unix_z(&raw)
-                        .map_err(|e| FilesystemError::Parse(format!("{}: {e}", f.name)))?;
-                    Box::new(fs_tar::mem_archive::open_tar(tar, label)?)
+                TapeFileKind::Tar | TapeFileKind::CompressedTar => {
+                    let mut spool = tempfile::NamedTempFile::new()?;
+                    let mut src = self.region(f.start, f.len)?;
+                    if f.kind == TapeFileKind::CompressedTar {
+                        arc_mac::stuffit_lzw::decompress_unix_z_to(&mut src, spool.as_file_mut())
+                            .map_err(|e| FilesystemError::Parse(format!("{}: {e}", f.name)))?;
+                    } else {
+                        std::io::copy(&mut src, spool.as_file_mut())?;
+                    }
+                    spool.as_file_mut().flush()?;
+                    let fs = fs_tar::mem_archive::open_path(spool.path(), label)?;
+                    self.spools.push(spool);
+                    Box::new(fs)
                 }
                 TapeFileKind::Ufs => {
-                    Box::new(fs_unix::ufs::UfsFilesystem::open(Cursor::new(raw), 0)?)
+                    let mut spool = tempfile::tempfile()?;
+                    std::io::copy(&mut self.region(f.start, f.len)?, &mut spool)?;
+                    Box::new(fs_unix::ufs::UfsFilesystem::open(spool, 0)?)
                 }
                 _ => return Err(FilesystemError::NotADirectory(f.name)),
             };
@@ -436,9 +472,7 @@ impl<R: Read + Seek + Send> Filesystem for TapeFilesystem<R> {
             .ok_or_else(|| FilesystemError::NotFound(entry.path.clone()))?;
         if inner == "/" {
             let f = self.files[i].clone();
-            let data = self.read_range(f.start, f.len)?;
-            writer.write_all(&data)?;
-            return Ok(f.len);
+            return Ok(std::io::copy(&mut self.region(f.start, f.len)?, writer)?);
         }
         let mut e = entry.clone();
         e.path = inner;
@@ -469,6 +503,7 @@ impl<R: Read + Seek + Send> Filesystem for TapeFilesystem<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn tar_member(name: &str, body: &[u8]) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
