@@ -381,24 +381,9 @@ impl<R: Read + Seek + Send> AppleDosFilesystem<R> {
 
         // Walk the catalog chain.
         let mut entries = Vec::new();
-        let mut track = vtoc.first_catalog_track;
-        let mut sector = vtoc.first_catalog_sector;
-        let mut seen = std::collections::HashSet::new();
-        for _hop in 0..MAX_CATALOG_SECTORS {
-            if track == 0 {
-                break;
-            }
-            if !seen.insert((track, sector)) {
-                return Err(FilesystemError::InvalidData(format!(
-                    "catalog chain cycle at T{track}S{sector}"
-                )));
-            }
-            let cat = read_sector(&mut reader, partition_offset, track, sector)?;
-            // 7 entries per catalog sector at offsets 0x0B, 0x0B+35, ...
-            for i in 0..7 {
-                let off = 0x0B + i * 35;
-                let entry_buf: &[u8; 35] = cat[off..off + 35].try_into().unwrap();
-                let e = AppleDosFileEntry::parse(entry_buf);
+        let first = (vtoc.first_catalog_track, vtoc.first_catalog_sector);
+        walk_catalog(&mut reader, partition_offset, first, true, |_, _, cat| {
+            for e in catalog_entries(cat) {
                 if entries.len() >= MAX_FILES {
                     return Err(FilesystemError::InvalidData(format!(
                         "catalog exceeds MAX_FILES = {MAX_FILES}"
@@ -406,9 +391,8 @@ impl<R: Read + Seek + Send> AppleDosFilesystem<R> {
                 }
                 entries.push(e);
             }
-            track = cat[0x01];
-            sector = cat[0x02];
-        }
+            Ok(None::<()>)
+        })?;
 
         Ok(AppleDosFilesystem {
             reader,
@@ -490,6 +474,49 @@ impl<R: Read + Seek + Send> AppleDosFilesystem<R> {
         }
         &bytes[4..4 + claimed_len]
     }
+}
+
+/// Walk the catalog chain from `first`, calling `visit` on each catalog sector until it returns
+/// `Some`. A loop ends the walk, or is an error when `strict`.
+fn walk_catalog<R: Read + Seek, T>(
+    reader: &mut R,
+    partition_offset: u64,
+    first: (u8, u8),
+    strict: bool,
+    mut visit: impl FnMut(u8, u8, &[u8; APPLE_II_SECTOR_BYTES]) -> Result<Option<T>, FilesystemError>,
+) -> Result<Option<T>, FilesystemError> {
+    let (mut track, mut sector) = first;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..MAX_CATALOG_SECTORS {
+        if track == 0 {
+            break;
+        }
+        if !seen.insert((track, sector)) {
+            if strict {
+                return Err(FilesystemError::InvalidData(format!(
+                    "catalog chain cycle at T{track}S{sector}"
+                )));
+            }
+            break;
+        }
+        let cat = read_sector(reader, partition_offset, track, sector)?;
+        if let Some(found) = visit(track, sector, &cat)? {
+            return Ok(Some(found));
+        }
+        track = cat[0x01];
+        sector = cat[0x02];
+    }
+    Ok(None)
+}
+
+/// The 7 file entries of one catalog sector, at 0x0B, 0x0B+35, ...
+fn catalog_entries(
+    cat: &[u8; APPLE_II_SECTOR_BYTES],
+) -> impl Iterator<Item = AppleDosFileEntry> + '_ {
+    (0..7).map(move |i| {
+        let off = 0x0B + i * 35;
+        AppleDosFileEntry::parse(cat[off..off + 35].try_into().unwrap())
+    })
 }
 
 /// Read a 256-byte Apple-II sector relative to `partition_offset`. The
@@ -900,32 +927,50 @@ impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
     /// Find a free catalog entry slot in the 15-sector catalog chain.
     /// Returns `(catalog_track, catalog_sector, entry_index_within_sector)`.
     fn find_free_catalog_slot(&mut self) -> Result<(u8, u8, usize), FilesystemError> {
-        let mut track = self.vtoc.first_catalog_track;
-        let mut sector = self.vtoc.first_catalog_sector;
-        let mut seen = std::collections::HashSet::new();
-        for _hop in 0..MAX_CATALOG_SECTORS {
-            if track == 0 {
-                break;
-            }
-            if !seen.insert((track, sector)) {
-                break;
-            }
-            let cat = read_sector(&mut self.reader, self.partition_offset, track, sector)?;
-            for i in 0..7 {
-                let off = 0x0B + i * 35;
-                let flags = cat[off];
-                // Free if first-T/S track byte is 0 (never used) or 0xFF
-                // (deleted, can be reclaimed).
-                if flags == 0 || flags == 0xFF {
-                    return Ok((track, sector, i));
-                }
-            }
-            track = cat[0x01];
-            sector = cat[0x02];
-        }
-        Err(FilesystemError::InvalidData(
-            "DOS 3.3 catalog full - no free entry slot in the 15-sector catalog chain".into(),
-        ))
+        let first = (
+            self.vtoc.first_catalog_track,
+            self.vtoc.first_catalog_sector,
+        );
+        // Free if first-T/S track byte is 0 (never used) or 0xFF (deleted, can be reclaimed).
+        let slot = walk_catalog(
+            &mut self.reader,
+            self.partition_offset,
+            first,
+            false,
+            |t, s, cat| {
+                Ok((0..7)
+                    .find(|i| matches!(cat[0x0B + i * 35], 0 | 0xFF))
+                    .map(|i| (t, s, i)))
+            },
+        )?;
+        slot.ok_or_else(|| {
+            FilesystemError::InvalidData(
+                "DOS 3.3 catalog full - no free entry slot in the 15-sector catalog chain".into(),
+            )
+        })
+    }
+
+    /// The `(track, sector, slot)` of the live catalog entry named `name`.
+    fn find_catalog_slot(&mut self, name: &str) -> Result<(u8, u8, usize), FilesystemError> {
+        let first = (
+            self.vtoc.first_catalog_track,
+            self.vtoc.first_catalog_sector,
+        );
+        let slot = walk_catalog(
+            &mut self.reader,
+            self.partition_offset,
+            first,
+            false,
+            |t, s, cat| {
+                Ok(catalog_entries(cat)
+                    .enumerate()
+                    .find(|(i, e)| !matches!(cat[0x0B + i * 35], 0 | 0xFF) && e.name == name)
+                    .map(|(i, _)| (t, s, i)))
+            },
+        )?;
+        slot.ok_or_else(|| {
+            FilesystemError::NotFound(format!("catalog slot for '{name}' not found"))
+        })
     }
 
     /// Write a 256-byte sector at (track, sector).
@@ -1239,40 +1284,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AppleDosFilesystem<R>
             tslist_sector = list_buf[0x02];
         }
 
-        // Locate the catalog slot for this entry by re-walking the
-        // catalog chain and matching name. Easier than caching the
-        // (track, sector, slot) trio for every entry.
-        let mut found = None;
-        let mut track = self.vtoc.first_catalog_track;
-        let mut sector = self.vtoc.first_catalog_sector;
-        let mut seen_cat = std::collections::HashSet::new();
-        'outer: for _ in 0..MAX_CATALOG_SECTORS {
-            if track == 0 {
-                break;
-            }
-            if !seen_cat.insert((track, sector)) {
-                break;
-            }
-            let cat = read_sector(&mut self.reader, self.partition_offset, track, sector)?;
-            for i in 0..7 {
-                let off = 0x0B + i * 35;
-                if cat[off] == 0 || cat[off] == 0xFF {
-                    continue;
-                }
-                let mut probe = [0u8; 35];
-                probe.copy_from_slice(&cat[off..off + 35]);
-                let parsed = AppleDosFileEntry::parse(&probe);
-                if parsed.name == de.name {
-                    found = Some((track, sector, i));
-                    break 'outer;
-                }
-            }
-            track = cat[0x01];
-            sector = cat[0x02];
-        }
-        let (ct, cs, slot) = found.ok_or_else(|| {
-            FilesystemError::NotFound(format!("catalog slot for '{}' not found", de.name))
-        })?;
+        let (ct, cs, slot) = self.find_catalog_slot(&de.name)?;
         let mut cat = read_sector(&mut self.reader, self.partition_offset, ct, cs)?;
         let off = 0x0B + slot * 35;
         // Mark as deleted per DOS 3.3 spec: byte 0x00 = 0xFF, original
@@ -1337,39 +1349,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AppleDosFilesystem<R>
             ));
         }
 
-        // Re-walk the catalog chain and match by name to find the slot,
-        // mirroring delete_entry.
-        let mut found = None;
-        let mut track = self.vtoc.first_catalog_track;
-        let mut sector = self.vtoc.first_catalog_sector;
-        let mut seen_cat = std::collections::HashSet::new();
-        'outer: for _ in 0..MAX_CATALOG_SECTORS {
-            if track == 0 {
-                break;
-            }
-            if !seen_cat.insert((track, sector)) {
-                break;
-            }
-            let cat = read_sector(&mut self.reader, self.partition_offset, track, sector)?;
-            for i in 0..7 {
-                let off = 0x0B + i * 35;
-                if cat[off] == 0 || cat[off] == 0xFF {
-                    continue;
-                }
-                let mut probe = [0u8; 35];
-                probe.copy_from_slice(&cat[off..off + 35]);
-                let parsed = AppleDosFileEntry::parse(&probe);
-                if parsed.name == de.name {
-                    found = Some((track, sector, i));
-                    break 'outer;
-                }
-            }
-            track = cat[0x01];
-            sector = cat[0x02];
-        }
-        let (ct, cs, slot) = found.ok_or_else(|| {
-            FilesystemError::NotFound(format!("catalog slot for '{}' not found", de.name))
-        })?;
+        let (ct, cs, slot) = self.find_catalog_slot(&de.name)?;
 
         let mut cat = read_sector(&mut self.reader, self.partition_offset, ct, cs)?;
         let off = 0x0B + slot * 35;
@@ -1456,25 +1436,20 @@ impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
     /// reflects the on-disk state.
     fn refresh_entries(&mut self) -> Result<(), FilesystemError> {
         let mut entries = Vec::new();
-        let mut track = self.vtoc.first_catalog_track;
-        let mut sector = self.vtoc.first_catalog_sector;
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..MAX_CATALOG_SECTORS {
-            if track == 0 {
-                break;
-            }
-            if !seen.insert((track, sector)) {
-                break;
-            }
-            let cat = read_sector(&mut self.reader, self.partition_offset, track, sector)?;
-            for i in 0..7 {
-                let off = 0x0B + i * 35;
-                let buf: &[u8; 35] = cat[off..off + 35].try_into().unwrap();
-                entries.push(AppleDosFileEntry::parse(buf));
-            }
-            track = cat[0x01];
-            sector = cat[0x02];
-        }
+        let first = (
+            self.vtoc.first_catalog_track,
+            self.vtoc.first_catalog_sector,
+        );
+        walk_catalog(
+            &mut self.reader,
+            self.partition_offset,
+            first,
+            false,
+            |_, _, cat| {
+                entries.extend(catalog_entries(cat));
+                Ok(None::<()>)
+            },
+        )?;
         self.entries = entries;
         Ok(())
     }

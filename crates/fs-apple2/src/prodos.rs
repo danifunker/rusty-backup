@@ -266,13 +266,8 @@ impl<R: Read + Seek + Send> ProDosFilesystem<R> {
             // fork is itself a seedling/sapling/tree, never another extended.
             mark_block(used, broken, total, key_pointer, who);
             if (key_pointer as usize) < total {
-                let ek = self.read_block_ro(key_pointer)?;
-                for base in [0usize, 256] {
-                    let fork_st = ek[base];
-                    let fork_kp = u16::from_le_bytes([ek[base + 1], ek[base + 2]]);
-                    if matches!(fork_st, 1..=3) {
-                        self.mark_data_fork(used, broken, total, fork_kp, fork_st, who)?;
-                    }
+                for (fork_st, fork_kp) in self.extended_forks(key_pointer)? {
+                    self.mark_data_fork(used, broken, total, fork_kp, fork_st, who)?;
                 }
             }
             return Ok(());
@@ -291,52 +286,56 @@ impl<R: Read + Seek + Send> ProDosFilesystem<R> {
         storage_type: u8,
         who: &str,
     ) -> Result<(), FilesystemError> {
-        if key_pointer == 0 {
+        self.walk_fork_blocks(key_pointer, storage_type, total, &mut |b| {
+            mark_block(used, broken, total, b, who)
+        })
+    }
+
+    /// Visit every block of one seedling / sapling / tree fork, index blocks included. Index
+    /// blocks at or past `limit` are visited but not read (fsck flags them instead).
+    fn walk_fork_blocks(
+        &mut self,
+        key: u16,
+        storage_type: u8,
+        limit: usize,
+        visit: &mut dyn FnMut(u16),
+    ) -> Result<(), FilesystemError> {
+        if key == 0 {
+            return Ok(());
+        }
+        visit(key);
+        if (key as usize) >= limit {
             return Ok(());
         }
         match storage_type {
-            // Seedling: the key block is the single data block.
-            1 => mark_block(used, broken, total, key_pointer, who),
-            // Sapling: key block is the index, holding up to 256 data blocks.
             2 => {
-                mark_block(used, broken, total, key_pointer, who);
-                if (key_pointer as usize) < total {
-                    let index =
-                        read_index_block(&mut self.reader, self.partition_offset, key_pointer)?;
-                    for &db in index.iter() {
-                        if db != 0 {
-                            mark_block(used, broken, total, db, who);
-                        }
-                    }
-                }
+                let index = read_index_block(&mut self.reader, self.partition_offset, key)?;
+                index.iter().filter(|&&b| b != 0).for_each(|&b| visit(b));
             }
-            // Tree: master index -> up to 128 index blocks -> data blocks.
             3 => {
-                mark_block(used, broken, total, key_pointer, who);
-                if (key_pointer as usize) < total {
-                    let master =
-                        read_index_block(&mut self.reader, self.partition_offset, key_pointer)?;
-                    for &ib in master[..128].iter() {
-                        if ib == 0 {
-                            continue;
-                        }
-                        mark_block(used, broken, total, ib, who);
-                        if (ib as usize) < total {
-                            let index =
-                                read_index_block(&mut self.reader, self.partition_offset, ib)?;
-                            for &db in index.iter() {
-                                if db != 0 {
-                                    mark_block(used, broken, total, db, who);
-                                }
-                            }
-                        }
+                let master = read_index_block(&mut self.reader, self.partition_offset, key)?;
+                for &ib in master[..128].iter().filter(|&&b| b != 0) {
+                    visit(ib);
+                    if (ib as usize) < limit {
+                        let index = read_index_block(&mut self.reader, self.partition_offset, ib)?;
+                        index.iter().filter(|&&b| b != 0).for_each(|&b| visit(b));
                     }
                 }
             }
-            // Unknown storage type: at least account for the key block.
-            _ => mark_block(used, broken, total, key_pointer, who),
+            _ => {}
         }
         Ok(())
+    }
+
+    /// An extended (storage type 5) file's forks as `(storage_type, key)`: the data fork's
+    /// entry sits at offset 0 of the key block, the resource fork's at 256.
+    fn extended_forks(&mut self, key: u16) -> Result<Vec<(u8, u16)>, FilesystemError> {
+        let ek = self.read_block_ro(key)?;
+        Ok([0usize, 256]
+            .iter()
+            .map(|&base| (ek[base], u16::from_le_bytes([ek[base + 1], ek[base + 2]])))
+            .filter(|&(st, _)| matches!(st, 1..=3))
+            .collect())
     }
 
     /// Recompute the allocated-block set by walking the directory tree and every
@@ -910,17 +909,14 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
         let mut blocks = Vec::new();
         if storage_type == 5 {
             // Extended file: the key block lists a data fork (offset 0) and a resource fork (256).
-            let ek = self.read_block_ro(key_pointer)?;
-            for base in [0usize, 256] {
-                let st = ek[base];
-                let kp = u16::from_le_bytes([ek[base + 1], ek[base + 2]]);
-                if matches!(st, 1..=3) && kp != 0 {
-                    self.collect_fork_blocks(kp, st, &mut blocks)?;
-                }
+            for (st, kp) in self.extended_forks(key_pointer)? {
+                self.walk_fork_blocks(kp, st, usize::MAX, &mut |b| blocks.push(b))?;
             }
             blocks.push(key_pointer);
         } else {
-            self.collect_fork_blocks(key_pointer, storage_type, &mut blocks)?;
+            self.walk_fork_blocks(key_pointer, storage_type, usize::MAX, &mut |b| {
+                blocks.push(b)
+            })?;
         }
         let total = self.header.total_blocks;
         let bitmap = self.header.bitmap_pointer;
@@ -936,34 +932,6 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
         for b in blocks {
             self.free_block(b)?;
         }
-        Ok(())
-    }
-
-    /// The blocks of one seedling / sapling / tree fork, index blocks included.
-    fn collect_fork_blocks(
-        &mut self,
-        key: u16,
-        storage_type: u8,
-        out: &mut Vec<u16>,
-    ) -> Result<(), FilesystemError> {
-        match storage_type {
-            2 => {
-                let index = read_index_block(&mut self.reader, self.partition_offset, key)?;
-                out.extend(index.iter().copied().filter(|&b| b != 0));
-            }
-            3 => {
-                let master = read_index_block(&mut self.reader, self.partition_offset, key)?;
-                for &ib in &master[..128] {
-                    if ib != 0 {
-                        let index = read_index_block(&mut self.reader, self.partition_offset, ib)?;
-                        out.extend(index.iter().copied().filter(|&b| b != 0));
-                        out.push(ib);
-                    }
-                }
-            }
-            _ => {}
-        }
-        out.push(key);
         Ok(())
     }
 
@@ -2249,100 +2217,39 @@ fn write_tree_to<R: Read + Seek>(
     Ok(written)
 }
 
+/// Read a seedling file into memory; `write_seedling_to` does the work.
 fn read_seedling<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
     key_ptr: u16,
     eof: usize,
 ) -> Result<Vec<u8>, FilesystemError> {
-    if key_ptr == 0 {
-        return Ok(vec![0u8; eof.min(512)]);
-    }
-    let offset = partition_offset + key_ptr as u64 * BLOCK_SIZE;
-    reader
-        .seek(SeekFrom::Start(offset))
-        .map_err(FilesystemError::Io)?;
-    let mut buf = [0u8; 512];
-    reader.read_exact(&mut buf).map_err(FilesystemError::Io)?;
-    Ok(buf[..eof.min(512)].to_vec())
+    let mut data = Vec::with_capacity(eof.min(16 << 20));
+    write_seedling_to(reader, partition_offset, key_ptr, eof, &mut data)?;
+    Ok(data)
 }
 
-/// Read a sapling file (index block → up to 256 data blocks).
+/// Read a sapling file into memory; `write_sapling_to` does the work.
 fn read_sapling<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
     key_ptr: u16,
     eof: usize,
 ) -> Result<Vec<u8>, FilesystemError> {
-    let index = read_index_block(reader, partition_offset, key_ptr)?;
-    let mut data = Vec::with_capacity(eof);
-
-    for &data_block in index.iter() {
-        if data.len() >= eof {
-            break;
-        }
-        let remaining = eof - data.len();
-        let to_take = remaining.min(512);
-
-        if data_block == 0 {
-            data.extend_from_slice(&vec![0u8; to_take]);
-        } else {
-            let offset = partition_offset + data_block as u64 * BLOCK_SIZE;
-            reader
-                .seek(SeekFrom::Start(offset))
-                .map_err(FilesystemError::Io)?;
-            let mut buf = [0u8; 512];
-            reader.read_exact(&mut buf).map_err(FilesystemError::Io)?;
-            data.extend_from_slice(&buf[..to_take]);
-        }
-    }
-
+    let mut data = Vec::with_capacity(eof.min(16 << 20));
+    write_sapling_to(reader, partition_offset, key_ptr, eof, &mut data)?;
     Ok(data)
 }
 
-/// Read a tree file (master index block → up to 128 index blocks → data blocks).
+/// Read a tree file into memory; `write_tree_to` does the work.
 fn read_tree<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
     key_ptr: u16,
     eof: usize,
 ) -> Result<Vec<u8>, FilesystemError> {
-    let master = read_index_block(reader, partition_offset, key_ptr)?;
-    let mut data = Vec::with_capacity(eof);
-
-    // ProDOS tree files use at most 128 index block slots in the master index.
-    for &index_block_num in master[..128].iter() {
-        if data.len() >= eof {
-            break;
-        }
-
-        let index = if index_block_num == 0 {
-            [0u16; 256] // Sparse index block
-        } else {
-            read_index_block(reader, partition_offset, index_block_num)?
-        };
-
-        for &data_block in index.iter() {
-            if data.len() >= eof {
-                break;
-            }
-            let remaining = eof - data.len();
-            let to_take = remaining.min(512);
-
-            if data_block == 0 {
-                data.extend_from_slice(&vec![0u8; to_take]);
-            } else {
-                let offset = partition_offset + data_block as u64 * BLOCK_SIZE;
-                reader
-                    .seek(SeekFrom::Start(offset))
-                    .map_err(FilesystemError::Io)?;
-                let mut buf = [0u8; 512];
-                reader.read_exact(&mut buf).map_err(FilesystemError::Io)?;
-                data.extend_from_slice(&buf[..to_take]);
-            }
-        }
-    }
-
+    let mut data = Vec::with_capacity(eof.min(16 << 20));
+    write_tree_to(reader, partition_offset, key_ptr, eof, &mut data)?;
     Ok(data)
 }
 
