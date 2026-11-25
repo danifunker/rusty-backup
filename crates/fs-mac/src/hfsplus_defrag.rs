@@ -418,12 +418,11 @@ fn allocate_fork(
 // =============================================================================
 
 use byteorder::{BigEndian, ByteOrder};
-use std::cmp::Ordering;
 
 use crate::hfs_common;
 use crate::hfsplus::{
-    write_blank_btree_header_node, ExtentDescriptor, ForkData, HfsPlusFilesystem, XattrKind,
-    XattrRecord, HFSPLUS_VOLUME_UNMOUNTED_BIT,
+    catalog_compare_keys, write_blank_btree_header_node, ExtentDescriptor, ForkData,
+    HfsPlusFilesystem, XattrKind, XattrRecord, HFSPLUS_VOLUME_UNMOUNTED_BIT,
 };
 use disk_core::filesystem::FilesystemError;
 
@@ -641,7 +640,7 @@ pub fn build_target_metadata(
     // (parent=2, name="") with `parentID=1` in its data and the
     // volume name in its `nodeName`.
     // ----------------------------------------------------------------
-    let cmp = |a: &[u8], b: &[u8]| catalog_compare(a, b, case_sensitive);
+    let cmp = |a: &[u8], b: &[u8]| catalog_compare_keys(a, b, case_sensitive);
     let label = &snapshot.volume.label;
     {
         let folder_meta = root_folder_metadata(snapshot);
@@ -1456,26 +1455,6 @@ fn init_btree_buffer(total_bytes: usize, max_key_len: u16, key_compare_type: u8)
 /// Mirrors `HfsPlusFilesystem::build_catalog_key` (which is `pub(crate)`).
 fn build_catalog_key(parent_cnid: u32, name: &str) -> Vec<u8> {
     HfsPlusFilesystem::<std::io::Cursor<Vec<u8>>>::build_catalog_key(parent_cnid, name)
-}
-
-/// HFS+ catalog key compare. Mirrors `HfsPlusFilesystem::catalog_compare`.
-fn catalog_compare(a: &[u8], b: &[u8], case_sensitive: bool) -> Ordering {
-    if a.len() < 8 || b.len() < 8 {
-        return a.len().cmp(&b.len());
-    }
-    let parent_a = BigEndian::read_u32(&a[2..6]);
-    let parent_b = BigEndian::read_u32(&b[2..6]);
-    let name_len_a = BigEndian::read_u16(&a[6..8]) as usize;
-    let name_len_b = BigEndian::read_u16(&b[6..8]) as usize;
-    let name_a: Vec<u16> = a[8..8 + name_len_a.min((a.len() - 8) / 2) * 2]
-        .chunks_exact(2)
-        .map(BigEndian::read_u16)
-        .collect();
-    let name_b: Vec<u16> = b[8..8 + name_len_b.min((b.len() - 8) / 2) * 2]
-        .chunks_exact(2)
-        .map(BigEndian::read_u16)
-        .collect();
-    hfs_common::compare_hfsplus_keys(parent_a, &name_a, parent_b, &name_b, case_sensitive)
 }
 
 /// Per-record metadata shared by file/folder bodies (dates + 16-byte
