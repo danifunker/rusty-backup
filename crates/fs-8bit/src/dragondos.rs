@@ -295,11 +295,7 @@ impl<R: Read + Seek + Send> DragonDosFilesystem<R> {
     }
 
     fn read_at(&mut self, off: u64, len: usize) -> Result<Vec<u8>, FilesystemError> {
-        self.reader
-            .seek(SeekFrom::Start(self.partition_offset + off))?;
-        let mut buf = vec![0u8; len];
-        self.reader.read_exact(&mut buf)?;
-        Ok(buf)
+        crate::common::read_vec_at(&mut self.reader, self.partition_offset + off, len)
     }
 
     /// Reload the directory track from disk.
@@ -604,10 +600,7 @@ impl<R: Read + Seek + Send> Filesystem for DragonDosFilesystem<R> {
 
 impl<R: Read + Write + Seek + Send> DragonDosFilesystem<R> {
     fn write_at(&mut self, off: u64, data: &[u8]) -> Result<(), FilesystemError> {
-        self.reader
-            .seek(SeekFrom::Start(self.partition_offset + off))?;
-        self.reader.write_all(data)?;
-        Ok(())
+        crate::common::write_all_at(&mut self.reader, self.partition_offset + off, data)
     }
 
     fn set_used(&mut self, lsn: u64) {

@@ -26,6 +26,8 @@ pub mod andos;
 pub mod atari_dos;
 #[cfg(feature = "cbm")]
 pub mod cbm;
+#[cfg(any(feature = "coco", feature = "atari-dos", feature = "trdos"))]
+mod common;
 #[cfg(feature = "acorn")]
 pub mod dfs;
 #[cfg(feature = "coco")]
