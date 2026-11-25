@@ -22,6 +22,7 @@ mod cli_cpm_floppy;
 mod cli_cpm_ibm3740;
 mod cli_dragon;
 mod cli_export;
+mod cli_gho_multipart;
 mod cli_hfs;
 mod cli_line_endings;
 mod cli_literal_paths;

@@ -333,11 +333,12 @@ Review by a separate agent, 2026-11-21, read-only.
 | GHO-010 | S2 | confirmed | gho.rs NTFS file-aware open | VBR `total_sectors` unchecked: a huge value aborts on allocation, products overflow. | fixed (fda1fc41) |
 | GHO-011 | S2 | confirmed | gho.rs `open_ntfs_compressed_mft_only`, `extend_ntfs_compressed_index` | Inflate output unbounded (~4 GiB); oversized block shifts later offsets and wrong data is served. | fixed (fda1fc41) |
 | GHO-012 | S2 | confirmed | gho.rs lazy NTFS scan; trim | I/O errors swallowed: unmapped clusters served as zeros, real errors treated as padding. | fixed (fda1fc41) |
-| GHO-013 | S2 | plausible | gho.rs uncompressed multi-partition | Acknowledged-unsupported layout served as one raw stream instead of refused; later partitions shifted. | open: needs an uncompressed multi-partition sample to detect the layout safely |
+| GHO-013 | S2 | plausible | gho.rs uncompressed multi-partition | Acknowledged-unsupported layout served as one raw stream instead of refused; later partitions shifted. | open: needs an uncompressed **sector-mode** multi-partition sample to detect the layout safely (the compressed sector-mode case is now covered by test_gho_11_sector) |
 | GHO-014 | S2 | confirmed | gho.rs MBR / EBR synthesis, blocked read | Unchecked subtraction of partition geometry (hidden < 63, overlapping or unsorted) panics or yields garbage. | fixed (3612a6a6) |
 | GHO-015 | S3 | confirmed | gho.rs `unsafe impl Send for GhoReader` | Unneeded `unsafe impl Send`. | fixed (fda1fc41) |
 | GHO-016 | S4 | confirmed | gho.rs | Dead / duplicated paths (materialize, emit copies, four zlib loops, three Seek impls; one in-RAM volume emitter); 9,850-line file with six jobs. | deferred (splitting the 9,850-line gho.rs is a refactor of its own) |
 | GHO-017 | S4 | confirmed | gho.rs headers | Stale docs (file-aware "deferred", password "errors", "SECTOR only"). | fixed (2441e66e) |
+| GHO-018 | S3 | confirmed | gho.rs file-aware tree walk / FAT emit | A file-aware image's volume label (BOOT, FAT16, ...) was rebuilt as an empty file instead of the FAT label. | fixed (this branch) |
 
 ## crates/fs-8bit
 
@@ -601,6 +602,7 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 | ADF-012 | S2 | plausible | adfs.rs | Free runs / sectors not bounded by the partition; overlapping runs accepted. | fixed (a1f98e4a) |
 | ADF-013 | S3 | confirmed | adfs.rs `AdfsFsm::read` | Zone load sized by on-disk count (128 MiB); every edit rewrites all zones; quadratic copy. | fixed (a1f98e4a) |
 | ADF-014 | S3 | confirmed | adfs.rs | Map written before data / entry (leaks on failure); no duplicate-name check. | fixed (a1f98e4a) |
+| ADF-015 | S3 | confirmed | adfs.rs `run_fsck`, `delete_entry` | An empty file stored with disc address 0 (as RISC OS writes it) was reported as a dangling reference, and deleting it was refused as a reserved fragment. Seen on a real Archimedes demo disc. | fixed (this branch) |
 | HPF-001 | S1 | confirmed | fs-hpfs hpfs.rs `fix_up_ptrs` etc. | Edit paths follow unchecked dnode pointers and write 2 KiB through an unchecked `write_sectors`. | fixed (2d2f9c3d) |
 | HPF-002 | S2 | confirmed | hpfs.rs `add_dirent` etc. | Dirent walks don't check `len` / `first_free`: infinite loop, panic. | fixed (2d2f9c3d) |
 | HPF-003 | S1 | confirmed | hpfs.rs `flush_bitmaps`, `open` | A bad bitmap pointer is kept: freeing writes 2 KiB to sector 0 or past the partition. | fixed (2d2f9c3d) |

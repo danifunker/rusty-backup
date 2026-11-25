@@ -941,6 +941,11 @@ pub struct AdfsDirEntry {
     pub attrs: u8,
 }
 
+/// RISC OS stores an empty file with disc address 0: it holds no fragment, so nothing to check.
+fn is_unallocated_empty_file(e: &AdfsDirEntry) -> bool {
+    !e.is_directory() && e.file_length == 0 && e.indirect_disc_addr >> 8 == 0
+}
+
 impl AdfsDirEntry {
     pub fn is_directory(&self) -> bool {
         self.attrs & 0x08 != 0
@@ -1230,6 +1235,10 @@ impl<R: Read + Seek + Send> AdfsFilesystem<R> {
                 }
             };
             for e in entries {
+                if is_unallocated_empty_file(&e) {
+                    files += 1;
+                    continue;
+                }
                 referenced.insert(e.indirect_disc_addr >> 8);
                 let resolves = self
                     .fsm
@@ -2656,6 +2665,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         // unreadable (ADF-002).
         let indaddr = entry.location as u32;
         let frag_id = indaddr >> 8;
+        // An empty file with no fragment owns nothing in the map: only its entry goes.
+        if frag_id == 0 && !entry.is_directory() && entry.size == 0 {
+            self.remove_dir_entry(parent_indaddr, &entry.name)?;
+            return Ok(());
+        }
         if frag_id <= ADFS_ROOT_FRAG {
             return Err(FilesystemError::InvalidData(format!(
                 "ADFS: refused to free reserved frag id {frag_id}"
@@ -3201,6 +3215,36 @@ mod tests {
             res.errors
         );
         assert_eq!(res.stats.files_checked, 1);
+    }
+
+    #[test]
+    fn an_empty_file_at_disc_address_zero_is_clean_and_deletable() {
+        // RISC OS writes empty files this way (seen on a real Archimedes demo disc).
+        let mut cur = Cursor::new(create_blank_adfs("D"));
+        {
+            let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.disc_record.root;
+            let entry = AdfsDirEntry {
+                name: "EMPTY".into(),
+                load_addr: 0xFFFFFFFF,
+                exec_addr: 0,
+                file_length: 0,
+                indirect_disc_addr: 0,
+                attrs: 0x03,
+            };
+            fs.insert_dir_entry(root, &entry).unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(res.is_clean(), "empty file flagged: {:?}", res.errors);
+        assert_eq!(res.stats.files_checked, 1);
+        let root = fs.root().unwrap();
+        let file = fs.list_directory(&root).unwrap().remove(0);
+        assert!(fs.read_file(&file, usize::MAX).unwrap().is_empty());
+        fs.delete_entry(&root, &file).unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        assert!(fs.fsck().unwrap().unwrap().is_clean());
     }
 
     #[test]

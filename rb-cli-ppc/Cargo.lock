@@ -639,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-ghost"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "disk-core",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "fs-adfs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "byteorder",
  "disk-core",
