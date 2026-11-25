@@ -28,7 +28,7 @@ use disk_core::filesystem::{EditableFilesystem, ImportedResourceFork};
 use crate::import_sink::{
     is_appledouble, safe_components, ImportItem, ImportOptions, ImportStats, Importer,
 };
-use crate::zip_compat::ZipEntryName as _;
+use crate::zip_compat::entry_name;
 
 /// The folder macOS keeps zipped AppleDouble sidecars under.
 const MACOSX_DIR: &str = "__MACOSX";
@@ -85,7 +85,7 @@ fn plan<R: Read + std::io::Seek>(
         let zf = zip
             .by_index_raw(index)
             .with_context(|| format!("reading ZIP entry {index}"))?;
-        let name = zf.entry_name();
+        let name = entry_name(zf.name(), zf.name_raw());
         let comps = match safe_components(Path::new(&name)) {
             Some(c) if !c.is_empty() => c,
             // Empty names, `..` and absolute paths are never written.

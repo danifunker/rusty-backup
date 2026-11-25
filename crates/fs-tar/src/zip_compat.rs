@@ -1,26 +1,32 @@
-//! A zip entry's name across the two zip lines this crate builds against (a copy of
-//! rusty-backup's `compat::ZipEntryName`): zip 9 decodes names fallibly, zip 2.4 (the only
-//! line Rust 1.73 can build) returns `&str`. The `rust173-polyfill` feature picks the 2.4 form.
+//! A zip entry's name across the two zip lines this crate builds against (zip 9 and zip 2.4,
+//! the only line Rust 1.73 can build). Both have `name()` and `name_raw()`; zip 9's `name()`
+//! decodes fallibly, zip 2.4's returns `&str`. Dispatching on that return type, not on a
+//! feature, keeps every feature mix building whichever zip Cargo resolves (TAR-007).
 
-/// A zip entry's decoded name.
-pub trait ZipEntryName {
-    /// The entry name, falling back to a lossy decode of the raw bytes when zip 9 cannot decode it.
-    fn entry_name(&self) -> String;
+use std::borrow::Cow;
+
+/// What `ZipFile::name()` returns, turned into an owned name.
+pub trait IntoEntryName {
+    /// The name, falling back to a lossy decode of `raw` when zip 9 cannot decode it.
+    fn into_entry_name(self, raw: &[u8]) -> String;
 }
 
-#[cfg(not(feature = "rust173-polyfill"))]
-impl<R: std::io::Read + ?Sized> ZipEntryName for zip::read::ZipFile<'_, R> {
-    fn entry_name(&self) -> String {
-        match self.name() {
+impl IntoEntryName for &str {
+    fn into_entry_name(self, _raw: &[u8]) -> String {
+        self.to_string()
+    }
+}
+
+impl<E> IntoEntryName for Result<Cow<'_, str>, E> {
+    fn into_entry_name(self, raw: &[u8]) -> String {
+        match self {
             Ok(n) => n.into_owned(),
-            Err(_) => String::from_utf8_lossy(self.name_raw()).into_owned(),
+            Err(_) => String::from_utf8_lossy(raw).into_owned(),
         }
     }
 }
 
-#[cfg(feature = "rust173-polyfill")]
-impl ZipEntryName for zip::read::ZipFile<'_> {
-    fn entry_name(&self) -> String {
-        self.name().to_string()
-    }
+/// A zip entry's decoded name on either zip line: `entry_name(f.name(), f.name_raw())`.
+pub fn entry_name<N: IntoEntryName>(name: N, raw: &[u8]) -> String {
+    name.into_entry_name(raw)
 }

@@ -14,7 +14,7 @@
 //! `flate2` for gzip.
 
 #[cfg(feature = "zip")]
-use crate::zip_compat::ZipEntryName as _;
+use crate::zip_compat::entry_name;
 use std::collections::HashMap;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 
@@ -280,7 +280,7 @@ pub fn open_zip(
         let mut zf = zip
             .by_index(i)
             .map_err(|e| FilesystemError::Parse(format!("zip entry {i}: {e}")))?;
-        let name = zf.entry_name();
+        let name = entry_name(zf.name(), zf.name_raw());
         let parts = split_name(&name);
         if parts.is_empty() {
             continue;
@@ -484,7 +484,7 @@ fn open_zip_indexed(
         let zf = zip
             .by_index_raw(i)
             .map_err(|e| FilesystemError::Parse(format!("zip entry {i}: {e}")))?;
-        let parts = split_name(&zf.entry_name());
+        let parts = split_name(&entry_name(zf.name(), zf.name_raw()));
         if parts.is_empty() {
             continue;
         }
