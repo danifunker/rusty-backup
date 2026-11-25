@@ -135,7 +135,7 @@ pub fn name_hash(name: &[u8], intl: bool) -> u32 {
     hash % HT_SIZE as u32
 }
 
-fn ascii_upper(b: u8) -> u8 {
+pub(crate) fn ascii_upper(b: u8) -> u8 {
     if b.is_ascii_lowercase() {
         b - 0x20
     } else {
@@ -143,7 +143,7 @@ fn ascii_upper(b: u8) -> u8 {
     }
 }
 
-fn intl_upper(b: u8) -> u8 {
+pub(crate) fn intl_upper(b: u8) -> u8 {
     if b.is_ascii_lowercase() {
         return b - 0x20;
     }

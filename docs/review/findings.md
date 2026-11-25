@@ -56,7 +56,7 @@ outside tests, no narrow `leading_zeros`. Read in full.
 | DC-003 | S2 | confirmed | [times.rs:446](../../crates/disk-core/src/times.rs#L446) | Clamped encoders keep the real month and day, which makes invalid dates: ProDOS clamps to 2039 (2040-02-29 is written as 2039-02-29, read back as no date); UCSD clamps to 1999 (any 29 February from 2028 on); LIF clamps to 2069. `unix_to_dos_datetime` already fixed this exact bug (comment at line 239). Pin the whole stamp, as DOS does. | fixed (disk-core 0.3.0) |
 | DC-004 | S2 | confirmed | [times.rs:678](../../crates/disk-core/src/times.rs#L678) | `unix_to_qdos_date` wraps with `as u32` instead of clamping: 2100-01-01 encodes as 91474304, which decodes to nothing (or, near the boundary, to a wrong 1960s date). The module doc promises clamping. | fixed (disk-core 0.3.0) |
 | DC-005 | S2 | plausible | [filesystem.rs:444](../../crates/disk-core/src/filesystem.rs#L444) | The default `delete_recursive` recurses with no depth limit or visited set. A corrupt image whose directory lists an ancestor (a FAT subdirectory cluster pointing back up) recurses until the stack overflows, and deletes along the way. Confirm with a FAT image whose subdir's first cluster is its parent's. | fixed (disk-core 0.3.0) |
-| DC-006 | S3 | confirmed | [filesystem.rs:89](../../crates/disk-core/src/filesystem.rs#L89) | The default `write_file_to` reads the whole file into one `Vec` (`read_file(entry, usize::MAX)`). 20 drivers rely on it. Most are floppy formats under the 3 MB rule, but CP/M (hard disks to 512 MB), HP LIF, QNX 2, Xerox Pilot and the SquashFS editor can hold files far larger, and `stream_pipe` / extract then buffer them whole. List: `grep` for `Filesystem for` impls without `fn write_file_to`. | open: fixed per driver as each crate is reviewed |
+| DC-006 | S3 | confirmed | [filesystem.rs:89](../../crates/disk-core/src/filesystem.rs#L89) | The default `write_file_to` reads the whole file into one `Vec` (`read_file(entry, usize::MAX)`). 20 drivers rely on it. Most are floppy formats under the 3 MB rule, but CP/M (hard disks to 512 MB), HP LIF, QNX 2, Xerox Pilot and the SquashFS editor can hold files far larger, and `stream_pipe` / extract then buffer them whole. List: `grep` for `Filesystem for` impls without `fn write_file_to`. | fixed (this branch): LIF, QNX 2, Xerox Pilot and the SquashFS editor stream `write_file_to`; the drivers left on the default are floppy formats under the 3 MB rule |
 | DC-007 | S3 | confirmed | [times.rs:378](../../crates/disk-core/src/times.rs#L378) | Local-time formats (FAT, HFS, ProDOS, exFAT without an offset) convert with today's UTC offset, not the offset in force on that date, so a summer file read in winter (or written then read across a DST change) is an hour out. Common practice (mtools does the same), but undocumented here. Either use chrono's offset for the date in question or say so in the module doc. | fixed (disk-core 0.3.0) |
 | DC-008 | S4 | confirmed | [entry.rs:133](../../crates/disk-core/src/entry.rs#L133) | Six full field lists of `FileEntry`'s 27 fields: `root`, `new_directory`, `new_file`, `new_symlink`, `new_special` and `unix_common::unix_entry_from_inode`. Adding a field means editing six places (the `qnx2_attrs` addition did). One private `blank(entry_type)` plus struct-update syntax removes ~170 lines. | fixed (disk-core 0.3.0) |
 | DC-009 | S4 | confirmed | [entry.rs:430](../../crates/disk-core/src/entry.rs#L430) | `entry::select_child` and `filesystem::find_child` are the same function with the arguments swapped (8 and 44 callers). Two more copies: `crates/fs-tar/src/import_sink.rs:570` and `src/fs/copy.rs:856`. Keep `find_child`. | fixed (disk-core 0.3.0) |
@@ -285,7 +285,7 @@ excluded. No reference C sources opened.
 | AMI-013 | S2 | confirmed | pfs3_clone.rs `clone_pfs3_volume`; pfs3.rs `do_create_file` | Clone stages all data in memory and syncs once: peak RAM is the volume's used data. Single-file creates hold the whole file (S3). | fixed (0360cf79) |
 | AMI-014 | S2 | confirmed | affs.rs `CompactAffsReader::new` | Uses `open` not `open_sized`: on an RDB disk the root search fails or the compact size covers the following partitions. | fixed (this branch): backup compaction and sizing pass the partition length to CompactAffsReader::new_sized |
 | AMI-015 | S2 | confirmed | sfs.rs `list_directory`, `create_file` | SFS drops protection, comment and dates on read and ignores them on write; softlinks list as empty files; no volume label. | fixed (0360cf79) |
-| AMI-016 | S4 | confirmed | affs.rs, sfs.rs, pfs3.rs, *_fsck.rs | Duplicates (`sync_metadata` / `flush_metadata`, `fs_type` / `fs_type_label`, `fold`, fsck helpers x3); stale comments; `create_days` read from 0x1A4 (root alteration date). | partly fixed (0360cf79): create date offset; duplicates left |
+| AMI-016 | S4 | confirmed | affs.rs, sfs.rs, pfs3.rs, *_fsck.rs | Duplicates (`sync_metadata` / `flush_metadata`, `fs_type` / `fs_type_label`, `fold`, fsck helpers x3); stale comments; `create_days` read from 0x1A4 (root alteration date). | fixed (this branch): shared fsck_common (issue, bucket, BitSet, free-map diff); fs_type / sync_metadata / fold reuse their twins |
 
 ## crates/fs-mac (remainder)
 
@@ -500,7 +500,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | DAP-003 | S2 | plausible | dc42.rs `encode_dc42_with_tags`; dart.rs | Tag checksum range, format byte and disk_format look off-spec; tagged DARTs all named "Lisa". | fixed (3de2eee2) |
 | DAP-004 | S4 | confirmed | dc42.rs | Disk names UTF-8 instead of Mac Roman. | fixed (27379918) |
 | DAP-005 | S4 | plausible | woz_write.rs `FORMAT_35_SSDD` | 400K format byte disagrees with dc42.rs; 3.5" WOZ marked Apple ][. | fixed (27379918) |
-| DAP-006 | S4 | confirmed | woz.rs, moof.rs | Duplicate readers, extra TRKS copy, WOZ CRC unchecked, dead code. | partly fixed (27379918: WOZ CRC checked; duplicate readers still open) |
+| DAP-006 | S4 | confirmed | woz.rs, moof.rs | Duplicate readers, extra TRKS copy, WOZ CRC unchecked, dead code. | fixed (this branch): WOZ CRC checked (27379918); TRKS kept as a range, not copied; dead trks_chunk_offset removed; both readers wrap a Cursor |
 
 ## crates/fs-squashfs, crates/dsk-vm, crates/fs-tar
 
@@ -511,7 +511,8 @@ Review by a separate agent, 2026-11-21, read-only.
 | SQ-004 | S2 | confirmed | squashfs.rs `build_node`; squashfs_verify.rs | No directory-cycle guard: stack overflow / endless verify. | fixed (32313343) |
 | SQ-005 | S2 | confirmed | squashfs.rs `read_metadata_span` and table loads | Capacities taken from on-disk u32s (4 GiB / 64 GiB). | fixed (32313343) |
 | SQ-006 | S3 | confirmed | squashfs_write.rs `write_node`; `read_build_tree` | Dir `parent` written wrong; hard links duplicated on rebuild. | fixed (0309cc99) |
-| SQ-007 | S4 | confirmed | squashfs.rs, squashfs_write.rs | Comment contradicts code; whole-Vec clone per file; near-duplicate table loaders. | partly fixed (21d43797: no per-file Vec clone; comment and table loaders still open) |
+| SQ-008 | S3 | confirmed | squashfs_edit.rs `read_file` | Hard-linked files (`FileContent::Shared`) failed to read in the editor ("not a regular file"). | fixed (this branch) |
+| SQ-007 | S4 | confirmed | squashfs.rs, squashfs_write.rs | Comment contradicts code; whole-Vec clone per file; near-duplicate table loaders. | fixed (this branch): flag comment corrected; fragment / ID / xattr-ID tables share one loader; per-file clone gone (21d43797) |
 | DVM-001 | S1 | plausible | qcow2.rs `open`, `ensure_free_cluster_index` | Edits accepted on dirty / corrupt images; with lazy refcounts live clusters are reused. | fixed (3612a6a6) |
 | DVM-002 | S2 | confirmed | qcow2.rs `export_qcow2` | One-cluster refcount table overflows into the first L2 table at small cluster sizes (latent). | fixed (f8e6b89b) |
 | DVM-003 | S1 | confirmed | vmdk_sparse.rs `export_vmdk_sparse` | Host offset `as u32` sectors: disks past 2 TiB written corrupt. | fixed (3612a6a6) |
@@ -520,13 +521,14 @@ Review by a separate agent, 2026-11-21, read-only.
 | DVM-006 | S2 | confirmed | vmdk_sparse.rs header parse | Grain size / GT entries unbounded: 8 GiB / 1 TiB allocations. | fixed (f8e6b89b) |
 | DVM-007 | S2 | plausible | vmdk.rs `read_descriptor` | Only 64 KiB of descriptor parsed: many-extent disks fail or silently shorten. | fixed (f8e6b89b) |
 | DVM-008 | S2 | plausible | qcow2.rs `open`, `allocate_cluster` | Unaligned file length gives unaligned new clusters and wrong refcounts. | fixed (f8e6b89b) |
-| DVM-009 | S4 | confirmed | vmdk.rs, lib.rs, qemu_img_test.rs | Test-only public fn; helpers duplicated with src/rbformats. | partly fixed (707bd60a: helper test-gated; duplicates with src/rbformats still open) |
+| DVM-009 | S4 | confirmed | vmdk.rs, lib.rs, qemu_img_test.rs | Test-only public fn; helpers duplicated with src/rbformats. | fixed (this branch): is_all_zeros / write_zeros live in disk_core::zeros, used by dsk-vm and src/rbformats |
 | TAR-001 | S1 | plausible | tar_import.rs `NormalizedTar::fill` | Data blocks counted from the ustar size only: pax sizes / GNU sparse headers make data be rewritten as headers (silent corruption). | fixed (8126d65f) |
 | TAR-002 | S2 | confirmed | tar_import.rs; zip_import.rs `plan` | `skip_appledouble=false` ignored: `._` files always consumed; preflight disagrees. | fixed (69648efe) |
 | TAR-003 | S2 | confirmed | mem_archive.rs | Small compressed archives inflated fully into RAM uncapped; indexed path fills disk; zip capacity from declared size. | fixed (69648efe) |
 | TAR-004 | S2 | plausible | tar_import.rs `open_tar_stream` | Multi-member .tar.gz imports only the first member. | fixed (69648efe) |
 | TAR-005 | S2 | plausible | tar_export.rs `walk` | Export recursion has no depth / visited guard. | fixed (69648efe) |
-| TAR-006 | S4 | confirmed | import_sink.rs, tar_export.rs, mem_archive.rs, zstd_compat.rs, zip_import.rs | Stats merge drops a field; stale docs; pure-zstd can't browse .tar.zst; duplicate date code. | partly fixed (b0a05a07, this branch): stats merge; pure-zstd builds browse .tar.zst; stale docs and duplicate date code still open |
+| TAR-006 | S4 | confirmed | import_sink.rs, tar_export.rs, mem_archive.rs, zstd_compat.rs, zip_import.rs | Stats merge drops a field; stale docs; pure-zstd can't browse .tar.zst; duplicate date code. | fixed (this branch): zip dates use disk_core's DOS conversion; tar_export's mtime doc corrected; stats merge and pure-zstd browse fixed earlier |
+| TAR-007 | S4 | confirmed | zip_compat.rs | `cargo build -p fs-tar --all-features` fails: `ZipFile<'_>` lacks the reader generic newer `zip` versions take. CI never builds that feature mix. | open |
 
 ## crates/fs-cpm
 
@@ -543,7 +545,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | CPM-007 | S2 | confirmed | cpm_diskdefs.rs `ALTAIR_CF`, `SVI328_CPM`; cpm.rs | Directory size from al0/al1 disagrees with drm: ALTAIR_CF creates always fail at sync after writing data. | fixed (6cd952f5) |
 | CPM-008 | S1 | confirmed | cpm.rs list / find / delete / rename | User number dropped from name handling: same-named files in two users collide; delete removes both. | fixed (13054e1c) |
 | CPM-009 | S2 | confirmed | cpm.rs `create_file` | Empty files never get an entry; a mid-loop "directory full" leaves a truncated file to be synced. | fixed (6cd952f5) |
-| CPM-010 | S2 | plausible | cpm_diskdefs.rs `ALTAIR_8IN`; cpm.rs | No sector skew: ibm-3740 images (skew 6) read garbled. | open: needs a skewed 8-inch sample |
+| CPM-010 | S2 | plausible | cpm_diskdefs.rs `ALTAIR_8IN`; cpm.rs | No sector skew: ibm-3740 images (skew 6) read garbled. | fixed (this branch): new `ibm_3740` preset reads and writes through the skew-6 table; `altair_8in` stays sequential. Tested on CP/M UG volume 54 (agn453/CPM-UG-Disks, Unlicense) |
 | CPM-011 | S3 | confirmed | cpm.rs `validate_cpm_name` | Wildcard / separator characters accepted in names. | fixed (9bd44acf) |
 | CPM-012 | S3 | confirmed | cpm.rs | Non-ASCII glyphs in user-visible errors. | fixed (9bd44acf) |
 | CPM-013 | S3 | confirmed | cpm.rs `read_file`, `create_file` | Whole-file buffering (DC-006 for this crate; largest preset 4 MiB). | fixed (this branch): create_file streams into its blocks and write_file_to streams out, one block at a time; read_file fills only up to max_bytes |
@@ -561,7 +563,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | DMG-004 | S2 | confirmed | dsk-dmg sparseimage.rs `detect_sparseimage` | Band table sized from header values: 32 GiB from a 4 KiB file. | fixed (70f1b62d) |
 | DMG-005 | S2 | confirmed | dsk-dmg ndif.rs `reconstruct_to` | Capacity from an unchecked entry count (~128 GiB). | fixed (70f1b62d) |
 | CZL-001 | S2 | confirmed | dsk-clonezilla partclone.rs `parse_header`, `parse_bitmap` | `block_size` / `total_blocks` unvalidated: OOM, a block size of 0 hangs, overflow. | fixed (64152ec1) |
-| CZL-002 | S2 | plausible | dsk-clonezilla partclone.rs `parse_header` | v1 images likely rejected by the magic check; endianness field ignored. | open: needs a partclone v1 sample |
+| CZL-002 | S2 | plausible | dsk-clonezilla partclone.rs `parse_header` | v1 images likely rejected by the magic check; endianness field ignored. | fixed (this branch): v1 (partclone 0.2.x, before ~2018) kept unsupported but named in the error; other format versions and big-endian images refused. Tested on a real v1 header from partclone 0.2.86 |
 | CZL-003 | S2 | confirmed | dsk-clonezilla metadata_scan.rs `identify_ext_metadata_blocks` | Off-by-4 bounds check panics the scan thread and poisons the cache mutex. | fixed (64152ec1) |
 | CZL-004 | S2 | confirmed | dsk-clonezilla metadata_scan.rs | Unchecked shifts / underflow; BPB-driven ranges insert billions of entries. | fixed (64152ec1) |
 | CZL-005 | S4 | confirmed | dsk-clonezilla block_cache.rs | Unneeded `unsafe impl Send`. | fixed (f7ecbb34) |
@@ -619,7 +621,7 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 | APF-005 | S2 | confirmed | apfs.rs `stream_extents` | 64 GiB cap truncates larger files silently with Ok. | fixed (42f7a075) |
 | APF-006 | S2 | confirmed | apfs.rs `parse_kek_blob`; apfs_crypto.rs | PBKDF2 iterations from the keybag unbounded (hour-long hang). | fixed (42f7a075) |
 | APF-007 | S2 | confirmed | apfs.rs `der_children` | DER length add overflows on 32-bit: panic. | fixed (42f7a075) |
-| APF-008 | S2 | plausible | apfs.rs `stream_phys` | XTS tweak from the physical block, not the extent's crypto_id. | no change (42f7a075): the FileVault fixture needs the physical-sector tweak |
+| APF-008 | S2 | plausible | apfs.rs `stream_phys` | XTS tweak from the physical block, not the extent's crypto_id. | wontfix (not reproducible): FileVault volumes filled after encryption and converted in place by `diskutil apfs encryptVolume` both decrypt with the physical-sector tweak; crypto_id never differed |
 | APF-009 | S3 | plausible | apfs.rs `build_catalog` | Whole catalog / omap flattened into HashMaps on first browse. | deferred (needs a lazy B-tree walk in place of the flattened maps; a redesign) |
 | QNX-001 | S2 | confirmed | fs-qnx qnx4.rs `extents` | Self-linked empty extent block loops forever. | fixed (172f817a) |
 | QNX-002 | S2 | confirmed | qnx4.rs `open` | Volume sized to the end of the reader (whole disk for MBR partitions). | fixed (172f817a) |

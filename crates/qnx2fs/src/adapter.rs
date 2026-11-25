@@ -305,6 +305,16 @@ impl<R: Read + Seek + Send> Filesystem for Qnx2Filesystem<R> {
         self.vol.read_file(&entry_ref(entry), max).map_err(qnx_err)
     }
 
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        self.vol
+            .write_file_to(&entry_ref(entry), writer)
+            .map_err(qnx_err)
+    }
+
     fn volume_label(&self) -> Option<&str> {
         None
     }
@@ -507,6 +517,9 @@ mod tests {
         let list = fs.list_directory(&root).unwrap();
         let hello = list.iter().find(|e| e.name == "HELLO").unwrap();
         assert_eq!(fs.read_file(hello, usize::MAX).unwrap(), b"hello\n");
+        let mut streamed = Vec::new();
+        assert_eq!(fs.write_file_to(hello, &mut streamed).unwrap(), 6);
+        assert_eq!(streamed, b"hello\n");
         assert_eq!(hello.path, "/HELLO");
         assert_eq!(hello.owner_label.as_deref(), Some("0.0"));
         assert!(hello.native_attrs.as_deref().unwrap().starts_with("owner "));

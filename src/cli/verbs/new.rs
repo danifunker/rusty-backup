@@ -320,7 +320,7 @@ pub struct FloppyArgs {
 
     /// CP/M disk-parameter-block preset (required with `cpm`). One of:
     /// amstrad_data, amstrad_sys, amstrad_pcw, einstein, svi328_cpm,
-    /// altair_8in, altair_cf, multicomp, zxplus3.
+    /// altair_8in, ibm_3740, altair_cf, multicomp, zxplus3.
     #[arg(long = "cpm-preset")]
     pub cpm_preset: Option<String>,
 

@@ -1195,6 +1195,27 @@ impl Filesystem for PilotFilesystem {
         Ok(out)
     }
 
+    // Page by page, as `read_file` concatenates them, without the whole-file copy (DC-006).
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        let file = self
+            .files
+            .get(entry.location as usize)
+            .ok_or_else(|| FilesystemError::Parse("Pilot: bad file index".into()))?;
+        let mut total = 0u64;
+        for &(_logical, vda) in file.pages.iter().skip(file.has_leader as usize) {
+            let Some(sector) = self.disk.sector(vda) else {
+                break;
+            };
+            writer.write_all(&sector.data[..PAGE_BYTES])?;
+            total += PAGE_BYTES as u64;
+        }
+        Ok(total)
+    }
+
     fn volume_label(&self) -> Option<&str> {
         Some(&self.volume.lv_label)
     }
@@ -2374,6 +2395,9 @@ mod tests {
 
         let got = fs.read_file(&entries[0], usize::MAX).unwrap();
         assert_eq!(got.len(), 2 * PAGE_BYTES);
+        let mut streamed = Vec::new();
+        fs.write_file_to(&entries[0], &mut streamed).unwrap();
+        assert_eq!(streamed, got);
         assert_eq!(&got[..payload.len()], &payload[..]); // data preserved
         assert!(got[payload.len()..].iter().all(|&b| b == 0)); // zero-padded
     }

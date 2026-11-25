@@ -193,8 +193,7 @@ pub fn write_moof(path: &Path, sectors: &[u8]) -> Result<()> {
 /// as a flat byte stream (same order the WOZ reader uses). MOOF floppies are
 /// ≤ 800 KB, so the whole image is decoded at open time and held in memory.
 pub struct MoofReader {
-    data: Vec<u8>,
-    position: u64,
+    data: io::Cursor<Vec<u8>>,
 }
 
 impl MoofReader {
@@ -220,7 +219,7 @@ impl MoofReader {
         // Parse chunks to find INFO (disk type), TMAP, and TRKS.
         let mut disk_type: Option<u8> = None;
         let mut tmap = [0xFFu8; TMAP_LENGTH];
-        let mut trks_data: Option<Vec<u8>> = None;
+        let mut trks: Option<std::ops::Range<usize>> = None;
         let mut pos = HEADER_LEN;
         while pos + CHUNK_HDR_LEN <= raw.len() {
             let id = &raw[pos..pos + 4];
@@ -236,7 +235,7 @@ impl MoofReader {
                 b"TMAP" if size >= TMAP_LENGTH => {
                     tmap.copy_from_slice(&raw[data_start..data_start + TMAP_LENGTH]);
                 }
-                b"TRKS" => trks_data = Some(raw[data_start..data_end].to_vec()),
+                b"TRKS" => trks = Some(data_start..data_end),
                 _ => {}
             }
             pos = data_end;
@@ -246,50 +245,33 @@ impl MoofReader {
         if disk_type != DISK_TYPE_400K && disk_type != DISK_TYPE_800K {
             bail!("unsupported MOOF disk type {disk_type} (only 400K/800K GCR are supported)");
         }
-        let trks_data = trks_data.context("MOOF file missing TRKS chunk")?;
+        let trks = trks.context("MOOF file missing TRKS chunk")?;
 
         // Reuse the WOZ2 3.5" GCR decoder (identical TRKS block layout).
-        let data = decode_35_bitstream(tmap, trks_data, raw)?;
-        Ok(Self { data, position: 0 })
+        let data = decode_35_bitstream(tmap, trks, raw)?;
+        Ok(Self {
+            data: io::Cursor::new(data),
+        })
     }
 
     pub fn len(&self) -> u64 {
-        self.data.len() as u64
+        self.data.get_ref().len() as u64
     }
 
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.data.get_ref().is_empty()
     }
 }
 
 impl Read for MoofReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let pos = self.position as usize;
-        if pos >= self.data.len() {
-            return Ok(0);
-        }
-        let n = buf.len().min(self.data.len() - pos);
-        buf[..n].copy_from_slice(&self.data[pos..pos + n]);
-        self.position += n as u64;
-        Ok(n)
+        self.data.read(buf)
     }
 }
 
 impl Seek for MoofReader {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let new = match pos {
-            SeekFrom::Start(n) => n as i64,
-            SeekFrom::End(n) => self.data.len() as i64 + n,
-            SeekFrom::Current(n) => self.position as i64 + n,
-        };
-        if new < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek before start of MOOF stream",
-            ));
-        }
-        self.position = new as u64;
-        Ok(self.position)
+        self.data.seek(pos)
     }
 }
 

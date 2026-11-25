@@ -609,16 +609,7 @@ pub fn compress_file_to_archive(
 
 /// Write `count` zero bytes to a writer, in chunks.
 pub(crate) fn write_zeros(writer: &mut impl Write, count: u64) -> Result<()> {
-    let zeros = vec![0u8; CHUNK_SIZE];
-    let mut remaining = count;
-    while remaining > 0 {
-        let n = (remaining as usize).min(CHUNK_SIZE);
-        writer
-            .write_all(&zeros[..n])
-            .context("failed to write zeros")?;
-        remaining -= n as u64;
-    }
-    Ok(())
+    disk_core::zeros::write_zeros(writer, count).context("failed to write zeros")
 }
 
 /// Write `count` zero bytes to a writer, calling `progress_cb` after each chunk.
@@ -646,9 +637,7 @@ pub(crate) fn write_zeros_with_progress(
     Ok(())
 }
 
-pub(crate) fn is_all_zeros(data: &[u8]) -> bool {
-    data.iter().all(|&b| b == 0)
-}
+pub(crate) use disk_core::zeros::is_all_zeros;
 
 /// Build the output file path with optional split numbering.
 /// `partition-0.zst` (no split) or `partition-0.001.zst` (split).

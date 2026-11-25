@@ -1,6 +1,6 @@
 [package]
 name = "dsk-vm"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -16,7 +16,7 @@ categories = ["parser-implementations", "virtualization"]
 rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.3", default-features = false }
+disk-core = { path = "../disk-core", version = "0.3.1", default-features = false }
 anyhow = "1"
 
 [dev-dependencies]

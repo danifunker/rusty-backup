@@ -1220,20 +1220,7 @@ impl<R: Read + Seek + Send> Filesystem for AffsFilesystem<R> {
     }
 
     fn fs_type(&self) -> &str {
-        match (
-            self.ffs,
-            self.intl,
-            is_dircache_variant(self.variant),
-            is_lnfs_variant(self.variant),
-        ) {
-            (false, false, false, _) => "OFS",
-            (true, false, false, false) => "FFS",
-            (false, true, false, _) => "OFS Intl",
-            (true, true, false, false) => "FFS Intl",
-            (false, _, true, _) => "OFS DirCache",
-            (true, _, true, _) => "FFS DirCache",
-            (_, _, _, true) => "FFS Long Names",
-        }
+        self.fs_type_label()
     }
 
     fn total_size(&self) -> u64 {
@@ -1633,21 +1620,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
     }
 
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
-        // Write every dirty block to disk in block-number order — gives the
-        // OS a clean forward sweep for the file system cache and makes the
-        // worst case (a half-flushed sync) the most innocuous: bitmap
-        // pages and the root come last.
-        let mut keys: Vec<u32> = self.dirty.keys().copied().collect();
-        keys.sort_unstable();
-        for block in keys {
-            let buf = self.dirty.get(&block).copied().unwrap();
-            let off = self.partition_offset + block as u64 * self.block_size;
-            self.reader.seek(SeekFrom::Start(off))?;
-            self.reader.write_all(&buf).map_err(FilesystemError::Io)?;
-        }
-        self.reader.flush().map_err(FilesystemError::Io)?;
-        self.dirty.clear();
-        Ok(())
+        self.flush_metadata()
     }
 
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
@@ -1714,9 +1687,8 @@ impl<R: Read + Write + Seek> AffsFilesystem<R> {
         Ok(())
     }
 
-    /// Convenience: flush every dirty block to disk and clear the cache.
-    /// Same effect as `sync_metadata` but available without the
-    /// `EditableFilesystem` trait import at the call site.
+    /// Write every dirty block in block order, so a half-finished sync leaves the bitmap
+    /// pages and root (the highest blocks) for last, then clear the cache.
     pub fn flush_metadata(&mut self) -> Result<(), FilesystemError> {
         let mut keys: Vec<u32> = self.dirty.keys().copied().collect();
         keys.sort_unstable();
@@ -1781,14 +1753,13 @@ fn names_equal(a: &str, b: &str, intl: bool) -> bool {
     true
 }
 
+/// AmigaDOS name case folding: ASCII, plus Latin-1 letters on an international volume.
 fn fold(b: u8, intl: bool) -> u8 {
-    if b.is_ascii_lowercase() {
-        return b - 0x20;
+    if intl {
+        crate::affs_common::intl_upper(b)
+    } else {
+        crate::affs_common::ascii_upper(b)
     }
-    if intl && (0xE0..=0xFE).contains(&b) && b != 0xF7 {
-        return b - 0x20;
-    }
-    b
 }
 
 /// Layout-preserving compaction reader for AFFS volumes.

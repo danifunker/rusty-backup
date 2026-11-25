@@ -397,6 +397,25 @@ impl<R: Read + Seek + Send> Filesystem for LifFilesystem<R> {
         Ok(out)
     }
 
+    // A LIF file is one contiguous run, copied straight through (DC-006).
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        let file = self.file_by_entry(entry)?;
+        let (start, len) = (file.start_byte, file.len_bytes);
+        self.reader.seek(SeekFrom::Start(self.base + start))?;
+        let copied = std::io::copy(&mut (&mut self.reader).take(len), writer)?;
+        if copied < len {
+            return Err(FilesystemError::InvalidData(format!(
+                "LIF file '{}' runs past the end of the image",
+                entry.name
+            )));
+        }
+        Ok(copied)
+    }
+
     fn volume_label(&self) -> Option<&str> {
         Some(self.volume.label.as_str()).filter(|l| !l.is_empty())
     }
@@ -731,6 +750,10 @@ mod tests {
         assert_eq!(files.len(), 1);
         let data = fs.read_file(&files[0], usize::MAX).unwrap();
         assert_eq!(data, vec![0xAA; 512]);
+        // The streamed copy (DC-006) is the same bytes.
+        let mut streamed = Vec::new();
+        assert_eq!(fs.write_file_to(&files[0], &mut streamed).unwrap(), 512);
+        assert_eq!(streamed, data);
         assert_eq!(fs.volume_label(), Some("BOOT43"));
     }
 

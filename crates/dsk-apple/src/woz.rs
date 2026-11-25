@@ -38,14 +38,18 @@ struct WozFile {
     version: u8, // 1 or 2
     disk_type: u8,
     tmap: [u8; 160],
-    /// For WOZ1: raw track data (6656 bytes per track entry).
-    /// For WOZ2: the entire TRKS chunk data (TRK descriptors + bit data).
-    trks_data: Vec<u8>,
-    /// For WOZ2: offset of the TRKS chunk within the file (to compute block offsets).
-    #[allow(dead_code)]
-    trks_chunk_offset: usize,
+    /// Where the TRKS chunk's data sits in `file_data`: WOZ1 track records (6656 bytes each)
+    /// or WOZ2 TRK descriptors, whose bit data lives at file-absolute blocks.
+    trks: std::ops::Range<usize>,
     /// Full file data (needed for WOZ2 block-based track references).
     file_data: Vec<u8>,
+}
+
+impl WozFile {
+    /// The TRKS chunk's data.
+    fn trks(&self) -> &[u8] {
+        &self.file_data[self.trks.clone()]
+    }
 }
 
 /// Parse a WOZ file from raw bytes.
@@ -80,8 +84,7 @@ fn parse_woz(data: Vec<u8>) -> Result<WozFile> {
     // Parse chunks starting at offset 12
     let mut disk_type = 0u8;
     let mut tmap = [0xFFu8; 160];
-    let mut trks_data = Vec::new();
-    let mut trks_chunk_offset = 0usize;
+    let mut trks = 0..0;
     let mut found_info = false;
     let mut found_tmap = false;
     let mut found_trks = false;
@@ -110,8 +113,7 @@ fn parse_woz(data: Vec<u8>) -> Result<WozFile> {
                 found_tmap = true;
             }
         } else if chunk_id == CHUNK_TRKS {
-            trks_data = data[chunk_data_start..chunk_data_end].to_vec();
-            trks_chunk_offset = chunk_data_start;
+            trks = chunk_data_start..chunk_data_end;
             found_trks = true;
         }
 
@@ -132,8 +134,7 @@ fn parse_woz(data: Vec<u8>) -> Result<WozFile> {
         version,
         disk_type,
         tmap,
-        trks_data,
-        trks_chunk_offset,
+        trks,
         file_data: data,
     })
 }
@@ -145,41 +146,35 @@ fn get_track_bits(woz: &WozFile, tmap_idx: u8) -> Option<(&[u8], u32)> {
         return None;
     }
     let idx = tmap_idx as usize;
+    let trks = woz.trks();
 
     if woz.version == 1 {
         // WOZ 1.0: each track is 6656 bytes within the TRKS chunk
         let track_offset = idx * 6656;
-        if track_offset + 6656 > woz.trks_data.len() {
+        if track_offset + 6656 > trks.len() {
             return None;
         }
-        let bytes_used = u16::from_le_bytes([
-            woz.trks_data[track_offset + 6646],
-            woz.trks_data[track_offset + 6647],
-        ]) as usize;
-        let bit_count = u16::from_le_bytes([
-            woz.trks_data[track_offset + 6648],
-            woz.trks_data[track_offset + 6649],
-        ]) as u32;
+        let bytes_used =
+            u16::from_le_bytes([trks[track_offset + 6646], trks[track_offset + 6647]]) as usize;
+        let bit_count =
+            u16::from_le_bytes([trks[track_offset + 6648], trks[track_offset + 6649]]) as u32;
         let end = track_offset + bytes_used.min(6646);
-        Some((&woz.trks_data[track_offset..end], bit_count))
+        Some((&trks[track_offset..end], bit_count))
     } else {
         // WOZ 2.0: TRK descriptor array (160 × 8 bytes), then bit data at block offsets
         let desc_offset = idx * 8;
-        if desc_offset + 8 > woz.trks_data.len() {
+        if desc_offset + 8 > trks.len() {
             return None;
         }
         let starting_block =
-            u16::from_le_bytes([woz.trks_data[desc_offset], woz.trks_data[desc_offset + 1]])
-                as usize;
-        let block_count = u16::from_le_bytes([
-            woz.trks_data[desc_offset + 2],
-            woz.trks_data[desc_offset + 3],
-        ]) as usize;
+            u16::from_le_bytes([trks[desc_offset], trks[desc_offset + 1]]) as usize;
+        let block_count =
+            u16::from_le_bytes([trks[desc_offset + 2], trks[desc_offset + 3]]) as usize;
         let bit_count = u32::from_le_bytes([
-            woz.trks_data[desc_offset + 4],
-            woz.trks_data[desc_offset + 5],
-            woz.trks_data[desc_offset + 6],
-            woz.trks_data[desc_offset + 7],
+            trks[desc_offset + 4],
+            trks[desc_offset + 5],
+            trks[desc_offset + 6],
+            trks[desc_offset + 7],
         ]);
 
         if starting_block == 0 || block_count == 0 {
@@ -864,15 +859,14 @@ fn decode_35_woz(woz: &WozFile) -> Result<Vec<u8>> {
 /// GCR track decoding itself is byte-for-byte the same on both formats.
 pub(crate) fn decode_35_bitstream(
     tmap: [u8; 160],
-    trks_data: Vec<u8>,
+    trks: std::ops::Range<usize>,
     file_data: Vec<u8>,
 ) -> Result<Vec<u8>> {
     let woz = WozFile {
         version: 2,
         disk_type: DISK_TYPE_35,
         tmap,
-        trks_data,
-        trks_chunk_offset: 0,
+        trks,
         file_data,
     };
     decode_35_woz(&woz)
@@ -886,8 +880,7 @@ pub(crate) fn decode_35_bitstream(
 /// Since floppy images are small (140KB-800KB), we decode the entire image at
 /// open time and keep it in memory.
 pub struct WozReader {
-    data: Vec<u8>,
-    position: u64,
+    data: io::Cursor<Vec<u8>>,
     disk_type: u8,
 }
 
@@ -911,21 +904,20 @@ impl WozReader {
         };
 
         Ok(Self {
-            data,
-            position: 0,
+            data: io::Cursor::new(data),
             disk_type,
         })
     }
 
     /// Total decoded data size in bytes.
     pub fn len(&self) -> u64 {
-        self.data.len() as u64
+        self.data.get_ref().len() as u64
     }
 
     /// `true` if no data was decoded (always `false` for a valid WOZ
     /// image; mandated by clippy alongside `len()`).
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.data.get_ref().is_empty()
     }
 
     /// Human-readable disk type description.
@@ -940,33 +932,13 @@ impl WozReader {
 
 impl Read for WozReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let remaining = self.data.len() as u64 - self.position;
-        if remaining == 0 {
-            return Ok(0);
-        }
-        let to_read = (buf.len() as u64).min(remaining) as usize;
-        let pos = self.position as usize;
-        buf[..to_read].copy_from_slice(&self.data[pos..pos + to_read]);
-        self.position += to_read as u64;
-        Ok(to_read)
+        self.data.read(buf)
     }
 }
 
 impl Seek for WozReader {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let new_pos = match pos {
-            SeekFrom::Start(p) => p as i64,
-            SeekFrom::Current(delta) => self.position as i64 + delta,
-            SeekFrom::End(delta) => self.data.len() as i64 + delta,
-        };
-        if new_pos < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek to negative position",
-            ));
-        }
-        self.position = (new_pos as u64).min(self.data.len() as u64);
-        Ok(self.position)
+        self.data.seek(pos)
     }
 }
 
@@ -1044,11 +1016,16 @@ mod tests {
 
     #[test]
     fn test_woz_reader_seek() {
-        let reader = WozReader {
-            data: vec![0xAA; 1000],
-            position: 0,
+        let mut reader = WozReader {
+            data: io::Cursor::new((0..1000u32).map(|i| i as u8).collect()),
             disk_type: DISK_TYPE_525,
         };
         assert_eq!(reader.len(), 1000);
+        reader.seek(SeekFrom::Start(500)).unwrap();
+        let mut b = [0u8; 2];
+        reader.read_exact(&mut b).unwrap();
+        assert_eq!(b, [500u32 as u8, 501u32 as u8]);
+        assert_eq!(reader.seek(SeekFrom::End(-1)).unwrap(), 999);
+        assert!(reader.seek(SeekFrom::Current(-2000)).is_err());
     }
 }

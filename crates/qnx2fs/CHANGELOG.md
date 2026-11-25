@@ -3,6 +3,12 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.4.1
+
+### Added
+- `Volume::write_file_to` and a streaming `Filesystem::write_file_to`: extraction copies a
+  file's extents a megabyte at a time instead of reading it whole into memory (DC-006).
+
 ## 0.4.0
 
 ### Changed

@@ -64,6 +64,8 @@ pub mod times;
 pub mod unix_common;
 #[cfg(feature = "fs")]
 pub mod xattr;
+// Always built: the container crates use it without the `fs` feature.
+pub mod zeros;
 
 /// Construct an `io::Error` of kind `Other` wrapping `error`.
 ///

@@ -17,6 +17,8 @@ pub mod affs;
 pub mod affs_common;
 #[cfg(feature = "affs")]
 pub mod affs_fsck;
+#[cfg(any(feature = "affs", feature = "pfs3", feature = "sfs"))]
+mod fsck_common;
 #[cfg(feature = "pfs3")]
 pub mod pfs3;
 #[cfg(feature = "pfs3")]

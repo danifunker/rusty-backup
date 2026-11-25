@@ -39,7 +39,7 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   byte-swapped images period SGI disk controllers produce, and writes back in
   whichever orientation the image is already in), CP/M (read + edit + create +
   fsck; multi-DPB: amstrad_data / amstrad_sys / amstrad_pcw / einstein /
-  svi328_cpm / altair_8in / altair_cf / multicomp / zxplus3), Human68k,
+  svi328_cpm / altair_8in / ibm_3740 / altair_cf / multicomp / zxplus3), Human68k,
   ADFS (read + edit [new-map + old-map D] + E-format create + new-map fsck),
   QDOS (QXL.WIN read + write + resize), QDOS Microdrive (detect-only scaffold),
   CBM DOS (1541 / 1571 / 1581 + PET 8050 / 8250 IEEE-488 read + write + fsck;
@@ -172,7 +172,7 @@ Legend for the **Support** column:
 | AmstradPCW | Amstrad PCW | Floppy | CP/M Plus | **Yes** — `fs::cpm` `amstrad_pcw` DPB. |
 | TatungEinstein | Tatung Einstein | Floppy | Xtal/DOS (CP/M-compatible) | **Yes** — `fs::cpm` `einstein` DPB. |
 | SVI328 | Spectravideo SV-328 | Floppy | CP/M (MSX-DOS/FAT12 possible) | **Partial** — CP/M side covered by `svi328_cpm` DPB; the MSX-DOS / FAT12 floppy variant routes through the existing FAT driver but no SV-specific BPB quirks have been validated. |
-| Altair8800 | MITS Altair 8800 | Floppy, IDE/CF | CP/M | **Yes** — `fs::cpm` ships both `altair_8in` (8-inch floppy) and `altair_cf` (CompactFlash HDD) DPBs. |
+| Altair8800 | MITS Altair 8800 | Floppy, IDE/CF | CP/M | **Yes** — `fs::cpm` ships `altair_8in` (8-inch floppy, records in sector order), `ibm_3740` (the standard 8-inch interchange floppy, sector skew 6) and `altair_cf` (CompactFlash HDD) DPBs. |
 | MultiComp | Grant Searle MultiComp | Floppy | CP/M | **Yes** — `fs::cpm` `multicomp` DPB. |
 | C64 | Commodore 64/128 | Floppy | CBM DOS (flat track/sector) | **Yes** — `fs::cbm` reads + writes `.d64` (1541) / `.d71` (1571) / `.d81` (1581); add/delete cross-validated against `c1541` / Python `d64`. |
 | C128 | Commodore 128 | Floppy | CBM DOS | **Yes** — `fs::cbm` `.d64` / `.d71` / `.d81`. |

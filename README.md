@@ -952,7 +952,7 @@ cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_
 | **Amstrad CPC**                | AMSDOS + CP/M 2.2 / Plus (`amstrad_data` + `amstrad_sys` DPBs) | Floppy `.dsk` |
 | **AmstradPCW**                 | CP/M Plus (`amstrad_pcw` DPB) | Floppy `.dsk` |
 | **TatungEinstein**             | Xtal-DOS / CP/M (`einstein` DPB) | Floppy `.dsk` |
-| **Altair8800**                 | CP/M (`altair_8in` 8-inch floppy + `altair_cf` CF/HDD DPBs) | Floppy + IDE/CF |
+| **Altair8800**                 | CP/M (`altair_8in` and `ibm_3740` (skewed) 8-inch floppy + `altair_cf` CF/HDD DPBs) | Floppy + IDE/CF |
 | **MultiComp**                  | CP/M (`multicomp` DPB) | Floppy `.dsk` |
 | **C64 / C128**                 | CBM DOS (1541 / 1571 / 1581, read + write) | Floppy `.d64` / `.d71` / `.d81` |
 | **VIC20 / C16 / Plus-4**       | CBM DOS (1541, read + write) | Floppy `.d64` |

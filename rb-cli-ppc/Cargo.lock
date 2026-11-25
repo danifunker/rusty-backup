@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "disk-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-apple"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-clonezilla"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-vm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "disk-core",
@@ -794,7 +794,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "fs-8bit"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "fs-amiga"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "fs-cpm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "disk-core",
 ]
@@ -893,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "fs-squashfs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "disk-core",
  "flate2",
@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "fs-tar"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "bzip2",
@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "fs-xerox"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "disk-core",
  "flate2",
@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "qnx2fs"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "disk-core",

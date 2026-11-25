@@ -19,6 +19,7 @@ mod cli_coco_os9;
 mod cli_container_rw;
 mod cli_cp;
 mod cli_cpm_floppy;
+mod cli_cpm_ibm3740;
 mod cli_dragon;
 mod cli_export;
 mod cli_hfs;
