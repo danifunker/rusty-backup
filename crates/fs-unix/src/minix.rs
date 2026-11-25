@@ -744,33 +744,20 @@ impl<R: Read + Seek> MinixFilesystem<R> {
         let modified =
             modified_unix.map(|s| disk_core::unix_common::inode::format_unix_timestamp(s as i64));
         FileEntry {
-            name: name.to_string(),
-            path,
-            entry_type,
-            size: inode.size as u64,
-            location: inode.ino as u64,
             modified,
             modified_unix,
-            type_code: None,
-            creator_code: None,
             symlink_target,
             special_type,
             mode: Some(inode.mode as u32),
             uid: Some(inode.uid as u32),
             gid: Some(inode.gid as u32),
-            resource_fork_size: None,
-            aux_type: None,
-            link_target_cnid: None,
-            amiga_protection: None,
-            amiga_comment: None,
-            amiga_date: None,
-            dos_attributes: None,
-            finder_flags: None,
-            prodos_file_type: None,
-            mac_dates: None,
-            owner_label: None,
-            native_attrs: None,
-            qnx2_attrs: None,
+            ..FileEntry::bare(
+                name.to_string(),
+                path,
+                entry_type,
+                inode.size as u64,
+                inode.ino as u64,
+            )
         }
     }
 }

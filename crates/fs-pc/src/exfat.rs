@@ -612,67 +612,25 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
 
                 let entry = if is_dir {
                     FileEntry {
-                        name,
-                        path,
-                        entry_type: EntryType::Directory,
-                        size: 0,
-                        location: first_cluster as u64,
-                        modified: None,
                         modified_unix,
-                        type_code: None,
-                        creator_code: None,
-                        symlink_target: None,
-                        special_type: None,
-                        mode: None,
-                        uid: None,
-                        gid: None,
-                        resource_fork_size: None,
-                        aux_type: None,
-                        link_target_cnid: None,
-                        amiga_protection: None,
-                        amiga_comment: None,
-                        amiga_date: None,
                         // exFAT FileAttributes share FAT's bit layout; carry
                         // RO/HID/SYS/ARC (drop the directory bit — that's entry_type).
                         dos_attributes: Some(file_attrs & 0x27),
-                        finder_flags: None,
-                        prodos_file_type: None,
-                        mac_dates: None,
-                        owner_label: None,
-                        native_attrs: None,
-                        qnx2_attrs: None,
+                        ..FileEntry::bare(name, path, EntryType::Directory, 0, first_cluster as u64)
                     }
                 } else {
                     FileEntry {
-                        name,
-                        path,
-                        entry_type: EntryType::File,
-                        size: data_length,
-                        location: first_cluster as u64,
-                        modified: None,
                         modified_unix,
-                        type_code: None,
-                        creator_code: None,
-                        symlink_target: None,
-                        special_type: None,
-                        mode: None,
-                        uid: None,
-                        gid: None,
-                        resource_fork_size: None,
-                        aux_type: None,
-                        link_target_cnid: None,
-                        amiga_protection: None,
-                        amiga_comment: None,
-                        amiga_date: None,
                         // exFAT FileAttributes share FAT's bit layout; carry
                         // RO/HID/SYS/ARC (drop the directory bit — that's entry_type).
                         dos_attributes: Some(file_attrs & 0x27),
-                        finder_flags: None,
-                        prodos_file_type: None,
-                        mac_dates: None,
-                        owner_label: None,
-                        native_attrs: None,
-                        qnx2_attrs: None,
+                        ..FileEntry::bare(
+                            name,
+                            path,
+                            EntryType::File,
+                            data_length,
+                            first_cluster as u64,
+                        )
                     }
                 };
 
@@ -693,33 +651,13 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
 impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         Ok(FileEntry {
-            name: "/".into(),
-            path: "/".into(),
-            entry_type: EntryType::Directory,
-            size: 0,
-            location: self.root_cluster as u64,
-            modified: None,
-            modified_unix: None,
-            type_code: None,
-            creator_code: None,
-            symlink_target: None,
-            special_type: None,
-            mode: None,
-            uid: None,
-            gid: None,
-            resource_fork_size: None,
-            aux_type: None,
-            link_target_cnid: None,
-            amiga_protection: None,
-            amiga_comment: None,
-            amiga_date: None,
-            dos_attributes: None,
-            finder_flags: None,
-            prodos_file_type: None,
-            mac_dates: None,
-            owner_label: None,
-            native_attrs: None,
-            qnx2_attrs: None,
+            ..FileEntry::bare(
+                "/".into(),
+                "/".into(),
+                EntryType::Directory,
+                0,
+                self.root_cluster as u64,
+            )
         })
     }
 

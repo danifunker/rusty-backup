@@ -558,33 +558,13 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         let modified =
             modified_unix.map(|s| disk_core::unix_common::inode::format_unix_timestamp(s as i64));
         Ok(FileEntry {
-            name,
-            path,
-            entry_type,
-            size,
-            location: ino,
             modified,
             modified_unix,
-            type_code: None,
-            creator_code: None,
             symlink_target,
-            special_type: None,
             mode: Some(core.mode as u32),
             uid: Some(core.uid),
             gid: Some(core.gid),
-            resource_fork_size: None,
-            aux_type: None,
-            link_target_cnid: None,
-            amiga_protection: None,
-            amiga_comment: None,
-            amiga_date: None,
-            dos_attributes: None,
-            finder_flags: None,
-            prodos_file_type: None,
-            mac_dates: None,
-            owner_label: None,
-            native_attrs: None,
-            qnx2_attrs: None,
+            ..FileEntry::bare(name, path, entry_type, size, ino)
         })
     }
 
@@ -929,33 +909,12 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
         let modified =
             modified_unix.map(|s| disk_core::unix_common::inode::format_unix_timestamp(s as i64));
         Ok(FileEntry {
-            name: "/".into(),
-            path: "/".into(),
-            entry_type: EntryType::Directory,
-            size: 0,
-            location: rootino,
             modified,
             modified_unix,
-            type_code: None,
-            creator_code: None,
-            symlink_target: None,
-            special_type: None,
             mode: Some(core.mode as u32),
             uid: Some(core.uid),
             gid: Some(core.gid),
-            resource_fork_size: None,
-            aux_type: None,
-            link_target_cnid: None,
-            amiga_protection: None,
-            amiga_comment: None,
-            amiga_date: None,
-            dos_attributes: None,
-            finder_flags: None,
-            prodos_file_type: None,
-            mac_dates: None,
-            owner_label: None,
-            native_attrs: None,
-            qnx2_attrs: None,
+            ..FileEntry::bare("/".into(), "/".into(), EntryType::Directory, 0, rootino)
         })
     }
 

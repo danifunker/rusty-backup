@@ -32,7 +32,7 @@ use super::types::{
 };
 use super::{read_at_aligned, XfsFilesystem};
 use disk_core::filesystem::{Filesystem, FilesystemError};
-use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
+use disk_core::fsck::{FsckBuilder, FsckResult, OrphanedEntry};
 
 /// FsckIssue codes the XFS repair path knows how to fix.
 ///
@@ -48,62 +48,6 @@ fn is_repairable_code(code: &str) -> bool {
         code,
         "ReplicaSbMismatch" | "AgfFreeblksMismatch" | "OrphanInode" | "LogDirty"
     )
-}
-
-/// Accumulates findings; keeps the per-check code focused.
-struct Builder {
-    errors: Vec<FsckIssue>,
-    warnings: Vec<FsckIssue>,
-    files_checked: u32,
-    dirs_checked: u32,
-    extra: Vec<(String, String)>,
-    orphaned: Vec<OrphanedEntry>,
-}
-
-impl Builder {
-    fn new() -> Self {
-        Self {
-            errors: Vec::new(),
-            warnings: Vec::new(),
-            files_checked: 0,
-            dirs_checked: 0,
-            extra: Vec::new(),
-            orphaned: Vec::new(),
-        }
-    }
-    fn err(&mut self, code: &str, msg: String) {
-        self.errors.push(FsckIssue {
-            code: code.into(),
-            message: msg,
-            repairable: is_repairable_code(code),
-            debug: false,
-        });
-    }
-    fn warn(&mut self, code: &str, msg: String) {
-        self.warnings.push(FsckIssue {
-            code: code.into(),
-            message: msg,
-            repairable: false,
-            debug: false,
-        });
-    }
-    fn stat(&mut self, label: &str, value: String) {
-        self.extra.push((label.into(), value));
-    }
-    fn finish(self) -> FsckResult {
-        let repairable = self.errors.iter().any(|e| e.repairable);
-        FsckResult {
-            errors: self.errors,
-            warnings: self.warnings,
-            stats: FsckStats {
-                files_checked: self.files_checked,
-                directories_checked: self.dirs_checked,
-                extra: self.extra,
-            },
-            repairable,
-            orphaned_entries: self.orphaned,
-        }
-    }
 }
 
 /// Per-AG header summary captured in Phase 1 and reused by Phase 2.
@@ -136,7 +80,7 @@ struct AgHeaders {
 impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// Run the XFS verifier and return a shared `FsckResult`.
     pub(crate) fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
-        let mut b = Builder::new();
+        let mut b = FsckBuilder::new(is_repairable_code);
         let sb = self.superblock().clone();
 
         // Like xfs_repair, judge nothing else while the log holds changes the volume lacks.
@@ -182,7 +126,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// where "sector" is `sb_sectsize`. We read the first four sectors of
     /// each AG in one aligned read and validate them against the primary.
     /// Returns per-AG info Phase 2 needs (inobt roots, AG lengths).
-    fn check_ag_headers(&mut self, sb: &XfsSuperblock, b: &mut Builder) -> Vec<AgHeaders> {
+    fn check_ag_headers(&mut self, sb: &XfsSuperblock, b: &mut FsckBuilder) -> Vec<AgHeaders> {
         let agcount = sb.agcount as u64;
         let agblocks = sb.agblocks as u64;
         let blocksize = sb.blocksize as u64;
@@ -360,7 +304,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         &mut self,
         sb: &XfsSuperblock,
         ags: &[AgHeaders],
-        b: &mut Builder,
+        b: &mut FsckBuilder,
     ) -> HashSet<u64> {
         let mut allocated: HashSet<u64> = HashSet::new();
 
@@ -690,7 +634,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         flfirst: u32,
         flcount: u32,
         map: &mut OwnerMap,
-        b: &mut Builder,
+        b: &mut FsckBuilder,
     ) {
         if flcount == 0 {
             return;
@@ -725,7 +669,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// reachable inode. Any allocated inode not reached is an orphan
     /// (repairable: R7 will reconnect it into lost+found). Directory entries
     /// pointing at inodes the inobt didn't mark allocated are dangling.
-    fn check_connectivity(&mut self, allocated: &HashSet<u64>, b: &mut Builder) {
+    fn check_connectivity(&mut self, allocated: &HashSet<u64>, b: &mut FsckBuilder) {
         if allocated.is_empty() {
             // Phase 2 was skipped or found nothing; orphan analysis needs the
             // allocated set, so there's nothing to compare against.
@@ -809,7 +753,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         sb: &XfsSuperblock,
         ino: u64,
         map: &mut OwnerMap,
-        b: &mut Builder,
+        b: &mut FsckBuilder,
     ) {
         let (core, inode_buf) = match self.read_inode_buf(ino) {
             Ok(v) => v,
@@ -881,7 +825,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         startblock: u64,
         count: u64,
         map: &mut OwnerMap,
-        b: &mut Builder,
+        b: &mut FsckBuilder,
     ) {
         let agblocks = sb.agblocks as u64;
         let agmask = (1u64 << sb.agblklog) - 1;
@@ -1186,7 +1130,7 @@ impl OwnerMap {
 /// enforced at `XfsSuperblock::parse`; we re-affirm the relationships that
 /// matter for the rest of the checker and would make later phases compute
 /// garbage if violated.
-fn check_superblock_geometry(sb: &XfsSuperblock, b: &mut Builder) {
+fn check_superblock_geometry(sb: &XfsSuperblock, b: &mut FsckBuilder) {
     if sb.agcount == 0 {
         b.err("BadAgGeometry", "sb_agcount is 0".into());
         return;
@@ -1253,7 +1197,7 @@ fn check_superblock_geometry(sb: &XfsSuperblock, b: &mut Builder) {
 /// clean mkfs'd v4 volume). Comparing them produced a false-positive
 /// `ReplicaSbMismatch` that `xfs_repair -n` did not report. A geometry
 /// mismatch is repairable: R4 rewrites the copy from the primary.
-fn check_sb_replica(primary: &XfsSuperblock, rep: &XfsSuperblock, agno: u64, b: &mut Builder) {
+fn check_sb_replica(primary: &XfsSuperblock, rep: &XfsSuperblock, agno: u64, b: &mut FsckBuilder) {
     let mut report = |field: &str, p: String, r: String| {
         b.err(
             "ReplicaSbMismatch",
@@ -1300,7 +1244,7 @@ fn check_sb_replica(primary: &XfsSuperblock, rep: &XfsSuperblock, agno: u64, b: 
 /// AGF structural + bounds sanity. The free-block *count* is only fully
 /// verifiable against a btree walk (Phase 2); here we bound-check it and the
 /// btree roots against the AG size.
-fn check_agf(agf: &XfsAgf, agno: u64, expected_len: u64, b: &mut Builder) {
+fn check_agf(agf: &XfsAgf, agno: u64, expected_len: u64, b: &mut FsckBuilder) {
     if agf.seqno as u64 != agno {
         b.err(
             "AgfSeqnoMismatch",
@@ -1336,7 +1280,7 @@ fn check_agf(agf: &XfsAgf, agno: u64, expected_len: u64, b: &mut Builder) {
 }
 
 /// AGI structural + bounds sanity.
-fn check_agi(agi: &XfsAgi, agno: u64, expected_len: u64, b: &mut Builder) {
+fn check_agi(agi: &XfsAgi, agno: u64, expected_len: u64, b: &mut FsckBuilder) {
     if agi.seqno as u64 != agno {
         b.err(
             "AgiSeqnoMismatch",

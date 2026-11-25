@@ -34,7 +34,7 @@ use crate::efs_v1::{
     EFS_V1_BITMAPBB, EFS_V1_DIRECTEXTENTS, EFS_V1_MAXEXTENTS, EFS_V1_ROOT_INODE,
 };
 use disk_core::filesystem::FilesystemError;
-use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
+use disk_core::fsck::{FsckBuilder, FsckResult, OrphanedEntry};
 
 /// Codes the EFS v1 `repair()` path knows how to fix. Anything else is
 /// reported with `repairable = false` so the UI can grey the button out.
@@ -69,64 +69,12 @@ pub(crate) fn is_structural_code(code: &str) -> bool {
     )
 }
 
-struct Builder {
-    errors: Vec<FsckIssue>,
-    warnings: Vec<FsckIssue>,
-    files_checked: u32,
-    dirs_checked: u32,
-    extra: Vec<(String, String)>,
-    orphaned: Vec<OrphanedEntry>,
-}
-
-impl Builder {
-    fn new() -> Self {
-        Self {
-            errors: Vec::new(),
-            warnings: Vec::new(),
-            files_checked: 0,
-            dirs_checked: 0,
-            extra: Vec::new(),
-            orphaned: Vec::new(),
-        }
-    }
-    fn err(&mut self, code: &str, msg: String) {
-        self.errors.push(FsckIssue {
-            code: code.into(),
-            message: msg,
-            repairable: is_repairable_code(code),
-            debug: false,
-        });
-    }
-    fn warn(&mut self, code: &str, msg: String) {
-        self.warnings.push(FsckIssue {
-            code: code.into(),
-            message: msg,
-            repairable: false,
-            debug: false,
-        });
-    }
-    fn finish(self) -> FsckResult {
-        let repairable = self.errors.iter().any(|e| e.repairable);
-        FsckResult {
-            errors: self.errors,
-            warnings: self.warnings,
-            stats: FsckStats {
-                files_checked: self.files_checked,
-                directories_checked: self.dirs_checked,
-                extra: self.extra,
-            },
-            repairable,
-            orphaned_entries: self.orphaned,
-        }
-    }
-}
-
 /// Run the verifier. Read-only: every method it calls is on the read impl, so
 /// a volume opened from an immutable source checks fine.
 pub fn fsck_efs_v1<R: Read + Seek>(
     fs: &mut EfsV1Filesystem<R>,
 ) -> Result<FsckResult, FilesystemError> {
-    let mut b = Builder::new();
+    let mut b = FsckBuilder::new(is_repairable_code);
     let sb = fs.superblock().clone();
     check_geometry(&sb, &mut b);
     check_checksum(fs, &mut b)?;
@@ -214,7 +162,7 @@ pub fn fsck_efs_v1<R: Read + Seek>(
 /// Account one extent's blocks, flagging anything out of bounds, in metadata,
 /// or already claimed by another inode.
 fn walk_extent(
-    b: &mut Builder,
+    b: &mut FsckBuilder,
     owner: &mut HashMap<u32, u32>,
     sb: &EfsV1Superblock,
     regions: &EfsV1DataRegions,
@@ -274,7 +222,7 @@ fn walk_extent(
 }
 
 /// `fs_size == firstcg + ncg * cgfsize`, and the metadata head has to fit.
-fn check_geometry(sb: &EfsV1Superblock, b: &mut Builder) {
+fn check_geometry(sb: &EfsV1Superblock, b: &mut FsckBuilder) {
     let expect = (sb.firstcg as u64) + (sb.ncg as u64) * (sb.cgfsize as u64);
     if expect != sb.fs_size as u64 {
         b.err(
@@ -320,7 +268,7 @@ fn check_geometry(sb: &EfsV1Superblock, b: &mut Builder) {
 /// The stored `fs_checksum` against a recomputation over 0..0x9E.
 fn check_checksum<R: Read + Seek>(
     fs: &mut EfsV1Filesystem<R>,
-    b: &mut Builder,
+    b: &mut FsckBuilder,
 ) -> Result<(), FilesystemError> {
     let sector = fs.read_superblock_sector()?;
     let stored = fs.superblock().checksum;
@@ -342,7 +290,7 @@ fn check_bitmap<R: Read + Seek>(
     sb: &EfsV1Superblock,
     regions: &EfsV1DataRegions,
     owner: &HashMap<u32, u32>,
-    b: &mut Builder,
+    b: &mut FsckBuilder,
 ) -> Result<(), FilesystemError> {
     let bm = match fs.read_bitmap() {
         Ok(bm) => bm,
@@ -420,7 +368,7 @@ fn count_free(bm: &[u8], regions: &EfsV1DataRegions) -> u32 {
 
 /// `fs_tinode` sits one below the free-inode count on a healthy volume — the
 /// convention both volumes of the IRIS 3130 disk follow.
-fn check_inode_accounting(sb: &EfsV1Superblock, free_inodes: u32, b: &mut Builder) {
+fn check_inode_accounting(sb: &EfsV1Superblock, free_inodes: u32, b: &mut FsckBuilder) {
     let expect = free_inodes.saturating_sub(1);
     if sb.tinode != expect {
         b.err(
@@ -437,7 +385,7 @@ fn check_inode_accounting(sb: &EfsV1Superblock, free_inodes: u32, b: &mut Builde
 fn check_connectivity<R: Read + Seek>(
     fs: &mut EfsV1Filesystem<R>,
     live: &[u32],
-    b: &mut Builder,
+    b: &mut FsckBuilder,
 ) -> Result<(), FilesystemError> {
     let root = match fs.read_inode(EFS_V1_ROOT_INODE) {
         Ok(r) => r,

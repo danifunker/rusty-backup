@@ -1656,33 +1656,19 @@ fn entry_from_inode(name: &str, parent_path: &str, ino: &EfsInode) -> FileEntry 
         None
     };
     FileEntry {
-        name: name.to_string(),
-        path,
-        entry_type: ino.entry_type(),
-        size,
-        location: ino.inum as u64,
         modified,
         modified_unix,
-        type_code: None,
-        creator_code: None,
-        symlink_target: None,
         special_type: ino.special_type(),
         mode: Some(ino.mode as u32),
         uid: Some(ino.uid as u32),
         gid: Some(ino.gid as u32),
-        resource_fork_size: None,
-        aux_type: None,
-        link_target_cnid: None,
-        amiga_protection: None,
-        amiga_comment: None,
-        amiga_date: None,
-        dos_attributes: None,
-        finder_flags: None,
-        prodos_file_type: None,
-        mac_dates: None,
-        owner_label: None,
-        native_attrs: None,
-        qnx2_attrs: None,
+        ..FileEntry::bare(
+            name.to_string(),
+            path,
+            ino.entry_type(),
+            size,
+            ino.inum as u64,
+        )
     }
 }
 
@@ -2257,33 +2243,10 @@ fn adopt_orphans_into_lost_found<R: Read + Write + Seek + Send>(
             // wants. The fields beyond `location` aren't consulted
             // by create_directory.
             let root_entry = disk_core::entry::FileEntry {
-                name: "/".into(),
-                path: "/".into(),
-                entry_type: EntryType::Directory,
-                size: 0,
-                location: 2,
-                modified: None,
-                modified_unix: None,
-                type_code: None,
-                creator_code: None,
-                symlink_target: None,
-                special_type: None,
                 mode: Some(root.mode as u32),
                 uid: Some(root.uid as u32),
                 gid: Some(root.gid as u32),
-                resource_fork_size: None,
-                aux_type: None,
-                link_target_cnid: None,
-                amiga_protection: None,
-                amiga_comment: None,
-                amiga_date: None,
-                dos_attributes: None,
-                finder_flags: None,
-                prodos_file_type: None,
-                mac_dates: None,
-                owner_label: None,
-                native_attrs: None,
-                qnx2_attrs: None,
+                ..FileEntry::bare("/".into(), "/".into(), EntryType::Directory, 0, 2)
             };
             let lf = fs.create_directory(
                 &root_entry,
@@ -2484,33 +2447,16 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
             )));
         }
         Ok(FileEntry {
-            name: "/".into(),
-            path: "/".into(),
-            entry_type: EntryType::Directory,
-            size: ino.size as u64,
-            location: EFS_ROOT_INODE as u64,
-            modified: None,
-            modified_unix: None,
-            type_code: None,
-            creator_code: None,
-            symlink_target: None,
-            special_type: None,
             mode: Some(ino.mode as u32),
             uid: Some(ino.uid as u32),
             gid: Some(ino.gid as u32),
-            resource_fork_size: None,
-            aux_type: None,
-            link_target_cnid: None,
-            amiga_protection: None,
-            amiga_comment: None,
-            amiga_date: None,
-            dos_attributes: None,
-            finder_flags: None,
-            prodos_file_type: None,
-            mac_dates: None,
-            owner_label: None,
-            native_attrs: None,
-            qnx2_attrs: None,
+            ..FileEntry::bare(
+                "/".into(),
+                "/".into(),
+                EntryType::Directory,
+                ino.size as u64,
+                EFS_ROOT_INODE as u64,
+            )
         })
     }
 
