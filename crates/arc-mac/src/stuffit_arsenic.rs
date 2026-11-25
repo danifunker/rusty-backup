@@ -11,80 +11,9 @@
 //! de-randomize → a 4-byte run-length expansion. A trailing CRC-32 (zlib /
 //! `0xedb88320`) covers the whole output and is verified.
 
+use crate::bitreader_be::BitReaderBE as BitReader;
+use crate::crc32::crc32_update;
 use anyhow::{bail, Result};
-
-/// MSB-first bit reader over a byte slice.
-struct BitReader<'a> {
-    data: &'a [u8],
-    pos: usize,
-    buf: u64,
-    nbits: u32,
-    /// Bits handed out past the end of the input, as zeros.
-    overrun: u64,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        BitReader {
-            data,
-            pos: 0,
-            buf: 0,
-            nbits: 0,
-            overrun: 0,
-        }
-    }
-
-    fn fill(&mut self) {
-        while self.nbits <= 56 && self.pos < self.data.len() {
-            self.buf = (self.buf << 8) | self.data[self.pos] as u64;
-            self.pos += 1;
-            self.nbits += 8;
-        }
-    }
-
-    /// Read `n` bits MSB-first (1..=32). Past EOF reads as zero bits.
-    fn next_bits(&mut self, n: u32) -> u32 {
-        if n == 0 {
-            return 0;
-        }
-        if self.nbits < n {
-            self.fill();
-        }
-        if self.nbits < n {
-            // Pad with zero bits at EOF.
-            let avail = self.nbits;
-            self.overrun += (n - avail) as u64;
-            let v = if avail == 0 {
-                0
-            } else {
-                ((self.buf << (n - avail)) & mask(n)) as u32
-            };
-            self.buf = 0;
-            self.nbits = 0;
-            return v;
-        }
-        let v = ((self.buf >> (self.nbits - n)) & mask(n)) as u32;
-        self.nbits -= n;
-        v
-    }
-
-    fn next_bit(&mut self) -> u32 {
-        self.next_bits(1)
-    }
-
-    /// True once the decoder has read well past the input: a stream that ends short.
-    fn exhausted(&self) -> bool {
-        self.overrun > 64
-    }
-}
-
-fn mask(n: u32) -> u64 {
-    if n >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << n) - 1
-    }
-}
 
 // ---- adaptive arithmetic model + decoder ----
 
@@ -244,19 +173,6 @@ fn inverse_bwt(block: &[u8]) -> Vec<u32> {
         counts[b] += 1;
     }
     transform
-}
-
-// CRC-32 (zlib, reflected poly 0xedb88320), table-free per-byte form.
-fn crc32_update(crc: u32, byte: u8) -> u32 {
-    let mut c = (crc ^ byte as u32) & 0xff;
-    for _ in 0..8 {
-        if c & 1 != 0 {
-            c = (c >> 1) ^ 0xedb88320;
-        } else {
-            c >>= 1;
-        }
-    }
-    (crc >> 8) ^ c
 }
 
 const RANDOMIZATION_TABLE: [u16; 256] = [
@@ -475,7 +391,7 @@ impl<'a> Arsenic<'a> {
             }
         }
 
-        self.crc = crc32_update(self.crc, outbyte);
+        self.crc = crc32_update(self.crc, &[outbyte]);
         Ok(Some(outbyte))
     }
 }
@@ -512,7 +428,7 @@ mod tests {
     fn crc32_matches_known() {
         let mut crc = 0xffffffffu32;
         for &b in b"123456789" {
-            crc = crc32_update(crc, b);
+            crc = crc32_update(crc, &[b]);
         }
         assert_eq!(!crc, 0xCBF43926); // standard CRC-32 check value
     }

@@ -609,19 +609,7 @@ mod tests {
     }
 
     fn crc32(data: &[u8]) -> u32 {
-        // Minimal CRC-32 (IEEE) for the test ZIP headers.
-        let mut crc = 0xFFFF_FFFFu32;
-        for &b in data {
-            crc ^= b as u32;
-            for _ in 0..8 {
-                crc = if crc & 1 != 0 {
-                    (crc >> 1) ^ 0xEDB8_8320
-                } else {
-                    crc >> 1
-                };
-            }
-        }
-        !crc
+        !crate::crc32::crc32_update(!0, data)
     }
 
     /// Build a Mac3 extra field. `blob` (uncompressed, UNCMPR set) is included

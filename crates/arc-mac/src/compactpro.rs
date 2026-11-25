@@ -16,9 +16,9 @@
 //! `~/repos/XADMaster`). The block-padding quirk in the LZH layer and the
 //! RLE escape sequence are faithful reproductions of that reference.
 
+use crate::crc32::crc32_update;
 use anyhow::{bail, Result};
 use byteorder::{BigEndian, ByteOrder};
-use std::sync::OnceLock;
 
 use super::stuffit::{ForkCodec, ForkInfo, StuffItArchive, StuffItEntry};
 use fs_mac::mac_roman::decode_mac_filename;
@@ -728,42 +728,6 @@ impl<'a> CpInput<'a> {
     fn buffer_offset(&self) -> i64 {
         self.currbyte as i64
     }
-}
-
-// ---------------------------------------------------------------------------
-// CRC-32 (reflected, polynomial 0xedb88320, no final XOR — Compact Pro stores
-// the running value directly)
-// ---------------------------------------------------------------------------
-
-fn crc_table() -> &'static [u32; 256] {
-    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut t = [0u32; 256];
-        let mut n = 0usize;
-        while n < 256 {
-            let mut c = n as u32;
-            let mut k = 0;
-            while k < 8 {
-                c = if c & 1 != 0 {
-                    0xedb8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-                k += 1;
-            }
-            t[n] = c;
-            n += 1;
-        }
-        t
-    })
-}
-
-fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
-    let t = crc_table();
-    for &b in data {
-        crc = t[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
-    }
-    crc
 }
 
 #[cfg(test)]
