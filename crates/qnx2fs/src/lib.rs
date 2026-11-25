@@ -799,9 +799,11 @@ impl<D: Read + Seek> Volume<D> {
 
     /// Stream a file's extents to `out` a megabyte at a time; returns the bytes written.
     pub fn write_file_to(&mut self, entry: &Entry, out: &mut dyn std::io::Write) -> Result<u64> {
-        let mut buf = vec![0u8; 1 << 20];
+        let extents = self.extents(entry.first)?;
+        let size: u64 = extents.iter().map(|x| x.size).sum();
+        let mut buf = vec![0u8; size.min(1 << 20) as usize];
         let mut total = 0u64;
-        for x in self.extents(entry.first)? {
+        for x in extents {
             self.dev.seek(SeekFrom::Start(
                 self.offset + (x.block - 1) * BLOCK + XTNT_HDR,
             ))?;

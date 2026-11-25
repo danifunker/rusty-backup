@@ -16,7 +16,8 @@ pub fn write_zeros(writer: &mut dyn Write, count: u64) -> std::io::Result<()> {
     let zeros = vec![0u8; count.min(ZERO_CHUNK as u64) as usize];
     let mut remaining = count;
     while remaining > 0 {
-        let n = (remaining as usize).min(zeros.len());
+        // Compared as u64: a 32-bit `as usize` would truncate a 4 GiB run to 0 and loop forever.
+        let n = remaining.min(zeros.len() as u64) as usize;
         writer.write_all(&zeros[..n])?;
         remaining -= n as u64;
     }

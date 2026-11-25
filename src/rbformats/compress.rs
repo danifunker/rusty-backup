@@ -626,7 +626,8 @@ pub(crate) fn write_zeros_with_progress(
     let mut remaining = count;
     let mut done: u64 = 0;
     while remaining > 0 {
-        let n = (remaining as usize).min(CHUNK_SIZE);
+        // Compared as u64, so a 4 GiB run can't truncate to 0 on a 32-bit build.
+        let n = remaining.min(CHUNK_SIZE as u64) as usize;
         writer
             .write_all(&zeros[..n])
             .context("failed to write zeros")?;

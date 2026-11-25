@@ -269,9 +269,7 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
         let image_len = reader
             .seek(SeekFrom::End(0))?
             .saturating_sub(partition_offset);
-        let reserved = dpb.off as u64 * dpb.spt as u64 * 128;
-        let fit = image_len.saturating_sub(reserved) / (dpb.block_size() as u64).max(1);
-        let usable_blocks = dpb.total_blocks().min(fit.min(u64::from(u32::MAX)) as u32);
+        let usable_blocks = blocks_that_fit(&dpb, image_len);
         Ok(CpmFilesystem {
             reader,
             partition_offset,
@@ -438,6 +436,24 @@ fn read_directory<R: Read + Seek>(
         }
     }
     Ok(out)
+}
+
+/// How many allocation blocks lie wholly inside an image of `image_len` bytes.
+fn blocks_that_fit(dpb: &Dpb, image_len: u64) -> u32 {
+    if super::cpm_diskdefs::skew_table(dpb).is_none() {
+        let reserved = dpb.off as u64 * dpb.spt as u64 * 128;
+        let fit = image_len.saturating_sub(reserved) / (dpb.block_size() as u64).max(1);
+        return dpb.total_blocks().min(fit.min(u64::from(u32::MAX)) as u32);
+    }
+    // Skewed records are scattered over the track, so a block fits only if every one does.
+    let bs = dpb.block_size();
+    (0..dpb.total_blocks())
+        .take_while(|&b| {
+            block_spans(dpb, b as u16, bs)
+                .iter()
+                .all(|(at, r)| at + r.len() as u64 <= image_len)
+        })
+        .count() as u32
 }
 
 /// Where the first `len` bytes of allocation block `b` lie, as (offset within the volume,
@@ -1197,7 +1213,17 @@ pub fn create_blank(dpb: Dpb) -> Vec<u8> {
 
 /// The length of a blank disk: its reserved tracks and data area.
 fn blank_size(dpb: &Dpb) -> u64 {
-    dpb.off as u64 * dpb.spt as u64 * 128 + dpb.data_bytes()
+    dpb.off as u64 * dpb.spt as u64 * 128 + data_area_bytes(dpb)
+}
+
+/// Bytes the data area takes on disk: whole tracks on a skewed preset, whose last blocks'
+/// records are scattered over the full final track.
+fn data_area_bytes(dpb: &Dpb) -> u64 {
+    if super::cpm_diskdefs::skew_table(dpb).is_none() {
+        return dpb.data_bytes();
+    }
+    let track = dpb.spt as u64 * 128;
+    dpb.data_bytes().div_ceil(track) * track
 }
 
 /// The streaming form of [`create_blank`]: fills the disk with 0xE5 at `at_offset`, 64 KiB at a
@@ -1521,6 +1547,23 @@ mod tests {
         let entry = fs.list_directory(&root).unwrap().remove(0);
         assert_eq!(fs.read_file(&entry, 4096).unwrap(), data);
         assert!(crate::cpm_diskdefs::skew_table(&crate::cpm_diskdefs::ALTAIR_8IN).is_none());
+    }
+
+    /// A blank IBM 3740 disk is the full 77 x 26 x 128 bytes, and its last block, scattered by the
+    /// skew over the final track, reads and writes without growing the image.
+    #[test]
+    fn a_blank_ibm_3740_disk_holds_its_last_block() {
+        use crate::cpm_diskdefs::IBM_3740;
+        let img = create_blank(IBM_3740);
+        assert_eq!(img.len(), 256_256);
+        let mut fs = CpmFilesystem::open_with_dpb(Cursor::new(img), 0, IBM_3740).unwrap();
+        assert_eq!(fs.usable_blocks, IBM_3740.total_blocks());
+        let last = IBM_3740.dsm;
+        fs.write_block(last, &[0x5A; 1024]).unwrap();
+        let mut back = [0u8; 1024];
+        fs.read_block(last, &mut back).unwrap();
+        assert_eq!(back, [0x5A; 1024]);
+        assert_eq!(fs.reader.get_ref().len(), 256_256);
     }
 
     /// EXM 1 (Einstein): an entry covers two logical extents, its extent byte names the last one

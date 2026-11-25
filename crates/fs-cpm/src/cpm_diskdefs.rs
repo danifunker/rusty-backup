@@ -240,7 +240,8 @@ const IBM_3740_SKEW: [u8; 26] = [
 /// The sector translation a preset's BIOS applies to data tracks, or `None` when records lie in
 /// sector order. Kept beside [`Dpb`] rather than in it so the struct stays as published.
 pub fn skew_table(dpb: &Dpb) -> Option<&'static [u8]> {
-    (dpb.name == IBM_3740.name).then_some(&IBM_3740_SKEW[..])
+    (dpb.name == IBM_3740.name && dpb.spt as usize == IBM_3740_SKEW.len())
+        .then_some(&IBM_3740_SKEW[..])
 }
 
 /// Altair 8800 CF disk (Altair-Z80 era). Sectorized as 512 B in 8 MB
