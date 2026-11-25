@@ -344,6 +344,11 @@ jobs:
       - name: Check image-files-only build (no-physical-devices)
         run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
 
+      # Every published crate must build with all its features on, as docs.rs and users may (TAR-007).
+      - name: Check crates with all features
+        if: ${{ matrix.arch == 'arm64' }}
+        run: cargo check --workspace --exclude rusty-backup --all-features --all-targets
+
       # rb-cli only: the egui app and its DMG are no longer built or shipped.
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} --bin rb-cli

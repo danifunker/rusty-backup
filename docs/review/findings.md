@@ -529,7 +529,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | TAR-004 | S2 | plausible | tar_import.rs `open_tar_stream` | Multi-member .tar.gz imports only the first member. | fixed (69648efe) |
 | TAR-005 | S2 | plausible | tar_export.rs `walk` | Export recursion has no depth / visited guard. | fixed (69648efe) |
 | TAR-006 | S4 | confirmed | import_sink.rs, tar_export.rs, mem_archive.rs, zstd_compat.rs, zip_import.rs | Stats merge drops a field; stale docs; pure-zstd can't browse .tar.zst; duplicate date code. | fixed (this branch): zip dates use disk_core's DOS conversion; tar_export's mtime doc corrected; stats merge and pure-zstd browse fixed earlier |
-| TAR-007 | S4 | confirmed | zip_compat.rs | `cargo build -p fs-tar --all-features` fails: `ZipFile<'_>` lacks the reader generic newer `zip` versions take. CI never builds that feature mix. | open |
+| TAR-007 | S4 | confirmed | zip_compat.rs | `cargo build -p fs-tar --all-features` fails: `ZipFile<'_>` lacks the reader generic newer `zip` versions take. CI never builds that feature mix. dsk-imz had the same shim and failed the same way. | fixed (this branch): both shims dispatch on what `name()` returns instead of a feature, and CI checks every crate with `--all-features` |
 
 ## crates/fs-cpm
 

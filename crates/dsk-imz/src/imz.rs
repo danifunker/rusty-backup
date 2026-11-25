@@ -14,7 +14,7 @@
 //! narrative. Files that present as encrypted but don't follow that
 //! framing (or where the password is wrong) surface as an explicit error.
 
-use crate::zip_compat::ZipEntryName as _;
+use crate::zip_compat::entry_name;
 #[cfg(all(feature = "rust173-polyfill", feature = "crypto"))]
 use disk_core::rust173::IntIsMultipleOf as _;
 use std::fs::File;
@@ -111,7 +111,7 @@ fn pick_entry_index<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<
             if entry.is_dir() {
                 continue;
             }
-            if is_image_entry(&entry.entry_name()) {
+            if is_image_entry(&entry_name(entry.name(), entry.name_raw())) {
                 chosen = Some(i);
                 break;
             }
@@ -254,7 +254,11 @@ fn open_entry<'a>(
             // Capture the entry's raw (still-encrypted) body up front.
             let (csz, name, size) = {
                 let raw = archive.by_index_raw(idx)?;
-                (raw.compressed_size(), raw.entry_name(), raw.size())
+                (
+                    raw.compressed_size(),
+                    entry_name(raw.name(), raw.name_raw()),
+                    raw.size(),
+                )
             };
             if csz > MAX_IMZ_BYTES {
                 bail!("IMZ entry \"{name}\" is {csz} bytes compressed; not a floppy image");
@@ -278,7 +282,7 @@ fn open_entry<'a>(
                 path.display(),
             )
         })?;
-        let name = entry.entry_name();
+        let name = entry_name(entry.name(), entry.name_raw());
         let size = entry.size();
         Ok((Box::new(entry) as Box<dyn Read + 'a>, name, size))
     } else {
@@ -287,7 +291,7 @@ fn open_entry<'a>(
         {
             let raw = archive.by_index_raw(idx)?;
             if raw.encrypted() {
-                let entry_name = raw.entry_name();
+                let entry_name = entry_name(raw.name(), raw.name_raw());
                 bail!(
                     "IMZ {} is password-protected (entry \"{entry_name}\"); \
                      password must be specified (use the GUI password prompt, \
@@ -297,7 +301,7 @@ fn open_entry<'a>(
             }
         }
         let entry = archive.by_index(idx)?;
-        let name = entry.entry_name();
+        let name = entry_name(entry.name(), entry.name_raw());
         let size = entry.size();
         Ok((Box::new(entry) as Box<dyn Read + 'a>, name, size))
     }
