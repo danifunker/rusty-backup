@@ -392,7 +392,7 @@ impl<R: Read + Seek + Send> Filesystem for CarveFilesystem<R> {
         let region = self
             .region_for(entry)
             .ok_or_else(|| FilesystemError::NotFound(entry.path.clone()))?;
-        let want = (region.size as usize).min(max_bytes);
+        let want = region.size.min(max_bytes as u64) as usize;
         let mut out = vec![0u8; want];
         self.reader.seek(SeekFrom::Start(region.offset))?;
         let got = fill(&mut self.reader, &mut out)?;

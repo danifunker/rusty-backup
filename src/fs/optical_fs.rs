@@ -409,7 +409,7 @@ mod tests {
             length: usize,
         ) -> Result<Vec<u8>, OptError> {
             let d = &self.nodes[entry.location as usize].data;
-            let start = (offset as usize).min(d.len());
+            let start = offset.min(d.len() as u64) as usize;
             let end = (start + length).min(d.len());
             Ok(d[start..end].to_vec())
         }
@@ -423,7 +423,7 @@ mod tests {
             length: usize,
         ) -> Result<Option<Vec<u8>>, OptError> {
             Ok(self.nodes[entry.location as usize].rsrc.as_ref().map(|r| {
-                let start = (offset as usize).min(r.len());
+                let start = offset.min(r.len() as u64) as usize;
                 let end = (start + length).min(r.len());
                 r[start..end].to_vec()
             }))

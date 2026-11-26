@@ -1545,7 +1545,7 @@ fn run_single_file_chd_restore_as_is(
         if is_cancelled(&progress) {
             bail!("restore cancelled");
         }
-        let want = (remaining as usize).min(buf.len());
+        let want = remaining.min(buf.len() as u64) as usize;
         reader
             .read_exact(&mut buf[..want])
             .with_context(|| format!("failed to read the disk image at offset {written}"))?;
@@ -2079,7 +2079,7 @@ fn run_single_file_chd_restore_resize(
             if is_cancelled(&progress) {
                 bail!("restore cancelled");
             }
-            let want = (remaining as usize).min(buf.len());
+            let want = remaining.min(buf.len() as u64) as usize;
             image
                 .read_exact(&mut buf[..want])
                 .with_context(|| format!("read partition-{} from the disk image", pm.index))?;
@@ -2112,7 +2112,7 @@ fn run_single_file_chd_restore_resize(
                 if is_cancelled(&progress) {
                     bail!("restore cancelled");
                 }
-                let want = (pad as usize).min(zeros.len());
+                let want = pad.min(zeros.len() as u64) as usize;
                 target
                     .write_all(&zeros[..want])
                     .with_context(|| format!("zero-pad partition-{} grow region", pm.index))?;

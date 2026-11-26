@@ -1301,7 +1301,7 @@ struct ZeroPaddedReader<R> {
 impl<R: Read> Read for ZeroPaddedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.inner_remaining > 0 {
-            let want = (self.inner_remaining as usize).min(buf.len());
+            let want = self.inner_remaining.min(buf.len() as u64) as usize;
             let n = self.inner.read(&mut buf[..want])?;
             if n == 0 {
                 // Inner exhausted early — convert the rest of inner_remaining
@@ -1315,7 +1315,7 @@ impl<R: Read> Read for ZeroPaddedReader<R> {
             self.inner_remaining -= n as u64;
             Ok(n)
         } else if self.pad_remaining > 0 {
-            let n = (self.pad_remaining as usize).min(buf.len());
+            let n = self.pad_remaining.min(buf.len() as u64) as usize;
             buf[..n].fill(0);
             self.pad_remaining -= n as u64;
             Ok(n)

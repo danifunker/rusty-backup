@@ -966,7 +966,7 @@ pub fn export_whole_disk(
                 if cancel_check() {
                     bail!("export cancelled");
                 }
-                let to_read = (remaining as usize).min(CHUNK_SIZE);
+                let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
                 let n = reader
                     .read(&mut buf[..to_read])
                     .context("failed to read source")?;
@@ -1234,7 +1234,7 @@ fn convert_from_vhd_temp(
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut remaining = data_size;
     while remaining > 0 {
-        let to_read = (remaining as usize).min(CHUNK_SIZE);
+        let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
         let n = reader.read(&mut buf[..to_read])?;
         if n == 0 {
             break;

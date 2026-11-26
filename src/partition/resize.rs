@@ -257,7 +257,7 @@ pub fn shift_region(
     file.seek(SeekFrom::Start(gap_start))?;
     let mut remaining = gap_len;
     while remaining > 0 {
-        let n = (remaining as usize).min(CHUNK_SIZE);
+        let n = remaining.min(CHUNK_SIZE as u64) as usize;
         file.write_all(&zeros[..n])?;
         remaining -= n as u64;
     }

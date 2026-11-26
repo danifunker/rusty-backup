@@ -696,7 +696,7 @@ pub fn export_whole_disk_vhd(
                         let mut gap_reader = (&mut reader).take(gap);
                         let mut gap_remaining = gap;
                         while gap_remaining > 0 {
-                            let to_read = (gap_remaining as usize).min(CHUNK_SIZE);
+                            let to_read = gap_remaining.min(CHUNK_SIZE as u64) as usize;
                             let n = gap_reader.read(&mut buf[..to_read])?;
                             if n == 0 {
                                 write_zeros(&mut writer, gap_remaining)?;
@@ -724,7 +724,7 @@ pub fn export_whole_disk_vhd(
                     if cancel_check() {
                         bail!("export cancelled");
                     }
-                    let to_read = (part_remaining as usize).min(CHUNK_SIZE);
+                    let to_read = part_remaining.min(CHUNK_SIZE as u64) as usize;
                     let n = part_reader.read(&mut buf[..to_read])?;
                     if n == 0 {
                         break;

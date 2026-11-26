@@ -520,7 +520,7 @@ pub fn chd_to_bincue_multi(
         );
         let mut remaining = track_bytes;
         while remaining > 0 {
-            let to_read = (remaining as usize).min(buf.len());
+            let to_read = remaining.min(buf.len() as u64) as usize;
             let n = bin_reader
                 .read(&mut buf[..to_read])
                 .with_context(|| format!("read {}", single_bin.display()))?;

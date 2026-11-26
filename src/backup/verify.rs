@@ -219,7 +219,7 @@ pub fn hash_reader_range(
             let mut hasher = Sha256::new();
             let mut remaining = length;
             while remaining > 0 {
-                let want = (remaining as usize).min(buf.len());
+                let want = remaining.min(buf.len() as u64) as usize;
                 let n = reader
                     .read(&mut buf[..want])
                     .context("checksum read error")?;
@@ -240,7 +240,7 @@ pub fn hash_reader_range(
             let mut hasher = crc32fast::Hasher::new();
             let mut remaining = length;
             while remaining > 0 {
-                let want = (remaining as usize).min(buf.len());
+                let want = remaining.min(buf.len() as u64) as usize;
                 let n = reader
                     .read(&mut buf[..want])
                     .context("checksum read error")?;

@@ -278,7 +278,7 @@ where
             source_disk.seek(SeekFrom::Start(src_off))?;
             let mut filled: u64 = 0;
             while filled < copy_bound {
-                let want = ((copy_bound - filled) as usize).min(buf.len());
+                let want = (copy_bound - filled).min(buf.len() as u64) as usize;
                 let n = source_disk.read(&mut buf[..want])?;
                 if n == 0 {
                     break;
@@ -312,7 +312,7 @@ where
             let zeros = vec![0u8; 64 * 1024];
             let mut remaining = gap;
             while remaining > 0 {
-                let n = (remaining as usize).min(zeros.len());
+                let n = remaining.min(zeros.len() as u64) as usize;
                 output.write_all(&zeros[..n])?;
                 remaining -= n as u64;
             }

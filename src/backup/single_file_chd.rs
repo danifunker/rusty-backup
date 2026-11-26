@@ -676,7 +676,7 @@ fn copy_capped(
         if cancel_check() {
             anyhow::bail!("operation cancelled");
         }
-        let want = (remaining as usize).min(CHUNK);
+        let want = remaining.min(CHUNK as u64) as usize;
         let n = reader.read(&mut buf[..want])?;
         if n == 0 {
             break;
@@ -806,7 +806,7 @@ impl Read for PositionedSegmentReader {
         if self.pos >= self.end {
             return Ok(0);
         }
-        let want = ((self.end - self.pos) as usize).min(buf.len());
+        let want = (self.end - self.pos).min(buf.len() as u64) as usize;
         self.file.seek(SeekFrom::Start(self.pos))?;
         let n = self.file.read(&mut buf[..want])?;
         self.pos += n as u64;
@@ -1366,7 +1366,7 @@ impl<R: Read> Read for TakeOrPad<R> {
         if self.remaining == 0 {
             return Ok(0);
         }
-        let cap = (self.remaining as usize).min(buf.len());
+        let cap = self.remaining.min(buf.len() as u64) as usize;
         if !self.inner_done {
             let n = self.inner.read(&mut buf[..cap])?;
             if n > 0 {

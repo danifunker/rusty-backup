@@ -982,7 +982,7 @@ pub fn reconstruct_raw_apm_disk(
             if cancel_check() {
                 bail!("export cancelled");
             }
-            let to_read = (remaining as usize).min(CHUNK_SIZE);
+            let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
             let n = reader
                 .read(&mut buf[..to_read])
                 .context("failed to read partition data")?;
@@ -1128,7 +1128,7 @@ pub fn reconstruct_raw_rdb_disk(
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut copied: u64 = 0;
     while copied < rdb_bytes {
-        let to_read = ((rdb_bytes - copied) as usize).min(CHUNK_SIZE);
+        let to_read = (rdb_bytes - copied).min(CHUNK_SIZE as u64) as usize;
         let n = reader
             .read(&mut buf[..to_read])
             .context("read RDB region")?;
@@ -1306,7 +1306,7 @@ pub fn reconstruct_raw_rdb_disk(
             if cancel_check() {
                 bail!("export cancelled");
             }
-            let to_read = (remaining as usize).min(CHUNK_SIZE);
+            let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
             let n = reader
                 .read(&mut buf[..to_read])
                 .with_context(|| format!("read partition '{}' data", p.drv_name))?;
@@ -2192,7 +2192,7 @@ pub fn reconstruct_raw_label_disk(
             if cancel_check() {
                 bail!("export cancelled");
             }
-            let want = (left as usize).min(buf.len());
+            let want = left.min(buf.len() as u64) as usize;
             let n = reader
                 .read(&mut buf[..want])
                 .context("read partition body")?;
@@ -2210,7 +2210,7 @@ pub fn reconstruct_raw_label_disk(
         let mut pad = o.export_size.saturating_sub(to_copy);
         let zeros = vec![0u8; CHUNK_SIZE];
         while pad > 0 {
-            let want = (pad as usize).min(zeros.len());
+            let want = pad.min(zeros.len() as u64) as usize;
             writer
                 .write_all(&zeros[..want])
                 .context("zero-fill grow region")?;

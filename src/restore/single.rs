@@ -434,7 +434,7 @@ pub fn run_single_partition_restore(
                     bail!("restore cancelled");
                 }
 
-                let to_read = ((limit - total_written) as usize).min(buf.len());
+                let to_read = (limit - total_written).min(buf.len() as u64) as usize;
                 if to_read == 0 {
                     break;
                 }
@@ -481,7 +481,7 @@ pub fn run_single_partition_restore(
             if is_cancelled(&progress) {
                 bail!("restore cancelled");
             }
-            let chunk = (remaining as usize).min(zero_buf.len());
+            let chunk = remaining.min(zero_buf.len() as u64) as usize;
             target.write_all(&zero_buf[..chunk])?;
             remaining -= chunk as u64;
             set_progress_bytes(

@@ -342,7 +342,7 @@ pub fn decompress_members_to_writer(
                 if cancel_check() {
                     bail!("export cancelled");
                 }
-                let to_read = (remaining as usize).min(CHUNK_SIZE);
+                let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
                 let n = reader.read(&mut buf[..to_read])?;
                 if n == 0 {
                     break;
@@ -366,7 +366,7 @@ pub fn decompress_members_to_writer(
                 if remaining == 0 {
                     break;
                 }
-                let to_read = (remaining as usize).min(CHUNK_SIZE);
+                let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
                 let n = decoder.read(&mut buf[..to_read])?;
                 if n == 0 {
                     break;
@@ -389,7 +389,7 @@ pub fn decompress_members_to_writer(
                 if remaining == 0 {
                     break;
                 }
-                let to_read = (remaining as usize).min(CHUNK_SIZE);
+                let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
                 let n = decoder.read(&mut buf[..to_read])?;
                 if n == 0 {
                     break;
@@ -413,7 +413,7 @@ pub fn decompress_members_to_writer(
                 if remaining == 0 {
                     break;
                 }
-                let to_read = (remaining as usize).min(CHUNK_SIZE);
+                let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
                 let n = decoder.read(&mut buf[..to_read])?;
                 if n == 0 {
                     break;

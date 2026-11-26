@@ -78,7 +78,7 @@ fn copy_n_hashed(f: &mut impl Read, w: &mut impl Write, n: u64) -> Result<u32> {
     let mut remaining = n;
     let mut buf = vec![0u8; 256 * 1024];
     while remaining > 0 {
-        let want = (remaining as usize).min(buf.len());
+        let want = remaining.min(buf.len() as u64) as usize;
         let got = f.read(&mut buf[..want])?;
         if got == 0 {
             bail!("cbk: short read copying chunk payload");

@@ -48,7 +48,7 @@ fn same_sectors(src: &Path, dest: &Path, hooks: &Hooks<'_>) -> Result<String, St
         if (hooks.cancelled)() {
             return Err("cancelled".to_string());
         }
-        let n = ((len_a - done) as usize).min(BLOCK);
+        let n = (len_a - done).min(BLOCK as u64) as usize;
         a.read_exact(&mut ba[..n])
             .map_err(|e| format!("reading the source: {e}"))?;
         b.read_exact(&mut bb[..n])
