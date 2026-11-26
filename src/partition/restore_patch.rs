@@ -603,10 +603,14 @@ fn patch_x68k(
     let adjusted = repack(overrides, ss.max(512), floor)?;
     check_fits(&adjusted, target_size, "the target")?;
     let mut out = head.to_vec();
-    let block = &mut out[table_off..table_off + table_len];
+    let block: &mut [u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE] =
+        (&mut out[table_off..table_off + table_len])
+            .try_into()
+            .expect("the table slice has the table's length");
+    // Slots are matched by where the partition starts, then written by the table's own
+    // patcher (PR-001), which keeps the start word's flag byte and refuses an overflow.
+    let mut by_slot = Vec::with_capacity(adjusted.len());
     for o in &adjusted {
-        // Slots are matched by where the partition starts; the high byte of the
-        // start word carries flags and is kept.
         let slot = (0..X68K_MAX_PARTITIONS).find(|&i| {
             let e = X68K_TABLE_HEADER_SIZE + i * X68K_ENTRY_SIZE;
             let start = (BigEndian::read_u32(&block[e + 8..e + 12]) & 0x00FF_FFFF) as u64;
@@ -620,12 +624,14 @@ fn patch_x68k(
                 o.index
             );
         };
-        let e = X68K_TABLE_HEADER_SIZE + slot * X68K_ENTRY_SIZE;
-        let flags = BigEndian::read_u32(&block[e + 8..e + 12]) & 0xFF00_0000;
-        let new_start = (o.effective_start_lba() * 512 / ss) as u32 & 0x00FF_FFFF;
-        BigEndian::write_u32(&mut block[e + 8..e + 12], flags | new_start);
-        BigEndian::write_u32(&mut block[e + 12..e + 16], (o.export_size / ss) as u32);
+        by_slot.push(PartitionSizeOverride {
+            index: slot,
+            new_start_lba: Some(o.effective_start_lba()),
+            ..o.clone()
+        });
     }
+    part_tables::x68k::patch_x68k_entries(block, &by_slot, ss)
+        .context("patching the X68k table")?;
     if BigEndian::read_u32(&block[4..8]) != 0 {
         let sectors = (target_size / ss) as u32;
         BigEndian::write_u32(&mut block[4..8], sectors);

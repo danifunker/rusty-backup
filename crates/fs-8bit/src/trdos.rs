@@ -484,10 +484,7 @@ pub fn create_blank_trdos(size_bytes: u64, label: &str) -> Result<Vec<u8>, Files
 
 impl<R: Read + Write + Seek> TrdosFilesystem<R> {
     fn write_at(&mut self, off: u64, data: &[u8]) -> Result<(), FilesystemError> {
-        self.reader
-            .seek(SeekFrom::Start(self.partition_offset + off))?;
-        self.reader.write_all(data)?;
-        Ok(())
+        crate::common::write_all_at(&mut self.reader, self.partition_offset + off, data)
     }
 
     /// Serialize and write a 16-byte catalogue entry at its slot.

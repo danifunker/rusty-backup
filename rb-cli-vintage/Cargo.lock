@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "arc-mac"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "disk-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-ghost"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "disk-core",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-tape"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "arc-mac",
  "disk-core",
@@ -925,7 +925,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "fs-8bit"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "fs-apple2"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "fs-mac"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1006,7 +1006,7 @@ version = "0.2.0"
 
 [[package]]
 name = "fs-pc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1052,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "fs-unix"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "fs-xfs"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "byteorder",
  "crc32c",

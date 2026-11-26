@@ -766,53 +766,63 @@ fn plan_restore_ebr_chain(
 
     logical_pms.sort_by_key(|pm| pm.start_lba);
 
-    // Detect whether any logical partition will change size.  If so, pack
-    // subsequent partitions contiguously rather than using stale original LBAs,
-    // which would leave large gaps and inflate the output image.
-    let any_resized = logical_pms.iter().any(|pm| {
-        overrides
-            .iter()
-            .find(|o| o.index == pm.index)
-            .map(|ov| ov.export_size != pm.original_size_bytes)
-            .unwrap_or(false)
-    });
-
-    let mut logical_infos: Vec<LogicalPartitionInfo> = Vec::with_capacity(logical_pms.len());
-    let mut logical_starts: Vec<(usize, u64)> = Vec::with_capacity(logical_pms.len());
-    let mut next_lba: u32 = 0;
-
-    for (i, pm) in logical_pms.iter().enumerate() {
-        let ov = overrides.iter().find(|o| o.index == pm.index);
-        let new_size_sectors = ov
-            .map(|o| o.export_size / 512)
-            .unwrap_or(pm.original_size_bytes / 512) as u32;
-
-        let start_lba = if i == 0 {
-            // First logical partition: always keep its original absolute LBA so
-            // the extended container entry in the MBR still points correctly.
-            ov.map(|o| o.effective_start_lba()).unwrap_or(pm.start_lba) as u32
-        } else if any_resized {
-            // Pack right after the previous partition, leaving 1 sector for the EBR.
-            next_lba + 1
-        } else {
-            ov.map(|o| o.effective_start_lba()).unwrap_or(pm.start_lba) as u32
-        };
-
-        next_lba = start_lba + new_size_sectors;
-        logical_starts.push((pm.index, start_lba as u64));
-        let ptype = if pm.partition_type_byte != 0 {
-            pm.partition_type_byte
-        } else {
-            infer_partition_type_byte(&pm.type_name)
-        };
-        logical_infos.push(LogicalPartitionInfo {
-            start_lba,
-            total_sectors: new_size_sectors,
-            partition_type: ptype,
-        });
-    }
+    let items: Vec<LogicalPlanItem> = logical_pms
+        .iter()
+        .map(|pm| {
+            let ov = overrides.iter().find(|o| o.index == pm.index);
+            LogicalPlanItem {
+                start_lba: ov.map(|o| o.effective_start_lba()).unwrap_or(pm.start_lba) as u32,
+                original_bytes: pm.original_size_bytes,
+                new_bytes: ov.map(|o| o.export_size).unwrap_or(pm.original_size_bytes),
+                partition_type: if pm.partition_type_byte != 0 {
+                    pm.partition_type_byte
+                } else {
+                    infer_partition_type_byte(&pm.type_name)
+                },
+            }
+        })
+        .collect();
+    let logical_infos = pack_logical_partitions(&items);
+    let logical_starts = logical_pms
+        .iter()
+        .zip(&logical_infos)
+        .map(|(pm, info)| (pm.index, info.start_lba as u64))
+        .collect();
 
     Some((extended_start_lba, logical_infos, logical_starts))
+}
+
+/// One logical partition to place: where it sits when nothing moves, and its old and new size.
+pub(crate) struct LogicalPlanItem {
+    pub(crate) start_lba: u32,
+    pub(crate) original_bytes: u64,
+    pub(crate) new_bytes: u64,
+    pub(crate) partition_type: u8,
+}
+
+/// Place logical partitions in start order: the first stays (the extended entry points at it);
+/// once any resizes, the rest pack one EBR sector apart. Shared by restore and VHD export.
+pub(crate) fn pack_logical_partitions(items: &[LogicalPlanItem]) -> Vec<LogicalPartitionInfo> {
+    let any_resized = items.iter().any(|it| it.new_bytes != it.original_bytes);
+    let mut next_lba: u32 = 0;
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| {
+            let total_sectors = (it.new_bytes / 512) as u32;
+            let start_lba = if i > 0 && any_resized {
+                next_lba + 1
+            } else {
+                it.start_lba
+            };
+            next_lba = start_lba + total_sectors;
+            LogicalPartitionInfo {
+                start_lba,
+                total_sectors,
+                partition_type: it.partition_type,
+            }
+        })
+        .collect()
 }
 
 /// Infer MBR partition type byte from a human-readable type name.

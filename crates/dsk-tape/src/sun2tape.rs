@@ -15,11 +15,11 @@
 //! names come from the tape's own XDR table of contents when it has one (SunOS
 //! install tapes do), else from the content type.
 //!
-//! Directory contents are decoded in memory on first access and cached; tape files
-//! are tens of megabytes at most.
+//! A tape file is spooled to a temp file the first time it is opened as a directory, so
+//! neither the tape nor a tape file is ever held in memory whole (TAP-001).
 
 use std::collections::HashMap;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::{Filesystem, FilesystemError};
@@ -185,6 +185,79 @@ fn toc_names(toc: &[u8], volume: usize) -> Vec<String> {
     names
 }
 
+/// SunOS tar records a hard link's target size but stores no data; zero such sizes (and
+/// restamp the checksum) when the next block is a header, as fs-tar does for in-memory tars.
+fn zero_link_sizes(f: &mut std::fs::File) -> Result<(), FilesystemError> {
+    let len = f.metadata()?.len();
+    let mut at = 0u64;
+    let mut pair = [0u8; 1024];
+    while at + 1024 <= len {
+        f.seek(SeekFrom::Start(at))?;
+        f.read_exact(&mut pair)?;
+        if !is_tar_header(&pair[..512]) {
+            break;
+        }
+        let field = String::from_utf8_lossy(&pair[124..136]).into_owned();
+        let size = u64::from_str_radix(field.trim_matches(|c: char| c == '\0' || c == ' '), 8)
+            .unwrap_or(0);
+        if matches!(pair[156], b'1' | b'2') && size > 0 && is_tar_header(&pair[512..]) {
+            let h = &mut pair[..512];
+            h[124..136].copy_from_slice(b"00000000000\0");
+            let sum: u32 = h[..148]
+                .iter()
+                .chain(&[b' '; 8])
+                .chain(&h[156..])
+                .map(|&b| b as u32)
+                .sum();
+            h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+            f.seek(SeekFrom::Start(at))?;
+            f.write_all(&pair[..512])?;
+            at += 512;
+            continue;
+        }
+        at += 512 + size.div_ceil(512) * 512;
+    }
+    Ok(())
+}
+
+/// Exactly `left` bytes of `inner`, failing if it ends sooner (as `read_exact` did).
+struct Exact<R> {
+    inner: R,
+    left: u64,
+}
+
+impl<R: Read> Read for Exact<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Ok(0);
+        }
+        let want = buf.len().min(self.left.min(usize::MAX as u64) as usize);
+        let n = self.inner.read(&mut buf[..want])?;
+        if n == 0 && want > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Sun tape: the image ends inside a tape file",
+            ));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// A writer keeping only the first block written to it.
+struct Head(Vec<u8>);
+
+impl Write for Head {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let room = 512usize.saturating_sub(self.0.len());
+        self.0.extend_from_slice(&buf[..room.min(buf.len())]);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A `SUN2TAPE` image browsed as a read-only filesystem.
 pub struct TapeFilesystem<R: Read + Seek + Send> {
     reader: R,
@@ -192,6 +265,8 @@ pub struct TapeFilesystem<R: Read + Seek + Send> {
     files: Vec<TapeFile>,
     volumes: usize,
     opened: HashMap<usize, Box<dyn Filesystem>>,
+    /// Temp files behind opened tar children, kept for as long as the children read them.
+    spools: Vec<tempfile::NamedTempFile>,
 }
 
 impl<R: Read + Seek + Send> TapeFilesystem<R> {
@@ -234,6 +309,7 @@ impl<R: Read + Seek + Send> TapeFilesystem<R> {
             files,
             volumes,
             opened: HashMap::new(),
+            spools: Vec::new(),
         };
         fs.name_files()?;
         Ok(fs)
@@ -260,10 +336,14 @@ impl<R: Read + Seek + Send> TapeFilesystem<R> {
         for i in 0..self.files.len() {
             if self.files[i].kind == TapeFileKind::Compressed {
                 let f = self.files[i].clone();
-                let raw = self.read_range(f.start, f.len)?;
-                let tar = arc_mac::stuffit_lzw::decompress_unix_z(&raw)
-                    .map(|d| is_tar_header(&d))
-                    .unwrap_or(false);
+                // The whole stream is decoded, as a corrupt one is not a tar, but only its head kept.
+                let mut head = Head(Vec::new());
+                let tar = arc_mac::stuffit_lzw::decompress_unix_z_to(
+                    &mut self.region(f.start, f.len)?,
+                    &mut head,
+                )
+                .map(|_| is_tar_header(&head.0))
+                .unwrap_or(false);
                 if tar {
                     self.files[i].kind = TapeFileKind::CompressedTar;
                 }
@@ -294,6 +374,15 @@ impl<R: Read + Seek + Send> TapeFilesystem<R> {
             self.files[i].name = name;
         }
         Ok(())
+    }
+
+    /// A reader over `len` bytes of the image at `start`; an image that ends first is an error.
+    fn region(&mut self, start: u64, len: u64) -> Result<Exact<&mut R>, FilesystemError> {
+        self.reader.seek(SeekFrom::Start(self.offset + start))?;
+        Ok(Exact {
+            inner: &mut self.reader,
+            left: len,
+        })
     }
 
     fn read_range(&mut self, start: u64, len: u64) -> Result<Vec<u8>, FilesystemError> {
@@ -329,17 +418,27 @@ impl<R: Read + Seek + Send> TapeFilesystem<R> {
     fn child(&mut self, i: usize) -> Result<&mut Box<dyn Filesystem>, FilesystemError> {
         if !self.opened.contains_key(&i) {
             let f = self.files[i].clone();
-            let raw = self.read_range(f.start, f.len)?;
             let label = Some(f.name.clone());
             let fs: Box<dyn Filesystem> = match f.kind {
-                TapeFileKind::Tar => Box::new(fs_tar::mem_archive::open_tar(raw, label)?),
-                TapeFileKind::CompressedTar => {
-                    let tar = arc_mac::stuffit_lzw::decompress_unix_z(&raw)
-                        .map_err(|e| FilesystemError::Parse(format!("{}: {e}", f.name)))?;
-                    Box::new(fs_tar::mem_archive::open_tar(tar, label)?)
+                TapeFileKind::Tar | TapeFileKind::CompressedTar => {
+                    let mut spool = tempfile::NamedTempFile::new()?;
+                    let mut src = self.region(f.start, f.len)?;
+                    if f.kind == TapeFileKind::CompressedTar {
+                        arc_mac::stuffit_lzw::decompress_unix_z_to(&mut src, spool.as_file_mut())
+                            .map_err(|e| FilesystemError::Parse(format!("{}: {e}", f.name)))?;
+                    } else {
+                        std::io::copy(&mut src, spool.as_file_mut())?;
+                    }
+                    zero_link_sizes(spool.as_file_mut())?;
+                    spool.as_file_mut().flush()?;
+                    let fs = fs_tar::mem_archive::open_path(spool.path(), label)?;
+                    self.spools.push(spool);
+                    Box::new(fs)
                 }
                 TapeFileKind::Ufs => {
-                    Box::new(fs_unix::ufs::UfsFilesystem::open(Cursor::new(raw), 0)?)
+                    let mut spool = tempfile::tempfile()?;
+                    std::io::copy(&mut self.region(f.start, f.len)?, &mut spool)?;
+                    Box::new(fs_unix::ufs::UfsFilesystem::open(spool, 0)?)
                 }
                 _ => return Err(FilesystemError::NotADirectory(f.name)),
             };
@@ -436,9 +535,7 @@ impl<R: Read + Seek + Send> Filesystem for TapeFilesystem<R> {
             .ok_or_else(|| FilesystemError::NotFound(entry.path.clone()))?;
         if inner == "/" {
             let f = self.files[i].clone();
-            let data = self.read_range(f.start, f.len)?;
-            writer.write_all(&data)?;
-            return Ok(f.len);
+            return Ok(std::io::copy(&mut self.region(f.start, f.len)?, writer)?);
         }
         let mut e = entry.clone();
         e.path = inner;
@@ -469,6 +566,7 @@ impl<R: Read + Seek + Send> Filesystem for TapeFilesystem<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn tar_member(name: &str, body: &[u8]) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
@@ -502,6 +600,49 @@ mod tests {
         }
         img.extend_from_slice(&body);
         img
+    }
+
+    #[test]
+    fn a_tape_file_cut_short_by_the_image_end_is_an_error() {
+        // One 20 KB text file (past the 16 KB probe), its last 1000 bytes missing from the image.
+        let mut img = vec![0u8; 512];
+        img[0..8].copy_from_slice(MAGIC);
+        img[8..12].copy_from_slice(&1u32.to_be_bytes());
+        img[12..16].copy_from_slice(&1u32.to_be_bytes());
+        img[16..20].copy_from_slice(&1u32.to_be_bytes());
+        img[20..24].copy_from_slice(&1u32.to_be_bytes());
+        img[24..28].copy_from_slice(&(1u32 + 40).to_be_bytes());
+        img.extend(std::iter::repeat(b'x').take(40 * 512 - 1000));
+        let mut fs = TapeFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().unwrap();
+        let text = fs.list_directory(&root).unwrap().remove(0);
+        let mut out = Vec::new();
+        assert!(fs.write_file_to(&text, &mut out).is_err());
+    }
+
+    #[test]
+    fn a_sunos_hard_link_size_is_zeroed_in_a_spooled_tar() {
+        // SunOS writes a link's target size with no data; the next block is the next header.
+        let mut tar = tar_member("a", b"data");
+        let mut link = tar::Header::new_old();
+        link.set_path("b").unwrap();
+        link.set_entry_type(tar::EntryType::Link);
+        link.set_link_name("a").unwrap();
+        link.set_size(4);
+        link.set_cksum();
+        let end = tar.len() - 1024;
+        tar.truncate(end);
+        tar.extend_from_slice(link.as_bytes());
+        tar.extend_from_slice(&tar_member("c", b"more"));
+        let mut f = tempfile::tempfile().unwrap();
+        f.write_all(&tar).unwrap();
+        zero_link_sizes(&mut f).unwrap();
+        let mut back = Vec::new();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.read_to_end(&mut back).unwrap();
+        let h = &back[end..end + 512];
+        assert_eq!(&h[124..135], b"00000000000");
+        assert!(is_tar_header(h), "checksum restamped");
     }
 
     #[test]

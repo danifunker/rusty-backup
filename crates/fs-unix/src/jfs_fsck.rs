@@ -1,5 +1,5 @@
 //! JFS2 integrity verifier. Mirrors `ufs_fsck.rs` / `efs_fsck.rs` in
-//! shape (Builder + ordered passes) but adapts every check for JFS's
+//! shape (FsckBuilder + ordered passes) but adapts every check for JFS's
 //! AIT + IAG + BMAP layout:
 //!
 //!   1. Superblock geometry sanity (version, bsize, pbsize, state — the
@@ -43,7 +43,7 @@ use crate::jfs::{
     FILESYSTEM_I, INOSPEREXT, LOG_I, PSIZE,
 };
 use disk_core::filesystem::FilesystemError;
-use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry, RepairReport};
+use disk_core::fsck::{FsckBuilder, FsckResult, OrphanedEntry, RepairReport};
 
 /// FsckIssue codes that a future JFS `repair()` would handle. Driving
 /// the flag on each issue lets the GUI grey out "Repair" when nothing
@@ -52,63 +52,11 @@ fn is_repairable_code(code: &str) -> bool {
     matches!(code, "OrphanInode")
 }
 
-struct Builder {
-    errors: Vec<FsckIssue>,
-    warnings: Vec<FsckIssue>,
-    files_checked: u32,
-    dirs_checked: u32,
-    extra: Vec<(String, String)>,
-    orphaned: Vec<OrphanedEntry>,
-}
-
-impl Builder {
-    fn new() -> Self {
-        Self {
-            errors: Vec::new(),
-            warnings: Vec::new(),
-            files_checked: 0,
-            dirs_checked: 0,
-            extra: Vec::new(),
-            orphaned: Vec::new(),
-        }
-    }
-    fn err(&mut self, code: &str, msg: String) {
-        self.errors.push(FsckIssue {
-            code: code.into(),
-            message: msg,
-            repairable: is_repairable_code(code),
-            debug: false,
-        });
-    }
-    fn warn(&mut self, code: &str, msg: String) {
-        self.warnings.push(FsckIssue {
-            code: code.into(),
-            message: msg,
-            repairable: false,
-            debug: false,
-        });
-    }
-    fn finish(self) -> FsckResult {
-        let repairable = self.errors.iter().any(|e| e.repairable);
-        FsckResult {
-            errors: self.errors,
-            warnings: self.warnings,
-            stats: FsckStats {
-                files_checked: self.files_checked,
-                directories_checked: self.dirs_checked,
-                extra: self.extra,
-            },
-            repairable,
-            orphaned_entries: self.orphaned,
-        }
-    }
-}
-
 /// Run the verifier.
 pub fn fsck_jfs<R: Read + Seek + Send>(
     fs: &mut JfsFilesystem<R>,
 ) -> Result<FsckResult, FilesystemError> {
-    let mut b = Builder::new();
+    let mut b = FsckBuilder::new(is_repairable_code);
 
     // ----- 1. Geometry re-validation -----
     check_geometry(fs, &mut b);
@@ -194,7 +142,7 @@ pub fn fsck_jfs<R: Read + Seek + Send>(
 /// out-of-band after open or a state field that flipped to non-clean
 /// since mount (the open path already refuses non-clean state — this is
 /// belt-and-suspenders for tampering after open).
-fn check_geometry<R: Read + Seek + Send>(fs: &mut JfsFilesystem<R>, b: &mut Builder) {
+fn check_geometry<R: Read + Seek + Send>(fs: &mut JfsFilesystem<R>, b: &mut FsckBuilder) {
     let version = fs.version();
     if !(1..=2).contains(&version) {
         b.err("BadVersion", format!("s_version {version} outside [1, 2]"));
@@ -219,7 +167,7 @@ fn check_geometry<R: Read + Seek + Send>(fs: &mut JfsFilesystem<R>, b: &mut Buil
 /// failures are diagnostic-only (we want the rest of the fsck to keep
 /// running). The kernel-reserved high slots 5..15 are normally
 /// `mode==0` and not used by the filesystem; that's fine.
-fn check_ait<R: Read + Seek + Send>(fs: &mut JfsFilesystem<R>, b: &mut Builder) {
+fn check_ait<R: Read + Seek + Send>(fs: &mut JfsFilesystem<R>, b: &mut FsckBuilder) {
     let role = |inum: u32| -> Option<&'static str> {
         match inum {
             AGGREGATE_I => Some("AGGREGATE_I"),
@@ -267,7 +215,7 @@ fn check_ait<R: Read + Seek + Send>(fs: &mut JfsFilesystem<R>, b: &mut Builder) 
 /// allocated fileset inums (pmap bit == 1) as it goes.
 fn check_iags<R: Read + Seek + Send>(
     fs: &mut JfsFilesystem<R>,
-    b: &mut Builder,
+    b: &mut FsckBuilder,
 ) -> Result<HashSet<u32>, FilesystemError> {
     let fs_ino = fs.read_ait_inode(FILESYSTEM_I)?;
     let logical_pages = fs_ino.size.div_ceil(PSIZE);
@@ -363,7 +311,7 @@ fn check_iags<R: Read + Seek + Send>(
 /// Drive `walk_bmap` for its stats and surface them. Failures during
 /// the BMAP walk are warnings (the fsck stays useful even if the BMAP
 /// is too large for our depth-1 walker).
-fn check_bmap_stats<R: Read + Seek + Send>(fs: &mut JfsFilesystem<R>, b: &mut Builder) {
+fn check_bmap_stats<R: Read + Seek + Send>(fs: &mut JfsFilesystem<R>, b: &mut FsckBuilder) {
     match fs.require_bmap_walk() {
         Ok(walk) => {
             b.extra
@@ -403,7 +351,7 @@ fn check_bmap_stats<R: Read + Seek + Send>(fs: &mut JfsFilesystem<R>, b: &mut Bu
 /// alike; the flag is false when some directory could not be read.
 fn check_connectivity<R: Read + Seek + Send>(
     fs: &mut JfsFilesystem<R>,
-    b: &mut Builder,
+    b: &mut FsckBuilder,
 ) -> (HashSet<u32>, bool) {
     let mut walked_all = true;
     let mut reached: HashSet<u32> = HashSet::new();

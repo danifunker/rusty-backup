@@ -32,7 +32,7 @@ use super::types::{
 };
 use super::{read_at_aligned, XfsFilesystem};
 use disk_core::filesystem::{Filesystem, FilesystemError};
-use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
+use disk_core::fsck::{FsckBuilder, FsckResult, OrphanedEntry};
 
 /// FsckIssue codes the XFS repair path knows how to fix.
 ///
@@ -50,61 +50,39 @@ fn is_repairable_code(code: &str) -> bool {
     )
 }
 
-/// Accumulates findings; keeps the per-check code focused.
-struct Builder {
-    errors: Vec<FsckIssue>,
-    warnings: Vec<FsckIssue>,
-    files_checked: u32,
-    dirs_checked: u32,
-    extra: Vec<(String, String)>,
-    orphaned: Vec<OrphanedEntry>,
+/// The shape of a short-form side tree whose blocks fsck only has to claim.
+#[derive(Clone, Copy)]
+struct SideTree {
+    /// Leaf magics for v4 and v5 (a v5-only tree repeats its v5 magic).
+    magics: [u32; 2],
+    rec_size: usize,
+    key_size: usize,
 }
 
-impl Builder {
-    fn new() -> Self {
-        Self {
-            errors: Vec::new(),
-            warnings: Vec::new(),
-            files_checked: 0,
-            dirs_checked: 0,
-            extra: Vec::new(),
-            orphaned: Vec::new(),
-        }
-    }
-    fn err(&mut self, code: &str, msg: String) {
-        self.errors.push(FsckIssue {
-            code: code.into(),
-            message: msg,
-            repairable: is_repairable_code(code),
-            debug: false,
-        });
-    }
-    fn warn(&mut self, code: &str, msg: String) {
-        self.warnings.push(FsckIssue {
-            code: code.into(),
-            message: msg,
-            repairable: false,
-            debug: false,
-        });
-    }
-    fn stat(&mut self, label: &str, value: String) {
-        self.extra.push((label.into(), value));
-    }
-    fn finish(self) -> FsckResult {
-        let repairable = self.errors.iter().any(|e| e.repairable);
-        FsckResult {
-            errors: self.errors,
-            warnings: self.warnings,
-            stats: FsckStats {
-                files_checked: self.files_checked,
-                directories_checked: self.dirs_checked,
-                extra: self.extra,
-            },
-            repairable,
-            orphaned_entries: self.orphaned,
-        }
-    }
-}
+/// Free space by count: the bnobt's 8-byte records and keys.
+const CNTBT: SideTree = SideTree {
+    magics: [XFS_ABTC_MAGIC, XFS_ABTC_CRC_MAGIC],
+    rec_size: 8,
+    key_size: 8,
+};
+/// Free inodes (v5 only): the inobt's 16-byte records, 4-byte keys.
+const FINOBT: SideTree = SideTree {
+    magics: [XFS_FIBT_CRC_MAGIC, XFS_FIBT_CRC_MAGIC],
+    rec_size: 16,
+    key_size: 4,
+};
+/// Reverse mapping: start 4 + count 4 + owner 8 + offset 8; keys start + owner + offset.
+const RMAPBT: SideTree = SideTree {
+    magics: [XFS_RMAP_CRC_MAGIC, XFS_RMAP_CRC_MAGIC],
+    rec_size: 24,
+    key_size: 20,
+};
+/// Reflink refcounts: start 4 + count 4 + refcount 4; keys start only.
+const REFCOUNTBT: SideTree = SideTree {
+    magics: [XFS_REFC_CRC_MAGIC, XFS_REFC_CRC_MAGIC],
+    rec_size: 12,
+    key_size: 4,
+};
 
 /// Per-AG header summary captured in Phase 1 and reused by Phase 2.
 struct AgHeaders {
@@ -136,7 +114,7 @@ struct AgHeaders {
 impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// Run the XFS verifier and return a shared `FsckResult`.
     pub(crate) fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
-        let mut b = Builder::new();
+        let mut b = FsckBuilder::new(is_repairable_code);
         let sb = self.superblock().clone();
 
         // Like xfs_repair, judge nothing else while the log holds changes the volume lacks.
@@ -182,7 +160,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// where "sector" is `sb_sectsize`. We read the first four sectors of
     /// each AG in one aligned read and validate them against the primary.
     /// Returns per-AG info Phase 2 needs (inobt roots, AG lengths).
-    fn check_ag_headers(&mut self, sb: &XfsSuperblock, b: &mut Builder) -> Vec<AgHeaders> {
+    fn check_ag_headers(&mut self, sb: &XfsSuperblock, b: &mut FsckBuilder) -> Vec<AgHeaders> {
         let agcount = sb.agcount as u64;
         let agblocks = sb.agblocks as u64;
         let blocksize = sb.blocksize as u64;
@@ -360,7 +338,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         &mut self,
         sb: &XfsSuperblock,
         ags: &[AgHeaders],
-        b: &mut Builder,
+        b: &mut FsckBuilder,
     ) -> HashSet<u64> {
         let mut allocated: HashSet<u64> = HashSet::new();
 
@@ -408,7 +386,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             // it only to mark its blocks (records mirror the bnobt).
             if let Some(cnt_root) = ag.agf_cnt_root {
                 if let Err(e) =
-                    self.mark_cntbt_blocks(sb, agno, cnt_root, ag.expected_len, &mut map)
+                    self.mark_tree_blocks(sb, agno, cnt_root, ag.expected_len, CNTBT, &mut map)
                 {
                     b.err("CntBtreeWalkFailed", format!("AG {agno} cnt btree: {e}"));
                 }
@@ -429,7 +407,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             // FINOBT — free-inode btree (v5 + FEAT_RO_FINOBT).
             if let Some(finobt_root) = ag.agi_free_root {
                 if let Err(e) =
-                    self.mark_finobt_blocks(sb, agno, finobt_root, ag.expected_len, &mut map)
+                    self.mark_tree_blocks(sb, agno, finobt_root, ag.expected_len, FINOBT, &mut map)
                 {
                     b.err(
                         "FinobtWalkFailed",
@@ -440,7 +418,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             // RMAPBT — reverse-mapping btree (v5 + FEAT_RO_RMAPBT).
             if let Some(rmap_root) = ag.agf_rmap_root {
                 if let Err(e) =
-                    self.mark_rmapbt_blocks(sb, agno, rmap_root, ag.expected_len, &mut map)
+                    self.mark_tree_blocks(sb, agno, rmap_root, ag.expected_len, RMAPBT, &mut map)
                 {
                     b.err(
                         "RmapBtreeWalkFailed",
@@ -450,9 +428,14 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             }
             // REFCOUNTBT — reflink refcount btree (v5 + FEAT_RO_REFLINK).
             if let Some(refc_root) = ag.agf_refcount_root {
-                if let Err(e) =
-                    self.mark_refcountbt_blocks(sb, agno, refc_root, ag.expected_len, &mut map)
-                {
+                if let Err(e) = self.mark_tree_blocks(
+                    sb,
+                    agno,
+                    refc_root,
+                    ag.expected_len,
+                    REFCOUNTBT,
+                    &mut map,
+                ) {
                     b.err(
                         "RefcountBtreeWalkFailed",
                         format!("AG {agno} refcount btree: {e}"),
@@ -567,14 +550,15 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         allocated
     }
 
-    /// Walk the free-space-by-count (cntbt) btree only to mark its blocks as
-    /// metadata; the records duplicate the bnobt so we ignore them.
-    fn mark_cntbt_blocks(
+    /// Walk a short-form side tree only to mark its blocks as metadata; its records are
+    /// skipped (the cntbt's duplicate the bnobt, and the rest only need their blocks claimed).
+    fn mark_tree_blocks(
         &mut self,
         sb: &XfsSuperblock,
         agno: u64,
         root_agbno: u32,
         expected_len: u64,
+        tree: SideTree,
         map: &mut OwnerMap,
     ) -> Result<(), FilesystemError> {
         self.walk_sblock_btree(
@@ -582,96 +566,9 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             agno,
             root_agbno,
             expected_len,
-            [XFS_ABTC_MAGIC, XFS_ABTC_CRC_MAGIC],
-            8,
-            8,
-            |_| {},
-            |linear| {
-                map.mark(linear, S_INUSE_FS);
-            },
-        )
-    }
-
-    /// Walk the free-inode btree (finobt) and mark its tree blocks. The
-    /// record + key shapes are identical to the inobt's
-    /// `xfs_inobt_rec` (rec_size=16, key_size=4), so the generic
-    /// `walk_sblock_btree` handles it with just the magic swapped to
-    /// `XFS_FIBT_CRC_MAGIC`. finobt is v5-only; the v4 entry of the
-    /// magic-list array uses the v5 magic again (no v4 finobt exists)
-    /// so the leaf-magic check still functions.
-    fn mark_finobt_blocks(
-        &mut self,
-        sb: &XfsSuperblock,
-        agno: u64,
-        root_agbno: u32,
-        expected_len: u64,
-        map: &mut OwnerMap,
-    ) -> Result<(), FilesystemError> {
-        self.walk_sblock_btree(
-            sb,
-            agno,
-            root_agbno,
-            expected_len,
-            [XFS_FIBT_CRC_MAGIC, XFS_FIBT_CRC_MAGIC],
-            16,
-            4,
-            |_| {},
-            |linear| {
-                map.mark(linear, S_INUSE_FS);
-            },
-        )
-    }
-
-    /// Walk the reverse-mapping btree (rmapbt) and mark its tree blocks.
-    /// rmapbt records are 24 bytes (startblock 4 + blockcount 4 +
-    /// owner 8 + offset/flags 8) with 20-byte keys (startblock 4 +
-    /// owner 8 + offset 8). The records themselves are skipped — we
-    /// only care about marking the tree's own blocks for the
-    /// completeness map.
-    fn mark_rmapbt_blocks(
-        &mut self,
-        sb: &XfsSuperblock,
-        agno: u64,
-        root_agbno: u32,
-        expected_len: u64,
-        map: &mut OwnerMap,
-    ) -> Result<(), FilesystemError> {
-        self.walk_sblock_btree(
-            sb,
-            agno,
-            root_agbno,
-            expected_len,
-            [XFS_RMAP_CRC_MAGIC, XFS_RMAP_CRC_MAGIC],
-            24,
-            20,
-            |_| {},
-            |linear| {
-                map.mark(linear, S_INUSE_FS);
-            },
-        )
-    }
-
-    /// Walk the reflink refcount btree (refcountbt) and mark its tree
-    /// blocks. Records are 12 bytes (startblock 4 + blockcount 4 +
-    /// refcount 4) with 4-byte keys (startblock only). Records
-    /// themselves are skipped — only the blocks matter for the
-    /// completeness map.
-    fn mark_refcountbt_blocks(
-        &mut self,
-        sb: &XfsSuperblock,
-        agno: u64,
-        root_agbno: u32,
-        expected_len: u64,
-        map: &mut OwnerMap,
-    ) -> Result<(), FilesystemError> {
-        self.walk_sblock_btree(
-            sb,
-            agno,
-            root_agbno,
-            expected_len,
-            [XFS_REFC_CRC_MAGIC, XFS_REFC_CRC_MAGIC],
-            12,
-            4,
+            tree.magics,
+            tree.rec_size,
+            tree.key_size,
             |_| {},
             |linear| {
                 map.mark(linear, S_INUSE_FS);
@@ -690,7 +587,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         flfirst: u32,
         flcount: u32,
         map: &mut OwnerMap,
-        b: &mut Builder,
+        b: &mut FsckBuilder,
     ) {
         if flcount == 0 {
             return;
@@ -725,7 +622,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// reachable inode. Any allocated inode not reached is an orphan
     /// (repairable: R7 will reconnect it into lost+found). Directory entries
     /// pointing at inodes the inobt didn't mark allocated are dangling.
-    fn check_connectivity(&mut self, allocated: &HashSet<u64>, b: &mut Builder) {
+    fn check_connectivity(&mut self, allocated: &HashSet<u64>, b: &mut FsckBuilder) {
         if allocated.is_empty() {
             // Phase 2 was skipped or found nothing; orphan analysis needs the
             // allocated set, so there's nothing to compare against.
@@ -809,7 +706,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         sb: &XfsSuperblock,
         ino: u64,
         map: &mut OwnerMap,
-        b: &mut Builder,
+        b: &mut FsckBuilder,
     ) {
         let (core, inode_buf) = match self.read_inode_buf(ino) {
             Ok(v) => v,
@@ -881,7 +778,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         startblock: u64,
         count: u64,
         map: &mut OwnerMap,
-        b: &mut Builder,
+        b: &mut FsckBuilder,
     ) {
         let agblocks = sb.agblocks as u64;
         let agmask = (1u64 << sb.agblklog) - 1;
@@ -1186,7 +1083,7 @@ impl OwnerMap {
 /// enforced at `XfsSuperblock::parse`; we re-affirm the relationships that
 /// matter for the rest of the checker and would make later phases compute
 /// garbage if violated.
-fn check_superblock_geometry(sb: &XfsSuperblock, b: &mut Builder) {
+fn check_superblock_geometry(sb: &XfsSuperblock, b: &mut FsckBuilder) {
     if sb.agcount == 0 {
         b.err("BadAgGeometry", "sb_agcount is 0".into());
         return;
@@ -1253,7 +1150,7 @@ fn check_superblock_geometry(sb: &XfsSuperblock, b: &mut Builder) {
 /// clean mkfs'd v4 volume). Comparing them produced a false-positive
 /// `ReplicaSbMismatch` that `xfs_repair -n` did not report. A geometry
 /// mismatch is repairable: R4 rewrites the copy from the primary.
-fn check_sb_replica(primary: &XfsSuperblock, rep: &XfsSuperblock, agno: u64, b: &mut Builder) {
+fn check_sb_replica(primary: &XfsSuperblock, rep: &XfsSuperblock, agno: u64, b: &mut FsckBuilder) {
     let mut report = |field: &str, p: String, r: String| {
         b.err(
             "ReplicaSbMismatch",
@@ -1300,7 +1197,7 @@ fn check_sb_replica(primary: &XfsSuperblock, rep: &XfsSuperblock, agno: u64, b: 
 /// AGF structural + bounds sanity. The free-block *count* is only fully
 /// verifiable against a btree walk (Phase 2); here we bound-check it and the
 /// btree roots against the AG size.
-fn check_agf(agf: &XfsAgf, agno: u64, expected_len: u64, b: &mut Builder) {
+fn check_agf(agf: &XfsAgf, agno: u64, expected_len: u64, b: &mut FsckBuilder) {
     if agf.seqno as u64 != agno {
         b.err(
             "AgfSeqnoMismatch",
@@ -1336,7 +1233,7 @@ fn check_agf(agf: &XfsAgf, agno: u64, expected_len: u64, b: &mut Builder) {
 }
 
 /// AGI structural + bounds sanity.
-fn check_agi(agi: &XfsAgi, agno: u64, expected_len: u64, b: &mut Builder) {
+fn check_agi(agi: &XfsAgi, agno: u64, expected_len: u64, b: &mut FsckBuilder) {
     if agi.seqno as u64 != agno {
         b.err(
             "AgiSeqnoMismatch",

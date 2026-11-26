@@ -37,7 +37,7 @@ use crate::efs::{
     EfsSuperblock, EFS_BLOCKSIZE, EFS_DIRECTEXTENTS_MAX,
 };
 use disk_core::filesystem::FilesystemError;
-use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
+use disk_core::fsck::{FsckBuilder, FsckResult, OrphanedEntry};
 
 /// FsckIssue codes that the EFS `repair()` path knows how to fix.
 /// Issues with codes outside this set are emitted with `repairable =
@@ -59,62 +59,8 @@ fn is_repairable_code(code: &str) -> bool {
     )
 }
 
-/// Wraps the boilerplate of building a `FsckResult` so the
-/// per-check closures stay focused on findings.
-struct Builder {
-    errors: Vec<FsckIssue>,
-    warnings: Vec<FsckIssue>,
-    files_checked: u32,
-    dirs_checked: u32,
-    extra: Vec<(String, String)>,
-    orphaned: Vec<OrphanedEntry>,
-}
-
-impl Builder {
-    fn new() -> Self {
-        Self {
-            errors: Vec::new(),
-            warnings: Vec::new(),
-            files_checked: 0,
-            dirs_checked: 0,
-            extra: Vec::new(),
-            orphaned: Vec::new(),
-        }
-    }
-    fn err(&mut self, code: &str, msg: String) {
-        self.errors.push(FsckIssue {
-            code: code.into(),
-            message: msg,
-            repairable: is_repairable_code(code),
-            debug: false,
-        });
-    }
-    fn warn(&mut self, code: &str, msg: String) {
-        self.warnings.push(FsckIssue {
-            code: code.into(),
-            message: msg,
-            repairable: false,
-            debug: false,
-        });
-    }
-    fn finish(self) -> FsckResult {
-        let repairable = self.errors.iter().any(|e| e.repairable);
-        FsckResult {
-            errors: self.errors,
-            warnings: self.warnings,
-            stats: FsckStats {
-                files_checked: self.files_checked,
-                directories_checked: self.dirs_checked,
-                extra: self.extra,
-            },
-            repairable,
-            orphaned_entries: self.orphaned,
-        }
-    }
-}
-
 fn walk_extent(
-    b: &mut Builder,
+    b: &mut FsckBuilder,
     allocated: &mut HashSet<u32>,
     sb: &EfsSuperblock,
     inum: u32,
@@ -168,7 +114,7 @@ fn walk_extent(
 /// `R: Read + Write + Seek + Send` works fine here because all
 /// methods used are inherited from the read-only impl.
 pub fn fsck_efs<R: Read + Seek>(fs: &mut EfsFilesystem<R>) -> Result<FsckResult, FilesystemError> {
-    let mut b = Builder::new();
+    let mut b = FsckBuilder::new(is_repairable_code);
     let sb = fs.sb_clone();
 
     // --- Step 1: superblock geometry ---
@@ -286,7 +232,7 @@ pub fn fsck_efs<R: Read + Seek>(fs: &mut EfsFilesystem<R>) -> Result<FsckResult,
 /// repair pass can adopt them.
 fn check_connectivity<R: Read + Seek>(
     fs: &mut EfsFilesystem<R>,
-    b: &mut Builder,
+    b: &mut FsckBuilder,
 ) -> Result<(), FilesystemError> {
     use std::collections::VecDeque;
     let mut reached: HashSet<u32> = HashSet::new();
@@ -354,7 +300,7 @@ fn check_connectivity<R: Read + Seek>(
     Ok(())
 }
 
-fn check_geometry(sb: &EfsSuperblock, b: &mut Builder) {
+fn check_geometry(sb: &EfsSuperblock, b: &mut FsckBuilder) {
     if sb.fs_size == 0 {
         b.err("ZeroFsSize", "fs_size is zero".into());
     }
@@ -392,7 +338,7 @@ fn check_geometry(sb: &EfsSuperblock, b: &mut Builder) {
 fn check_replica<R: Read + Seek>(
     fs: &mut EfsFilesystem<R>,
     primary: &EfsSuperblock,
-    b: &mut Builder,
+    b: &mut FsckBuilder,
 ) -> Result<(), FilesystemError> {
     let replica = fs.read_replica_superblock()?;
     macro_rules! cmp {

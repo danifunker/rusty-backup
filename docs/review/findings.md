@@ -206,8 +206,8 @@ clone / defrag / journal modules. A regression run for 0.1.11 is still owed.
 
 | ID | Sev | Verdict | Where | Finding | Status |
 |---|---|---|---|---|---|
-| PR-001 | S4 | confirmed | [restore_patch.rs:579](../../src/partition/restore_patch.rs#L579) | Two X68k table patchers: `restore_patch::patch_x68k` (slot matching, repack, keeps flags) and `part_tables::x68k::patch_x68k_entries` (used by `src/rbformats/mod.rs`). The crate one lost the flags byte until PT-010. One should go. | deferred (merging the two X68k patchers changes restore behaviour; needs its own change) |
-| PR-002 | S4 | confirmed | [vhd.rs:246](../../src/rbformats/vhd.rs#L246) | `rebuild_vhd_ebr_chain` re-implements `restore::build_restore_ebr_chain` ("same algorithm", says its own comment), with its own silent fallback when the chain can't be rebuilt. | deferred (merging the EBR chain builders needs its own change and a restore regression) |
+| PR-001 | S4 | confirmed | [restore_patch.rs:579](../../src/partition/restore_patch.rs#L579) | Two X68k table patchers: `restore_patch::patch_x68k` (slot matching, repack, keeps flags) and `part_tables::x68k::patch_x68k_entries` (used by `src/rbformats/mod.rs`). The crate one lost the flags byte until PT-010. One should go. | fixed (this branch): restore_patch writes X68k entries through `patch_x68k_entries`; overflow refused, not truncated |
+| PR-002 | S4 | confirmed | [vhd.rs:246](../../src/rbformats/vhd.rs#L246) | `rebuild_vhd_ebr_chain` re-implements `restore::build_restore_ebr_chain` ("same algorithm", says its own comment), with its own silent fallback when the chain can't be rebuilt. | fixed (this branch): `restore::pack_logical_partitions`; an unbuildable chain now stops VHD export too |
 
 ## src/model/convert
 
@@ -261,7 +261,7 @@ magic on v5, skips attribute forks and does not cross-check finobt / rmapbt.
 | XFS-017 | S2 | confirmed | xfs/mod.rs `read_symlink_target` | v5 remote symlinks include the 56-byte XSLM header in the target, and only the first block is read. | fixed (a5dc5563) |
 | XFS-018 | S2 | confirmed | inode.rs | BIGTIME timestamps not decoded: mtimes wrong in listings and tar export. | fixed (a5dc5563) |
 | XFS-019 | S4 | confirmed | repair.rs, edit.rs, freespace_rebuild.rs, inobt_repair.rs, inode_repair.rs, format.rs | Stale docs (mutations "Unsupported", "v4 only", "v5 gate"); public test-only `create_blank_xfs` builds a volume-sized Vec. | fixed (a5dc5563) |
-| XFS-020 | S4 | confirmed | fsck.rs, inobt_repair.rs, v5_crc.rs, edit.rs | Duplicate btree walkers / `mark_*_blocks` / `stamp_*`; each allocation rebuilds the AG's whole bnobt / cntbt; edit.rs is 4,145 lines with five jobs. | deferred (refactor of edit.rs, own change) |
+| XFS-020 | S4 | confirmed | fsck.rs, inobt_repair.rs, v5_crc.rs, edit.rs | Duplicate btree walkers / `mark_*_blocks` / `stamp_*`; each allocation rebuilds the AG's whole bnobt / cntbt; edit.rs is 4,145 lines with five jobs. | fixed (this branch): edit.rs split by job into edit/; one `mark_tree_blocks`. The per-allocation free-space rebuild stays (correct, slow; changing it is not a tidy-up) |
 
 ## crates/fs-amiga
 
@@ -309,11 +309,14 @@ B-tree handling, fsck / repair, clone / defrag / journal, codecs.
 | MAC-013 | S2 | confirmed | fork_export.rs; resource_fork.rs `build_appledouble`, `build_macbinary` | Export drops Finder flags (invisible, custom icon, bundle) in BinHex, MacBinary and AppleDouble. | fixed (b9aecbe2) |
 | MAC-014 | S2 | confirmed | binhex.rs `parse_decoded`; resource_fork.rs `parse_macbinary`; mac_alias.rs | Unchecked `usize` adds of u32 lengths wrap on 32-bit targets and panic. | fixed (b9aecbe2) |
 | MAC-015 | S2 | plausible | hfs.rs `read_fork_data`; lisa.rs `open` | Allocations sized by on-disk u32 fields before checking the stream length. | fixed (b9aecbe2) |
-| MAC-016 | S2 | plausible | hfsplus_wrapper_clone.rs `patch_mdb_in_place` | A wrapper shrink keeps the bad-block extent at the old length, past the new volume end. | deferred (needs a shrunk OS 8.1 wrapper volume to confirm with fsck_hfs) |
+| MAC-016 | S2 | confirmed | hfsplus_wrapper_clone.rs `patch_mdb_in_place` | A wrapper shrink keeps the bad-block extent at the old length, past the new volume end. | fixed (this branch): the wrapper's bad-block run is resized with the volume. Confirmed on a Mac OS 8.1 wrapped volume (QEMU Quadra 800): fsck_hfs and Mac OS 8.1 Disk First Aid pass the shrunk volume |
 | MAC-017 | S3 | confirmed | hfsplus_defrag.rs `emit_progress` | `eprintln!` in library code; thread-local progress sink; no `cancel_check` for whole-volume streams. | fixed (b9aecbe2) |
-| MAC-018 | S3 | confirmed | mfs.rs `create_blank_mfs`; hfv.rs `build_blank_hfv` | Public builders hold the whole volume in RAM, above the 3 MB floppy exception. | deferred (app caps MFS at 800 KB and build_blank_hfv is test-only; streaming builders are their own change) |
-| MAC-019 | S4 | confirmed | hfsplus.rs, hfsplus_defrag.rs, hfs_fsck | Three copies of `catalog_compare`; near-duplicate hardlink creators and fsck pairs. | deferred (refactor, own change) |
+| MAC-018 | S3 | confirmed | mfs.rs `create_blank_mfs`; hfv.rs `build_blank_hfv` | Public builders hold the whole volume in RAM, above the 3 MB floppy exception. | fixed (this branch): `write_blank_mfs_into`, `write_blank_hfv_into`; `rb-cli new --fs mfs` streams |
+| MAC-019 | S4 | confirmed | hfsplus.rs, hfsplus_defrag.rs, hfs_fsck | Three copies of `catalog_compare`; near-duplicate hardlink creators and fsck pairs. | fixed (this branch): one `catalog_compare_keys`, shared link-stub writer and link-count adjuster. The classic-HFS catalog and extents checks now share one strict offset-table check (the catalog side let equal offsets through) and the extents checks report the catalog's specific codes; the record-shape checks stay per tree, as the formats differ |
 | MAC-020 | S4 | confirmed | mfs.rs, mac_roman.rs, mac_alias.rs, CLAUDE.md | Docs that no longer match (MFS "extract-only", name-length doc, map offset, GPL note, HFV limit 2047 vs 4063 MB); mac_alias shows Mac Roman as `?`. | fixed (b9aecbe2) |
+| MAC-021 | S2 | confirmed | hfsplus_defrag.rs `plan_defrag_layout`, `build_target_metadata` | Defrag clone of a volume with 512 B or 1 KiB blocks (Mac OS 8.1's choice for small volumes) panicked: the volume header was assumed to fit block 0, and a small source's B-trees could be under three of the target's 4 KiB nodes. Found on the real 8.1 volume. | fixed (this branch) |
+| MAC-022 | S2 | confirmed | hfsplus.rs `build_blank_hfsplus_front` | `rb-cli new volume hfsplus --block-size 512/1024` wrote volumes fsck_hfs rejects ("Invalid B-tree header"): blocks-per-node was inverted, so each 4 KiB node got one block, and the header overlapped the bitmap. | fixed (this branch) |
+| MAC-023 | S1 | confirmed | src/fs/mod.rs APM compaction; src/backup/sizes.rs | A backup of HFS+ inside an HFS wrapper (APM `Apple_HFS`) compacted only the inner volume, so the backup lost the wrapper (and restored without it); shrink-to-minimum was also never offered, as the wrapped minimum was weighed against the inner trim point. | fixed (this branch): the wrapper's head and tail are kept around the compacted volume, never trimmed; the wrapped minimum is computed |
 
 ## crates/dsk-ghost
 
@@ -336,7 +339,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | GHO-013 | S2 | plausible | gho.rs uncompressed multi-partition | Acknowledged-unsupported layout served as one raw stream instead of refused; later partitions shifted. | open: needs an uncompressed **sector-mode** multi-partition sample to detect the layout safely (the compressed sector-mode case is now covered by test_gho_11_sector) |
 | GHO-014 | S2 | confirmed | gho.rs MBR / EBR synthesis, blocked read | Unchecked subtraction of partition geometry (hidden < 63, overlapping or unsorted) panics or yields garbage. | fixed (3612a6a6) |
 | GHO-015 | S3 | confirmed | gho.rs `unsafe impl Send for GhoReader` | Unneeded `unsafe impl Send`. | fixed (fda1fc41) |
-| GHO-016 | S4 | confirmed | gho.rs | Dead / duplicated paths (materialize, emit copies, four zlib loops, three Seek impls; one in-RAM volume emitter); 9,850-line file with six jobs. | deferred (splitting the 9,850-line gho.rs is a refactor of its own) |
+| GHO-016 | S4 | confirmed | gho.rs | Dead / duplicated paths (materialize, emit copies, four zlib loops, three Seek impls; one in-RAM volume emitter); 9,850-line file with six jobs. | fixed (this branch): gho/ split into eleven modules, public API unchanged; two zlib loops share `zlib_decode_block`. The two FAT emitters stay (they differ in what they do) |
 | GHO-017 | S4 | confirmed | gho.rs headers | Stale docs (file-aware "deferred", password "errors", "SECTOR only"). | fixed (2441e66e) |
 | GHO-018 | S3 | confirmed | gho.rs file-aware tree walk / FAT emit | A file-aware image's volume label (BOOT, FAT16, ...) was rebuilt as an empty file instead of the FAT label. | fixed (this branch) |
 
@@ -361,7 +364,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | B8-013 | S2 | confirmed | dragondos.rs `parse_geometry` | Track counts past the bitmap's 3,488 LSNs flip bits in the directory. | fixed (7170f90a) |
 | B8-014 | S3 | confirmed | cbm.rs, qdos.rs, atari_dos.rs, dragondos.rs, rsdos.rs, trdos.rs | Em dash (U+2014) in user-visible error strings. | fixed (d6f2d9b7) |
 | B8-015 | S4 | confirmed | andos.rs, qdos_mdv.rs | Errors point at moved `src/fs/` paths; andos doc says it lists an empty root. | fixed (d6f2d9b7) |
-| B8-016 | S4 | confirmed | rsdos.rs, atari_dos.rs, dragondos.rs, trdos.rs | Byte-identical name codecs and sector I/O helpers. | deferred (shared helpers across four drivers: a refactor of its own) |
+| B8-016 | S4 | confirmed | rsdos.rs, atari_dos.rs, dragondos.rs, trdos.rs | Byte-identical name codecs and sector I/O helpers. | fixed (this branch): `fs-8bit::common` |
 
 ## crates/fs-unix
 
@@ -428,8 +431,8 @@ drivers are merged.
 | UNX-056 | S3 | confirmed | jfs.rs, jfs_fsck.rs | `≥`, `⇒`, `—` in user-visible messages. | fixed (5694446c) |
 | UNX-057 | S3 | confirmed | bfs_write.rs, ofs_write.rs, ofs.rs | Whole-source `read_to_end`; OFS buffers a whole extent. | fixed (58e7a44e) |
 | UNX-058 | S4 | confirmed | bfs_write.rs, minix.rs, vxfs.rs | Each allocation rereads the whole bitmap; VxFS bmap rereads indirects per block. | fixed (this branch): BFS and minix cache their bitmaps (BFS writes back only changed blocks; minix resumes each search past the last zone); VxFS keeps the last indirect extent it read |
-| UNX-059 | S4 | confirmed | efs_fsck.rs, efs_v1_fsck.rs, jfs_fsck.rs, ufs_fsck.rs (+ fs-xfs) | Five copies of the fsck `Builder`; belongs in `disk_core::fsck`. | deferred (moving the fsck Builder into disk_core touches five drivers and fs-xfs) |
-| UNX-060 | S4 | confirmed | ufs.rs, efs.rs | Full 27-field `FileEntry` literals (DC-008 class). | deferred (FileEntry constructors: the DC-008 refactor, across drivers) |
+| UNX-059 | S4 | confirmed | efs_fsck.rs, efs_v1_fsck.rs, jfs_fsck.rs, ufs_fsck.rs (+ fs-xfs) | Five copies of the fsck `Builder`; belongs in `disk_core::fsck`. | fixed (this branch): `disk_core::fsck::FsckBuilder` |
+| UNX-060 | S4 | confirmed | ufs.rs, efs.rs | Full 27-field `FileEntry` literals (DC-008 class). | fixed (this branch): `FileEntry::bare` is public; EFS, UFS, Minix, XFS, HFS, HFS+, ProDOS, NTFS and exFAT fill only their own fields |
 | UNX-061 | S4 | confirmed | lib.rs, ufs.rs, efs_resize.rs, ext_format.rs | Stale docs (ofs GPL note, UFS scope, shrink hard-link claim, batch-builder caller). | fixed (705602dc) |
 
 ## crates/fs-apple2
@@ -456,7 +459,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | AP2-016 | S2 | confirmed | ucsd.rs `create_file` | Block count `as u16` wraps at 32 MiB; slice panics. | fixed (0735476c) |
 | AP2-017 | S3 | confirmed | prodos.rs, apple_dos.rs, ucsd.rs, sector_order.rs | Em dash / multiplication sign in user-visible errors. | fixed (d3e79acf) |
 | AP2-018 | S3 | confirmed | prodos_types.rs `parse_json` | Format crate reads the app config dir; a bad override file is silently ignored. | fixed (d3e79acf) |
-| AP2-019 | S4 | confirmed | apple_dos.rs, prodos.rs | Catalog walk copied 5 times; read_* duplicate write_*_to; fork walkers duplicated. | deferred (one catalog walker for apple_dos / prodos: a refactor of its own) |
+| AP2-019 | S4 | confirmed | apple_dos.rs, prodos.rs | Catalog walk copied 5 times; read_* duplicate write_*_to; fork walkers duplicated. | fixed (this branch): Apple DOS `walk_catalog`; ProDOS `walk_fork_blocks` / `extended_forks`, read_* through write_*_to |
 
 ## crates/fs-xerox
 
@@ -490,7 +493,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | ARC-010 | S3 | confirmed | extract.rs, mar.rs, maczip.rs | Archives held whole in RAM, several copies. | deferred (needs the archive readers to work from a Read + Seek source; a redesign) |
 | ARC-011 | S3 | confirmed | maczip.rs, stuffit5.rs `parse` | Unreadable forks dropped silently; ZIP CRC unchecked; truncated SIT5 unreported. | fixed (6ca2f3b3) |
 | ARC-012 | S2 | plausible | stuffit_arsenic.rs `read_block` | Zero-run counters overflow (panic / spin). | fixed (a6f17e49) |
-| ARC-013 | S4 | confirmed | arsenic, lzah, lzh, detect.rs | Duplicate bit readers / PrefixCode / three CRC-32s; BinHex decoded twice. | deferred (shared bit readers / CRC-32 across five codecs: a refactor of its own) |
+| ARC-013 | S4 | confirmed | arsenic, lzah, lzh, detect.rs | Duplicate bit readers / PrefixCode / three CRC-32s; BinHex decoded twice. | fixed (this branch): shared `BitReaderBE`, `prefix_code`, `crc32`; BinHex decoded once (MAR's CRC is another polynomial) |
 
 ## crates/dsk-apple
 
@@ -578,7 +581,7 @@ Review by a separate agent, 2026-11-21, read-only.
 | FLX-005 | S2 | confirmed | dsk-flux flux/kryoflux.rs `parse_stream` | u32 overflow counter overflows (panic / wrong interval). | fixed (50641b3b) |
 | FLX-006 | S4 | confirmed | dsk-flux mfm_emu.rs, mfm.rs | `crc16` twice; byte helpers duplicate disk_core. | fixed (18396b2a) |
 | IMZ-001 | S2 | confirmed | dsk-imz imz.rs `open_with_password` | Capacity from ZIP header sizes; whole entry in RAM with no cap. | fixed (52f2afa6) |
-| TAP-001 | S3 | confirmed | dsk-tape sun2tape.rs, sun2tape_edit.rs | Tape files read whole into RAM (up to three copies). | deferred (needs tape files streamed from the image; a redesign of the editor) |
+| TAP-001 | S3 | confirmed | dsk-tape sun2tape.rs, sun2tape_edit.rs | Tape files read whole into RAM (up to three copies). | fixed (this branch): tape files spooled to temp files; streaming .Z codec in arc-mac; `TarSection` over file ranges |
 | TAP-002 | S2 | plausible | dsk-tape sun2tape.rs, sun2tape_edit.rs `build_image` | Zero-length tape files dropped on rebuild: later files renumbered. | fixed (fe41fa48) |
 | TAP-003 | S3 | confirmed | dsk-tape tar_section.rs `TarSection::parse` | A leading `./` entry disappears from the rebuilt archive. | fixed (06523f71) |
 

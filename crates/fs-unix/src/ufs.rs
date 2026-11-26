@@ -3712,33 +3712,16 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
             // pull the actual child inum. Simpler: list children and find
             // by name.
             let root_entry = FileEntry {
-                name: "/".into(),
-                path: "/".into(),
-                entry_type: EntryType::Directory,
-                size: 0,
-                location: ROOT_INODE as u64,
-                modified: None,
-                modified_unix: None,
-                type_code: None,
-                creator_code: None,
-                symlink_target: None,
-                special_type: None,
                 mode: Some(root_inode.mode),
                 uid: Some(root_inode.uid),
                 gid: Some(root_inode.gid),
-                resource_fork_size: None,
-                aux_type: None,
-                link_target_cnid: None,
-                amiga_protection: None,
-                amiga_comment: None,
-                amiga_date: None,
-                dos_attributes: None,
-                finder_flags: None,
-                prodos_file_type: None,
-                mac_dates: None,
-                owner_label: None,
-                native_attrs: None,
-                qnx2_attrs: None,
+                ..FileEntry::bare(
+                    "/".into(),
+                    "/".into(),
+                    EntryType::Directory,
+                    0,
+                    ROOT_INODE as u64,
+                )
             };
             let children =
                 (fs as &mut dyn disk_core::filesystem::Filesystem).list_directory(&root_entry)?;
@@ -3754,33 +3737,16 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
         }
         None => {
             let root_entry = FileEntry {
-                name: "/".into(),
-                path: "/".into(),
-                entry_type: EntryType::Directory,
-                size: 0,
-                location: ROOT_INODE as u64,
-                modified: None,
-                modified_unix: None,
-                type_code: None,
-                creator_code: None,
-                symlink_target: None,
-                special_type: None,
                 mode: Some(root_inode.mode),
                 uid: Some(root_inode.uid),
                 gid: Some(root_inode.gid),
-                resource_fork_size: None,
-                aux_type: None,
-                link_target_cnid: None,
-                amiga_protection: None,
-                amiga_comment: None,
-                amiga_date: None,
-                dos_attributes: None,
-                finder_flags: None,
-                prodos_file_type: None,
-                mac_dates: None,
-                owner_label: None,
-                native_attrs: None,
-                qnx2_attrs: None,
+                ..FileEntry::bare(
+                    "/".into(),
+                    "/".into(),
+                    EntryType::Directory,
+                    0,
+                    ROOT_INODE as u64,
+                )
             };
             let lf = fs.create_directory(
                 &root_entry,

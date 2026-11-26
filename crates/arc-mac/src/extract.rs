@@ -69,15 +69,19 @@ pub fn open(path: &Path) -> Result<(Vec<u8>, StuffItArchive)> {
 /// Mac file is synthesized into a single-entry archive so the rest of the
 /// extract / browse path needs no special case.
 pub fn open_bytes(raw: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
-    use super::detect::{detect_mac_archive, MacArchiveKind};
+    use super::detect::{detect_mac_archive, detect_mac_archive_decoded, MacArchiveKind};
 
-    match detect_mac_archive(&raw) {
+    let (kind, mut decoded) = match detect_mac_archive_decoded(&raw) {
+        Some((kind, decoded)) => (Some(kind), decoded),
+        None => (None, None),
+    };
+    match kind {
         Some(MacArchiveKind::BinHexSingleFile) => {
             // BinHex carrying one Mac file with no SIT/SEA inside.
             // Synthesize a single-entry StuffIt archive that points at
             // the decoded forks (method = 0 / store, fork bytes laid
             // out back-to-back in the returned buffer).
-            let bh = binhex::parse_binhex(&raw)?;
+            let bh = take_binhex(&mut decoded, &raw)?;
             if super::tome::is_tome(&bh.data_fork) {
                 return parse_tome(bh.data_fork);
             }
@@ -85,12 +89,12 @@ pub fn open_bytes(raw: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
         }
         Some(MacArchiveKind::BinHexOverSit) | Some(MacArchiveKind::BinHexOverSea) => {
             // Peel the HQX, then parse the inner SIT / SIT5 / SEA.
-            let bh = binhex::parse_binhex(&raw)?;
+            let bh = take_binhex(&mut decoded, &raw)?;
             parse_sit_family(bh.data_fork)
         }
         Some(MacArchiveKind::BinHexOverCompactPro) => {
             // Peel the HQX, then parse the inner Compact Pro archive.
-            let bh = binhex::parse_binhex(&raw)?;
+            let bh = take_binhex(&mut decoded, &raw)?;
             let archive = super::compactpro::parse(&bh.data_fork)?;
             Ok((bh.data_fork, archive))
         }
@@ -185,6 +189,14 @@ fn parse_tome(bytes: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
         damage: Vec::new(),
     };
     Ok((bytes, archive))
+}
+
+/// The BinHex decode detection already did, or a fresh one.
+fn take_binhex(decoded: &mut Option<binhex::BinHexFile>, raw: &[u8]) -> Result<binhex::BinHexFile> {
+    match decoded.take() {
+        Some(bh) => Ok(bh),
+        None => Ok(binhex::parse_binhex(raw)?),
+    }
 }
 
 /// Manufacture a one-entry `StuffItArchive` from a BinHex file that

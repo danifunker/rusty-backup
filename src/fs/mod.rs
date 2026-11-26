@@ -3293,6 +3293,69 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
     }
 }
 
+#[allow(clippy::type_complexity)] // the same shape as compact_partition_reader_by_string
+/// HFS+ inside an HFS wrapper: the wrapper's head and tail (its MDB, B-trees and alternate MDB)
+/// verbatim around the compacted inner volume, so the backup keeps the wrapper (MAC-016).
+fn wrapped_hfsplus_compact_reader<R: Read + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+    inner_offset: u64,
+    partition_size: Option<u64>,
+) -> Result<Option<(Box<dyn Read + Send>, CompactResult)>, String> {
+    let Some(partition_size) = partition_size else {
+        return Ok(None);
+    };
+    let mut head = vec![0u8; (inner_offset - partition_offset) as usize];
+    reader
+        .seek(SeekFrom::Start(partition_offset))
+        .and_then(|_| reader.read_exact(&mut head))
+        .map_err(|e| format!("reading the HFS wrapper ahead of its HFS+ volume: {e}"))?;
+    let info = hfsplus_wrapper_clone::detect_wrapped_hfsplus(
+        &mut reader,
+        partition_offset,
+        partition_size,
+    )
+    .ok_or_else(|| "the HFS wrapper's embedded extent does not fit its partition".to_string())?;
+    let inner_end = info.inner_offset + info.inner_size;
+    let partition_end = partition_offset + partition_size;
+    if inner_end > partition_end {
+        return Err(format!(
+            "wrapped HFS+ volume ends at {inner_end}, past its partition's end {partition_end}"
+        ));
+    }
+    let mut tail = vec![0u8; (partition_end - inner_end) as usize];
+    reader
+        .seek(SeekFrom::Start(inner_end))
+        .and_then(|_| reader.read_exact(&mut tail))
+        .map_err(|e| format!("reading the HFS wrapper after its HFS+ volume: {e}"))?;
+    let extent = info.inner_size;
+    let (compact, info) = CompactHfsPlusReader::new(reader, inner_offset)
+        .map_err(|e| format!("CompactHfsPlusReader::new failed at offset {inner_offset}: {e}"))?;
+    if info.original_size > extent {
+        return Err(format!(
+            "wrapped HFS+ volume ({} bytes) is larger than its embedded extent ({extent})",
+            info.original_size
+        ));
+    }
+    // A volume shorter than its extent is padded, so the tail lands where the wrapper puts it.
+    let pad = extent - info.original_size;
+    let shell = (head.len() + tail.len()) as u64 + pad;
+    Ok(Some((
+        Box::new(
+            std::io::Cursor::new(head)
+                .chain(compact)
+                .chain(std::io::repeat(0).take(pad))
+                .chain(std::io::Cursor::new(tail)),
+        ),
+        CompactResult {
+            original_size: info.original_size + shell,
+            compacted_size: info.compacted_size + shell,
+            data_size: info.data_size + shell,
+            clusters_used: info.clusters_used,
+        },
+    )))
+}
+
 /// Try to create a compacted reader by APM partition type string.
 /// Returns `Ok(None)` when the type is unsupported, `Ok(Some(...))` on success,
 /// and `Err(msg)` when the type is recognised but the reader constructor fails.
@@ -3308,6 +3371,12 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
         "Apple_HFS" | "48465300-0000-11AA-AA11-00306543ECAC" => {
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
             match fs_type {
+                "hfsplus" if hfsplus_offset != partition_offset => wrapped_hfsplus_compact_reader(
+                    reader,
+                    partition_offset,
+                    hfsplus_offset,
+                    partition_size,
+                ),
                 "hfsplus" => {
                     let (compact, info) = CompactHfsPlusReader::new(reader, hfsplus_offset)
                         .map_err(|e| {

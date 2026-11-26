@@ -131,7 +131,13 @@ pub enum EntryType {
 
 impl FileEntry {
     /// An entry with every optional field empty; the constructors fill in what they know.
-    fn bare(name: String, path: String, entry_type: EntryType, size: u64, location: u64) -> Self {
+    pub fn bare(
+        name: String,
+        path: String,
+        entry_type: EntryType,
+        size: u64,
+        location: u64,
+    ) -> Self {
         Self {
             name,
             path,

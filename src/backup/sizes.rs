@@ -89,6 +89,19 @@ pub(super) fn analyze_partitions(
             format!("Attempting compaction for partition-{}...", part.index),
         );
         let part_offset = part.start_lba * 512;
+        // HFS+ inside an HFS wrapper is never trimmed: that would cut off the wrapper's tail. It is
+        // imaged whole (free space zeroed) or shrunk by the wrapper-aware clone (MAC-016).
+        let wrapped = source
+            .open()
+            .ok()
+            .and_then(|clone| {
+                fs_mac::hfsplus_wrapper_clone::detect_wrapped_hfsplus(
+                    &mut BufReader::new(clone),
+                    part_offset,
+                    part.size_bytes,
+                )
+            })
+            .is_some();
         let clone_result = source.open();
         if let Err(ref e) = clone_result {
             log(
@@ -162,7 +175,10 @@ pub(super) fn analyze_partitions(
 
             // Packed: data_size is the tightest possible image.
             // LP: ask the filesystem for last-used-block via effective_partition_size.
-            let minimum = if !is_lp && result.data_size < part.size_bytes {
+            let minimum = if wrapped {
+                // Trimming would cut off the wrapper's alternate MDB; its free space is zeros anyway.
+                None
+            } else if !is_lp && result.data_size < part.size_bytes {
                 Some(result.data_size)
             } else {
                 // Report a failure here rather than swallowing it. For a
@@ -317,6 +333,26 @@ pub(super) fn analyze_partitions(
             };
             sizing.effective_sizes.push(stream);
             sizing.stream_sizes.push(stream);
+        } else if wrapped {
+            // Whole: its free space is zeros, and the wrapper's alternate MDB sits at the end.
+            let defrag = source
+                .open()
+                .ok()
+                .and_then(|clone| {
+                    fs::defragmented_partition_size(
+                        BufReader::new(clone),
+                        part_offset,
+                        part.partition_type_byte,
+                        part.partition_type_string.as_deref(),
+                    )
+                })
+                .filter(|&d| d < part.size_bytes);
+            sizing.effective_sizes.push(part.size_bytes);
+            sizing.stream_sizes.push(part.size_bytes);
+            sizing.compact_sizes.push(None);
+            sizing.minimum_sizes.push(None);
+            sizing.defragmented_min_sizes.push(defrag);
+            sizing.is_layout_preserving_flags.push(false);
         } else {
             // Trim-based fallback.
             let effective = source

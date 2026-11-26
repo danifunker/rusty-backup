@@ -791,9 +791,15 @@ fn format_volume<W: Write + Seek>(
             let len = fs_unix::ofs_write::write_blank_ofs_into(w, 0, size, label)?;
             Ok(done(len, format!("BeOS OFS, volume {label:?}")))
         }
-        FsKind::Mfs => in_ram(w, "MFS", label, || {
-            fs_mac::mfs::create_blank_mfs(size, label).map_err(|e| anyhow!("{e}"))
-        }),
+        FsKind::Mfs => {
+            let len = fs_mac::mfs::write_blank_mfs_into(w, 0, size, label)?;
+            let summary = if label.is_empty() {
+                "MFS".to_string()
+            } else {
+                format!("MFS, volume {label:?}")
+            };
+            Ok(done(len, summary))
+        }
         FsKind::Adfs => in_ram(w, "ADFS E", label, || {
             Ok(fs_adfs::adfs::create_blank_adfs(label))
         }),

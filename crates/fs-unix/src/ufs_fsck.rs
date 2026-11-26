@@ -1,4 +1,4 @@
-//! UFS integrity verifier. Mirrors `efs_fsck.rs` in shape (Builder +
+//! UFS integrity verifier. Mirrors `efs_fsck.rs` in shape (FsckBuilder +
 //! ordered passes) but adapts every check for UFS's per-cylinder-group
 //! layout: each CG owns a header, a SB replica, an inode table, and a
 //! free-fragment bitmap whose "set bit = FREE" convention is the
@@ -44,7 +44,7 @@ use crate::ufs::{
 };
 use crate::unix_common::bitmap::BitmapReader;
 use disk_core::filesystem::FilesystemError;
-use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
+use disk_core::fsck::{FsckBuilder, FsckResult, OrphanedEntry};
 use disk_core::unix_common::inode::{unix_file_type, UnixFileType};
 
 /// FsckIssue codes the future UFS `repair()` path knows how to fix.
@@ -67,63 +67,11 @@ fn is_repairable_code(code: &str) -> bool {
     )
 }
 
-struct Builder {
-    errors: Vec<FsckIssue>,
-    warnings: Vec<FsckIssue>,
-    files_checked: u32,
-    dirs_checked: u32,
-    extra: Vec<(String, String)>,
-    orphaned: Vec<OrphanedEntry>,
-}
-
-impl Builder {
-    fn new() -> Self {
-        Self {
-            errors: Vec::new(),
-            warnings: Vec::new(),
-            files_checked: 0,
-            dirs_checked: 0,
-            extra: Vec::new(),
-            orphaned: Vec::new(),
-        }
-    }
-    fn err(&mut self, code: &str, msg: String) {
-        self.errors.push(FsckIssue {
-            code: code.into(),
-            message: msg,
-            repairable: is_repairable_code(code),
-            debug: false,
-        });
-    }
-    fn warn(&mut self, code: &str, msg: String) {
-        self.warnings.push(FsckIssue {
-            code: code.into(),
-            message: msg,
-            repairable: false,
-            debug: false,
-        });
-    }
-    fn finish(self) -> FsckResult {
-        let repairable = self.errors.iter().any(|e| e.repairable);
-        FsckResult {
-            errors: self.errors,
-            warnings: self.warnings,
-            stats: FsckStats {
-                files_checked: self.files_checked,
-                directories_checked: self.dirs_checked,
-                extra: self.extra,
-            },
-            repairable,
-            orphaned_entries: self.orphaned,
-        }
-    }
-}
-
 /// Run the verifier.
 pub fn fsck_ufs<R: Read + Seek + Send>(
     fs: &mut UfsFilesystem<R>,
 ) -> Result<FsckResult, FilesystemError> {
-    let mut b = Builder::new();
+    let mut b = FsckBuilder::new(is_repairable_code);
 
     // ----- 1. Geometry re-validation -----
     check_geometry(fs, &mut b);
@@ -267,7 +215,7 @@ pub fn fsck_ufs<R: Read + Seek + Send>(
 /// Re-validate the superblock fields the parser also gates on. Catches a
 /// SB that was edited out-of-band after open (`tunefs -L` setting a
 /// label, etc., is fine — those fields aren't checked).
-fn check_geometry<R: Read + Seek + Send>(fs: &mut UfsFilesystem<R>, b: &mut Builder) {
+fn check_geometry<R: Read + Seek + Send>(fs: &mut UfsFilesystem<R>, b: &mut FsckBuilder) {
     let bsize = fs.bsize;
     let fsize = fs.fsize;
     let frag = fs.frag;
@@ -310,7 +258,7 @@ fn check_geometry<R: Read + Seek + Send>(fs: &mut UfsFilesystem<R>, b: &mut Buil
 fn check_cg<R: Read + Seek + Send>(
     fs: &mut UfsFilesystem<R>,
     cg: u32,
-    b: &mut Builder,
+    b: &mut FsckBuilder,
 ) -> Result<(Vec<u8>, u64), FilesystemError> {
     // The bitmap reader doubles as a CG-header validator — it already
     // checks magic + cg_cgx + cg_ndblk + cg_freeoff bounds.
@@ -344,7 +292,7 @@ fn compare_replica<R: Read + Seek + Send>(
     fs: &mut UfsFilesystem<R>,
     cg: u32,
     replica: &[u8],
-    b: &mut Builder,
+    b: &mut FsckBuilder,
 ) {
     let endian = fs.endian_value();
     let version = fs.version();
@@ -485,7 +433,7 @@ fn record_frags(
     label: &str,
     inum: u32,
     total_frags: u64,
-    b: &mut Builder,
+    b: &mut FsckBuilder,
 ) {
     for &f in frags {
         if f == 0 {
@@ -511,7 +459,7 @@ fn record_frags(
 /// (mode != 0) outside the reachable set is reported as `OrphanInode`.
 fn check_connectivity<R: Read + Seek + Send>(
     fs: &mut UfsFilesystem<R>,
-    b: &mut Builder,
+    b: &mut FsckBuilder,
 ) -> Result<(), FilesystemError> {
     let mut reached: HashSet<u32> = HashSet::new();
     reached.insert(ROOT_INODE);

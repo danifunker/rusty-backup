@@ -3249,33 +3249,8 @@ fn build_blank_mdb(
 impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         Ok(FileEntry {
-            name: "/".into(),
-            path: "/".into(),
-            entry_type: EntryType::Directory,
-            size: 0,
-            location: 2, // HFS root directory CNID
-            modified: None,
-            modified_unix: None,
-            type_code: None,
-            creator_code: None,
-            symlink_target: None,
-            special_type: None,
-            mode: None,
-            uid: None,
-            gid: None,
-            resource_fork_size: None,
-            aux_type: None,
-            link_target_cnid: None,
-            amiga_protection: None,
-            amiga_comment: None,
-            amiga_date: None,
-            dos_attributes: None,
-            finder_flags: None,
-            prodos_file_type: None,
-            mac_dates: None,
-            owner_label: None,
-            native_attrs: None,
-            qnx2_attrs: None,
+            // Location 2 is the HFS root directory CNID.
+            ..FileEntry::bare("/".into(), "/".into(), EntryType::Directory, 0, 2)
         })
     }
 

@@ -526,9 +526,7 @@ const HFSPLUS_HARDLINK_DIR_TYPE: &[u8; 4] = b"fdrp";
 /// Magic 4-byte creator code on directory hardlink stubs.
 const HFSPLUS_HARDLINK_DIR_CREATOR: &[u8; 4] = b"MACS";
 
-/// Free-function form of `HfsPlusFilesystem::catalog_compare`, callable
-/// from sibling modules (e.g. `hfsplus_fsck`) that only have the raw
-/// catalog bytes and no `<R>`-typed filesystem instance.
+/// Order two HFS+ catalog keys (`key_len(2) + parent_id(4) + name_len(2) + name(UTF-16BE)`).
 pub(crate) fn catalog_compare_keys(a: &[u8], b: &[u8], case_sensitive: bool) -> Ordering {
     if a.len() < 8 || b.len() < 8 {
         return a.len().cmp(&b.len());
@@ -1428,7 +1426,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         let header = hfs_common::BTreeHeader::read(&self.catalog_data);
         let search_key = Self::build_catalog_key(parent_cnid, "");
         let cs = self.case_sensitive();
-        let cmp = |a: &[u8], b: &[u8]| Self::catalog_compare(a, b, cs);
+        let cmp = |a: &[u8], b: &[u8]| catalog_compare_keys(a, b, cs);
         let (start_leaf, _chain) =
             hfs_common::btree_find_insert_leaf(&self.catalog_data, &header, &search_key, &cmp);
         let mut node_idx = if start_leaf != 0 {
@@ -1859,26 +1857,6 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         self.catalog_header.key_compare_type == KEY_COMPARE_BINARY
     }
 
-    fn catalog_compare(a: &[u8], b: &[u8], case_sensitive: bool) -> Ordering {
-        // Both records start with: key_len(2) + parent_id(4) + name_len(2) + name(UTF-16BE)
-        if a.len() < 8 || b.len() < 8 {
-            return a.len().cmp(&b.len());
-        }
-        let parent_a = BigEndian::read_u32(&a[2..6]);
-        let parent_b = BigEndian::read_u32(&b[2..6]);
-        let name_len_a = BigEndian::read_u16(&a[6..8]) as usize;
-        let name_len_b = BigEndian::read_u16(&b[6..8]) as usize;
-        let name_a: Vec<u16> = a[8..8 + name_len_a.min((a.len() - 8) / 2) * 2]
-            .chunks_exact(2)
-            .map(BigEndian::read_u16)
-            .collect();
-        let name_b: Vec<u16> = b[8..8 + name_len_b.min((b.len() - 8) / 2) * 2]
-            .chunks_exact(2)
-            .map(BigEndian::read_u16)
-            .collect();
-        hfs_common::compare_hfsplus_keys(parent_a, &name_a, parent_b, &name_b, case_sensitive)
-    }
-
     /// Find a catalog record by (parent_cnid, name).
     /// Returns Some((node_idx, rec_idx, absolute_offset_in_catalog_data)) if found.
     /// Scans leaf nodes linearly (correct for all catalog sizes we encounter).
@@ -1912,7 +1890,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                 }
                 let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
                 let key_portion = &rec[..2 + key_len.min(rec.len() - 2)];
-                if Self::catalog_compare(key_portion, search_key, cs) == Ordering::Equal {
+                if catalog_compare_keys(key_portion, search_key, cs) == Ordering::Equal {
                     Some((node_idx, rec_idx, abs_off))
                 } else {
                     None
@@ -2006,7 +1984,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         // DiskFull means the volume itself is full — propagate it.
         let mut grown = false;
         loop {
-            let cmp = |a: &[u8], b: &[u8]| Self::catalog_compare(a, b, cs);
+            let cmp = |a: &[u8], b: &[u8]| catalog_compare_keys(a, b, cs);
             match hfs_common::btree_insert_full(
                 &mut self.catalog_data,
                 key_record,
@@ -2034,7 +2012,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         let node_size = self.catalog_header.node_size as usize;
         let offset = node_idx as usize * node_size;
         let cs = self.case_sensitive();
-        let cmp = |a: &[u8], b: &[u8]| Self::catalog_compare(a, b, cs);
+        let cmp = |a: &[u8], b: &[u8]| catalog_compare_keys(a, b, cs);
         btree_remove_record(
             &mut self.catalog_data[offset..offset + node_size],
             node_size,
@@ -3200,33 +3178,8 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
 impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         Ok(FileEntry {
-            name: "/".into(),
-            path: "/".into(),
-            entry_type: EntryType::Directory,
-            size: 0,
-            location: 2, // HFS+ root directory CNID
-            modified: None,
-            modified_unix: None,
-            type_code: None,
-            creator_code: None,
-            symlink_target: None,
-            special_type: None,
-            mode: None,
-            uid: None,
-            gid: None,
-            resource_fork_size: None,
-            aux_type: None,
-            link_target_cnid: None,
-            amiga_protection: None,
-            amiga_comment: None,
-            amiga_date: None,
-            dos_attributes: None,
-            finder_flags: None,
-            prodos_file_type: None,
-            mac_dates: None,
-            owner_label: None,
-            native_attrs: None,
-            qnx2_attrs: None,
+            // Location 2 is the HFS+ root directory CNID.
+            ..FileEntry::bare("/".into(), "/".into(), EntryType::Directory, 0, 2)
         })
     }
 
@@ -4727,33 +4680,7 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
                     ))
                 })?;
 
-            // Create the stub as an empty file with type/creator overrides.
-            let mut empty: &[u8] = &[];
-            let stub = self.create_file(
-                parent,
-                name,
-                &mut empty,
-                0,
-                &CreateFileOptions {
-                    os_type: Some(*b"hlnk"),
-                    os_creator: Some(*b"hfs+"),
-                    ..Default::default()
-                },
-            )?;
-
-            // Patch bsdInfo.special on the stub to hold the iNodeNum.
-            let parent_cnid = parent.location as u32;
-            let (_, _, abs) = self.find_catalog_record(parent_cnid, name).ok_or_else(|| {
-                FilesystemError::NotFound(format!(
-                    "freshly-created stub '{name}' missing from catalog"
-                ))
-            })?;
-            let key_len = BigEndian::read_u16(&self.catalog_data[abs..abs + 2]) as usize;
-            let mut body = abs + 2 + key_len;
-            if !body.is_multiple_of(2) {
-                body += 1;
-            }
-            BigEndian::write_u32(&mut self.catalog_data[body + 44..body + 48], inode_num);
+            let stub = self.create_link_stub(parent, name, inode_num, *b"hlnk", *b"hfs+")?;
 
             // Bump linkCount on the inode (saturates if it overflows).
             self.adjust_inode_link_count(private_cnid, inode_num, 1)?;
@@ -4832,32 +4759,7 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
                     ))
                 })?;
 
-            let mut empty: &[u8] = &[];
-            let stub = self.create_file(
-                parent,
-                name,
-                &mut empty,
-                0,
-                &CreateFileOptions {
-                    os_type: Some(*b"fdrp"),
-                    os_creator: Some(*b"MACS"),
-                    ..Default::default()
-                },
-            )?;
-
-            // Patch bsdInfo.special on the stub to hold the iNodeNum.
-            let parent_cnid = parent.location as u32;
-            let (_, _, abs) = self.find_catalog_record(parent_cnid, name).ok_or_else(|| {
-                FilesystemError::NotFound(format!(
-                    "freshly-created stub '{name}' missing from catalog"
-                ))
-            })?;
-            let key_len = BigEndian::read_u16(&self.catalog_data[abs..abs + 2]) as usize;
-            let mut body = abs + 2 + key_len;
-            if !body.is_multiple_of(2) {
-                body += 1;
-            }
-            BigEndian::write_u32(&mut self.catalog_data[body + 44..body + 48], inode_num);
+            let stub = self.create_link_stub(parent, name, inode_num, *b"fdrp", *b"MACS")?;
 
             // Bump linkCount on the dir-inode's folder record (lives at
             // body+44..48 of the folder record too — DInfo doesn't overlap).
@@ -4880,37 +4782,80 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         result
     }
 
-    /// Adjust the directory-inode `linkCount` (`bsdInfo.special` u32 — at
-    /// folder-record body offset 32+12 = 44, same as file records) by
-    /// `delta`. Mirrors `adjust_inode_link_count` for file inodes.
+    /// Adjust the directory-inode `linkCount` (`bsdInfo.special`, folder-record body offset 44,
+    /// as in file records) by `delta`.
     fn adjust_dir_inode_link_count(
         &mut self,
         dir_private_cnid: u32,
         inode_num: u32,
         delta: i64,
     ) -> Result<u32, FilesystemError> {
-        let inode_name = format!("dir_{inode_num}");
-        let (_, _, abs_off) = self
-            .find_catalog_record(dir_private_cnid, &inode_name)
+        let name = format!("dir_{inode_num}");
+        let missing = format!("directory inode '{name}' missing from .HFS+ Private Directory Data");
+        self.adjust_link_count(dir_private_cnid, &name, &missing, delta, false)
+    }
+
+    /// Create an empty link stub at `(parent, name)` with FInfo `(os_type, os_creator)` and
+    /// `bsdInfo.special = inode_num`.
+    fn create_link_stub(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        inode_num: u32,
+        os_type: [u8; 4],
+        os_creator: [u8; 4],
+    ) -> Result<FileEntry, FilesystemError> {
+        let mut empty: &[u8] = &[];
+        let options = CreateFileOptions {
+            os_type: Some(os_type),
+            os_creator: Some(os_creator),
+            ..Default::default()
+        };
+        let stub = self.create_file(parent, name, &mut empty, 0, &options)?;
+        let (_, _, abs) = self
+            .find_catalog_record(parent.location as u32, name)
             .ok_or_else(|| {
-                FilesystemError::InvalidData(format!(
-                    "directory inode '{inode_name}' missing from .HFS+ Private Directory Data"
+                FilesystemError::NotFound(format!(
+                    "freshly-created stub '{name}' missing from catalog"
                 ))
             })?;
-        let key_len = BigEndian::read_u16(&self.catalog_data[abs_off..abs_off + 2]) as usize;
-        let mut body_start = abs_off + 2 + key_len;
-        if !body_start.is_multiple_of(2) {
-            body_start += 1;
-        }
+        let body = self.catalog_record_body(abs);
+        BigEndian::write_u32(&mut self.catalog_data[body + 44..body + 48], inode_num);
+        Ok(stub)
+    }
+
+    /// The offset of a catalog record's body: past its key, rounded up to even.
+    fn catalog_record_body(&self, abs: usize) -> usize {
+        let key_len = BigEndian::read_u16(&self.catalog_data[abs..abs + 2]) as usize;
+        let body = abs + 2 + key_len;
+        body + body % 2
+    }
+
+    /// Add `delta` to the `linkCount` (`bsdInfo.special`) of `name` under `private_cnid`,
+    /// stopping at zero, and stamp the record's dates when `stamp`.
+    fn adjust_link_count(
+        &mut self,
+        private_cnid: u32,
+        name: &str,
+        missing: &str,
+        delta: i64,
+        stamp: bool,
+    ) -> Result<u32, FilesystemError> {
+        let (_, _, abs_off) = self
+            .find_catalog_record(private_cnid, name)
+            .ok_or_else(|| FilesystemError::InvalidData(missing.to_string()))?;
+        let body_start = self.catalog_record_body(abs_off);
         let cur = BigEndian::read_u32(&self.catalog_data[body_start + 44..body_start + 48]) as i64;
         let new = (cur + delta).max(0) as u32;
         BigEndian::write_u32(
             &mut self.catalog_data[body_start + 44..body_start + 48],
             new,
         );
+        if stamp {
+            self.stamp_record_dates(body_start, false);
+        }
         Ok(new)
     }
-
     fn create_file_inner(
         &mut self,
         parent: &FileEntry,
@@ -5296,27 +5241,9 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         inode_num: u32,
         delta: i64,
     ) -> Result<u32, FilesystemError> {
-        let inode_name = format!("iNode{inode_num}");
-        let (_, _, abs_off) = self
-            .find_catalog_record(private_cnid, &inode_name)
-            .ok_or_else(|| {
-                FilesystemError::InvalidData(format!(
-                    "hardlink inode '{inode_name}' missing from HFS+ Private Data"
-                ))
-            })?;
-        let key_len = BigEndian::read_u16(&self.catalog_data[abs_off..abs_off + 2]) as usize;
-        let mut body_start = abs_off + 2 + key_len;
-        if !body_start.is_multiple_of(2) {
-            body_start += 1;
-        }
-        let cur = BigEndian::read_u32(&self.catalog_data[body_start + 44..body_start + 48]) as i64;
-        let new = (cur + delta).max(0) as u32;
-        BigEndian::write_u32(
-            &mut self.catalog_data[body_start + 44..body_start + 48],
-            new,
-        );
-        self.stamp_record_dates(body_start, false);
-        Ok(new)
+        let name = format!("iNode{inode_num}");
+        let missing = format!("hardlink inode '{name}' missing from HFS+ Private Data");
+        self.adjust_link_count(private_cnid, &name, &missing, delta, true)
     }
 
     /// Decrement `linkCount` on the inode named `iNode<inode_num>` under the
@@ -5848,9 +5775,8 @@ fn build_blank_hfsplus_front(
     // node_size pinned at 4096 — Apple's default and what every existing
     // helper in this file assumes (compute_record_offsets, etc.).
     let node_size: usize = 4096;
-    let nodes_per_block: u32 = (node_size as u32 / block_size).max(1);
-    let blocks_per_node: u32 = (block_size / node_size as u32).max(1);
-    let _ = nodes_per_block;
+    // A 4 KiB node spans eight 512-byte blocks; blocks larger than a node hold one each.
+    let blocks_per_node: u32 = (node_size as u32 / block_size).max(1);
 
     // Size the catalog B-tree from the volume (docs/hfsplus_btree_growth_plan.md
     // §4c): HFS+ has no grow-on-full path, so a blank that reserved only the
@@ -5885,7 +5811,8 @@ fn build_blank_hfsplus_front(
     let bitmap_bytes = total_blocks.div_ceil(8) as u64;
     let bitmap_blocks = bitmap_bytes.div_ceil(bs) as u32;
 
-    let bitmap_start: u32 = 1;
+    // Boot blocks plus the volume header fill bytes 0..1536: three 512-byte blocks, two 1 KiB.
+    let bitmap_start: u32 = 1536u32.div_ceil(block_size);
     let extents_start: u32 = bitmap_start + bitmap_blocks;
     let catalog_start: u32 = extents_start + extents_btree_blocks;
     let reserved_blocks: u32 = catalog_start + catalog_btree_blocks;
@@ -6681,6 +6608,47 @@ mod tests {
 
     /// Apple stamps kBTBigKeysMask on every HFS+ tree and adds
     /// kBTVariableIndexKeysMask on the catalog and attributes trees; so do we.
+    #[test]
+    fn small_block_blanks_give_each_node_its_whole_size() {
+        // fsck_hfs rejected these ("Invalid B-tree header") when each 4 KiB node got one block.
+        for bs in [512u32, 1024] {
+            let img = create_blank_hfsplus(32 * 1024 * 1024, bs, "Small", false);
+            let vh = &img[1024..1536];
+            assert_eq!(&vh[0..2], b"H+");
+            // Catalog fork (VH 0x110): its logical size must cover every node of the tree.
+            let fork = 0x110;
+            let logical = BigEndian::read_u64(&vh[fork..fork + 8]);
+            let blocks = BigEndian::read_u32(&vh[fork + 12..fork + 16]) as u64;
+            assert_eq!(logical, blocks * bs as u64, "{bs}: catalog fork size");
+            let start = BigEndian::read_u32(&vh[fork + 16..fork + 20]) as usize * bs as usize;
+            let node_size = BigEndian::read_u16(&img[start + 32..start + 34]) as u64;
+            let nodes = BigEndian::read_u32(&img[start + 36..start + 40]) as u64;
+            assert_eq!(
+                nodes * node_size,
+                logical,
+                "{bs}: header's node count vs fork size"
+            );
+            let mut fs = HfsPlusFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+            fs.prepare_for_edit().unwrap();
+            let root = fs.root().unwrap();
+            for i in 0..40 {
+                let body = format!("file {i}");
+                fs.create_file(
+                    &root,
+                    &format!("f{i:02}"),
+                    &mut body.as_bytes(),
+                    body.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap();
+            }
+            fs.sync_metadata().unwrap();
+            assert_eq!(fs.list_directory(&root).unwrap().len(), 40);
+            let res = fs.fsck().unwrap().unwrap();
+            assert!(res.is_clean(), "{bs}-byte blocks: {:?}", res.errors);
+        }
+    }
+
     #[test]
     fn blank_btree_headers_carry_apples_attribute_bits() {
         let img = create_blank_hfsplus(16 * 1024 * 1024, 4096, "Attrs", false);
@@ -7549,7 +7517,7 @@ mod tests {
             .expect("victim listed");
         fs.delete_entry(&root, &victim).unwrap();
 
-        let cmp = |a: &[u8], b: &[u8]| Fs::catalog_compare(a, b, false);
+        let cmp = |a: &[u8], b: &[u8]| catalog_compare_keys(a, b, false);
         let stale = btree_stale_index_keys(
             fs.catalog_data(),
             node_size,
@@ -9249,7 +9217,7 @@ mod tests {
         write_empty_leaf_node(&mut buf[node_size..2 * node_size]);
 
         let kf = BTreeKeyFormat::HFSPLUS_CATALOG;
-        let cmp = |a: &[u8], b: &[u8]| Fs::catalog_compare(a, b, false);
+        let cmp = |a: &[u8], b: &[u8]| catalog_compare_keys(a, b, false);
 
         // ~2500 files in shuffled key order (multiplicative hash is a bijection
         // mod 2^32 — unique names that land mid-leaf, not appended) sprayed
@@ -10160,7 +10128,7 @@ mod tests {
         write_empty_leaf_node(&mut buf[node_size..2 * node_size]);
 
         let kf = BTreeKeyFormat::HFSPLUS_CATALOG;
-        let cmp = |a: &[u8], b: &[u8]| Fs::catalog_compare(a, b, false);
+        let cmp = |a: &[u8], b: &[u8]| catalog_compare_keys(a, b, false);
         const DIRS: u32 = 40;
         const N: u32 = 3000;
         for i in 0..N {

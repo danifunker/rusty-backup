@@ -603,3 +603,57 @@ mod ufs {
         );
     }
 }
+
+/// HFS+ in an HFS wrapper (as Mac OS 8.1 writes it): its compacted image keeps the wrapper's head
+/// and alternate MDB around the inner volume, so a backup restores a wrapped volume (MAC-016).
+#[test]
+fn compacting_a_wrapped_hfsplus_partition_keeps_its_wrapper() {
+    use byteorder::{BigEndian, ByteOrder};
+    use std::io::Read as _;
+    let (inner_size, al, embed_start) = (4u64 * 1024 * 1024, 4096u64, 1u16);
+    let inner = fs_mac::hfsplus::create_blank_hfsplus(inner_size, 4096, "Inner", false);
+    let embed_count = (inner_size / al) as u16;
+    let total = embed_start + embed_count;
+    let al_start = 3 + (total as u64).div_ceil(8).div_ceil(512);
+    let inner_at = al_start * 512 + embed_start as u64 * al;
+    let len = al_start * 512 + total as u64 * al + 1024;
+    let mut img = vec![0u8; len as usize];
+    {
+        let mdb = &mut img[1024..1536];
+        BigEndian::write_u16(&mut mdb[0..2], 0x4244);
+        BigEndian::write_u16(&mut mdb[14..16], 3);
+        BigEndian::write_u16(&mut mdb[18..20], total);
+        BigEndian::write_u32(&mut mdb[20..24], al as u32);
+        BigEndian::write_u16(&mut mdb[28..30], al_start as u16);
+        BigEndian::write_u16(&mut mdb[124..126], 0x482B);
+        BigEndian::write_u16(&mut mdb[126..128], embed_start);
+        BigEndian::write_u16(&mut mdb[128..130], embed_count);
+    }
+    img[inner_at as usize..(inner_at + inner_size) as usize].copy_from_slice(&inner);
+    let alt = len as usize - 1024;
+    let mdb = img[1024..1536].to_vec();
+    img[alt..alt + 512].copy_from_slice(&mdb);
+    // Leftovers in the inner volume's free space must go; the wrapper must not.
+    img[inner_at as usize + 3 * 1024 * 1024] = 0xEE;
+
+    let (mut reader, info) = crate::fs::try_compact_partition_reader_sized(
+        std::io::Cursor::new(img.clone()),
+        0,
+        0,
+        Some("Apple_HFS"),
+        Some(len),
+    )
+    .expect("a wrapped volume compacts");
+    let mut out = Vec::new();
+    reader.read_to_end(&mut out).unwrap();
+    assert_eq!(out.len() as u64, len);
+    assert_eq!(info.original_size, len);
+    assert_eq!(&out[1024..1026], b"BD", "the wrapper MDB leads the image");
+    assert_eq!(out[..inner_at as usize], img[..inner_at as usize]);
+    assert_eq!(out[alt..], img[alt..], "the alternate MDB is kept");
+    assert_eq!(
+        out[inner_at as usize + 3 * 1024 * 1024],
+        0,
+        "free space is zeroed"
+    );
+}

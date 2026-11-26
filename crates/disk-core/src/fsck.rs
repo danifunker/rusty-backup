@@ -79,3 +79,73 @@ pub struct RepairReport {
     /// Number of errors that cannot be repaired (e.g. missing parent directories).
     pub unrepairable_count: usize,
 }
+
+/// Collects a check's issues and counts, then builds its [`FsckResult`].
+#[derive(Debug)]
+pub struct FsckBuilder {
+    pub errors: Vec<FsckIssue>,
+    pub warnings: Vec<FsckIssue>,
+    pub files_checked: u32,
+    pub dirs_checked: u32,
+    pub extra: Vec<(String, String)>,
+    pub orphaned: Vec<OrphanedEntry>,
+    /// Which error codes the filesystem's repair can fix.
+    repairable_code: fn(&str) -> bool,
+}
+
+impl FsckBuilder {
+    /// An empty builder; `repairable_code` says which error codes are repairable.
+    pub fn new(repairable_code: fn(&str) -> bool) -> Self {
+        Self {
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            files_checked: 0,
+            dirs_checked: 0,
+            extra: Vec::new(),
+            orphaned: Vec::new(),
+            repairable_code,
+        }
+    }
+
+    /// Record an error.
+    pub fn err(&mut self, code: &str, msg: String) {
+        let repairable = (self.repairable_code)(code);
+        self.errors.push(FsckIssue {
+            code: code.into(),
+            message: msg,
+            repairable,
+            debug: false,
+        });
+    }
+
+    /// Record a warning (never repairable).
+    pub fn warn(&mut self, code: &str, msg: String) {
+        self.warnings.push(FsckIssue {
+            code: code.into(),
+            message: msg,
+            repairable: false,
+            debug: false,
+        });
+    }
+
+    /// Record a labelled statistic.
+    pub fn stat(&mut self, label: &str, value: String) {
+        self.extra.push((label.into(), value));
+    }
+
+    /// The finished result; repairable when any error is.
+    pub fn finish(self) -> FsckResult {
+        let repairable = self.errors.iter().any(|e| e.repairable);
+        FsckResult {
+            errors: self.errors,
+            warnings: self.warnings,
+            stats: FsckStats {
+                files_checked: self.files_checked,
+                directories_checked: self.dirs_checked,
+                extra: self.extra,
+            },
+            repairable,
+            orphaned_entries: self.orphaned,
+        }
+    }
+}

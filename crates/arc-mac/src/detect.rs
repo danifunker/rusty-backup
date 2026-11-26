@@ -127,22 +127,35 @@ impl MacArchiveKind {
 /// SEA-wrapped). For a multi-MB HQX this is the bulk of the cost.
 /// Non-BinHex inputs are O(small constant) — just magic comparisons.
 pub fn detect_mac_archive(bytes: &[u8]) -> Option<MacArchiveKind> {
+    detect_mac_archive_decoded(bytes).map(|(kind, _)| kind)
+}
+
+/// [`detect_mac_archive`], also handing back the BinHex decode it did so a caller need not
+/// decode the file a second time (ARC-013).
+pub(crate) fn detect_mac_archive_decoded(
+    bytes: &[u8],
+) -> Option<(MacArchiveKind, Option<binhex::BinHexFile>)> {
     // BinHex first. The banner is text so a quick header peek would
     // suffice as a gate, but parse_binhex already searches for it
     // with bounded work; calling it directly keeps one code path.
     if let Ok(bh) = binhex::parse_binhex(bytes) {
         let inner = bh.data_fork.as_slice();
-        if is_stuffit(inner) || is_stuffit5(inner) {
-            return Some(MacArchiveKind::BinHexOverSit);
-        }
-        if is_compactpro(inner) {
-            return Some(MacArchiveKind::BinHexOverCompactPro);
-        }
-        if find_sea_archive(inner).is_some() {
-            return Some(MacArchiveKind::BinHexOverSea);
-        }
-        return Some(MacArchiveKind::BinHexSingleFile);
+        let kind = if is_stuffit(inner) || is_stuffit5(inner) {
+            MacArchiveKind::BinHexOverSit
+        } else if is_compactpro(inner) {
+            MacArchiveKind::BinHexOverCompactPro
+        } else if find_sea_archive(inner).is_some() {
+            MacArchiveKind::BinHexOverSea
+        } else {
+            MacArchiveKind::BinHexSingleFile
+        };
+        return Some((kind, Some(bh)));
     }
+    detect_plain_archive(bytes).map(|kind| (kind, None))
+}
+
+/// The non-BinHex archive shapes, by magic.
+fn detect_plain_archive(bytes: &[u8]) -> Option<MacArchiveKind> {
     // Standalone SIT / SIT5 / SEA. is_stuffitx is checked too so the
     // "looks like StuffIt but is actually StuffIt X" case doesn't
     // falsely match SEA's broader signature scan.

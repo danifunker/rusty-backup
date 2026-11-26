@@ -136,53 +136,13 @@ impl AtariDirEntry {
 
 /// Decode an 11-byte 8.3 name into "NAME.EXT" (trailing spaces stripped).
 fn decode_name(raw: &[u8; 11]) -> String {
-    let name = String::from_utf8_lossy(&raw[0..8]).trim_end().to_string();
-    let ext = String::from_utf8_lossy(&raw[8..11]).trim_end().to_string();
-    if ext.is_empty() {
-        name
-    } else {
-        format!("{name}.{ext}")
-    }
+    crate::common::decode_space_padded_83(raw)
 }
 
 /// Encode "NAME.EXT" into the 11-byte space-padded on-disk form. Atari
 /// names are uppercase ATASCII; the first character must be a letter.
 pub fn encode_name(name: &str) -> Result<[u8; 11], FilesystemError> {
-    let (base, ext) = match name.split_once('.') {
-        Some((b, e)) => (b, e),
-        None => (name, ""),
-    };
-    if base.is_empty() || base.len() > 8 || ext.len() > 3 {
-        return Err(FilesystemError::InvalidData(format!(
-            "Atari filename '{name}' must be 1-8 chars + optional 1-3 char extension"
-        )));
-    }
-    let mut out = [b' '; 11];
-    let put = |slice: &str, dst: &mut [u8]| -> Result<(), FilesystemError> {
-        for (i, c) in slice.chars().enumerate() {
-            if !c.is_ascii() {
-                return Err(FilesystemError::InvalidData(format!(
-                    "Atari filename '{name}' contains non-ASCII character '{c}'"
-                )));
-            }
-            let b = (c as u8).to_ascii_uppercase();
-            if !b.is_ascii_uppercase() && !b.is_ascii_digit() {
-                return Err(FilesystemError::InvalidData(format!(
-                    "Atari filename '{name}' char '{c}' must be A-Z or 0-9"
-                )));
-            }
-            dst[i] = b;
-        }
-        Ok(())
-    };
-    put(base, &mut out[0..8])?;
-    put(ext, &mut out[8..11])?;
-    if !out[0].is_ascii_uppercase() {
-        return Err(FilesystemError::InvalidData(format!(
-            "Atari filename '{name}' must start with a letter"
-        )));
-    }
-    Ok(out)
+    crate::common::encode_alnum_83(name, "Atari")
 }
 
 /// Sniff whether the flat body at `partition_offset` is an Atari DOS 2

@@ -25,11 +25,13 @@
 
 pub mod bitreader_be;
 pub mod compactpro;
+mod crc32;
 pub mod detect;
 pub mod extract;
 pub mod macbinary;
 pub mod maczip;
 pub mod mar;
+mod prefix_code;
 pub mod shrinkwrap;
 pub mod stuffit;
 pub mod stuffit13_tables;

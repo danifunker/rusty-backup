@@ -11,9 +11,17 @@
 //! loudly rather than produce silent garbage.
 
 use anyhow::{bail, Result};
-use std::collections::HashMap;
 
 use super::bitreader_be::BitReaderBE;
+use crate::prefix_code::PrefixCode;
+
+/// The next symbol of `code`, or this codec's error for a codeword not in it.
+fn decode(code: &PrefixCode, br: &mut BitReaderBE) -> Result<i32> {
+    match code.decode(|| br.next_bit()) {
+        Some(sym) => Ok(sym),
+        None => bail!("LZAH: invalid distance code"),
+    }
+}
 
 const NUM_LEAVES: usize = 314;
 const NUM_NODES: usize = NUM_LEAVES * 2 - 1; // 627
@@ -26,46 +34,6 @@ const DISTANCE_LENGTHS: [i32; 64] = [
     3, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
     7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
 ];
-
-/// Canonical prefix code (MSB-first codewords) decoded from a BE bitstream.
-struct PrefixCode {
-    map: HashMap<(u32, u32), i32>,
-    maxlen: u32,
-}
-
-impl PrefixCode {
-    fn from_lengths(lengths: &[i32]) -> PrefixCode {
-        let maxlen = lengths
-            .iter()
-            .copied()
-            .filter(|&l| l > 0)
-            .max()
-            .unwrap_or(0) as u32;
-        let mut map = HashMap::new();
-        let mut code: u32 = 0;
-        for len in 1..=maxlen {
-            for (sym, &l) in lengths.iter().enumerate() {
-                if l == len as i32 {
-                    map.insert((len, code), sym as i32);
-                    code += 1;
-                }
-            }
-            code <<= 1;
-        }
-        PrefixCode { map, maxlen }
-    }
-
-    fn decode(&self, br: &mut BitReaderBE) -> Result<i32> {
-        let mut acc = 0u32;
-        for len in 1..=self.maxlen {
-            acc = (acc << 1) | br.next_bit();
-            if let Some(&s) = self.map.get(&(len, acc)) {
-                return Ok(s);
-            }
-        }
-        bail!("LZAH: invalid distance code");
-    }
-}
 
 /// One node of the adaptive Huffman tree. Links are storage indices (-1 = none).
 #[derive(Clone, Copy)]
@@ -306,7 +274,7 @@ pub fn decompress(comp: &[u8], want: usize) -> Result<Vec<u8>> {
                 continue;
             }
             let length = (lit - 0x100 + 3) as usize;
-            let highbits = distancecode.decode(&mut br)? as usize;
+            let highbits = decode(&distancecode, &mut br)? as usize;
             let lowbits = br.next_bits(6) as usize;
             let offset = (highbits << 6) + lowbits + 1;
             match_len = length;
