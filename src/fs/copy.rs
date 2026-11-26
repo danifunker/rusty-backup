@@ -159,7 +159,7 @@ pub fn project(
     recursive: bool,
 ) -> Result<u64> {
     let unit = alloc_unit.unwrap_or(512).max(1);
-    let round = |n: u64| n.div_ceil(unit) * unit;
+    let round = |n: u64| n.div_ceil(unit).saturating_mul(unit);
     match entry.entry_type {
         EntryType::Directory => {
             if !recursive {
@@ -224,8 +224,12 @@ pub fn copy_into(
         opts,
         stats,
         log,
+        0,
     )
 }
+
+/// The deepest folder nesting a copy follows before calling the source damaged.
+const MAX_DEPTH: usize = 512;
 
 #[allow(clippy::too_many_arguments)]
 fn copy_recursive(
@@ -239,7 +243,15 @@ fn copy_recursive(
     opts: &CopyOptions,
     stats: &mut CopyStats,
     log: &dyn Fn(&str),
+    depth: usize,
 ) -> Result<()> {
+    // A catalog whose folder lists an ancestor would recurse until the stack ran out (FSX-012).
+    if depth > MAX_DEPTH {
+        bail!(
+            "{} is nested more than {MAX_DEPTH} folders deep; the source may be damaged",
+            src_entry.path
+        );
+    }
     match src_entry.entry_type {
         EntryType::Directory => {
             if !opts.recursive {
@@ -262,6 +274,7 @@ fn copy_recursive(
                             opts,
                             stats,
                             log,
+                            depth + 1,
                         )?;
                     }
                     return Ok(());
@@ -296,6 +309,7 @@ fn copy_recursive(
                     opts,
                     stats,
                     log,
+                    depth + 1,
                 )?;
             }
             // Stamp the folder's own dates last, so nothing written into it

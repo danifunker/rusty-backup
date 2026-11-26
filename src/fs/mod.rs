@@ -749,7 +749,8 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                 // HFS MDB; drEmbedSigWord at 124 marks a wrapped HFS+ volume.
                 0x4244 if hfs_mdb_plausible(&sb_buf) => {
                     let embed_sig = u16::from_be_bytes([sb_buf[124], sb_buf[125]]);
-                    if embed_sig == 0x482B {
+                    // HFSX can be embedded as well, which the resize guard already knew (FSG-019).
+                    if embed_sig == 0x482B || embed_sig == 0x4858 {
                         return "hfsplus";
                     }
                     return "hfs";
@@ -791,10 +792,7 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     if qnx2::looks_like_qnx2(reader, partition_offset) {
         return "qnx2";
     }
-    // QNX 4: a `/` root entry at block 1; QNX 6: its superblock magic after the 8 KiB boot area.
-    if qnx4::looks_like_qnx4(reader, partition_offset) {
-        return "qnx4";
-    }
+    // QNX 4 was probed ahead of FAT (FSG-021); QNX 6: its superblock magic after the 8 KiB boot area.
     if qnx6::looks_like_qnx6(reader, partition_offset) {
         return "qnx6";
     }
@@ -1478,9 +1476,12 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
                     )?,
                 }
             }
-            (None, 0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C) => {
-                fat_compact_reader(reader, partition_offset, keep_swap)?
-            }
+            // Hidden FAT12 (0x11) and the EFI partition (0xEF) are FAT too (FSG-012).
+            (
+                None,
+                0x01 | 0x04 | 0x06 | 0x0E | 0x11 | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C
+                | 0xEF,
+            ) => fat_compact_reader(reader, partition_offset, keep_swap)?,
             (None, 0x07) => {
                 let fs_type = detect_0x07_type(&mut reader, partition_offset);
                 match fs_type {
@@ -3977,7 +3978,7 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
     // FAT12/16/32 partition types (same set as `fs_name_for`'s FAT arm).
     if matches!(
         ptype,
-        0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E
+        0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E | 0x11 | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E | 0xEF
     ) {
         return true;
     }
