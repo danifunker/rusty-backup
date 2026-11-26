@@ -1,6 +1,8 @@
 //! Directory edits: short-form insert and remove, conversion to block form, and the full layout rebuild.
 
 use super::*;
+// mrustc's macro matcher cannot read `super::super` inside a `matches!` pattern.
+use super::super::types::DiFormat;
 
 impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Initialize a freshly-allocated inode as an empty short-form directory
@@ -88,7 +90,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     ) -> Result<(), FilesystemError> {
         let has_ftype = sb.has_ftype();
         let (core, mut buf) = self.read_inode_buf(parent_ino)?;
-        if !core.is_dir() || core.format != super::super::types::DiFormat::Local {
+        if !core.is_dir() || core.format != DiFormat::Local {
             return Err(FilesystemError::Unsupported(
                 "parent is not a short-form directory".into(),
             ));
@@ -235,7 +237,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     ) -> Result<(), FilesystemError> {
         let has_ftype = sb.has_ftype();
         let (core, mut buf) = self.read_inode_buf(parent_ino)?;
-        if !core.is_dir() || core.format != super::super::types::DiFormat::Local {
+        if !core.is_dir() || core.format != DiFormat::Local {
             return Err(FilesystemError::Unsupported(
                 "parent is not a short-form directory".into(),
             ));
@@ -320,10 +322,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         }
         // Leaf/node form: a hash lookup for the duplicate check, and room
         // for the couple of dir blocks an insert can add.
-        if matches!(
-            core.format,
-            super::super::types::DiFormat::Extents | super::super::types::DiFormat::Btree
-        ) {
+        if matches!(core.format, DiFormat::Extents | DiFormat::Btree) {
             let dup = match DiskDirStore::open(self, sb, parent_ino)? {
                 Some(mut store) => {
                     Some(dir2_tree::Dir2Op::new(&mut store).contains(name.as_bytes())?)
@@ -348,7 +347,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             return Err(FilesystemError::AlreadyExists(name.into()));
         }
         match core.format {
-            super::super::types::DiFormat::Local => {
+            DiFormat::Local => {
                 // Inline fit?
                 let fs = sb.fork_offset();
                 let entry_len = 1 + 2 + name.len() + usize::from(has_ftype) + 4;
@@ -377,7 +376,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 )
                 .map(|_| ())
             }
-            super::super::types::DiFormat::Extents => {
+            DiFormat::Extents => {
                 let ft = if new_is_dir {
                     XFS_DIR3_FT_DIR
                 } else {
@@ -425,7 +424,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     ) -> Result<(), FilesystemError> {
         let (core, _buf) = self.read_inode_buf(parent_ino)?;
         match core.format {
-            super::super::types::DiFormat::Local => {
+            DiFormat::Local => {
                 match self.sf_insert_entry(sb, parent_ino, name, child_ino, is_dir) {
                     Err(FilesystemError::DiskFull(_)) => {
                         self.convert_sf_dir_to_block(sb, parent_ino, name, child_ino, is_dir)
@@ -433,7 +432,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     other => other,
                 }
             }
-            super::super::types::DiFormat::Extents | super::super::types::DiFormat::Btree => {
+            DiFormat::Extents | DiFormat::Btree => {
                 self.extents_insert_entry(sb, parent_ino, name, child_ino, is_dir)
             }
             _ => Err(FilesystemError::Unsupported(
@@ -859,7 +858,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         core: &super::super::inode::XfsDinodeCore,
         buf: &[u8],
     ) -> Result<Vec<u64>, FilesystemError> {
-        if core.format != super::super::types::DiFormat::Btree {
+        if core.format != DiFormat::Btree {
             return Ok(Vec::new());
         }
         let fork = &buf[sb.fork_offset()..data_fork_end(sb, core, buf.len())];
@@ -893,10 +892,8 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     ) -> Result<(), FilesystemError> {
         let (core, _buf) = self.read_inode_buf(parent_ino)?;
         match core.format {
-            super::super::types::DiFormat::Local => {
-                self.sf_remove_entry(sb, parent_ino, name, child_was_dir)
-            }
-            super::super::types::DiFormat::Extents | super::super::types::DiFormat::Btree => {
+            DiFormat::Local => self.sf_remove_entry(sb, parent_ino, name, child_was_dir),
+            DiFormat::Extents | DiFormat::Btree => {
                 self.extents_remove_entry(sb, parent_ino, name, child_was_dir)
             }
             _ => Err(FilesystemError::Unsupported(
@@ -916,12 +913,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     ) -> Result<(u64, DirEntries), FilesystemError> {
         let has_ftype = sb.has_ftype();
         match core.format {
-            super::super::types::DiFormat::Local => {
+            DiFormat::Local => {
                 let fs = sb.fork_offset();
                 let fork = &buf[fs..fs + core.size as usize];
                 Ok(sf_entries_with_ftype(fork, has_ftype)?)
             }
-            super::super::types::DiFormat::Extents | super::super::types::DiFormat::Btree => {
+            DiFormat::Extents | DiFormat::Btree => {
                 let extents = self.decode_data_extents(core, buf)?;
                 self.read_multi_dir_entries(sb, &extents)
             }

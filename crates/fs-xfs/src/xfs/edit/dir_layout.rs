@@ -2,6 +2,8 @@
 //! leaf, node), plus the on-disk store the in-place tree editor writes through.
 
 use super::*;
+// mrustc's macro matcher cannot read `super::super` inside a `matches!` pattern.
+use super::super::types::DiFormat;
 
 /// [`dir2_tree::Dir2Store`] over a leaf/node-form directory inode on disk:
 /// reads via the extent map; `apply` allocates, stamps, writes, remaps, frees.
@@ -25,10 +27,7 @@ impl<'a, R: Read + Write + Seek + Send> DiskDirStore<'a, R> {
         ino: u64,
     ) -> Result<Option<Self>, FilesystemError> {
         let (core, buf) = fs.read_inode_buf(ino)?;
-        if !matches!(
-            core.format,
-            super::super::types::DiFormat::Extents | super::super::types::DiFormat::Btree
-        ) {
+        if !matches!(core.format, DiFormat::Extents | DiFormat::Btree) {
             return Ok(None);
         }
         let extents = fs.decode_data_extents(&core, &buf)?;

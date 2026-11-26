@@ -138,7 +138,7 @@ pub(super) fn check_btree_structure(
             continue;
         }
 
-        check_offset_table(node, node_size, node_idx, num_records, errors);
+        check_offset_table(node, node_size, node_idx, num_records, "", errors);
 
         let kind = node[8] as i8;
         if kind == BTREE_INDEX_NODE {
@@ -489,11 +489,14 @@ fn check_index_separators(catalog_data: &[u8], header: &BTreeHeader, errors: &mu
     }
 }
 
-fn check_offset_table(
+/// A node's offset table must stay inside the node and strictly increase (every record has a
+/// key length byte at least); shared by the catalog and extents trees, `tree` naming which.
+pub(super) fn check_offset_table(
     node: &[u8],
     node_size: usize,
     node_idx: u32,
     num_records: usize,
+    tree: &str,
     errors: &mut Vec<FsckIssue>,
 ) {
     let mut prev_offset = 0u16;
@@ -508,18 +511,18 @@ fn check_offset_table(
             errors.push(hfs_issue(
                 HfsFsckCode::OffsetTableOutOfBounds,
                 format!(
-                    "node {}: offset[{}] = {} >= node_size {}",
+                    "{tree}node {}: offset[{}] = {} >= node_size {}",
                     node_idx, i, offset, node_size
                 ),
             ));
             return; // no point checking further
         }
 
-        if i > 0 && offset < prev_offset {
+        if i > 0 && offset <= prev_offset {
             errors.push(hfs_issue(
                 HfsFsckCode::OffsetTableNotMonotonic,
                 format!(
-                    "node {}: offset[{}] = {} < offset[{}] = {} (not monotonic)",
+                    "{tree}node {}: offset[{}] = {} <= offset[{}] = {} (not increasing)",
                     node_idx,
                     i,
                     offset,
@@ -1454,4 +1457,49 @@ fn count_leaf_records(catalog_data: &[u8], header: &BTreeHeader) -> u32 {
         node_idx = BigEndian::read_u32(&catalog_data[off..off + 4]);
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 512-byte node whose offset table holds `offsets` (record 0 first).
+    fn node_with_offsets(offsets: &[u16]) -> Vec<u8> {
+        let mut node = vec![0u8; 512];
+        for (i, &o) in offsets.iter().enumerate() {
+            let pos = 512 - 2 * (i + 1);
+            BigEndian::write_u16(&mut node[pos..pos + 2], o);
+        }
+        node
+    }
+
+    #[test]
+    fn an_offset_table_must_strictly_increase() {
+        // Two records at the same offset (a zero-length record) passed the catalog check before.
+        let node = node_with_offsets(&[14, 14, 40]);
+        let mut errors = Vec::new();
+        check_offset_table(&node, 512, 3, 2, "", &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "OffsetTableNotMonotonic");
+        assert!(!errors[0].repairable);
+
+        let mut errors = Vec::new();
+        check_offset_table(&node, 512, 3, 2, "extents ", &mut errors);
+        assert!(
+            errors[0].message.starts_with("extents node 3"),
+            "{}",
+            errors[0].message
+        );
+
+        let mut errors = Vec::new();
+        check_offset_table(
+            &node_with_offsets(&[14, 30, 40]),
+            512,
+            3,
+            2,
+            "",
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
 }

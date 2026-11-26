@@ -1,6 +1,8 @@
 //! Orphan reconnection into `lost+found` (repair R7).
 
 use super::*;
+// mrustc's macro matcher cannot read `super::super` inside a `matches!` pattern.
+use super::super::types::DiFormat;
 
 impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// R7 (reconnection half): link every allocated-but-unreachable inode into
@@ -169,7 +171,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     ) -> Result<(), FilesystemError> {
         let (core, mut buf) = self.read_inode_buf(ino)?;
         match core.format {
-            super::super::types::DiFormat::Local => {
+            DiFormat::Local => {
                 let fs = sb.fork_offset();
                 if buf[fs + 1] > 0 {
                     BigEndian::write_u64(&mut buf[fs + 2..fs + 10], new_parent);
@@ -178,7 +180,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 }
                 self.write_inode_region(sb, ino, &buf)
             }
-            super::super::types::DiFormat::Extents => {
+            DiFormat::Extents => {
                 let extents = self.decode_data_extents(&core, &buf)?;
                 let first = extents
                     .first()

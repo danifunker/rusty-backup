@@ -53,7 +53,7 @@ pub(super) fn check_extents_btree_structure(extents_data: &[u8], errors: &mut Ve
     let kind = extents_data[8] as i8;
     if kind != BTREE_HEADER_NODE {
         errors.push(hfs_issue(
-            HfsFsckCode::ExtentsBtreeStructure,
+            HfsFsckCode::HeaderNodeBadKind,
             format!(
                 "extents B-tree node 0 kind = {} (expected {} = header)",
                 kind, BTREE_HEADER_NODE
@@ -96,7 +96,7 @@ pub(super) fn check_extents_btree_structure(extents_data: &[u8], errors: &mut Ve
             };
             if root_kind != expected {
                 errors.push(hfs_issue(
-                    HfsFsckCode::ExtentsBtreeStructure,
+                    HfsFsckCode::RootNodeBadKind,
                     format!(
                         "extents B-tree root node {} kind = {} (expected {})",
                         header.root_node, root_kind, expected
@@ -146,7 +146,14 @@ pub(super) fn check_extents_btree_structure(extents_data: &[u8], errors: &mut Ve
         }
 
         // Offset table monotonicity
-        check_extents_offset_table(node, node_size, node_idx, num_records, errors);
+        super::btree::check_offset_table(
+            node,
+            node_size,
+            node_idx,
+            num_records,
+            "extents ",
+            errors,
+        );
 
         // Record length checks
         if nk == BTREE_INDEX_NODE {
@@ -168,7 +175,7 @@ pub(super) fn check_extents_btree_structure(extents_data: &[u8], errors: &mut Ve
     let leaf_count = count_extents_leaf_records(extents_data, &header);
     if leaf_count != header.leaf_records {
         errors.push(hfs_issue(
-            HfsFsckCode::ExtentsBtreeStructure,
+            HfsFsckCode::LeafRecordCountMismatch,
             format!(
                 "extents B-tree leaf record count: walked {} but header says {}",
                 leaf_count, header.leaf_records
@@ -223,7 +230,7 @@ fn check_extents_map_nodes(extents_data: &[u8], node_size: usize, errors: &mut V
         let node = &extents_data[off..off + node_size];
         if node[8] as i8 != BTREE_MAP_NODE {
             errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
+                HfsFsckCode::MapNodeBadStructure,
                 format!(
                     "extents map node {} has wrong kind {}",
                     node_idx, node[8] as i8
@@ -232,7 +239,7 @@ fn check_extents_map_nodes(extents_data: &[u8], node_size: usize, errors: &mut V
         }
         if BigEndian::read_u16(&node[10..12]) != 1 {
             errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
+                HfsFsckCode::MapNodeBadStructure,
                 format!(
                     "extents map node {} has {} records (expected 1)",
                     node_idx,
@@ -241,41 +248,6 @@ fn check_extents_map_nodes(extents_data: &[u8], node_size: usize, errors: &mut V
             ));
         }
         node_idx = BigEndian::read_u32(&node[0..4]);
-    }
-}
-
-fn check_extents_offset_table(
-    node: &[u8],
-    node_size: usize,
-    node_idx: u32,
-    num_records: usize,
-    errors: &mut Vec<FsckIssue>,
-) {
-    let mut prev = 0u16;
-    for i in 0..=num_records {
-        let pos = node_size - 2 * (i + 1);
-        let off = BigEndian::read_u16(&node[pos..pos + 2]);
-        if off as usize >= node_size {
-            errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
-                format!(
-                    "extents node {} offset[{}] = {} out of bounds",
-                    node_idx, i, off
-                ),
-            ));
-            return;
-        }
-        if i > 0 && off <= prev {
-            errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
-                format!(
-                    "extents node {} offset table not monotonic at index {}",
-                    node_idx, i
-                ),
-            ));
-            return;
-        }
-        prev = off;
     }
 }
 
@@ -299,7 +271,7 @@ fn check_extents_index_record_lengths(
         let key_len = node[rec_start] as usize;
         if key_len != 7 {
             errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
+                HfsFsckCode::InvalidRecordLength,
                 format!(
                     "extents index node {} record {}: key_len {} (expected 7)",
                     node_idx, i, key_len
@@ -309,7 +281,7 @@ fn check_extents_index_record_lengths(
         // Total: 1 (key_len) + 7 (key) + 4 (child ptr) = 12
         if rec_len != 12 {
             errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
+                HfsFsckCode::InvalidRecordLength,
                 format!(
                     "extents index node {} record {}: length {} (expected 12)",
                     node_idx, i, rec_len
@@ -336,7 +308,7 @@ fn check_extents_leaf_record_lengths(
         let key_len = node[rec_start] as usize;
         if key_len != 7 {
             errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
+                HfsFsckCode::InvalidRecordLength,
                 format!(
                     "extents leaf node {} record {}: key_len {} (expected 7)",
                     node_idx, i, key_len
@@ -347,7 +319,7 @@ fn check_extents_leaf_record_lengths(
         // Total: 1 (key_len) + 7 (key data) + 12 (3 × 4-byte extent descriptors) = 20
         if rec_len != 20 {
             errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
+                HfsFsckCode::InvalidRecordLength,
                 format!(
                     "extents leaf node {} record {}: length {} (expected 20)",
                     node_idx, i, rec_len
@@ -371,7 +343,7 @@ fn check_extents_leaf_chain(
     while node_idx != 0 {
         if !visited.insert(node_idx) {
             errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
+                HfsFsckCode::LeafChainBroken,
                 format!("extents leaf chain loop at node {}", node_idx),
             ));
             break;
@@ -379,7 +351,7 @@ fn check_extents_leaf_chain(
         let off = node_idx as usize * node_size;
         if off + node_size > extents_data.len() {
             errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
+                HfsFsckCode::LeafChainBroken,
                 format!("extents leaf node {} out of range", node_idx),
             ));
             break;
@@ -388,7 +360,7 @@ fn check_extents_leaf_chain(
         let kind = node[8] as i8;
         if kind != BTREE_LEAF_NODE {
             errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
+                HfsFsckCode::LeafChainBroken,
                 format!(
                     "extents node {} in leaf chain has kind {} (expected leaf)",
                     node_idx, kind
@@ -399,7 +371,7 @@ fn check_extents_leaf_chain(
         let blink = BigEndian::read_u32(&node[4..8]);
         if count > 0 && blink != prev_idx {
             errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
+                HfsFsckCode::LeafBacklinkMismatch,
                 format!(
                     "extents node {}: bLink {} != previous {}",
                     node_idx, blink, prev_idx
@@ -440,7 +412,7 @@ fn check_extents_index_sibling_links(
             let exp_b = if i > 0 { level_nodes[i - 1] } else { 0 };
             if flink != exp_f {
                 errors.push(hfs_issue(
-                    HfsFsckCode::ExtentsBtreeStructure,
+                    HfsFsckCode::IndexSiblingLinkBroken,
                     format!(
                         "extents index node {}: fLink {} expected {}",
                         nidx, flink, exp_f
@@ -449,7 +421,7 @@ fn check_extents_index_sibling_links(
             }
             if blink != exp_b {
                 errors.push(hfs_issue(
-                    HfsFsckCode::ExtentsBtreeStructure,
+                    HfsFsckCode::IndexSiblingLinkBroken,
                     format!(
                         "extents index node {}: bLink {} expected {}",
                         nidx, blink, exp_b
@@ -558,7 +530,7 @@ fn check_extents_node_bitmap(
     for &nidx in &referenced {
         if !bitmap_test_bit_be(bitmap, nidx) {
             errors.push(hfs_issue(
-                HfsFsckCode::ExtentsBtreeStructure,
+                HfsFsckCode::NodeBitmapMissing,
                 format!(
                     "extents node {} referenced but not allocated in node bitmap",
                     nidx
@@ -601,7 +573,7 @@ fn check_extents_key_ordering(
             }
             if compare_extents_keys(key_a, key_b) != Ordering::Less {
                 errors.push(hfs_issue(
-                    HfsFsckCode::ExtentsBtreeStructure,
+                    HfsFsckCode::KeysOutOfOrder,
                     format!(
                         "extents node {} records {} and {}: keys not in ascending order",
                         node_idx,
@@ -1248,7 +1220,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.code == "ExtentsBtreeStructure" && e.message.contains("kind")),
+                .any(|e| e.code == "HeaderNodeBadKind" && e.message.contains("kind")),
             "should detect bad header kind: {:?}",
             errors
                 .iter()
@@ -1269,7 +1241,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.code == "ExtentsBtreeStructure" && e.message.contains("length")),
+                .any(|e| e.code == "InvalidRecordLength" && e.message.contains("length")),
             "should detect bad record length: {:?}",
             errors
                 .iter()
@@ -1305,7 +1277,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.code == "ExtentsBtreeStructure" && e.message.contains("ascending")),
+                .any(|e| e.code == "KeysOutOfOrder" && e.message.contains("ascending")),
             "should detect out-of-order keys: {:?}",
             errors
                 .iter()

@@ -12,6 +12,9 @@ All notable changes to this crate are documented here. This project follows
 - The HFS+ defrag clone works on 512-byte and 1 KiB allocation blocks (Mac OS 8.1's choice
   for small volumes); it used to panic.
 - `create_blank_hfsplus` with 512-byte or 1 KiB blocks writes volumes fsck_hfs accepts.
+- The classic-HFS checker flags a catalog node whose offset table repeats an offset
+  (a zero-length record), as it already did for the extents tree; extents problems
+  now carry the same specific codes as catalog ones instead of one catch-all.
 
 ### Added
 - `mfs::write_blank_mfs_into` and `hfv::write_blank_hfv_into` stream a blank volume
