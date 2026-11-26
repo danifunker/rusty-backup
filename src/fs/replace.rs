@@ -209,12 +209,14 @@ fn staged_replace(
         return Ok(None);
     };
 
-    // 1. New contents under a temp name. A driver that rejects the name (an
-    // 8.3-only volume with an awkward rule, say) is a reason to fall back, not
-    // to fail: nothing has been touched yet.
+    // 1. New contents under a temp name. A failure here (disk full, a bad read) already consumed
+    // the source, so the fallback would delete the original for nothing (FSX-001).
     let staged = match efs.create_file(parent, &tmp_new, data, data_len, opts) {
         Ok(e) => e,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            let _ = current_entry(efs, parent, &tmp_new).map(|t| efs.delete_entry(parent, &t));
+            return Err(e);
+        }
     };
 
     // 2. Original aside. Unsupported rename is discovered here, with the
@@ -321,6 +323,29 @@ mod tests {
             .find(|e| e.name.eq_ignore_ascii_case(name))
             .expect("entry present");
         fs.read_file(&entry, usize::MAX).expect("read")
+    }
+
+    /// FSX-001: a staged write that ran out of space fell back, deleting the original.
+    #[test]
+    fn a_replace_that_cannot_fit_keeps_the_original() {
+        let mut fs = blank();
+        put(&mut fs, "A.TXT", b"original", OnConflict::Fail);
+        let root = fs.root().unwrap();
+        let big = vec![7u8; 6 * 1024 * 1024];
+        let err = create_or_replace(
+            &mut fs,
+            &root,
+            "A.TXT",
+            &mut Cursor::new(big.clone()),
+            big.len() as u64,
+            &CreateFileOptions::default(),
+            ReplacePolicy {
+                on_conflict: OnConflict::Replace,
+                ..Default::default()
+            },
+        );
+        assert!(err.is_err(), "a 6 MiB file can't fit a 4 MiB volume");
+        assert_eq!(read_back(&mut fs, "A.TXT"), b"original");
     }
 
     #[test]

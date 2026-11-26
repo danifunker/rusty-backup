@@ -48,6 +48,8 @@ struct BlockHandle {
     file: std::fs::File,
     size: u64,
     writable: bool,
+    /// A device target's unmount claim and volume locks, held as long as the handle (RMT-011).
+    _locks: Option<crate::os::DeviceWriteHandle>,
 }
 
 /// Daemon configuration (from the `serve` verb).
@@ -140,12 +142,29 @@ pub fn serve_on(
     staging_dir: Option<PathBuf>,
     writable: bool,
 ) -> Result<()> {
+    // A peer that connects and stalls holds a thread; past this many the daemon turns new ones away (RMT-006).
+    const MAX_CONNECTIONS: usize = 32;
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                use std::sync::atomic::Ordering;
+                if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    eprintln!("rb-cli serve: {MAX_CONNECTIONS} connections open; refusing another");
+                    continue;
+                }
+                let live = std::sync::Arc::clone(&live);
                 let root = root.clone();
                 let staging_dir = staging_dir.clone();
                 std::thread::spawn(move || {
+                    struct Release(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+                    impl Drop for Release {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    let _release = Release(live);
                     let peer = stream
                         .peer_addr()
                         .map(|a| a.to_string())
@@ -178,6 +197,7 @@ fn handle_family_b(
     client_caps: u16,
     root: &Path,
     staging_dir: Option<&Path>,
+    writable: bool,
 ) -> Result<()> {
     eprintln!(
         "rb-cli serve: Family-B client connected (version {client_version}, caps {client_caps:#06x})"
@@ -189,6 +209,11 @@ fn handle_family_b(
     match read_family_b_op(&mut reader).context("reading Family-B op")? {
         // Hello-only client (e.g. NETHELLO): clean disconnect, nothing to do.
         None => Ok(()),
+        // A PUT writes a .cbk into the root, so a read-only daemon drops it (RMT-002).
+        Some(FamilyBOp::Put(_)) if !writable => {
+            eprintln!("rb-cli serve: refusing a Family-B PUT; this daemon is read-only");
+            Ok(())
+        }
         Some(FamilyBOp::Put(hdr)) => receive_put(&mut reader, &mut writer, root, staging_dir, hdr),
         Some(FamilyBOp::Get { name }) => serve_get(&mut reader, &mut writer, root, &name),
     }
@@ -374,7 +399,7 @@ fn receive_put(
     {
         let cbk_size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
         eprintln!(
-            "rb-cli serve: PUT {:?} incremental — source unchanged (fingerprint {:#010x}); skipping, prior {} stands ({cbk_size} bytes)",
+            "rb-cli serve: PUT {:?} incremental - source unchanged (fingerprint {:#010x}); skipping, prior {} stands ({cbk_size} bytes)",
             hdr.name,
             hdr.fingerprint,
             dest.display()
@@ -398,7 +423,7 @@ fn receive_put(
         }
         Some(_) => {
             eprintln!(
-                "rb-cli serve: PUT {:?} fingerprint changed — discarding stale staging, starting fresh",
+                "rb-cli serve: PUT {:?} fingerprint changed - discarding stale staging, starting fresh",
                 hdr.name
             );
             std::fs::remove_dir_all(&staging).ok();
@@ -507,7 +532,7 @@ fn receive_put(
                 gz_committed += 1;
                 if drop_after == Some(gz_committed) {
                     eprintln!(
-                        "rb-cli serve: TEST drop after {gz_committed} committed chunk(s) — resume to continue"
+                        "rb-cli serve: TEST drop after {gz_committed} committed chunk(s) - resume to continue"
                     );
                     bail!("test-induced drop after {gz_committed} committed chunks");
                 }
@@ -743,7 +768,8 @@ fn cbk_dest_path(root: &Path, name: &str) -> Result<PathBuf> {
     if name.is_empty() {
         bail!("PUT container name is empty");
     }
-    if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
+    // A ':' makes `C:x` a drive-relative path that replaces the root on Windows (RMT-005).
+    if name.contains(['/', '\\', ':', '\0']) || name.contains("..") {
         bail!("PUT container name {name:?} is not a flat base name");
     }
     let file = if name.to_ascii_lowercase().ends_with(".cbk") {
@@ -761,6 +787,7 @@ fn validate_member_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.contains('/')
         || name.contains('\\')
+        || name.contains(':')
         || name.contains("..")
         || name.contains('\0')
     {
@@ -813,7 +840,15 @@ fn handle_conn(
                 );
                 return Ok(());
             }
-            return handle_family_b(reader, writer, version, capabilities, root, staging_dir);
+            return handle_family_b(
+                reader,
+                writer,
+                version,
+                capabilities,
+                root,
+                staging_dir,
+                writable,
+            );
         }
         // Peer hung up before sending anything — a clean end, not an error.
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
@@ -846,7 +881,7 @@ fn handle_conn(
                         &mut writer,
                         format!(
                             "this daemon speaks protocol v{PROTOCOL_VERSION}, the client \
-                             speaks v{version} — update rb-cli on the client"
+                             speaks v{version} - update rb-cli on the client"
                         ),
                     )?;
                     return Ok(());
@@ -1156,6 +1191,7 @@ fn handle_conn(
                             file,
                             size,
                             writable: false,
+                            _locks: None,
                         },
                     );
                     write_control(&mut writer, &Response::BlockOpened { handle, size })?;
@@ -1179,6 +1215,7 @@ fn handle_conn(
                             file,
                             size,
                             writable: true,
+                            _locks: None,
                         },
                     );
                     write_control(&mut writer, &Response::BlockOpened { handle, size })?;
@@ -1206,6 +1243,7 @@ fn handle_conn(
                             file,
                             size,
                             writable: false,
+                            _locks: None,
                         },
                     );
                     write_control(&mut writer, &Response::BlockOpened { handle, size })?;
@@ -1303,7 +1341,7 @@ fn handle_conn(
                 force,
             } => match open_write_target(root, &path, is_device, size, force) {
                 Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
-                Ok((file, actual_size)) => {
+                Ok((file, actual_size, locks)) => {
                     let handle = next_handle;
                     next_handle += 1;
                     block_handles.insert(
@@ -1312,6 +1350,7 @@ fn handle_conn(
                             file,
                             size: actual_size,
                             writable: true,
+                            _locks: locks,
                         },
                     );
                     write_control(
@@ -2034,7 +2073,7 @@ fn open_write_target(
     is_device: bool,
     size: u64,
     force: bool,
-) -> Result<(std::fs::File, u64)> {
+) -> Result<(std::fs::File, u64, Option<crate::os::DeviceWriteHandle>)> {
     if is_device {
         // Same validation as the read-side `open_device`: the path must match a
         // live enumerated device exactly, so this can't write an arbitrary file.
@@ -2052,10 +2091,7 @@ fn open_write_target(
                 dev_path.display()
             );
         }
-        // `open_target_for_writing` does the platform-appropriate prep (unmount /
-        // lock); on Linux/MiSTer — the supported daemon target — it returns a
-        // plain read-write File. (A Windows/macOS daemon would need to keep the
-        // returned handle's volume locks alive; out of scope here.)
+        // `open_target_for_writing` unmounts and locks; the handle goes back whole to keep that.
         let handle = crate::os::open_target_for_writing(&dev_path).with_context(|| {
             format!(
                 "opening device {} for writing (the daemon may need to run as root)",
@@ -2076,7 +2112,11 @@ fn open_write_target(
                 dev_path.display()
             );
         }
-        Ok((handle.file, dev_size))
+        let file = handle
+            .file
+            .try_clone()
+            .context("duplicating the device handle")?;
+        Ok((file, dev_size, Some(handle)))
     } else {
         let full = sandbox_join_create(root, path)?;
         // A restore truncates its target; an image that is already there is
@@ -2095,7 +2135,7 @@ fn open_write_target(
             .with_context(|| format!("creating image target {}", full.display()))?;
         f.set_len(size)
             .with_context(|| format!("sizing image target {} to {size} bytes", full.display()))?;
-        Ok((f, size))
+        Ok((f, size, None))
     }
 }
 
@@ -2125,7 +2165,7 @@ fn write_block(
         .ok_or_else(|| anyhow!("write offset {offset} + length overflows"))?;
     if end > size {
         bail!(
-            "write [{offset}, {end}) extends past the image end ({size}) — \
+            "write [{offset}, {end}) extends past the image end ({size}) - \
              block-tier edits never grow the file"
         );
     }
@@ -2344,7 +2384,12 @@ fn sandbox_join_create(root: &Path, rel: &str) -> Result<PathBuf> {
     if !canon_parent.starts_with(root) {
         bail!("target path {rel:?} escapes the serve root");
     }
-    Ok(canon_parent.join(file_name))
+    let target = canon_parent.join(file_name);
+    // Create and truncate follow a final symlink, which can point anywhere (RMT-004).
+    if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!("target path {rel:?} is a symlink; write to the file it names instead");
+    }
+    Ok(target)
 }
 
 /// Join a parent dir + name for display, avoiding a doubled slash at root.

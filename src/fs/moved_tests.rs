@@ -504,7 +504,7 @@ mod squashfs {
             "/Users/dani/Downloads/ubuntu-12.04-desktop-powerpc.iso".to_string()
         });
         let Ok(mut file) = std::fs::File::open(&path) else {
-            eprintln!("{path} not present — skipping");
+            eprintln!("{path} not present - skipping");
             return;
         };
         let Some(offset) = find_squashfs_offset(&mut file) else {

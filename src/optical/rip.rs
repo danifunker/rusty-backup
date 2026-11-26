@@ -273,6 +273,24 @@ fn open_optical_source(config: &RipConfig) -> Result<Box<dyn OpticalSource>> {
 const SECTORS_PER_CHUNK: u32 = 128;
 
 #[cfg(feature = "cd-audio")]
+/// A TOC every rip can index and subtract over: an empty, unsorted or overlapping one (a
+/// remote daemon's is unvalidated) panicked or wrapped (OPT-008).
+fn check_toc(toc: &cd_da_reader::Toc) -> Result<()> {
+    let Some(first) = toc.tracks.first() else {
+        bail!("the disc's table of contents lists no tracks");
+    };
+    let sorted = toc
+        .tracks
+        .windows(2)
+        .all(|w| w[0].start_lba <= w[1].start_lba);
+    let last = toc.tracks.last().map_or(first.start_lba, |t| t.start_lba);
+    if !sorted || toc.leadout_lba < last {
+        bail!("the disc's table of contents is out of order");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cd-audio")]
 fn rip_iso(
     config: &RipConfig,
     source: &dyn OpticalSource,
@@ -282,6 +300,7 @@ fn rip_iso(
     let toc = source
         .read_toc()
         .context("Failed to read table of contents")?;
+    check_toc(&toc)?;
 
     log(
         progress,
@@ -374,6 +393,7 @@ fn rip_bin_cue(
     let toc = source
         .read_toc()
         .context("Failed to read table of contents")?;
+    check_toc(&toc)?;
 
     log(
         progress,

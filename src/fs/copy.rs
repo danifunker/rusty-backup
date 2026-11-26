@@ -370,8 +370,11 @@ fn copy_file(
         Some(n) => n,
         None => return Ok(()),
     };
-    if let Some(skip) = handle_conflict(dst, dst_parent, &name, opts, stats, log)? {
-        if skip {
+    // A file in the way is replaced only once the new copy exists (FSX-002).
+    let replace_file = opts.conflict == ConflictMode::Force
+        && find_child(dst, dst_parent, &name)?.is_some_and(|e| !e.is_directory());
+    if !replace_file {
+        if let Some(true) = handle_conflict(dst, dst_parent, &name, opts, stats, log)? {
             return Ok(());
         }
     }
@@ -387,7 +390,8 @@ fn copy_file(
     let rsrc_size = src_entry.resource_fork_size.unwrap_or(0);
     if rsrc_size > 0 {
         if dst_caps.resource_forks {
-            let mut buf = Vec::with_capacity(rsrc_size as usize);
+            // The size is the image's word; reserve modestly and let real bytes grow it (FSX-005).
+            let mut buf = Vec::with_capacity(rsrc_size.min(16 << 20) as usize);
             src.write_resource_fork_to(src_entry, &mut buf)
                 .map_err(|e| anyhow!("reading resource fork of {}: {e}", src_entry.path))?;
             options.resource_fork = Some(ResourceForkSource::Data(buf));
@@ -407,9 +411,21 @@ fn copy_file(
         .seek(SeekFrom::Start(0))
         .map_err(|e| anyhow!("rewinding spool for {}: {e}", src_entry.path))?;
 
-    let created = dst
-        .create_file(dst_parent, &name, &mut spool, len, &options)
-        .map_err(|e| anyhow!("writing {name}: {e}"))?;
+    let created = if replace_file {
+        let policy = crate::fs::replace::ReplacePolicy {
+            on_conflict: crate::fs::replace::OnConflict::Replace,
+            preserve_meta: false,
+        };
+        crate::fs::replace::create_or_replace(
+            dst, dst_parent, &name, &mut spool, len, &options, policy,
+        )
+        .map_err(|e| anyhow!("writing {name}: {e}"))?
+        .created
+        .ok_or_else(|| anyhow!("writing {name}: the replace produced no file"))?
+    } else {
+        dst.create_file(dst_parent, &name, &mut spool, len, &options)
+            .map_err(|e| anyhow!("writing {name}: {e}"))?
+    };
 
     // Finder flags (hasBundle, hasCustomIcon, isInvisible, ...) don't ride in
     // CreateFileOptions; stamp them after creation via set_finder_info — the
@@ -869,6 +885,71 @@ mod tests {
             Some(0x2000),
             "fdFlags must survive disk-to-disk cp"
         );
+    }
+
+    /// FSX-002: `--force` deleted the destination first, so a copy that couldn't fit lost it.
+    #[test]
+    fn a_forced_copy_that_cannot_fit_keeps_the_destination_file() {
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
+        use std::io::Cursor;
+        let mut src = FatFilesystem::open(
+            Cursor::new(create_blank_fat(16 << 20, Some("S")).unwrap()),
+            0,
+        )
+        .unwrap();
+        let sroot = src.root().unwrap();
+        let big = vec![9u8; 6 << 20];
+        let opts = CreateFileOptions::default();
+        src.create_file(
+            &sroot,
+            "A.BIN",
+            &mut Cursor::new(big.clone()),
+            big.len() as u64,
+            &opts,
+        )
+        .unwrap();
+        let src_entry = src
+            .list_directory(&sroot)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "A.BIN")
+            .unwrap();
+        let mut dst = FatFilesystem::open(
+            Cursor::new(create_blank_fat(4 << 20, Some("D")).unwrap()),
+            0,
+        )
+        .unwrap();
+        let droot = dst.root().unwrap();
+        dst.create_file(
+            &droot,
+            "A.BIN",
+            &mut Cursor::new(b"keep".to_vec()),
+            4,
+            &opts,
+        )
+        .unwrap();
+        let force = CopyOptions {
+            conflict: ConflictMode::Force,
+            ..CopyOptions::default()
+        };
+        let r = copy_into(
+            &mut src,
+            &src_entry,
+            &mut dst,
+            &droot,
+            "A.BIN",
+            &force,
+            &mut CopyStats::default(),
+            &|_| {},
+        );
+        assert!(r.is_err(), "6 MiB can't fit a 4 MiB volume");
+        let kept = dst
+            .list_directory(&droot)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "A.BIN")
+            .unwrap();
+        assert_eq!(dst.read_file(&kept, usize::MAX).unwrap(), b"keep");
     }
 
     /// `cp --preserve-times` from HFS to HFS keeps the raw catalog create,

@@ -159,8 +159,15 @@ impl Filesystem for BootAreaFs {
     }
 
     fn read_file(&mut self, entry: &FileEntry) -> Result<Vec<u8>, FilesystemError> {
-        let len = self.file_for(entry)?.len as usize;
-        self.read_file_range(entry, 0, len)
+        // The length comes from a boot-area table, so a hostile one can't size the buffer (OPT-012).
+        let len = self.file_for(entry)?.len;
+        if len > 64 << 20 {
+            return Err(FilesystemError::InvalidData(format!(
+                "{} claims {len} bytes, too large for a boot-area file",
+                entry.name
+            )));
+        }
+        self.read_file_range(entry, 0, len as usize)
     }
 
     fn read_file_range(

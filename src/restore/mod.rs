@@ -1306,7 +1306,8 @@ fn run_restore_inner(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>
 
             match fs_type {
                 PartitionFsType::Ntfs if needs_resize => {
-                    let new_sectors = export_size / 512;
+                    let new_sectors =
+                        crate::fs::native_sectors(inner_file, part_offset, export_size)?.1;
                     resize_ntfs_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     })?;
@@ -1315,7 +1316,8 @@ fn run_restore_inner(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>
                     })?;
                 }
                 PartitionFsType::Exfat if needs_resize => {
-                    let new_sectors = export_size / 512;
+                    let new_sectors =
+                        crate::fs::native_sectors(inner_file, part_offset, export_size)?.2;
                     let mut info = |msg: &str| log(&progress, LogLevel::Info, msg);
                     resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut info)?;
                     crate::fs::grow_exfat_past_its_fat(
@@ -1363,7 +1365,8 @@ fn run_restore_inner(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>
                     resize_human68k_in_place(inner_file, part_offset, export_size, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     })?;
-                    let new_sectors = (export_size / 512) as u32;
+                    let new_sectors =
+                        crate::fs::native_sectors(inner_file, part_offset, export_size)?.0;
                     resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     })?;
@@ -1581,21 +1584,19 @@ fn run_single_file_chd_restore_as_is(
             let mut local_log = |m: &str| log(&progress, LogLevel::Info, m);
             match detect_partition_fs_type(inner_file, offset) {
                 PartitionFsType::Fat => {
-                    resize_fat_in_place(
-                        inner_file,
-                        offset,
-                        (full_size / 512) as u32,
-                        &mut local_log,
-                    )
-                    .with_context(|| format!("grow partition-{} FAT", pm.index))?;
+                    let sectors = crate::fs::native_sectors(inner_file, offset, full_size)?.0;
+                    resize_fat_in_place(inner_file, offset, sectors, &mut local_log)
+                        .with_context(|| format!("grow partition-{} FAT", pm.index))?;
                 }
                 PartitionFsType::Ntfs => {
-                    resize_ntfs_in_place(inner_file, offset, full_size / 512, &mut local_log)
+                    let sectors = crate::fs::native_sectors(inner_file, offset, full_size)?.1;
+                    resize_ntfs_in_place(inner_file, offset, sectors, &mut local_log)
                         .with_context(|| format!("grow partition-{} NTFS", pm.index))?;
                     ensure_backup_boot_sector(inner_file, offset, &mut local_log)?;
                 }
                 PartitionFsType::Exfat => {
-                    resize_exfat_in_place(inner_file, offset, full_size / 512, &mut local_log)
+                    let sectors = crate::fs::native_sectors(inner_file, offset, full_size)?.2;
+                    resize_exfat_in_place(inner_file, offset, sectors, &mut local_log)
                         .with_context(|| format!("grow partition-{} exFAT", pm.index))?;
                     crate::fs::grow_exfat_past_its_fat(
                         inner_file,

@@ -165,7 +165,7 @@ pub fn export_to_folder(
         let target = if rel.is_empty() {
             dest_dir.to_path_buf()
         } else {
-            let t = dest_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let t = host_subdir(dest_dir, &rel);
             std::fs::create_dir_all(&t).with_context(|| format!("creating {}", t.display()))?;
             t
         };
@@ -254,7 +254,8 @@ impl rb_fsexporter::Host for FolderHost<'_, '_> {
 
 /// Read a file's data fork fully into memory.
 fn read_data_fork(fs: &mut dyn Filesystem, e: &FileEntry) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(e.size as usize);
+    // `e.size` is the image's word; a hostile one aborted the export on the reservation (FSX-004).
+    let mut buf = Vec::with_capacity(e.size.min(16 << 20) as usize);
     fs.write_file_to(e, &mut buf)
         .with_context(|| format!("reading '{}'", e.name))?;
     Ok(buf)
@@ -398,7 +399,13 @@ fn export_zip_file(
     for e in entries {
         // Each root keeps its folder relative to the common parent, so a
         // cross-folder selection cannot collide on a bare name.
-        let rel = relative_dir(e, &base);
+        // Member names from the image can't climb out of the archive when extracted (FSX-003).
+        let rel = relative_dir(e, &base)
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .map(zip_component)
+            .collect::<Vec<_>>()
+            .join("/");
         zip_recurse(
             fs,
             std::slice::from_ref(e),
@@ -415,11 +422,27 @@ fn export_zip_file(
 }
 
 /// One zip path component: a Mac name may hold a slash or backslash, which would nest or escape.
+/// `rel`'s folders under `dest`, each a legal host name: a folder called `..` or `C:` on the image
+/// would otherwise land outside the chosen folder (FSX-003).
+fn host_subdir(dest: &Path, rel: &str) -> std::path::PathBuf {
+    rel.split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .fold(dest.to_path_buf(), |p, c| {
+            p.join(rb_fsexporter::sanitize_filename(c))
+        })
+}
+
 fn zip_component(name: &str) -> String {
-    name.chars()
+    let c: String = name
+        .chars()
         .filter(|&c| c != '\0')
         .map(|c| if c == '/' || c == '\\' { ':' } else { c })
-        .collect()
+        .collect();
+    // A whole component of `.` or `..` would still walk an extractor up a folder (FSX-003).
+    match c.as_str() {
+        "" | "." | ".." => "_".to_string(),
+        _ => c,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -660,6 +683,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn image_folder_names_stay_inside_the_export_folder() {
+        let dest = Path::new("/out");
+        for rel in ["..", "../..", "a/../..", "C:", "/etc"] {
+            let p = host_subdir(dest, rel);
+            assert!(p.starts_with(dest), "{rel} -> {}", p.display());
+            assert!(
+                !p.components().any(|c| c == std::path::Component::ParentDir),
+                "{rel}"
+            );
+        }
+        assert_eq!(host_subdir(dest, "a/b"), dest.join("a").join("b"));
+    }
 
     #[test]
     fn zip_component_keeps_mac_names_in_one_member() {

@@ -66,7 +66,7 @@ pub struct DaemonConfig {
     pub writable: bool,
     /// Staging dir for uploads; `None` = system temp.
     pub staging_dir: Option<PathBuf>,
-    /// Optional shared token (future hardening; carried in `Hello`).
+    /// Optional shared token. Not enforced yet: the protocol has no field for it (RMT-003).
     pub token: Option<String>,
 }
 
@@ -562,6 +562,16 @@ fn spawn_daemon(paths: &ServicePaths, cfg: &DaemonConfig) -> Result<u32> {
         .open(&paths.log_file)
         .with_context(|| format!("opening log {}", paths.log_file.display()))?;
     let log_err = log.try_clone().context("cloning log handle")?;
+    // The protocol has no token yet; saying so beats a config that implies protection (RMT-003).
+    if cfg.token.is_some() {
+        use std::io::Write as _;
+        let _ = writeln!(
+            &log,
+            "Warning: rb-daemon.ini sets a token, but the daemon does not check one yet; \
+             any host that can reach {} can use it",
+            cfg.bind
+        );
+    }
 
     let mut cmd = Command::new(&paths.exe);
     cmd.arg("serve")

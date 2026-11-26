@@ -194,7 +194,11 @@ pub fn bincue_to_iso(
     } else {
         let bin_size = data_track.bin_path.metadata()?.len();
         let sector_size = data_track.sector_size();
-        (bin_size - data_track.file_byte_offset) / sector_size
+        // A cue pointing past the BIN's end wrapped this into a huge count (OPT-007).
+        bin_size
+            .checked_sub(data_track.file_byte_offset)
+            .context("the CUE's data track starts past the end of its BIN")?
+            / sector_size
     };
 
     let total_bytes = sector_count * 2048;
@@ -481,7 +485,7 @@ pub fn chd_to_bincue_multi(
             LogLevel::Warning,
             format!(
                 "multi-bin: track sizes (sum {}) don't match bin size ({}); the CHD likely has \
-                 padframes/splitframes that aren't exposed publicly — falling back to single-bin output",
+                 padframes/splitframes that aren't exposed publicly - falling back to single-bin output",
                 claimed, bin_size,
             ),
         );
@@ -536,7 +540,10 @@ pub fn chd_to_bincue_multi(
                 .with_context(|| format!("write {}", track_bin.display()))?;
             remaining -= n as u64;
         }
-        writer.flush().ok();
+        // A short track on a full disk was dropped here, then the only full copy deleted (OPT-001).
+        writer
+            .flush()
+            .with_context(|| format!("write {}", track_bin.display()))?;
         per_track_bins.push(track_bin);
     }
 

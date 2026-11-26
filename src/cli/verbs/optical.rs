@@ -369,6 +369,14 @@ pub struct RipArgs {
 }
 
 fn run_rip_verb(args: RipArgs) -> Result<()> {
+    // The GUI checked this and the CLI didn't: `-o disc.bin --format bincue` wrote the cue over the BIN (OPT-003).
+    let out_fmt = match args.format {
+        RipFmt::Iso => crate::model::optical_ops::OutputFormat::Iso,
+        RipFmt::Bincue => crate::model::optical_ops::OutputFormat::BinCue,
+    };
+    if let Some(why) = crate::model::optical_ops::output_refusal(&args.output, out_fmt, &[]) {
+        bail!("{why}");
+    }
     log_stderr(format!(
         "rb-cli optical rip: {} -> {} (format: {:?})",
         args.device.display(),
@@ -485,6 +493,17 @@ fn run_convert_verb(args: ConvertArgs) -> Result<()> {
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
+    // An output that is the source was truncated before it was read (OPT-002).
+    let out_fmt = match args.format {
+        OpticalConvertFmt::Iso => crate::model::optical_ops::OutputFormat::Iso,
+        OpticalConvertFmt::Bincue => crate::model::optical_ops::OutputFormat::BinCue,
+        OpticalConvertFmt::Chd => crate::model::optical_ops::OutputFormat::Chd,
+    };
+    let disc = (src_ext == "cue").then_some(opticaldiscs::formats::DiscFormat::BinCue);
+    let sources = crate::model::optical_ops::source_files(&args.source, disc);
+    if let Some(why) = crate::model::optical_ops::output_refusal(&args.dest, out_fmt, &sources) {
+        bail!("{why}");
+    }
     log_stderr(format!(
         "rb-cli optical convert: {} -> {} (format: {:?})",
         args.source.display(),

@@ -123,6 +123,44 @@ pub fn patch_hidden_sectors_for(
     Ok(())
 }
 
+/// `bytes` as the FAT (saturated to 32 bits), NTFS and exFAT sector counts the resizers take.
+pub fn native_sectors(
+    file: &mut (impl Read + Seek),
+    partition_offset: u64,
+    bytes: u64,
+) -> anyhow::Result<(u32, u64, u64)> {
+    let (bps, exfat_bps) = native_sector_sizes(file, partition_offset)?;
+    Ok((
+        u32::try_from(bytes / bps).unwrap_or(u32::MAX),
+        bytes / bps,
+        bytes / exfat_bps,
+    ))
+}
+
+/// The sector sizes a FAT/NTFS BPB and an exFAT VBR count in; 512 where neither is present.
+fn native_sector_sizes(
+    file: &mut (impl Read + Seek),
+    partition_offset: u64,
+) -> anyhow::Result<(u64, u64)> {
+    let mut vbr = [0u8; 512];
+    file.seek(SeekFrom::Start(partition_offset))?;
+    if file.read_exact(&mut vbr).is_err() {
+        return Ok((512, 512));
+    }
+    let bps = u64::from(u16::from_le_bytes([vbr[11], vbr[12]]));
+    let bps = if matches!(bps, 512 | 1024 | 2048 | 4096) {
+        bps
+    } else {
+        512
+    };
+    let exfat = if &vbr[3..11] == b"EXFAT   " && (9..=12).contains(&vbr[0x6C]) {
+        1u64 << vbr[0x6C]
+    } else {
+        512
+    };
+    Ok((bps, exfat))
+}
+
 /// Resize like [`resize_filesystem_for`], but refuse to shrink a filesystem it has no resizer for.
 pub fn resize_filesystem_from(
     file: &mut (impl Read + Write + Seek),
@@ -189,8 +227,11 @@ pub fn resize_filesystem_for(
     new_size_bytes: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> anyhow::Result<()> {
-    let new_sectors_u32 = (new_size_bytes / 512) as u32;
-    let new_sectors_u64 = new_size_bytes / 512;
+    // Counts go in the volume's own sector size; 512 grew a 2048-bps or 4Kn volume 4-8x (FSG-001).
+    let (bps, exfat_bps) = native_sector_sizes(file, partition_offset)?;
+    let new_sectors_u32 = u32::try_from(new_size_bytes / bps).unwrap_or(u32::MAX);
+    let new_sectors_u64 = new_size_bytes / bps;
+    let exfat_sectors = new_size_bytes / exfat_bps;
     // FAT says it declined only through its bool, so a shrink it refused is caught here.
     let fat_resized = fat::resize_fat_in_place(file, partition_offset, new_sectors_u32, log_cb)?;
     if fat_resized {
@@ -212,7 +253,7 @@ pub fn resize_filesystem_for(
     // not the 512-byte unit the FAT path assumes. No-op for non-SHARP/KG BPBs.
     human68k::resize_human68k_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     ntfs::resize_ntfs_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
-    exfat::resize_exfat_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
+    exfat::resize_exfat_in_place(file, partition_offset, exfat_sectors, log_cb)?;
     grow_exfat_past_its_fat(file, partition_offset, new_size_bytes, log_cb)?;
     // The classic resizer would rewrite a wrapper's MDB and leave the HFS+ inside untouched.
     if !wrapped_hfsplus_guard(file, partition_offset, new_size_bytes, log_cb)? {
@@ -3224,7 +3265,7 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             let preset_name = &s[4..];
             let dpb = cpm_diskdefs::preset_by_name(preset_name).ok_or_else(|| {
                 FilesystemError::Unsupported(format!(
-                    "unknown CP/M DPB preset '{preset_name}' — \
+                    "unknown CP/M DPB preset '{preset_name}' - \
                      valid names: {}",
                     cpm_diskdefs::ALL_PRESETS
                         .iter()
@@ -3362,7 +3403,15 @@ fn wrapped_hfsplus_compact_reader<R: Read + Seek + Send + 'static>(
     let Some(partition_size) = partition_size else {
         return Ok(None);
     };
-    let mut head = vec![0u8; (inner_offset - partition_offset) as usize];
+    // Both ends are held in RAM; their sizes come from the MDB, so they are capped (FSG-006, FSG-007).
+    const WRAPPER_END_MAX: u64 = 256 << 20;
+    let head_len = inner_offset.saturating_sub(partition_offset);
+    if head_len > WRAPPER_END_MAX {
+        return Err(format!(
+            "the HFS wrapper claims a {head_len}-byte head ahead of its HFS+ volume"
+        ));
+    }
+    let mut head = vec![0u8; head_len as usize];
     reader
         .seek(SeekFrom::Start(partition_offset))
         .and_then(|_| reader.read_exact(&mut head))
@@ -3379,6 +3428,12 @@ fn wrapped_hfsplus_compact_reader<R: Read + Seek + Send + 'static>(
         return Err(format!(
             "wrapped HFS+ volume ends at {inner_end}, past its partition's end {partition_end}"
         ));
+    }
+    if partition_end - inner_end > WRAPPER_END_MAX {
+        return Err(
+            "the HFS wrapper is far larger than its HFS+ volume; back it up sector by sector"
+                .to_string(),
+        );
     }
     let mut tail = vec![0u8; (partition_end - inner_end) as usize];
     reader
@@ -4198,7 +4253,7 @@ pub fn defrag_clone_shape<R: Read + Seek>(
     let unmounted_clean = attributes & 0x100 != 0;
     if journaled && !unmounted_clean {
         return Err(
-            "journaled HFS+ volume is dirty (kHFSVolumeUnmountedBit clear) — the \
+            "journaled HFS+ volume is dirty (kHFSVolumeUnmountedBit clear) - the \
              on-disk journal carries pending metadata changes that haven't been \
              applied to the catalog. Mount + cleanly unmount the volume first \
              (or run `fsck_hfs -f` against it), then re-run the backup."
@@ -4781,6 +4836,24 @@ mod tests {
         let buf = xfsb_sector();
         let mut cursor = Cursor::new(buf);
         assert_eq!(detect_filesystem_type(&mut cursor, 0), "xfs");
+    }
+
+    /// FSG-001: resizers count in the volume's sectors, so 512-byte counts grew a 2048-bps FAT 4x.
+    #[test]
+    fn resize_counts_are_in_the_volumes_own_sectors() {
+        let mut vbr = vec![0u8; 4096];
+        vbr[11..13].copy_from_slice(&2048u16.to_le_bytes());
+        let (fat, ntfs, exfat) = native_sectors(&mut Cursor::new(vbr), 0, 8 << 20).unwrap();
+        assert_eq!((fat, ntfs, exfat), (4096, 4096, 16384));
+        let mut ex = vec![0u8; 4096];
+        ex[3..11].copy_from_slice(b"EXFAT   ");
+        ex[0x6C] = 12;
+        assert_eq!(
+            native_sectors(&mut Cursor::new(ex), 0, 8 << 20).unwrap().2,
+            2048
+        );
+        let huge = native_sectors(&mut Cursor::new(vec![0u8; 512]), 0, 3 << 40).unwrap();
+        assert_eq!(huge.0, u32::MAX, "saturates, never wraps (FSG-004)");
     }
 
     #[test]

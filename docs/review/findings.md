@@ -848,3 +848,115 @@ os, privileged, device.rs. Mechanical: no `eprintln!`; input-sized allocations a
 | OSL-012 | S4 | confirmed | [linux.rs:531](../../src/os/linux.rs#L531) | `LinuxDiskAccess` is dead and duplicates the unmount loop. | fixed: `LinuxDiskAccess` removed |
 | OSL-013 | S4 | confirmed | [linux.rs:79](../../src/os/linux.rs#L79) | `unescape_mountinfo` is quadratic. | fixed: a peek |
 | OSL-014 | S4 | plausible | [linux.rs:59](../../src/os/linux.rs#L59) | eMMC boot partitions, md, mtdblock, zd listed as disks; Solaris `is_read_only` hard-coded. | deferred (plausible): extra rows, no wrong writes |
+
+# src/ review, slice 3 (branch `review-src-3`, started 2026-11-26)
+
+fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the rest of `src/fs` (FSX), `src/optical` (OPT), `src/remote` (RMT).
+
+## src/fs/mod.rs
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| FSG-001 | S1 | confirmed | [mod.rs:192](../../src/fs/mod.rs#L192) | `resize_filesystem_for` passes `bytes/512` to the FAT/NTFS/exFAT resizers, which read it in the volume's own sector size: a 2048-bps FAT or 4Kn NTFS/exFAT grows to claim 4-8x its partition. | fixed: `native_sectors` converts to the BPB/VBR sector size at the dispatch and in restore; test `resize_counts_are_in_the_volumes_own_sectors` |
+| FSG-002 | S1 | plausible | [mod.rs:219](../../src/fs/mod.rs#L219) | The resize dispatch runs every resizer; a FAT whose FAT table holds 0x4244/0xEF53 at +1024 also gets the HFS or ext resizer. Dispatch on the detected type. | open |
+| FSG-003 | S1 | plausible | [mod.rs:518](../../src/fs/mod.rs#L518) | `in_place_resize_support` maps "unknown" to `NoFilesystem`, so a shrink of a filesystem detection misses (CP/M, LIF, Lisa) is let through. | open |
+| FSG-004 | S2 | confirmed | [mod.rs:192](../../src/fs/mod.rs#L192) | `(bytes/512) as u32` wraps at 2 TiB for FAT. | fixed: the FAT count saturates |
+| FSG-005 | S2 | confirmed | [mod.rs:120](../../src/fs/mod.rs#L120) | The FAT hidden-sector patch accepts NTFS and writes only the primary boot sector; the NTFS patcher then sees nothing to do, so the backup boot sector keeps the stale value. | open |
+| FSG-006 | S2 | confirmed | [mod.rs:3365](../../src/fs/mod.rs#L3365) | `wrapped_hfsplus_compact_reader` allocates the wrapper head from an unchecked MDB offset (up to ~2^48). | fixed: the wrapper head is capped at 256 MiB |
+| FSG-007 | S2 | plausible | [mod.rs:3383](../../src/fs/mod.rs#L3383) | The same reader holds the partition tail after the embedded volume in RAM. | fixed: the tail is capped too; a bigger wrapper is refused with a sector-by-sector hint |
+| FSG-008 | S2 | confirmed | [mod.rs:820](../../src/fs/mod.rs#L820) | UFS/ADFS/JFS/DOS 3.3 detection does unaligned sub-sector reads, which fail on a raw device. | open |
+| FSG-009 | S2 | plausible | [mod.rs:4015](../../src/fs/mod.rs#L4015) | `fit_apple_volume_to_partition` reads 2 bytes at +1024 on a raw device. | open |
+| FSG-010 | S2 | plausible | [mod.rs:268](../../src/fs/mod.rs#L268) | `recount_fat32_free`'s last FAT chunk isn't a sector multiple. | open |
+| FSG-011 | S2 | plausible | [mod.rs:362](../../src/fs/mod.rs#L362) | `grow_exfat_past_its_fat` rewrites in place with the only copy in an unnamed tempfile. | open |
+| FSG-012 | S4 | confirmed | [mod.rs:1420](../../src/fs/mod.rs#L1420) | `packed_partition_reader_padded` misses FAT types 0x11, 0xEF, 0x27. | open |
+| FSG-013 | S4 | confirmed | [mod.rs:3485](../../src/fs/mod.rs#L3485) | `Apple_UNIX_SVR2` compaction handles only ext/btrfs. | open |
+| FSG-014 | S4 | confirmed | [mod.rs:1781](../../src/fs/mod.rs#L1781) | `EXPENSIVE_MINIMUM_STRINGS` misses `Apple_HFS+`, `Apple_UNIX_SRVR2`, ProDOS. | open |
+| FSG-015 | S4 | confirmed | [mod.rs:1604](../../src/fs/mod.rs#L1604) | `fs_name_for` says "unknown" for strings the routers open. | open |
+| FSG-016 | S4 | confirmed | [mod.rs:3209](../../src/fs/mod.rs#L3209) | PFS3/SFS read/compact arms ignore `partition_size`; 0x07 drops the passphrase. | open |
+| FSG-017 | S4 | confirmed | [mod.rs:2309](../../src/fs/mod.rs#L2309) | Detected `human68k` has no 0x00 auto-detect arm. | open |
+| FSG-018 | S4 | confirmed | [mod.rs:3903](../../src/fs/mod.rs#L3903) | `is_checkable_type` misses 0x11/0xEF; its doc contradicts `is_checkable_fs_name`. | open |
+| FSG-019 | S4 | confirmed | [mod.rs:691](../../src/fs/mod.rs#L691) | Detection treats only 0x482B as wrapped; the guard also takes 0x4858. | open |
+| FSG-020 | S4 | confirmed | [mod.rs:136](../../src/fs/mod.rs#L136) | `resize_filesystem_from` passes no type string, so its Amiga branch is dead. | open |
+| FSG-021 | S4 | confirmed | [mod.rs:734](../../src/fs/mod.rs#L734) | QNX4 probed twice; the FAT comment sits above it. | open |
+| FSG-022 | S3 | confirmed | [mod.rs:3227](../../src/fs/mod.rs#L3227) | Em dashes in user-visible errors. | fixed |
+| FSG-023 | S4 | confirmed | [mod.rs:552](../../src/fs/mod.rs#L552) | `fs_display_name` covers half the detected tokens. | open |
+| FSG-024 | S4 | confirmed | [mod.rs:235](../../src/fs/mod.rs#L235) | FAT/exFAT on-disk logic in app glue; belongs in `fs-pc`. | open |
+
+## src/fs operations
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| FSX-001 | S1 | confirmed | [replace.rs:215](../../src/fs/replace.rs#L215) | A failed temp-name create returns `Ok(None)`; the fallback deletes the original and re-reads an already consumed source. | fixed: a failed staged write returns the error with the original intact; test `a_replace_that_cannot_fit_keeps_the_original` |
+| FSX-002 | S1 | confirmed | [copy.rs:373](../../src/fs/copy.rs#L373) | `Force` deletes the destination before the source is read or written. | fixed: a file in the way is replaced through the staged `create_or_replace`; test `a_forced_copy_that_cannot_fit_keeps_the_destination_file` |
+| FSX-003 | S2 | confirmed | [export_selection.rs:168](../../src/fs/export_selection.rs#L168) | `relative_dir` from on-disk names (`..`, `/`, `C:`) is joined onto the export folder unsanitised; same in zip and StuffIt member names. | fixed: folder components are legalized one by one and zip members can't be `.`/`..`; test `image_folder_names_stay_inside_the_export_folder`. StuffIt names stay Mac names inside the archive |
+| FSX-004 | S2 | confirmed | [export_selection.rs:257](../../src/fs/export_selection.rs#L257) | `read_data_fork` sizes a Vec from the image's entry size; StuffIt export holds every file in RAM. | fixed for the reservation (capped at 16 MiB); a whole-file read is still how per-file gzip/zip work |
+| FSX-005 | S2 | confirmed | [copy.rs:390](../../src/fs/copy.rs#L390) | `Vec::with_capacity(rsrc_size)` from the image. | fixed: reservation capped |
+| FSX-006 | S2 | confirmed | [zstd_stream.rs:72](../../src/fs/zstd_stream.rs#L72) | `fill_to` keeps every decompressed byte; End-seek returns the buffered length. | open |
+| FSX-007 | S2 | confirmed | [optical_fs.rs:272](../../src/fs/optical_fs.rs#L272) | Optical file reads load the whole file; `read_file_range` exists. | open |
+| FSX-008 | S2 | confirmed | [hfs_clone.rs:276](../../src/fs/hfs_clone.rs#L276) | Driver partitions buffered from an unchecked `block_count`. | open |
+| FSX-009 | S2 | confirmed | [mac_scsi_bless.rs:161](../../src/fs/mac_scsi_bless.rs#L161) | Donor driver read sized by an unchecked `block_count`; `ddSize as u16` truncates. | open |
+| FSX-010 | S2 | confirmed | [copy.rs:252](../../src/fs/copy.rs#L252) | Flatten mode on a flat volume silently overwrites same-named files from different folders. | open |
+| FSX-011 | S2 | plausible | [mac_scsi_bless.rs:277](../../src/fs/mac_scsi_bless.rs#L277) | Bless writes into the first `is_driver_type` match (also Patches/ATA/FW) and replaces the DDR with one descriptor. | open |
+| FSX-012 | S2 | plausible | [copy.rs:287](../../src/fs/copy.rs#L287) | Directory walks recurse with no depth or cycle cap. | open |
+| FSX-013 | S2 | plausible | [archive_fs.rs:129](../../src/fs/archive_fs.rs#L129) | An empty archive member name maps to `/`, so the root lists itself. | open |
+| FSX-014 | S2 | confirmed | [mac_archive_import.rs:44](../../src/fs/mac_archive_import.rs#L44) | `looks_like_mac_archive` reads the whole file to sniff it. | fixed: files over 256 MiB are not sniffed (BinHex detection needs the whole file) |
+| FSX-015 | S3 | confirmed | [dir_import.rs:49](../../src/fs/dir_import.rs#L49) | `is_maczip` reads zips up to 256 MiB into RAM. | open |
+| FSX-016 | S3 | confirmed | [tree.rs:58](../../src/fs/tree.rs#L58) | Control characters shown as U+2400 glyphs. | fixed: control characters show as `?` |
+| FSX-017 | S3 | confirmed | [make_bootable.rs:253](../../src/fs/make_bootable.rs#L253) | The donor is validated after the driver and DDR are written. | open |
+| FSX-018 | S3 | confirmed | [export_selection.rs:367](../../src/fs/export_selection.rs#L367) | Tar/zip exports leave a truncated archive on error or cancel. | open |
+| FSX-019 | S3 | confirmed | [tree.rs:87](../../src/fs/tree.rs#L87) | Unchecked size arithmetic from disk. | open |
+| FSX-020 | S4 | confirmed | [hfs_clone.rs:1](../../src/fs/hfs_clone.rs#L1) | Module docs claim re-exports that don't exist. | open |
+| FSX-021 | S4 | confirmed | [hfs_clone.rs:61](../../src/fs/hfs_clone.rs#L61) | `emit_apm_disk_with_hfs` is an in-RAM API used only by a test. | open |
+| FSX-022 | S4 | confirmed | [mac_scsi_bless.rs:74](../../src/fs/mac_scsi_bless.rs#L74) | `is_driver_type` duplicated in hfs_clone.rs. | open |
+
+## src/optical
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| OPT-001 | S1 | confirmed | [convert.rs:539](../../src/optical/convert.rs#L539) | Per-track flush errors are dropped with `.ok()`, then the single-bin is deleted: a full disk loses the only complete copy. | fixed: a failed track flush stops before the single-bin is deleted |
+| OPT-002 | S1 | confirmed | [convert.rs:149](../../src/optical/convert.rs#L149) | Convert never refuses an output that is the source; `a.iso -> a.iso --format bincue` overwrites the ISO with the cue. | fixed: `rb-cli optical convert` applies `output_refusal` |
+| OPT-003 | S1 | confirmed | [rip.rs:399](../../src/optical/rip.rs#L399) | `--output disc.bin --format bincue` writes the cue over the ripped BIN. | fixed: `rb-cli optical rip` applies it too |
+| OPT-004 | S2 | confirmed | [rip.rs:422](../../src/optical/rip.rs#L422) | Every data track is read as Mode 1, so Mode 2 discs (PSX, VCD, CD-i) can't be ripped. | open |
+| OPT-005 | S2 | confirmed | [rip.rs:304](../../src/optical/rip.rs#L304) | The ISO rip reads to the lead-out, through a mixed-mode disc's audio tracks, and fails. | open |
+| OPT-006 | S2 | confirmed | [convert.rs:192](../../src/optical/convert.rs#L192) | `bincue_to_iso` includes the next audio track's pregap. | open |
+| OPT-007 | S2 | confirmed | [convert.rs:197](../../src/optical/convert.rs#L197) | `bin_size - file_byte_offset` unchecked. | fixed: checked |
+| OPT-008 | S2 | confirmed | [rip.rs:389](../../src/optical/rip.rs#L389) | `toc.tracks[0]` and unchecked LBA subtractions on an empty or unsorted TOC (remote TOCs unvalidated). | fixed: `check_toc` refuses an empty or unsorted TOC |
+| OPT-009 | S2 | plausible | [rip.rs:450](../../src/optical/rip.rs#L450) | Short sector reads aren't checked against the requested count. | open |
+| OPT-010 | S2 | confirmed | [convert.rs:403](../../src/optical/convert.rs#L403) | CHD extracts ignore cancel. | open |
+| OPT-011 | S2 | confirmed | [source.rs:386](../../src/optical/source.rs#L386) | DVD/BD reads have no retry or chunk reduction. | open |
+| OPT-012 | S2 | confirmed | [boot_area.rs:162](../../src/optical/boot_area.rs#L162) | `read_file` allocates an unchecked length. | fixed: boot-area files over 64 MiB are refused |
+| OPT-013 | S2 | confirmed | [convert.rs:114](../../src/optical/convert.rs#L114) | MSF minutes wrap past 99; a trailing partial sector is dropped. | open |
+| OPT-014 | S2 | plausible | [convert.rs:125](../../src/optical/convert.rs#L125) | Synthesised MODE1/2352 frames carry zero EDC/ECC. | open |
+| OPT-015 | S2 | plausible | [rip.rs:415](../../src/optical/rip.rs#L415) | CD-Extra's session gap is read as part of the last audio track. | open |
+| OPT-016 | S3 | confirmed | [rip.rs:324](../../src/optical/rip.rs#L324) | Failed or cancelled rips/converts leave their output (and a temp BIN). | open |
+| OPT-017 | S3 | plausible | [source.rs:272](../../src/optical/source.rs#L272) | Windows eject quoting. | open |
+| OPT-018 | S4 | confirmed | [convert.rs:600](../../src/optical/convert.rs#L600) | chd-only helpers not cfg-gated. | open |
+| OPT-019 | S4 | confirmed | [rip.rs:515](../../src/optical/rip.rs#L515) | Three LBA-to-MSF copies; helpers copied between rip and convert. | open |
+| OPT-020 | S4 | plausible | [rip.rs:240](../../src/optical/rip.rs#L240) | Any TOC failure sends a CD down the DVD path. | open |
+
+## src/remote
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| RMT-001 | S1 | confirmed | [server.rs:773](../../src/remote/server.rs#L773) | The daemon has no authentication, binds 0.0.0.0:7341 and is writable by default: any LAN peer can write images and non-system disks. | open |
+| RMT-002 | S1 | confirmed | [server.rs:816](../../src/remote/server.rs#L816) | The chunked-upload path ignores `--read-only`. | fixed: a read-only daemon drops a Family-B PUT |
+| RMT-003 | S1 | confirmed | [service.rs:70](../../src/remote/service.rs#L70) | `rb-daemon.ini`'s `token` is parsed but never enforced. | partly fixed: the daemon log warns that a configured token is not enforced; enforcing one needs a protocol field and a token prompt in every client (needs a decision with RMT-001) |
+| RMT-004 | S1 | confirmed | [server.rs:2329](../../src/remote/server.rs#L2329) | `sandbox_join_create` follows a final-component symlink out of the root. | fixed: a final-component symlink is refused |
+| RMT-005 | S1 | plausible | [server.rs:742](../../src/remote/server.rs#L742) | Member names allow `C:x` on a Windows daemon. | fixed: `:` is refused in container and member names |
+| RMT-006 | S2 | confirmed | [server.rs:148](../../src/remote/server.rs#L148) | Unbounded threads, no socket timeouts. | partly fixed: at most 32 concurrent connections; idle timeouts wait on a client heartbeat |
+| RMT-007 | S2 | confirmed | [client.rs:57](../../src/remote/client.rs#L57) | The client clears its read timeout and has no write timeout. | open |
+| RMT-008 | S2 | confirmed | [client.rs:666](../../src/remote/client.rs#L666) | `read_block` buffers an unbounded reply before checking its length. | fixed: `CappedSink` refuses past the requested length |
+| RMT-009 | S2 | confirmed | [server.rs:686](../../src/remote/server.rs#L686) | Uploaded manifest/metadata members read whole. | open |
+| RMT-010 | S2 | confirmed | [server.rs:1135](../../src/remote/server.rs#L1135) | `WriteHostFile` truncates before the body arrives and doesn't check the size. | open |
+| RMT-011 | S2 | confirmed | [server.rs:2079](../../src/remote/server.rs#L2079) | `open_write_target` drops the volume locks/DA claim at once. | fixed: the `DeviceWriteHandle` lives in the block handle |
+| RMT-012 | S2 | plausible | [server.rs:363](../../src/remote/server.rs#L363) | Concurrent PUTs of one name share a staging dir. | open |
+| RMT-013 | S2 | plausible | [server.rs:1196](../../src/remote/server.rs#L1196) | No cross-connection exclusion on an image or device. | open |
+| RMT-014 | S2 | confirmed | [connection.rs:68](../../src/remote/connection.rs#L68) | `heartbeat` ignores a write failure. | open |
+| RMT-015 | S2 | confirmed | [block_reader.rs:252](../../src/remote/block_reader.rs#L252) | Unchecked signed seek arithmetic. | fixed: unsigned checked seek |
+| RMT-016 | S2 | plausible | [server.rs:773](../../src/remote/server.rs#L773) | No per-connection handle limit. | open |
+| RMT-017 | S3 | confirmed | [server.rs:800](../../src/remote/server.rs#L800) | `Hello` isn't required before other requests. | open |
+| RMT-018 | S3 | confirmed | [server.rs:2239](../../src/remote/server.rs#L2239) | `host_stat` is an existence oracle outside the root. | open |
+| RMT-019 | S3 | confirmed | [server.rs:849](../../src/remote/server.rs#L849) | Em dashes in replies and logs. | fixed |
+| RMT-020 | S3 | confirmed | [service.rs:341](../../src/remote/service.rs#L341) | Unquoted exe path in `user-startup.sh`. | open |
+| RMT-021 | S3 | plausible | [service.rs:471](../../src/remote/service.rs#L471) | `stop` trusts a PID file in /tmp. | open |
+| RMT-022 | S4 | confirmed | [server.rs:1438](../../src/remote/server.rs#L1438) | `reply_err`'s doc sits on `in_job`. | open |
