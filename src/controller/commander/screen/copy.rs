@@ -133,11 +133,8 @@ impl CommanderController {
         };
         // The daemon's files go through the same review a local copy gets (MCM-002).
         let existing = self.pane(to).names_in(&parent.path);
-        let conflicts: Vec<String> = entries
-            .iter()
-            .filter(|e| existing.contains(&e.name))
-            .map(|e| e.name.clone())
-            .collect();
+        let forks = (!self.pane(from).is_host_pane()).then_some(self.export_fork_mode);
+        let conflicts = commander_ops::remote_copy_conflicts(&entries, &existing, forks);
         let dest_parent = parent.path;
         let job = if self.pane(from).is_host_pane() {
             HostCopyJob::HostToRemoteHost {

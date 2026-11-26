@@ -1291,6 +1291,29 @@ pub fn host_copy_conflicts(
     out
 }
 
+/// [`host_copy_conflicts`] against a remote folder's listed `existing` names: the encoded
+/// names an upload writes, compared case-insensitively since the daemon's host may fold case.
+pub fn remote_copy_conflicts(
+    entries: &[FileEntry],
+    existing: &[String],
+    fork_mode: Option<ResourceForkMode>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in entries.iter().filter(|e| !e.is_directory()) {
+        let name = match fork_mode {
+            Some(mode) => primary_output_path(entry, Path::new(""), &safe_name(entry), mode)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.name.clone()),
+            None => entry.name.clone(),
+        };
+        if existing.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// What to do about an existing host file: `Ok(true)` writes over it.
 fn resolve_host_conflict(
     target: &Path,
@@ -1662,16 +1685,34 @@ fn upload_dir_files_to_remote(
     on: OnConflict,
     status: &Arc<Mutex<HostCopyStatus>>,
 ) -> Result<bool> {
-    let mut wrote = false;
-    for dent in std::fs::read_dir(dir)?.flatten() {
-        if dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            let name = dent.file_name().to_string_lossy().into_owned();
-            let dest = join_remote(dest_parent, &name);
-            wrote |= put_remote(conn, &dest, &dent.path(), on, status)
-                .with_context(|| format!("uploading '{name}'"))?;
+    let files: Vec<(String, PathBuf)> = std::fs::read_dir(dir)?
+        .flatten()
+        .filter(|d| d.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|d| {
+            (
+                join_remote(dest_parent, &d.file_name().to_string_lossy()),
+                d.path(),
+            )
+        })
+        .collect();
+    // One entry's encoded files (data and sidecar) are skipped or refused together.
+    if on != OnConflict::Replace {
+        if let Some((dest, _)) = files
+            .iter()
+            .find(|(d, _)| matches!(conn.host_stat(d), Ok((true, _))))
+        {
+            if on == OnConflict::Fail {
+                bail!("{dest} already exists on the daemon");
+            }
+            note_skipped(status, Path::new(dest), "already exists");
+            return Ok(false);
         }
     }
-    Ok(wrote)
+    for (dest, src) in &files {
+        conn.write_host_file(dest, src, true)
+            .with_context(|| format!("uploading '{dest}'"))?;
+    }
+    Ok(!files.is_empty())
 }
 
 /// Write one file to the daemon under the conflict policy: uploads always forced before, so the
@@ -2008,6 +2049,30 @@ crate::model::worker::finished_with_error!(HostCopyStatus, StageCopyStatus);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MCM-002: the upload's review sees the names it will write, whatever their case.
+    #[test]
+    fn remote_conflicts_use_the_written_names_and_ignore_case() {
+        let file = FileEntry::new_file("README".into(), "/README".into(), 4, 0);
+        let dir = FileEntry::new_directory("Docs".into(), "/Docs".into(), 0);
+        let existing = vec!["readme".to_string(), "docs".to_string()];
+        let hits = remote_copy_conflicts(&[file.clone(), dir], &existing, None);
+        assert_eq!(
+            hits,
+            vec!["README".to_string()],
+            "folders merge; files conflict"
+        );
+        let hqx = remote_copy_conflicts(
+            &[file],
+            &["README.hqx".to_string()],
+            Some(ResourceForkMode::BinHex),
+        );
+        assert_eq!(
+            hqx,
+            vec!["README.hqx".to_string()],
+            "BinHex writes README.hqx"
+        );
+    }
 
     #[test]
     fn stage_host_for_reads_prodos_suffixes_and_keeps_forks_to_hfs() {
