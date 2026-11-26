@@ -311,6 +311,34 @@ pub fn apply_resize(
         new_data_size
     };
 
+    // The table edit is rehearsed first: once data has moved, a refused edit strands it (PAR-001).
+    let mut edits = Vec::new();
+    for plan in plans {
+        if plan.new_size_bytes != plan.old_size_bytes {
+            edits.push(PartitionTableEdit::ResizeEntry {
+                index: plan.index,
+                new_size_bytes: plan.new_size_bytes,
+            });
+        }
+        if plan.new_start_lba != plan.old_start_lba {
+            edits.push(PartitionTableEdit::MoveEntry {
+                index: plan.index,
+                new_start_lba: plan.new_start_lba,
+            });
+        }
+    }
+
+    if !edits.is_empty() {
+        let warnings = editor::validate_edits(table, &edits, new_data_size)
+            .context("The partition table can't take this resize; nothing has been written")?;
+        for w in warnings {
+            log_cb(&format!("Warning: {w}"));
+        }
+        let mut rehearsal = super::overlay::Overlay::new(&mut *file);
+        editor::apply_edits(&mut rehearsal, table, &edits, new_data_size, &mut |_| {})
+            .context("The partition table can't take this resize; nothing has been written")?;
+    }
+
     // Calculate total bytes to move for progress reporting
     let total_move_bytes: u64 = plans
         .iter()
@@ -392,22 +420,6 @@ pub fn apply_resize(
 
     // Step 4: Update partition table entries
     log_cb("Updating partition table...");
-    let mut edits = Vec::new();
-    for plan in plans {
-        if plan.new_size_bytes != plan.old_size_bytes {
-            edits.push(PartitionTableEdit::ResizeEntry {
-                index: plan.index,
-                new_size_bytes: plan.new_size_bytes,
-            });
-        }
-        if plan.new_start_lba != plan.old_start_lba {
-            edits.push(PartitionTableEdit::MoveEntry {
-                index: plan.index,
-                new_start_lba: plan.new_start_lba,
-            });
-        }
-    }
-
     if !edits.is_empty() {
         editor::apply_edits(file, table, &edits, new_data_size, log_cb)
             .context("Failed to update partition table")?;
@@ -970,5 +982,44 @@ mod tests {
         std::fs::write(qcow2.path(), &head).unwrap();
         let err = expand_image_file(qcow2.path(), 4096, &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("QCOW2"), "{err}");
+    }
+
+    /// PAR-001: data used to move before the table editor refused the edit.
+    #[test]
+    fn a_table_the_editor_refuses_leaves_the_data_unmoved() {
+        let disk_size = 8192u64 * 512;
+        let mut disk = vec![0u8; disk_size as usize];
+        disk[2048 * 512..2048 * 512 + 4].copy_from_slice(b"KEEP");
+        let before = disk.clone();
+        let table = PartitionTable::None {
+            size_bytes: 1 << 20,
+            fs_hint: "Unknown".into(),
+        };
+        let plans = [PartitionResizePlan {
+            index: 0,
+            old_start_lba: 2048,
+            old_size_bytes: 1 << 20,
+            new_start_lba: 4096,
+            new_size_bytes: 1 << 20,
+            needs_data_move: true,
+            move_delta_bytes: 1 << 20,
+        }];
+        let mut cursor = std::io::Cursor::new(&mut disk[..]);
+        let err = apply_resize(
+            &mut cursor,
+            &plans,
+            &table,
+            true,
+            false,
+            disk_size,
+            &mut |_, _| {},
+            &mut |_| {},
+        )
+        .expect_err("a superfloppy has no table to edit");
+        assert!(
+            format!("{err:#}").contains("nothing has been written"),
+            "{err:#}"
+        );
+        assert!(disk == before, "no byte moved");
     }
 }

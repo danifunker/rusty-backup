@@ -740,6 +740,14 @@ fn reconstruct_disk_inner(
         // We always use absolute seeks (SeekFrom::Start) rather than relative
         // seeks because the patch_*_hidden_sectors calls at the end of each
         // iteration may have moved the file cursor away from total_written.
+        // A grown partition reaching past the next start would push it off its LBA (RBF-008).
+        if total_written > part_offset {
+            bail!(
+                "partition {} would start at byte {}, inside data already written (up to byte {total_written})",
+                pm.index,
+                part_offset
+            );
+        }
         if total_written < part_offset {
             let gap = part_offset - total_written;
             // On Windows physical drives, we must write zeros to gaps (seeking
@@ -2623,6 +2631,94 @@ mod mbr_gap_restore_tests {
             log.iter()
                 .any(|l| l.contains("between the MBR and the first partition")),
             "{log:?}"
+        );
+    }
+
+    /// RBF-008: a partition grown past the next start used to push that one to the cursor.
+    #[test]
+    fn a_partition_grown_over_its_neighbour_is_refused() {
+        const PART_BYTES: u64 = 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path();
+        let mut mbr = [0u8; 512];
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        let mut parts = Vec::new();
+        for (index, start) in [(0usize, 2048u64), (1, 4096)] {
+            let name = format!("partition-{index}.raw");
+            std::fs::write(folder.join(&name), vec![0u8; PART_BYTES as usize]).unwrap();
+            parts.push(PartitionMetadata {
+                index,
+                type_name: "FAT16".to_string(),
+                partition_type_byte: 0x06,
+                start_lba: start,
+                start_byte: None,
+                original_size_bytes: PART_BYTES,
+                imaged_size_bytes: PART_BYTES,
+                compressed_files: vec![name],
+                checksum: String::new(),
+                resized: false,
+                compacted: false,
+                is_logical: false,
+                partition_type_string: None,
+                minimum_size_bytes: None,
+                defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
+                defragmented_clone: false,
+            });
+        }
+        let total = 8192 * 512;
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-11-25T00:00:00Z".to_string(),
+            source_device: "synthetic".to_string(),
+            source_size_bytes: total,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: crate::backup::CompressionType::None.as_str().to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::PerPartition,
+            container: None,
+            container_logical_size: None,
+            container_sha1: None,
+            size_policy: None,
+            alignment: AlignmentMetadata {
+                detected_type: "Modern1MB".to_string(),
+                first_partition_lba: 2048,
+                alignment_sectors: 2048,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: parts,
+            bad_sectors: vec![],
+            extended_container: None,
+        };
+        let grow = [PartitionSizeOverride::size_only(
+            0,
+            2048,
+            PART_BYTES,
+            2 * PART_BYTES,
+        )];
+        let err = reconstruct_disk_from_backup(
+            folder,
+            &metadata,
+            Some(&mbr),
+            &grow,
+            total,
+            &mut std::io::Cursor::new(Vec::new()),
+            false,
+            false,
+            None,
+            None,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .expect_err("partition 1 would land at the cursor");
+        assert!(
+            format!("{err:#}").contains("inside data already written"),
+            "{err:#}"
         );
     }
 }

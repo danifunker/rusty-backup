@@ -65,6 +65,14 @@ impl WrapTable {
             WrapTable::Gpt { alignment, .. } => alignment.first_partition_lba().max(34),
         }
     }
+
+    /// Bytes at the disk's end the table keeps for itself: GPT's backup header and entries.
+    pub fn tail_bytes(&self) -> u64 {
+        match self {
+            WrapTable::Mbr { .. } => 0,
+            WrapTable::Gpt { .. } => 33 * SECTOR_SIZE,
+        }
+    }
 }
 
 /// All parameters needed to wrap a superfloppy and stream it to a target.
@@ -121,11 +129,15 @@ where
     let end_byte = first_byte
         .checked_add(params.partition_size_bytes)
         .context("partition end overflows")?;
-    if end_byte > params.target_size_bytes {
+    // A GPT partition reaching into the last 33 sectors loses them to the backup GPT (RST-004).
+    let room = params
+        .target_size_bytes
+        .saturating_sub(params.table.tail_bytes());
+    if end_byte > room {
         bail!(
-            "partition end ({} bytes) exceeds target size ({} bytes)",
+            "partition end ({} bytes) exceeds the room the target leaves for it ({} bytes)",
             end_byte,
-            params.target_size_bytes
+            room
         );
     }
 
@@ -479,11 +491,15 @@ pub fn build_wrap_overlay(
     let end_byte = first_byte
         .checked_add(params.partition_size_bytes)
         .context("partition end overflows")?;
-    if end_byte > params.target_size_bytes {
+    // A GPT partition reaching into the last 33 sectors loses them to the backup GPT (RST-004).
+    let room = params
+        .target_size_bytes
+        .saturating_sub(params.table.tail_bytes());
+    if end_byte > room {
         bail!(
-            "partition end ({} bytes) exceeds target size ({} bytes)",
+            "partition end ({} bytes) exceeds the room the target leaves for it ({} bytes)",
             end_byte,
-            params.target_size_bytes
+            room
         );
     }
 

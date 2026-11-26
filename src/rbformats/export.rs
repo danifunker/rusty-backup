@@ -755,13 +755,16 @@ pub fn export_whole_disk(
 
         let (gpt_sidecar, apm_sidecar) =
             super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
+        // The disk is written at offsets from its own start, so it sits past the header (RBF-002).
+        let mut body =
+            crate::model::format::Window::new(&mut file, header_size, u64::MAX - header_size);
         total_written = reconstruct_disk_for_export(
             source_path,
             meta,
             mbr_bytes,
             partition_sizes,
             meta.source_size_bytes,
-            &mut file,
+            &mut body,
             false,
             false,
             gpt_sidecar.as_ref(),
@@ -1123,16 +1126,7 @@ pub fn export_clonezilla_disk(
         );
     }
 
-    // For Raw/2MG/WOZ: wrap the VHD export logic but skip footer / add header.
-    // Since the Clonezilla disk export is complex (EBR, gap filling, etc.),
-    // we call the VHD version to a temp file and then strip/convert.
-    // However, that's wasteful. Instead, replicate the core logic.
-    //
-    // Actually, the simplest correct approach: use the VHD export, then
-    // post-process to strip the 512-byte footer and optionally prepend 2MG header.
-    // This avoids duplicating the complex Clonezilla reconstruction logic.
-
-    // Export as VHD first
+    // The Clonezilla reconstruction lives in the VHD export; every other format starts from it.
     let temp_vhd = output_path.with_extension("vhd.tmp");
     super::vhd::export_clonezilla_disk_vhd(
         cz_image,
@@ -1140,17 +1134,55 @@ pub fn export_clonezilla_disk(
         &temp_vhd,
         partition_sizes,
         progress_cb,
-        cancel_check,
+        &cancel_check,
         &mut log_cb,
     )?;
-
-    // Convert: strip VHD footer, optionally add 2MG header or encode as WOZ.
-    convert_from_vhd_temp(&temp_vhd, output_path, format, &mut log_cb)?;
-
-    // Clean up temp
+    let result = if matches!(
+        format,
+        ExportFormat::Raw
+            | ExportFormat::TwoMg
+            | ExportFormat::Woz
+            | ExportFormat::Moof
+            | ExportFormat::Dc42
+    ) {
+        convert_from_vhd_temp(&temp_vhd, output_path, format, &mut log_cb)
+    } else {
+        // Containers (QCOW2, VMDK, CHD...) used to get the raw bytes under their name (RBF-007).
+        clonezilla_raw_to(&temp_vhd, output_path, format, &cancel_check, &mut log_cb)
+    };
     let _ = std::fs::remove_file(&temp_vhd);
+    result
+}
 
-    Ok(())
+/// Strip the temp VHD's footer and encode the raw disk as `format`, as a raw-image export would.
+fn clonezilla_raw_to(
+    temp_vhd: &Path,
+    output_path: &Path,
+    format: ExportFormat,
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    let raw = temp_vhd.with_extension("img");
+    std::fs::rename(temp_vhd, &raw).context("rename the Clonezilla temp image")?;
+    let result = (|| {
+        let f = std::fs::OpenOptions::new().write(true).open(&raw)?;
+        let len = f.metadata()?.len();
+        f.set_len(len.saturating_sub(512))?;
+        drop(f);
+        export_whole_disk(
+            format,
+            &raw,
+            None,
+            None,
+            &[],
+            output_path,
+            |_| {},
+            cancel_check,
+            |m| log_cb(m),
+        )
+    })();
+    let _ = std::fs::remove_file(&raw);
+    result
 }
 
 /// Export a single partition from a Clonezilla image in the specified format.
@@ -2000,5 +2032,21 @@ mod tests {
         let mut roundtrip = vec![0u8; logical_size];
         std::io::Read::read_exact(&mut reader, &mut roundtrip).unwrap();
         assert_eq!(roundtrip, src, "CHD round-trip must be byte-equal");
+    }
+
+    #[test]
+    fn a_clonezilla_disk_exported_to_qcow2_is_a_qcow2() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp_vhd = dir.path().join("out.vhd.tmp");
+        let mut disk = vec![0u8; 1 << 20];
+        disk[510] = 0x55;
+        disk[511] = 0xAA;
+        disk.extend_from_slice(&[0xEEu8; 512]);
+        std::fs::write(&temp_vhd, &disk).unwrap();
+        let out = dir.path().join("out.qcow2");
+        clonezilla_raw_to(&temp_vhd, &out, ExportFormat::Qcow2, &|| false, &mut |_| {}).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[..4], b"QFI\xfb", "a QCOW2 header, not raw bytes");
+        assert!(!temp_vhd.exists() && !dir.path().join("out.vhd.img").exists());
     }
 }

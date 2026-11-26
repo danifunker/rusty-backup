@@ -688,6 +688,14 @@ pub fn export_whole_disk_vhd(
                 let source_offset = pw.source_lba * 512;
 
                 // Fill gap between current position and this partition's dest
+                // A grown partition reaching past the next start would push it off its LBA (RBF-008).
+                if total_written > dest_offset {
+                    bail!(
+                        "partition {} would start at byte {}, inside data already written (up to byte {total_written})",
+                        pw.index,
+                        dest_offset
+                    );
+                }
                 if total_written < dest_offset {
                     let gap = dest_offset - total_written;
                     if pw.source_lba == pw.dest_lba {
@@ -924,6 +932,11 @@ pub fn export_clonezilla_disk_vhd(
         patch_mbr_entries(&mut mbr_buf, partition_sizes).context("patching the MBR")?;
         log_cb("Patched MBR partition table with export sizes");
     }
+    // Clonezilla keeps only the first EBR, so the chain is rebuilt as restore does (RBF-009).
+    let ebr_layout = crate::restore::clonezilla_ebr_layout(cz_image, partition_sizes);
+    if let Some(ref layout) = ebr_layout {
+        crate::restore::patch_clonezilla_extended_entry(&mut mbr_buf, cz_image, layout);
+    }
     file.write_all(&mbr_buf).context("failed to write MBR")?;
     total_written += 512;
 
@@ -948,33 +961,26 @@ pub fn export_clonezilla_disk_vhd(
             bail!("export cancelled");
         }
 
-        let part_offset = cz_part.start_lba * 512;
-        let export_size = get_export_size(cz_part.index, cz_part.size_bytes());
-
-        // Fill gap to partition start
-        if total_written < part_offset {
-            let gap = part_offset - total_written;
-
-            // Write EBR if this is an extended partition and we have EBR data
-            if let Some(ebr_data) = cz_image.ebr_data.get(&cz_part.device_name) {
-                // EBR sits at the partition's start LBA
-                let ebr_gap = part_offset - total_written - ebr_data.len().min(512) as u64;
-                if ebr_gap > 0 {
-                    super::write_zeros(&mut file, ebr_gap)?;
-                    total_written += ebr_gap;
-                }
-                let write_len = ebr_data.len().min(512);
-                file.write_all(&ebr_data[..write_len])?;
-                total_written += write_len as u64;
-            } else {
-                super::write_zeros(&mut file, gap)?;
-                total_written += gap;
-            }
-        }
-
-        // Handle extended container partitions (no data to write)
+        // The container has no data of its own; its EBRs are written after the partitions.
         if cz_part.is_extended {
             continue;
+        }
+        let effective_lba = partition_sizes
+            .iter()
+            .find(|ps| ps.index == cz_part.index)
+            .map(|ps| ps.effective_start_lba())
+            .unwrap_or(cz_part.start_lba);
+        let part_offset = effective_lba * 512;
+        let export_size = get_export_size(cz_part.index, cz_part.size_bytes());
+        if part_offset < total_written {
+            bail!(
+                "partition {} would start at byte {part_offset}, inside data already written",
+                cz_part.device_name
+            );
+        }
+        if total_written < part_offset {
+            super::write_zeros(&mut file, part_offset - total_written)?;
+            total_written = part_offset;
         }
 
         // Write partition data from partclone
@@ -1023,12 +1029,6 @@ pub fn export_clonezilla_disk_vhd(
 
         // Patch hidden sectors and resize filesystem
         {
-            let effective_lba = partition_sizes
-                .iter()
-                .find(|ps| ps.index == cz_part.index)
-                .map(|ps| ps.effective_start_lba())
-                .unwrap_or(cz_part.start_lba);
-
             patch_hidden_sectors_for(&mut file, part_offset, effective_lba, &mut log_cb)?;
 
             if export_size != cz_part.size_bytes() {
@@ -1048,6 +1048,17 @@ pub fn export_clonezilla_disk_vhd(
         log_cb(&format!(
             "partition-{}: wrote {} bytes",
             cz_part.index, export_size,
+        ));
+    }
+
+    if let Some(ref layout) = ebr_layout {
+        for (offset, sector) in &layout.ebr_sectors {
+            file.seek(SeekFrom::Start(*offset))?;
+            file.write_all(sector).context("failed to write EBR")?;
+        }
+        log_cb(&format!(
+            "Wrote {} EBR(s) for logical partitions",
+            layout.ebr_sectors.len()
         ));
     }
 

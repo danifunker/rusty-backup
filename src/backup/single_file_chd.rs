@@ -409,14 +409,17 @@ pub fn run_export(
     // hand off to `run_via_staging`.
     log_cb("Re-exporting whole disk to CHD with resize plan...");
     let dest_dir = inputs.dest_path.parent().unwrap_or(Path::new("."));
-    let temp_decompressed = if is_chd_extension(inputs.source_path) {
+    // Any container is decoded, not just CHD: sector 0 came through a decoder too (BKP-004).
+    let probe = File::open(inputs.source_path)
+        .with_context(|| format!("failed to open {}", inputs.source_path.display()))?;
+    let fmt = crate::rbformats::detect_image_format_with_path(probe, Some(inputs.source_path))?;
+    let temp_decompressed = if !matches!(fmt, crate::rbformats::ImageFormat::Raw) {
         let path = dest_dir.join(format!(".rusty-backup-export-{}.img", std::process::id(),));
-        log_cb(&format!(
-            "Decompressing source CHD to {}...",
-            path.display()
-        ));
-        decompress_chd_to_file(inputs.source_path, &path, cancel_check)
-            .with_context(|| format!("failed to decompress source CHD to {}", path.display()))?;
+        log_cb(&format!("Decoding source image to {}...", path.display()));
+        let file = File::open(inputs.source_path)?;
+        let (mut reader, _) = crate::rbformats::wrap_image_reader(file, fmt)?;
+        decode_to_file(&mut reader, &path, cancel_check)
+            .with_context(|| format!("failed to decode the source to {}", path.display()))?;
         Some(path)
     } else {
         None
@@ -477,22 +480,12 @@ pub fn run_export(
     Ok(())
 }
 
-fn is_chd_extension(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()),
-        Some(ref s) if s == "chd"
-    )
-}
-
-/// Stream the entire logical contents of a CHD into a fresh raw `.img`
-/// at `dest`. Used by the resize re-export path because the resize
-/// pipeline needs raw `File` semantics on the source.
-fn decompress_chd_to_file(
-    chd_path: &Path,
+/// Stream a decoded image into a fresh raw `.img` at `dest`, for the resize path's raw `File`.
+fn decode_to_file(
+    reader: &mut impl Read,
     dest: &Path,
     cancel_check: &dyn Fn() -> bool,
 ) -> Result<()> {
-    let mut reader = ChdReader::open(chd_path)?;
     let mut out = File::create(dest)?;
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
@@ -543,6 +536,13 @@ pub fn build_resize_plans(
     }
     if effective.is_empty() && !has_clone_targets {
         return Ok(None);
+    }
+    // The plan covers primaries only, so a staged copy left logicals as zeros (BKP-001).
+    if inputs.partitions.iter().any(|p| p.is_logical) {
+        anyhow::bail!(
+            "a resized single-file CHD can't carry logical partitions yet; \
+             back up at the original sizes, or to Zstd per partition, to keep them"
+        );
     }
 
     // Excluded partitions (skipped via filter) keep their original size in
@@ -2297,6 +2297,45 @@ mod tests {
         mbr[454..458].copy_from_slice(&1u32.to_le_bytes()); // start LBA
         mbr[458..462].copy_from_slice(&partition_sectors.to_le_bytes());
         mbr
+    }
+
+    /// BKP-001: the resize plan covers primaries only, so logicals came out as zeros.
+    #[test]
+    fn a_resized_chd_with_logical_partitions_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        let mut data = vec![0u8; 8192 * 512];
+        data[..512].copy_from_slice(&build_test_mbr(4095));
+        std::fs::write(&source_path, &data).unwrap();
+        let source_file = File::open(&source_path).unwrap();
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).unwrap();
+        let mut partitions = table.partitions();
+        let mut logical = partitions[0].clone();
+        logical.index = 4;
+        logical.is_logical = true;
+        partitions.push(logical);
+        let output_base = tmp.path().join("out");
+        let targets = [(partitions[0].index, 2048 * 512)];
+        let inputs = SingleFileChdInputs {
+            keep_swap: true,
+            source_file: &source_file,
+            source_size: data.len() as u64,
+            source_partition_table_bytes: &data[..512],
+            partition_table: &table,
+            partitions: &partitions,
+            partition_filter: None,
+            sector_by_sector: false,
+            chd_options: None,
+            is_dvd: false,
+            output_base: &output_base,
+            resize_targets: Some(&targets),
+            hfsplus_clone_targets: None,
+            alignment_sectors: 0,
+            checksum_type: crate::backup::ChecksumType::Sha256,
+        };
+        let err = build_resize_plans(&inputs).expect_err("logicals would be lost");
+        assert!(err.to_string().contains("logical partitions"), "{err}");
     }
 
     /// Label schemes take the verbatim-head path, a partitionless volume has no

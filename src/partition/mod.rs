@@ -9,6 +9,7 @@ pub mod mac_cd_builder;
 use part_tables::mbr;
 use part_tables::next;
 pub mod next_cd_builder;
+pub(crate) mod overlay;
 pub mod provision;
 use part_tables::rdb;
 pub mod resize;

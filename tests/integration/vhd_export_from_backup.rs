@@ -125,3 +125,33 @@ fn a_shrunk_partition_takes_its_fat_with_it() {
     let total = if small != 0 { small } else { large };
     assert_eq!(total, new_sectors, "the BPB follows the partition");
 }
+
+#[test]
+fn a_2mg_from_a_backup_keeps_header_and_disk_apart() {
+    let b = back_up_a_fat_disk();
+    let dest = b.vhd.with_extension("2mg");
+    rusty_backup::rbformats::export::export_whole_disk(
+        rusty_backup::rbformats::export::ExportFormat::TwoMg,
+        &b.folder,
+        Some(&b.meta),
+        Some(&b.mbr),
+        &[],
+        &dest,
+        |_| {},
+        || false,
+        |_| {},
+    )
+    .unwrap();
+    let out = std::fs::read(&dest).unwrap();
+    assert_eq!(&out[..4], b"2IMG", "header intact");
+    assert_eq!(
+        &out[64 + 510..64 + 512],
+        &[0x55, 0xAA],
+        "MBR right after the header"
+    );
+    let p = 64 + START as usize * 512;
+    assert_eq!(
+        out[p + 512..p + 1024],
+        b.disk[START as usize * 512 + 512..][..512]
+    );
+}

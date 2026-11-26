@@ -523,21 +523,33 @@ fn calculate_apm_restore_layout(
 
     match alignment {
         RestoreAlignment::Original => {
-            // Each partition keeps its original absolute position
-            for pm in &sorted_parts {
+            // Each partition keeps its original absolute position, so it can grow only to the next.
+            for (i, pm) in sorted_parts.iter().enumerate() {
                 let size_choice = partition_sizes
                     .iter()
                     .find(|s| s.index == pm.index)
                     .map(|s| &s.size_choice)
                     .unwrap_or(&RestoreSizeChoice::Original);
+                let next = sorted_parts.get(i + 1).map(|n| n.start_lba * 512);
 
                 let partition_size = compute_partition_size(
                     size_choice,
                     pm,
                     pm.start_lba,
-                    usable_target_size,
+                    next.unwrap_or(usable_target_size),
                     restore_size_floor(metadata, pm),
                 );
+                if let Some(next) = next {
+                    if pm.start_lba * 512 + partition_size > next {
+                        bail!(
+                            "partition {} would grow to {} and run into the next partition; \
+                             with Original alignment it can be at most {}",
+                            pm.index,
+                            disk_core::display::format_size(partition_size),
+                            disk_core::display::format_size(next - pm.start_lba * 512)
+                        );
+                    }
+                }
 
                 overrides.push(PartitionSizeOverride {
                     index: pm.index,
@@ -2372,14 +2384,14 @@ fn clonezilla_first_ebr_gap(cz_image: &ClonezillaImage) -> u64 {
 }
 
 /// Where the extended container and its EBRs go after a Clonezilla restore layout.
-struct ClonezillaEbrLayout {
-    ext_start: u32,
-    ext_sectors: u32,
-    ebr_sectors: Vec<(u64, [u8; 512])>,
+pub(crate) struct ClonezillaEbrLayout {
+    pub(crate) ext_start: u32,
+    pub(crate) ext_sectors: u32,
+    pub(crate) ebr_sectors: Vec<(u64, [u8; 512])>,
 }
 
 /// Rebuild the EBR chain; Clonezilla saves only the first EBR and relies on sfdisk to redo the rest.
-fn clonezilla_ebr_layout(
+pub(crate) fn clonezilla_ebr_layout(
     cz_image: &ClonezillaImage,
     overrides: &[PartitionSizeOverride],
 ) -> Option<ClonezillaEbrLayout> {
@@ -2430,7 +2442,7 @@ fn clonezilla_ebr_layout(
 }
 
 /// Point the MBR's extended-container entry at the rebuilt container.
-fn patch_clonezilla_extended_entry(
+pub(crate) fn patch_clonezilla_extended_entry(
     mbr: &mut [u8; 512],
     cz_image: &ClonezillaImage,
     layout: &ClonezillaEbrLayout,
@@ -5083,6 +5095,85 @@ mod clonezilla_layout_tests {
         assert_eq!(
             u32::from_le_bytes(mbr[474..478].try_into().unwrap()),
             layout.ext_sectors
+        );
+    }
+
+    #[test]
+    fn a_clonezilla_vhd_export_puts_each_ebr_at_its_lba() {
+        let mut cz = ubuntu_image();
+        cz.partitions = vec![
+            part("sda1", 0, 2048, 2048, 0x83),
+            part("sda2", 1, 4094, 6146, 0x05),
+            part("sda5", 4, 4096, 2048, 0x83),
+            part("sda6", 5, 8192, 2048, 0x82),
+        ];
+        let mut mbr = [0u8; 512];
+        for (i, (ptype, start, size)) in [(0x83u8, 2048u32, 2048u32), (0x05, 4094, 6146)]
+            .iter()
+            .enumerate()
+        {
+            let off = 446 + i * 16;
+            mbr[off + 4] = *ptype;
+            mbr[off + 8..off + 12].copy_from_slice(&start.to_le_bytes());
+            mbr[off + 12..off + 16].copy_from_slice(&size.to_le_bytes());
+        }
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        cz.mbr_bytes = mbr;
+        cz.source_size_bytes = 10240 * 512;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("cz.vhd");
+        crate::rbformats::vhd::export_clonezilla_disk_vhd(
+            &cz,
+            dir.path(),
+            &out,
+            &[],
+            |_| {},
+            || false,
+            |_| {},
+        )
+        .unwrap();
+        let disk = std::fs::read(&out).unwrap();
+        let sector = |lba: usize| &disk[lba * 512..(lba + 1) * 512];
+        for lba in [4094, 8191] {
+            assert_eq!(&sector(lba)[510..], &[0x55, 0xAA], "EBR at LBA {lba}");
+        }
+        assert_eq!(
+            u32::from_le_bytes(sector(4094)[454..458].try_into().unwrap()),
+            2
+        );
+        assert!(
+            sector(4093).iter().all(|&b| b == 0),
+            "nothing one sector early"
+        );
+    }
+
+    /// RST-003: with Original alignment an APM partition keeps its start, so it can't grow over the next.
+    #[test]
+    fn an_apm_partition_can_grow_only_to_the_next_one() {
+        let meta = logical_backup_metadata();
+        let target = 200_000u64 * 512;
+        let size = |choice| {
+            calculate_apm_restore_layout(
+                &meta,
+                &RestoreAlignment::Original,
+                &[RestorePartitionSize {
+                    index: 0,
+                    size_choice: choice,
+                }],
+                target,
+            )
+        };
+        let fill = size(RestoreSizeChoice::FillRemaining).unwrap();
+        assert_eq!(
+            fill[0].export_size,
+            (24577 - 2048) * 512,
+            "fills up to the next start"
+        );
+        let err = size(RestoreSizeChoice::Custom(20 << 20)).expect_err("overlaps partition 4");
+        assert!(
+            err.to_string().contains("run into the next partition"),
+            "{err}"
         );
     }
 }
