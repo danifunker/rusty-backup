@@ -364,6 +364,22 @@ pub(super) struct VolumeState {
     sniffed: Option<(String, Option<MacArchiveKind>)>,
 }
 
+impl VolumeState {
+    /// Forget the old source's probes and their verdicts (CBR-005, CBR-016).
+    pub(super) fn forget_source(&mut self) {
+        if let Some(j) = self.boot_probe.take() {
+            j.cancel();
+        }
+        if let Some(j) = self.donor.take() {
+            j.cancel();
+        }
+        if let Some(j) = self.sniff.take() {
+            j.cancel();
+        }
+        *self = VolumeState::default();
+    }
+}
+
 impl BrowserPaneController {
     /// The last tree listing, handed over once (the view keeps the text).
     pub fn take_tree_text(&mut self) -> Option<TreeText> {

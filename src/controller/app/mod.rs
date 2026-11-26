@@ -135,6 +135,17 @@ impl AppController {
         self.log_auto_scroll
     }
 
+    /// True (and says why) while a job runs: killing the process mid-write corrupts the disk.
+    fn refuse_exit(&mut self) -> bool {
+        let running = self.jobs.running();
+        let Some(first) = running.first() else {
+            return false;
+        };
+        self.log
+            .error(format!("Wait for \"{first}\" to finish before restarting."));
+        true
+    }
+
     pub fn jobs(&self) -> &JobRegistry {
         &self.jobs
     }
@@ -167,6 +178,10 @@ impl Controller for AppController {
                 self.refresh_devices();
                 Vec::new()
             }
+            // A relaunch exits this process, so it waits for every disk job (CTK-003).
+            AppAction::RequestElevation if self.refuse_exit() => Vec::new(),
+            AppAction::ConfirmElevation(true) if self.refuse_exit() => Vec::new(),
+            AppAction::RestartApp if self.refuse_exit() => Vec::new(),
             AppAction::RequestElevation => {
                 self.request_elevation();
                 Vec::new()

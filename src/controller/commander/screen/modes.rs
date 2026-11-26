@@ -447,7 +447,7 @@ impl CommanderController {
         self.open_fixed_session(session, &label)
     }
 
-    fn mode_busy(&self) -> bool {
+    pub(super) fn mode_busy(&self) -> bool {
         self.modes.job.is_some() || self.copy.is_some()
     }
 

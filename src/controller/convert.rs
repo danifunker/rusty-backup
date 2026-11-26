@@ -806,10 +806,11 @@ impl ConvertController {
         if !self.can_start() {
             return;
         }
+        // A BIN/CUE also writes its .bin, so an existing one is a conflict too (CTK-001).
         let conflicts: Vec<usize> = self
             .ready()
             .into_iter()
-            .filter(|(_, dest)| dest.exists())
+            .filter(|(_, dest)| outputs_of(dest).iter().any(|p| p.exists()))
             .map(|(n, _)| n)
             .collect();
         if conflicts.is_empty() {
@@ -941,6 +942,11 @@ impl ConvertController {
                         cancelled: &cancelled,
                         log: &log,
                     };
+                    // Only files this run creates are cleaned up after a failure (CTK-002).
+                    let existed: Vec<PathBuf> = outputs_of(dest)
+                        .into_iter()
+                        .filter(|p| p.exists())
+                        .collect();
                     match convert_one(found, dest.as_path(), &options, &hooks) {
                         Ok(done) => {
                             result.succeeded += 1;
@@ -952,7 +958,7 @@ impl ConvertController {
                         Err(e) => {
                             result.failed += 1;
                             // A refused output that is the source must not be "cleaned up" (MJB-001).
-                            remove_partial(dest.as_path(), &found.path);
+                            remove_partial(dest.as_path(), &found.path, &existed);
                             say(LogLevel::Warning, format!("  Failed: {name}: {e:#}"));
                         }
                     }
@@ -996,21 +1002,26 @@ impl ConvertController {
     }
 }
 
-/// A failed output is removed, with a BIN/CUE's .bin.
-fn remove_partial(dest: &Path, source: &Path) {
-    let same = |a: &Path, b: &Path| {
-        a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
-    };
-    let source_bin = source.with_extension("bin");
-    let mut doomed = vec![dest.to_path_buf()];
+/// The files writing `dest` produces: itself, and a BIN/CUE's .bin.
+fn outputs_of(dest: &Path) -> Vec<PathBuf> {
+    let mut out = vec![dest.to_path_buf()];
     if dest
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
     {
-        doomed.push(dest.with_extension("bin"));
+        out.push(dest.with_extension("bin"));
     }
-    for p in doomed {
-        if !same(&p, source) && !same(&p, &source_bin) {
+    out
+}
+
+/// A failed output is removed, with a BIN/CUE's .bin, but never the source or a file that
+/// was there before the run (`existed`).
+fn remove_partial(dest: &Path, source: &Path, existed: &[PathBuf]) {
+    let same = |a: &Path, b: &Path| crate::model::same_file(a, b);
+    let source_bin = source.with_extension("bin");
+    for p in outputs_of(dest) {
+        let kept = same(&p, source) || same(&p, &source_bin) || existed.iter().any(|e| same(&p, e));
+        if !kept {
             let _ = std::fs::remove_file(p);
         }
     }

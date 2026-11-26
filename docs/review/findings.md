@@ -1073,3 +1073,119 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | MJB-020 | S4 | fixed | [run.rs:536](../../src/model/convert/run.rs#L536) | HFS ceiling probed through container bytes. | the HFS ceiling is probed through a CHD's decoder (other containers stay as files: this runs on the UI thread) |
 | MJB-021 | S4 | fixed | [mod.rs:611](../../src/model/convert/mod.rs#L611) | Folder walk follows symlink loops. | linked folders are not followed |
 | MJB-022 | S4 | fixed | [classify.rs:151](../../src/model/convert/classify.rs#L151) | The text size gate is dead. | the cue-sheet size gate reads the file's size |
+
+## src/controller browser (CBR)
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| CBR-001 | S1 | fixed | [source.rs:544](../../src/controller/browser/pane/source.rs#L544) | `reopen_after_apply` parks still-staged edits in `reopen_restore`, never cleared before the next open lands: after a partly-failed Apply, picking another partition during the reopen pushes partition i's edits onto partition j's queue; an immediate spawn failure loses them. | the parked edits are set before the reopen and handed back if it can't start; switching is refused while they wait |
+| CBR-002 | S1 | fixed | [tools.rs:782](../../src/controller/browser/pane/tools.rs#L782) | A saved editor text goes to temp `text-{queue.len()}`, which repeats once the queue shrinks, so two staged AddFiles can share one temp and the first is written with the second's text. | each saved text gets its own `tempfile` name |
+| CBR-003 | S1 | fixed | [tools.rs:772](../../src/controller/browser/pane/tools.rs#L772) | `SaveText` finds its folder with `entry_at` and falls back to cwd, so after collapsing or navigating away it stages a Replace in the wrong folder. | the save names the document's own folder by path; no cwd fallback |
+| CBR-004 | S1 | fixed | [tools.rs:607](../../src/controller/browser/pane/tools.rs#L607) | Browser-pane Repair and tar import write without the MCM-003 re-encode warning. | Repair's confirm carries the re-encode note; tar import asks first (`browser.lossy_tar`) |
+| CBR-005 | S1 | fixed | [source.rs:750](../../src/controller/browser/pane/source.rs#L750) | A source switch resets `ed` but not `tl`/`arc`/`vol`: a pending metadata form, Bless, text doc, import or boot-block donor lands against the new volume. | `source_changed` drops the old source's forms, text, Bless, imports, viewer and probes (a running Repair or host write is kept) |
+| CBR-006 | S2 | confirmed | [edits.rs:1294](../../src/controller/browser/pane/edits.rs#L1294) | `written` removes landed edits by snapshot index, but CancelRename / a late rename answer / `stage_metadata` can change the queue during Writing, so a written edit stays staged and an unwritten one is dropped. | open |
+| CBR-007 | S2 | fixed | [source.rs:706](../../src/controller/browser/pane/source.rs#L706) | Switching or "Discard & switch" during an Apply write drops the Writing job unpolled; its outcome is lost and the image stays busy. | switching is refused while a check, write or tool job runs |
+| CBR-008 | S2 | confirmed | [tools.rs:188](../../src/controller/browser/pane/tools.rs#L188) | The metadata form shows non-printable OSType bytes as `?`; editing only the type re-parses the creator, writing `????` over e.g. `\0\0\0\0`. | open |
+| CBR-009 | S2 | plausible | [pane.rs:545](../../src/controller/browser/pane.rs#L545) | A no-staging pane's auto-apply refused while another job runs leaves the edit queued with no message and no retry. | open |
+| CBR-010 | S2 | plausible | [tools.rs:927](../../src/controller/browser/pane/tools.rs#L927) | The metadata form starts from on-disk values, so submitting it overwrites a staged type/date change of the untouched field. | open |
+| CBR-011 | S3 | confirmed | [edits.rs:324](../../src/controller/browser/pane/edits.rs#L324) | Staging is accepted while the apply review is up, and the reviewed write then includes edits the preflight never checked. | open |
+| CBR-012 | S3 | plausible | [pane.rs:490](../../src/controller/browser/pane.rs#L490) | Apply is not refused after `set_read_only(true)` with edits staged. | open |
+| CBR-013 | S3 | confirmed | [source.rs:671](../../src/controller/browser/pane/source.rs#L671) | CancelOpen ignores a deferred open, which starts anyway. | open |
+| CBR-014 | S3 | confirmed | [pane.rs:844](../../src/controller/browser/pane.rs#L844) | Expanding a nested wrapper streams and mounts the inner image on the UI thread. | open |
+| CBR-015 | S3 | confirmed | [tree.rs:65](../../src/controller/browser/pane/tree.rs#L65) | Tree folder expansion lists synchronously in every apply/tick. | open |
+| CBR-016 | S3 | plausible | [tools.rs:607](../../src/controller/browser/pane/tools.rs#L607) | A Repair or tool read still running at a source change lands its report and reopen on the new source. | open |
+| CBR-017 | S4 | confirmed | [tools.rs:109](../../src/controller/browser/pane/tools.rs#L109) | Mac date format/parse and `resolved_prodos_type` duplicate hfs_common / EditQueue helpers and have drifted. | open |
+
+## src/controller commander (CCM)
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| CCM-001 | S1 | fixed | [copy.rs:544](../../src/controller/commander/screen/copy.rs#L544) | An image-pane loose-files export to a picked folder skips the conflict review and overwrites existing host files. | a folder export refuses when names already exist there |
+| CCM-002 | S1 | fixed | [screen.rs:1559](../../src/controller/commander/screen.rs#L1559) | Close/Quit during a pane apply or host copy asks "Discard & Quit" about edits being written, then kills the write halfway. | close / quit wait while a pane write, a copy or a mode job runs |
+| CCM-003 | S2 | confirmed | [copy.rs:379](../../src/controller/commander/screen/copy.rs#L379) | A finished image->image copy is staged on whatever the destination pane holds now, even another image. | open |
+| CCM-004 | S2 | confirmed | [modes.rs:815](../../src/controller/commander/screen/modes.rs#L815) | A failed CHD flatten strands the applied edits in an untracked diff. | open |
+| CCM-005 | S2 | confirmed | [modes.rs:915](../../src/controller/commander/screen/modes.rs#L915) | A reviewed write that finishes before the next tick drops the apply follow-up (Recompress / Leave). | open |
+| CCM-006 | S2 | confirmed | [screen.rs:1599](../../src/controller/commander/screen.rs#L1599) | File Info stages metadata on a read-only or optical pane, and close then drops them silently. | open |
+| CCM-007 | S2 | confirmed | [copy.rs:57](../../src/controller/commander/screen/copy.rs#L57) | Commander's host->image copy skips `stage_host_for`, so forks into non-HFS and ProDOS suffixes are handled unlike drop/pick. | open |
+| CCM-008 | S2 | confirmed | [modes.rs:981](../../src/controller/commander/screen/modes.rs#L981) | A failed or cancelled "Open as Disk Image" extraction still opens the partial file. | open |
+| CCM-009 | S2 | plausible | [copy.rs:289](../../src/controller/commander/screen/copy.rs#L289) | New copy work while a conflict window or picker is pending replaces the running copy, orphaning it. | open |
+| CCM-010 | S2 | fixed | [modes.rs:373](../../src/controller/commander/screen/modes.rs#L373) | Close during a Compress or Flatten mode job deletes the archive temp it is reading. | covered by the CCM-002 gate (mode jobs) |
+| CCM-011 | S3 | confirmed | [screen.rs:639](../../src/controller/commander/screen.rs#L639) | An implicit cursor selection survives a non-key action, so a later Delete acts on that stale row. | open |
+| CCM-012 | S3 | confirmed | [copy.rs:57](../../src/controller/commander/screen/copy.rs#L57) | Host->image copy walks and sniffs the whole host tree on the UI thread. | open |
+| CCM-013 | S3 | plausible | [modes.rs:419](../../src/controller/commander/screen/modes.rs#L419) | ShowDeleted / CarveFullScan / budget actions reopen the source during a mode job. | open |
+| CCM-014 | S3 | confirmed | [modes.rs:906](../../src/controller/commander/screen/modes.rs#L906) | An uncompressed CHD written in place is marked dirty, offering a Discard that can't undo it. | open |
+| CCM-015 | S3 | plausible | [screen.rs:1561](../../src/controller/commander/screen.rs#L1561) | Quit skips the modes' unsaved question, dropping an unsaved CHD diff or archive temp. | open |
+| CCM-016 | S3 | plausible | [modes.rs:968](../../src/controller/commander/screen/modes.rs#L968) | The free-space probe opens the image editable in a job that declares no resources. | open |
+| CCM-017 | S3 | plausible | [copy.rs:217](../../src/controller/commander/screen/copy.rs#L217) | Rename-notice Undo truncates the queue by position without checking its shape. | open |
+| CCM-018 | S3 | plausible | [copy.rs:539](../../src/controller/commander/screen/copy.rs#L539) | A pending export/extract takes its source at pick time, so a source change exports one volume's paths from another. | open |
+| CCM-019 | S3 | fixed | [budget.rs:75](../../src/controller/commander/screen/budget.rs#L75) | Budget MiB fields multiply unchecked: a debug panic, or a wrapped tiny ceiling. | budget MiB values multiply saturating |
+| CCM-020 | S4 | confirmed | [modes.rs:585](../../src/controller/commander/screen/modes.rs#L585) | Leaving archive Edit Mode recompresses even when nothing was written. | open |
+| CCM-021 | S4 | confirmed | [screen.rs:1609](../../src/controller/commander/screen.rs#L1609) | A refused File Info job spawn is never retried. | open |
+| CCM-022 | S4 | confirmed | [panel.rs:426](../../src/controller/commander/screen/panel.rs#L426) | `mark_bar(side)` reports the active pane's export format. | open |
+| CCM-023 | S4 | confirmed | [windows.rs:439](../../src/controller/commander/screen/windows.rs#L439) | The empty-log text holds a run of spaces from a lost line continuation. | open |
+| CCM-024 | S4 | plausible | [windows.rs:619](../../src/controller/commander/screen/windows.rs#L619) | The Apply report's Retry bypasses the mode apply, so an archive retry is never recompressed. | open |
+
+## src/controller inspect, optical, archives (CIN)
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| CIN-001 | S1 | fixed | [tools.rs:375](../../src/controller/inspect/tools.rs#L375) | A new check moves `repair_target` but keeps the old `fsck_result` window; if the new check fails, its Repair confirms partition A's errors and repairs partition B. | a new check clears the old result, so the shown result and the Repair target are one partition |
+| CIN-002 | S1 | fixed | [tools.rs:435](../../src/controller/inspect/tools.rs#L435) | Write tools only refuse a second run of their own kind, so Repair can run while Defragment (or Make Bootable) rewrites the same partition. | one `writing()` gate covers Repair, Make Bootable, table apply, Expand, Defragment and Swab |
+| CIN-003 | S1 | fixed | [export.rs:579](../../src/controller/inspect/export.rs#L579) | Export never refuses the inspected image (or a backup data file) as its destination, truncating the source mid-read. | Export refuses the inspected image as its destination |
+| CIN-004 | S1 | fixed | [tools.rs:435](../../src/controller/inspect/tools.rs#L435) | Repair, Make Bootable, Apply Table and Expand Image don't close an open browse of the volume, whose cached metadata then writes stale edits. | every in-place write closes an open browse first (`ready_to_write`) |
+| CIN-005 | S2 | fixed | [tools.rs:1014](../../src/controller/inspect/tools.rs#L1014) | Defragment closes the browse view without the unsaved-edits gate, dropping staged edits silently. | a write with staged browse edits is refused instead of dropping them |
+| CIN-006 | S2 | plausible | [mod.rs:1230](../../src/controller/inspect/mod.rs#L1230) | The row Browse button skips the unsaved gate SwitchBrowse uses, discarding staged edits. | open |
+| CIN-007 | S2 | confirmed | [tools.rs:63](../../src/controller/inspect/tools.rs#L63) | A check still running at a source switch opens its window with the old source's verdict over the new one. | open |
+| CIN-008 | S2 | plausible | [mod.rs:631](../../src/controller/inspect/mod.rs#L631) | Close/Open is refused only during export; during Repair or a table write on a device it releases the elevated descriptor and claim mid-write. | open |
+| CIN-009 | S2 | confirmed | [mod.rs:578](../../src/controller/optical/mod.rs#L578) | A drive scan requested while one runs is dropped, so a daemon connected mid-scan never shows its drives. | open |
+| CIN-010 | S3 | confirmed | [browse.rs:105](../../src/controller/inspect/browse.rs#L105) | `browsing` is set before failure paths, so the switcher names a partition that never opened. | open |
+| CIN-011 | S3 | confirmed | [tools.rs:524](../../src/controller/inspect/tools.rs#L524) | A Make Bootable assess landing after a source switch opens its donor picker and writes to the previous image. | open |
+| CIN-012 | S3 | confirmed | [tools.rs:206](../../src/controller/inspect/tools.rs#L206) | In-place write tools run on a temp-backed Archives payload and report success though the result is thrown away. | open |
+| CIN-013 | S3 | confirmed | [mod.rs:1230](../../src/controller/inspect/mod.rs#L1230) | Browse/Check/CalcMin are accepted during a repack; only shells enforce the lock. | open |
+| CIN-014 | S3 | confirmed | [mod.rs:922](../../src/controller/optical/mod.rs#L922) | OpenImage and CloseDisc are accepted while a rip runs, changing the form under it. | open |
+| CIN-015 | S3 | confirmed | [mod.rs:741](../../src/controller/optical/mod.rs#L741) | A CHD Info job for the previous image opens over a newly opened one. | open |
+| CIN-016 | S3 | plausible | [mod.rs:600](../../src/controller/optical/mod.rs#L600) | Drive selection survives a refresh by label only, so two identical drives can swap. | open |
+| CIN-017 | S3 | confirmed | [archives.rs:406](../../src/controller/archives.rs#L406) | Mounting an archive's disk-image payload writes it to a temp dir on the UI thread. | open |
+| CIN-018 | S3 | plausible | [mod.rs:912](../../src/controller/inspect/mod.rs#L912) | The first frame after a reinspect opens a ChdReader on the UI thread for the disk size. | open |
+| CIN-019 | S4 | confirmed | [tools.rs:184](../../src/controller/inspect/tools.rs#L184) | Four copies of a `finished(job)` helper beside `controller::job_outcome`. | open |
+
+## src/controller write tasks (CWR)
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| CWR-001 | S2 | fixed | [source.rs:206](../../src/controller/backup/source.rs#L206) | A Start waiting on source A's minimums still fires once source B is idle: source changes clear the bool but not `run.pending`, so an unrequested backup of B begins unvalidated. | source changes clear the pending Start itself (`clear_pending`) |
+| CWR-002 | S2 | confirmed | [source.rs:426](../../src/controller/restore/source.rs#L426) | A failed or cancelled decode of a wrapped image falls back to the picked file, so Restore writes (and Backup backs up) the container's raw bytes. | open |
+| CWR-003 | S2 | confirmed | [source.rs:355](../../src/controller/restore/source.rs#L355) | A drop-swap reload of backup A landing after B is opened replaces B's loaded data, so Restore writes A; a .cbk temp may be deleted under it. | open |
+| CWR-004 | S2 | confirmed | [run.rs:265](../../src/controller/restore/run.rs#L265) | A remote full-disk restore drops the remote drive's size: Fill-remaining never grows, and validate checks the local device slot instead. | open |
+| CWR-005 | S2 | confirmed | [mod.rs:1339](../../src/controller/build_disk/mod.rs#L1339) | Create runs while a row probe, folder measure or donor read is pending, building without that content; the late result then changes the shown layout. | open |
+| CWR-006 | S2 | fixed | [run.rs:252](../../src/controller/backup/run.rs#L252) | The VHD window survives a source change and its Start exports the new disk with the old disk's overrides. | `clear_found` drops the VHD window |
+| CWR-007 | S2 | confirmed | [mod.rs:523](../../src/controller/restore/mod.rs#L523) | Restore and Disk Write only warn about a system-disk target, where Build Disk and the CLI refuse it. | open |
+| CWR-008 | S2 | plausible | [run.rs:216](../../src/controller/restore/run.rs#L216) | A restore to an image file never refuses the source image itself as the target. | open |
+| CWR-009 | S2 | plausible | [mod.rs:764](../../src/controller/backup/mod.rs#L764) | Source changes during a running backup/restore drop the decoded image's TempDir under the job. | open |
+| CWR-010 | S2 | plausible | [mod.rs:702](../../src/controller/backup/mod.rs#L702) | Backup never refuses an existing `<dest>/<name>` folder or .vhd, overwriting an earlier backup. | open |
+| CWR-011 | S3 | fixed | [run.rs:116](../../src/controller/restore/run.rs#L116) | The single-partition confirm names "Partition {index}" from 0 where every other screen counts from 1. | the confirm and log count partitions from 1 |
+| CWR-012 | S3 | confirmed | [run.rs:134](../../src/controller/restore/run.rs#L134) | No restore confirm names the source, so a source swap passes the staleness check. | open |
+| CWR-013 | S3 | confirmed | [mod.rs:505](../../src/controller/backup/mod.rs#L505) | Backup's device list follows the row, not the disk, after a refresh. | open |
+| CWR-014 | S3 | confirmed | [source.rs:237](../../src/controller/restore/source.rs#L237) | Reopening a backup that failed to load is a no-op instead of a retry. | open |
+| CWR-015 | S4 | confirmed | [source.rs:236](../../src/controller/restore/source.rs#L236) | Superseded decode jobs are dropped without cancel and keep decompressing. | open |
+
+## src/controller other tasks (CTK)
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| CTK-001 | S1 | fixed | [convert.rs:809](../../src/controller/convert.rs#L809) | The overwrite check tests only `dest`; a BIN/CUE output also writes `dest.bin` (and track .bins), overwriting an existing `.bin` unasked. | a BIN/CUE's .bin counts as an output in the conflict check (`outputs_of`) |
+| CTK-002 | S1 | fixed | [convert.rs:1004](../../src/controller/convert.rs#L1004) | A failed conversion's cleanup deletes `dest.bin` even when it was the user's file before the run. | cleanup after a failure keeps files that existed before the run |
+| CTK-003 | S1 | partly fixed | [shell.rs:360](../../src/controller/app/shell.rs#L360) | Elevation relaunch and Restart exit the process with no check for a running job, killing an in-place write halfway. | relaunch / restart refuse while the app's job registry has a job; native shells keep per-tab registries, so they must report tab jobs (shell pass) |
+| CTK-004 | S2 | confirmed | [resize_image.rs:1145](../../src/controller/resize_image.rs#L1145) | Edits during "Checking the plan" are accepted; the old plan reaches Review while Start writes the new sizes. | open |
+| CTK-005 | S2 | confirmed | [resize_image.rs:1239](../../src/controller/resize_image.rs#L1239) | The in-place confirm's answer starts without re-checking `can_start` or comparing what was asked. | open |
+| CTK-006 | S2 | confirmed | [resize_image.rs:1128](../../src/controller/resize_image.rs#L1128) | A Repair from the wizard writes the image but never sets `disk_changed`, so Inspect keeps a stale view. | open |
+| CTK-007 | S2 | plausible | [resize_image.rs:1205](../../src/controller/resize_image.rs#L1205) | The wizard closes while its Repair job is still writing the image. | open |
+| CTK-008 | S2 | plausible | [resize.rs:309](../../src/controller/resize.rs#L309) | An unknown minimum becomes 512 bytes, so Custom shrinks below the real minimum pass the preview. | open |
+| CTK-009 | S2 | plausible | [convert.rs:858](../../src/controller/convert.rs#L858) | A conflict answer is acted on with no pending question, run or unchanged items check, so a stray answer starts a second job and Skip applies to stale indices. | open |
+| CTK-010 | S2 | fixed | [keys.rs:737](../../src/controller/keys.rs#L737) | A multibyte chord in keybindings.toml panics the TUI at start-up (byte slicing in `strip_prefix_ci`). | `strip_prefix_ci` uses `str::get` |
+| CTK-011 | S3 | confirmed | [keys.rs:543](../../src/controller/keys.rs#L543) | Rebinding to a chord another command uses does nothing and reports nothing; `[section]` headers are ignored. | open |
+| CTK-012 | S3 | confirmed | [resize_image.rs:793](../../src/controller/resize_image.rs#L793) | Opening the wizard reads the disk size (a daemon round trip or a CHD open) on the UI thread. | open |
+| CTK-013 | S3 | plausible | [expand_hfs.rs:250](../../src/controller/expand_hfs.rs#L250) | When used space exceeds the block size's ceiling, Expand stays enabled and fails after building the target. | open |
+| CTK-014 | S3 | plausible | [settings.rs:152](../../src/controller/settings.rs#L152) | File-association (un)registration errors are dropped and the settings report success. | open |
+| CTK-015 | S4 | fixed | [resize.rs:197](../../src/controller/resize.rs#L197) | Resize Partitions names partitions from 0 where the layout bar and Inspect count from 1. | Resize Partitions' confirm and errors count from 1 |
+| CTK-016 | S4 | confirmed | [shell.rs:226](../../src/controller/app/shell.rs#L226) | Two doc comments sit on the wrong items. | open |

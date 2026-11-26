@@ -105,6 +105,23 @@ fn msg(text: impl Into<String>) -> Vec<Effect> {
     vec![Effect::Message(text.into())]
 }
 
+impl ToolState {
+    /// Forget everything tied to the old source: a form, a text, a Bless or a read landing later
+    /// acted on the new volume (CBR-005, CBR-016). A running Repair is kept; it owns its write.
+    pub(super) fn forget_source(&mut self) {
+        match self.job.take() {
+            Some(keep @ ToolJob::Repair { .. }) => self.job = Some(keep),
+            Some(ToolJob::Volume { job, .. }) => job.cancel(),
+            Some(ToolJob::Read(job)) => job.cancel(),
+            None => {}
+        }
+        self.text = None;
+        self.form = None;
+        self.bless = None;
+        self.staging_errors.clear();
+    }
+}
+
 /// A Mac-epoch timestamp as `YYYY-MM-DD HH:MM:SS` (UTC).
 pub fn format_mac_date(mac: u32) -> String {
     let unix = mac as i64 - MAC_EPOCH_OFFSET;
@@ -433,6 +450,7 @@ impl BrowserPaneController {
             A::Repair => self.ask_repair(),
             A::Confirmed { purpose, yes } if purpose == purpose::REPAIR => {
                 if yes {
+                    self.accept_loss();
                     self.start_repair()
                 } else {
                     Vec::new()
@@ -592,11 +610,16 @@ impl BrowserPaneController {
                 self.queue.len()
             )
         };
+        // A repaired WOZ / D88 / DIM is re-encoded like a save, so the confirm says what goes (CBR-004).
+        let loss = self
+            .unaccepted_loss()
+            .map(|l| format!("\n\n{l}"))
+            .unwrap_or_default();
         vec![Effect::Confirm(ConfirmSpec {
             purpose: purpose::REPAIR,
             title: "Repair filesystem?".into(),
             message: format!(
-                "Repair {} in place? This writes to the image now.{staged}",
+                "Repair {} in place? This writes to the image now.{staged}{loss}",
                 self.volume().name()
             ),
             confirm_label: "Repair".into(),
@@ -769,20 +792,37 @@ impl BrowserPaneController {
             }
             Err(e) => return msg(format!("cannot save: {e}")),
         };
-        let folder = self.entry_at(folder).filter(|e| e.is_directory());
-        let Some(parent) = folder.or_else(|| self.listing.cwd().cloned()) else {
-            return msg("no folder open.");
-        };
+        // The document's own folder, by path (the apply resolves it there): falling back to the
+        // folder on screen saved over a same-named file elsewhere (CBR-003).
+        let parent = self
+            .entry_at(folder)
+            .filter(|e| e.is_directory())
+            .unwrap_or_else(|| {
+                let leaf = folder
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("");
+                FileEntry::new_directory(leaf.to_string(), folder.to_string(), 0)
+            });
         if self.tl.temp.is_none() {
             self.tl.temp = tempfile::TempDir::new().ok();
         }
         let Some(dir) = self.tl.temp.as_ref().map(|t| t.path().to_path_buf()) else {
             return msg("cannot save: no temporary folder.");
         };
-        let host_path = dir.join(format!("text-{}", self.queue.len()));
-        if let Err(e) = std::fs::write(&host_path, &bytes) {
-            return msg(format!("cannot save: {e}"));
-        }
+        // A unique name per save: the queue length repeats once edits are unstaged (CBR-002).
+        let saved = tempfile::Builder::new()
+            .prefix("text-")
+            .tempfile_in(&dir)
+            .and_then(|mut f| {
+                std::io::Write::write_all(&mut f, &bytes)?;
+                f.keep().map_err(|e| e.error)
+            });
+        let host_path = match saved {
+            Ok((_, path)) => path,
+            Err(e) => return msg(format!("cannot save: {e}")),
+        };
         self.stage_tool(StagedEdit::AddFile {
             parent,
             name: name.to_string(),

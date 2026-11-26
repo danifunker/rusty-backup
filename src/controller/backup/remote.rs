@@ -210,7 +210,8 @@ impl BackupController {
         // The remote drive replaces the local source.
         self.source = None;
         self.src.drop_decode();
-        self.run.pending_start = false;
+        // The pending Start itself, or it fired for the next source (CWR-001).
+        self.run.clear_pending();
         self.clear_found();
         let addr = self.remote.addr.clone().unwrap_or_default();
         let display = format!("rb://{addr}{path}");

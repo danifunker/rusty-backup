@@ -597,6 +597,9 @@ impl BrowserPaneController {
 
     /// Drops expanded wrappers, the tree selection and the cursor after the view swaps the source.
     pub fn source_changed(&mut self) {
+        self.tl.forget_source();
+        self.vol.forget_source();
+        self.arc.forget_source();
         self.collapse_wrappers();
         self.folders.clear();
         self.folders_source_changed();

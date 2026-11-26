@@ -583,6 +583,19 @@ impl InspectController {
         if self.export.job.is_some() {
             return;
         }
+        // Writing over the image being read truncates it before a byte is copied (CIN-003).
+        let sources = [self.disk_path(), self.image_path().map(|p| p.to_path_buf())];
+        if sources
+            .iter()
+            .flatten()
+            .any(|src| crate::model::same_file(src, &dest))
+        {
+            self.error(format!(
+                "{} is the image being exported; choose another destination.",
+                dest.display()
+            ));
+            return;
+        }
         let s = self.export.settings.clone();
         let format = s.format;
         let size_map = export_runner::build_size_map(s.configs.as_slice());

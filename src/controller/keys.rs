@@ -735,10 +735,11 @@ fn key_name(key: Key) -> String {
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
+    // `get`, not slicing: a multibyte character across the cut panicked at start-up (CTK-010).
+    let head = s.get(..prefix.len())?;
+    match head.eq_ignore_ascii_case(prefix) {
+        true => s.get(prefix.len()..),
+        false => None,
     }
 }
 

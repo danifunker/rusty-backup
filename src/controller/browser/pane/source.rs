@@ -52,6 +52,7 @@ pub mod purpose {
     pub const DISCARD_EDITS: &str = "commander.discard_edits";
     pub const DISCARD_STAGED: &str = "commander.discard_staged";
     pub const LOSSY_SAVE: &str = "browser.lossy_save";
+    pub const LOSSY_TAR: &str = "browser.lossy_tar";
     pub const HOST_DELETE: &str = "commander.host_delete";
     pub const RENAME: &str = "commander.rename";
     pub const NEW_FOLDER: &str = "commander.new_folder";
@@ -540,8 +541,14 @@ impl BrowserPaneController {
         };
         let keep: Vec<StagedEdit> = self.queue.drain().collect();
         let cwd = self.listing.cwd_path().to_string();
-        let fx = self.open_partition(i);
+        // Parked first, so an open that fails at once still hands them back (CBR-001).
         self.src.reopen_restore = Some((keep, cwd));
+        let fx = self.open_partition(i);
+        if self.src.opening.is_none() {
+            if let Some((edits, _)) = self.src.reopen_restore.take() {
+                edits.into_iter().for_each(|e| self.queue.push(e));
+            }
+        }
         fx
     }
 
@@ -704,6 +711,14 @@ impl BrowserPaneController {
     }
 
     fn request_switch(&mut self, sw: Switch) -> Vec<Effect> {
+        // A write in flight, or the reopen that follows it, owns the staged edits: switching then
+        // dropped the write's outcome, or landed partition i's edits on partition j (CBR-001, CBR-007).
+        let writing = self.checking().is_some() || self.applying().is_some() || self.tool_busy();
+        if writing || self.src.reopen_restore.is_some() {
+            return vec![message(
+                "wait for the write to finish before switching.".into(),
+            )];
+        }
         if self.queue.is_empty() {
             return self.switch(sw);
         }

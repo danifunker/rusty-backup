@@ -536,6 +536,33 @@ impl CommanderController {
             };
             return self.start_host_copy(job, None, conflicts, resources, where_to);
         }
+        // The folder exports overwrite what is there; refuse rather than replace unasked (CCM-001).
+        let taken = match format {
+            ExportFormat::LooseFiles => {
+                commander_ops::host_copy_conflicts(&entries, &dest, Some(self.export_fork_mode))
+            }
+            ExportFormat::GzipPerFile | ExportFormat::ZstdPerFile => {
+                let ext = if format == ExportFormat::GzipPerFile {
+                    "gz"
+                } else {
+                    "zst"
+                };
+                entries
+                    .iter()
+                    .map(|e| format!("{}.{ext}", e.name))
+                    .filter(|n| dest.join(n).exists())
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        if !taken.is_empty() {
+            return format!(
+                "Export refused: {} item(s) already exist in {} (first: {}); pick an empty folder.",
+                taken.len(),
+                dest.display(),
+                taken[0]
+            );
+        }
         let Some(source) = self.pane(from).copy_stage_source() else {
             return "Source volume is not open.".to_string();
         };

@@ -120,6 +120,11 @@ impl RunState {
         }
     }
 
+    /// Drop a waiting Start along with its flag.
+    pub(super) fn clear_pending(&mut self) {
+        self.set_pending(None);
+    }
+
     fn set_pending(&mut self, why: Option<Pending>) {
         self.pending = why;
         self.pending_start = why.is_some();

@@ -114,8 +114,9 @@ impl RestoreController {
         let idx = self.targets.sp_part?;
         let p = self.targets.sp_parts.iter().find(|p| p.index == idx)?;
         Some(format!(
+            // Counted from 1, as every other screen does (CWR-011).
             "Partition {} ({}, {})",
-            p.index,
+            p.index + 1,
             p.type_name,
             format_size(p.size_bytes)
         ))
@@ -328,7 +329,7 @@ impl RestoreController {
         );
         self.info(format!(
             "Starting single-partition restore to partition {} on {}",
-            part.index,
+            part.index + 1,
             device.path.display(),
         ));
         self.spawn_restore(

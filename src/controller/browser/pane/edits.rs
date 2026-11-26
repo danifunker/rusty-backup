@@ -1136,6 +1136,15 @@ impl BrowserPaneController {
         self.ed.loss_asking
     }
 
+    /// The re-encode note, while the user has not yet accepted it for this source.
+    pub(super) fn unaccepted_loss(&self) -> Option<&'static str> {
+        self.loss_note().filter(|_| !self.ed.loss_accepted)
+    }
+
+    pub(super) fn accept_loss(&mut self) {
+        self.ed.loss_accepted = true;
+    }
+
     /// What saving would drop from this source's container, if anything.
     fn loss_note(&self) -> Option<&'static str> {
         crate::model::container_edit::reencode_loss(self.source_path()?)

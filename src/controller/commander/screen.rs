@@ -1557,6 +1557,15 @@ impl CommanderController {
     }
 
     fn request_close(&mut self, quit: bool) -> Vec<Effect> {
+        // A write in flight is not "unapplied": closing then killed it halfway (CCM-002).
+        let writing = [&self.left, &self.right]
+            .iter()
+            .any(|p| p.applying().is_some() || p.checking().is_some());
+        if writing || self.copy.is_some() || self.mode_busy() {
+            return vec![Effect::Message(
+                "A write is still running; wait for it to finish before closing.".into(),
+            )];
+        }
         // A CHD diff or archive copy in Edit Mode is saved or discarded by the modes' question.
         if self.modes_active() && !quit && self.has_unsaved_edits() {
             return self.apply_mode(ModeAction::RequestClose);
