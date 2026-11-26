@@ -227,7 +227,8 @@ pub fn prepare(open: WriteOpen) -> (WriteSource, WrapForm) {
 /// The VBR's hidden-sectors field (offset 0x1C), or `None` when the first sector cannot be read.
 fn hidden_sectors(path: &Path) -> Option<u32> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
+    // Through the same peeling as the probe: a gz/CHD/VHD file's first bytes are its header (MWR-014).
+    let mut f = crate::model::source_reader::open_peeled_read_with_entry(path, None, None).ok()?;
     let mut sector = [0u8; 512];
     f.read_exact(&mut sector).ok()?;
     Some(u32::from_le_bytes([

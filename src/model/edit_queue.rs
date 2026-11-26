@@ -662,10 +662,32 @@ impl EditQueue {
     /// Bytes the staged batch will allocate on a volume with `unit`-byte blocks,
     /// net of staged file deletes; each fork rounds up, each new folder costs a block.
     pub fn bytes_needed(&self, unit: u64) -> u64 {
+        self.bytes_needed_crediting(unit, &mut |_| 0)
+    }
+
+    /// [`Self::bytes_needed`] that also credits what a staged recursive folder delete frees on `fs` (MCM-021).
+    pub fn bytes_needed_on(&self, fs: &mut dyn Filesystem, unit: u64) -> u64 {
+        let unit = unit.max(1);
+        self.bytes_needed_crediting(unit, &mut |dir| tree_bytes(fs, dir, unit, 0))
+    }
+
+    fn bytes_needed_crediting(&self, unit: u64, folder: &mut dyn FnMut(&FileEntry) -> u64) -> u64 {
         let unit = unit.max(1);
         let round = |n: u64| n.div_ceil(unit) * unit;
         let mut need = 0u64;
         let mut freed = 0u64;
+        // A folder deleted whole already counts what is inside it.
+        let gone: Vec<String> = self
+            .edits
+            .iter()
+            .filter_map(|e| match e {
+                StagedEdit::DeleteRecursive { entry, .. } if entry.is_directory() => {
+                    Some(format!("{}/", entry.path.trim_end_matches('/')))
+                }
+                _ => None,
+            })
+            .collect();
+        let in_deleted = |path: &str| gone.iter().any(|g| path.starts_with(g.as_str()));
         for edit in &self.edits {
             match edit {
                 StagedEdit::AddFile {
@@ -681,9 +703,14 @@ impl EditQueue {
                 StagedEdit::CreateDirectory { .. } => need = need.saturating_add(unit),
                 StagedEdit::DeleteEntry { entry, .. }
                 | StagedEdit::DeleteRecursive { entry, .. }
-                    if !entry.is_directory() =>
+                    if !entry.is_directory() && !in_deleted(&entry.path) =>
                 {
                     freed = freed.saturating_add(round(entry.size));
+                }
+                StagedEdit::DeleteRecursive { entry, .. }
+                    if entry.is_directory() && !in_deleted(entry.path.trim_end_matches('/')) =>
+                {
+                    freed = freed.saturating_add(folder(entry));
                 }
                 _ => {}
             }
@@ -1227,6 +1254,25 @@ impl EditQueue {
     }
 }
 
+/// Blocks a folder's tree holds on `fs`: each file rounded up, each folder one block.
+fn tree_bytes(fs: &mut dyn Filesystem, dir: &FileEntry, unit: u64, depth: usize) -> u64 {
+    let Ok(children) = fs.list_directory(dir) else {
+        return 0;
+    };
+    let mut total = unit;
+    for child in &children {
+        if child.name == "." || child.name == ".." {
+            continue;
+        }
+        total = total.saturating_add(match child.is_directory() {
+            true if depth < 64 => tree_bytes(fs, child, unit, depth + 1),
+            true => 0,
+            false => child.size.div_ceil(unit) * unit,
+        });
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1432,6 +1478,34 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("Permissions: /d/f -> 600"));
         assert!(lines[1].starts_with("Delete: /d/f"));
+    }
+
+    #[test]
+    fn a_recursive_folder_delete_credits_its_tree() {
+        use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
+
+        let img = create_blank_fat(2 * MIB, Some("T")).unwrap();
+        let mut fs = FatFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let docs = fs
+            .create_directory(&root, "DOCS", &CreateDirectoryOptions::default())
+            .unwrap();
+        let mut d = Cursor::new(vec![7u8; 3000]);
+        fs.create_file(&docs, "BIG", &mut d, 3000, &CreateFileOptions::default())
+            .unwrap();
+        let mut q = EditQueue::new();
+        q.push(StagedEdit::DeleteRecursive {
+            parent: root.clone(),
+            entry: docs,
+        });
+        q.push(StagedEdit::CreateDirectory {
+            parent: root,
+            name: "NEW".into(),
+            qnx2_attrs: None,
+        });
+        assert_eq!(q.bytes_needed(512), 512);
+        assert_eq!(q.bytes_needed_on(&mut fs, 512), 0);
     }
 
     /// X5: a staged "new folder" whose name already exists as a folder is

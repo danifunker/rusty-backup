@@ -46,7 +46,7 @@ pub fn legalize_staged_names(
     // Old full folder path -> new full folder path, for re-parenting descendants.
     let mut moved: HashMap<String, String> = HashMap::new();
     // Folder path -> names already present or claimed by this batch.
-    let mut claimed: HashMap<String, (bool, Vec<String>)> = HashMap::new();
+    let mut claimed: HashMap<String, (bool, Vec<String>, Vec<String>)> = HashMap::new();
     let mut dropped_dirs: Vec<String> = Vec::new();
     let mut keep = vec![true; edits.len()];
 
@@ -79,21 +79,23 @@ pub fn legalize_staged_names(
                 continue;
             }
         };
-        let (seeded, taken) = claimed.entry(parent.path.clone()).or_default();
-        let final_name = if new_name == *name {
+        let (seeded, taken, renamed_to) = claimed.entry(parent.path.clone()).or_default();
+        let same = |a: &str, b: &str| a == b || (fold_case && a.eq_ignore_ascii_case(b));
+        // A legal name keeps its on-disk conflict for the review, but not a clash with a rename
+        // made earlier in this batch (MJB-004).
+        let final_name = if new_name == *name && !renamed_to.iter().any(|t| same(t, &new_name)) {
             new_name
         } else {
             if !*seeded {
                 taken.extend(existing(&parent.path));
                 *seeded = true;
             }
-            let clash = |n: &str| {
-                taken
-                    .iter()
-                    .any(|t| t == n || (fold_case && t.eq_ignore_ascii_case(n)))
-            };
+            let clash = |n: &str| taken.iter().any(|t| same(t, n));
             unique_name(validate, &new_name, &clash).unwrap_or(new_name)
         };
+        if final_name != *name {
+            renamed_to.push(final_name.clone());
+        }
         taken.push(final_name.clone());
         if final_name != *name {
             report.renamed.push(NameChange {
@@ -219,5 +221,15 @@ mod tests {
         assert_eq!(edits.len(), 1);
         assert_eq!(target(&edits[0]).1, "keep");
         assert_eq!(report.dropped.len(), 1);
+    }
+
+    #[test]
+    fn a_legal_name_steps_aside_for_an_earlier_repair() {
+        let v = |n: &str| validate_amiga_name(n, 30, "SFS");
+        let mut edits = vec![file("/", "a:b"), file("/", "a_b")];
+        legalize_staged_names(&mut edits, &v, true, &mut |_| Vec::new());
+        let names: Vec<_> = edits.iter().map(|e| target(e).1).collect();
+        assert_eq!(names[0], "a_b");
+        assert_ne!(names[1], "a_b", "{names:?}");
     }
 }

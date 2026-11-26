@@ -102,12 +102,13 @@ pub fn classify(path: &Path) -> std::io::Result<Classified> {
         return Ok(found);
     }
     let (size, container) = if gz {
-        (gzip_size(path).unwrap_or(file_size), "gzip")
+        (gzip_size(path, file_size).unwrap_or(file_size), "gzip")
     } else {
         decoded_size(path, file_size)
     };
     found.size = size;
-    let floppy = (64 * 1024..=FLOPPY_MAX).contains(&size);
+    // Size alone made a small MBR or RDB disk a floppy, refusing every hard-disk format (MJB-006).
+    let floppy = (64 * 1024..=FLOPPY_MAX).contains(&size) && !has_partition_table(path);
     found.kind = if floppy {
         ImageKind::Floppy
     } else {
@@ -229,8 +230,26 @@ fn is_dc42(path: &Path) -> bool {
     head.len() >= 0x54 && head[0] <= 63 && head[0x52] == 0x01 && head[0x53] == 0x00
 }
 
-/// A gzip stream's size from its trailer (modulo 4 GiB, which no floppy reaches).
-fn gzip_size(path: &Path) -> Option<u64> {
+/// Whether the decoded image carries a hard-disk table; Sun, NeXT and BSD labels sit on floppies too.
+fn has_partition_table(path: &Path) -> bool {
+    use crate::partition::PartitionTable as T;
+    let Ok((mut r, _)) = super::open_disk(path) else {
+        return false;
+    };
+    matches!(
+        T::detect(&mut r),
+        Ok(T::Mbr(_) | T::Gpt { .. } | T::Rdb(_) | T::Apm(_))
+    )
+}
+
+/// A gzip stream's size: the trailer when the file is too small to hold 4 GiB, else counted (MJB-007).
+fn gzip_size(path: &Path, file_size: u64) -> Option<u64> {
+    // Deflate packs at most ~1032:1, so under 4 MiB the modulo-4-GiB ISIZE is exact.
+    if file_size > 4 << 20 {
+        let f = std::fs::File::open(path).ok()?;
+        let mut gz = flate2::read::GzDecoder::new(std::io::BufReader::new(f));
+        return std::io::copy(&mut gz, &mut std::io::sink()).ok();
+    }
     let mut f = std::fs::File::open(path).ok()?;
     f.seek(SeekFrom::End(-4)).ok()?;
     let mut b = [0u8; 4];

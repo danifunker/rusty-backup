@@ -422,10 +422,15 @@ impl ConvertController {
 
     /// The file list's rows.
     pub fn rows(&self) -> Vec<Row> {
-        self.items.iter().map(|i| self.row(i)).collect()
+        let ready: std::collections::HashMap<usize, PathBuf> = self.ready().into_iter().collect();
+        self.items
+            .iter()
+            .enumerate()
+            .map(|(n, i)| self.row(i, ready.get(&n)))
+            .collect()
     }
 
-    fn row(&self, item: &Item) -> Row {
+    fn row(&self, item: &Item, dest: Option<&PathBuf>) -> Row {
         match &item.found {
             Err(e) => Row {
                 name: item.name.clone(),
@@ -440,8 +445,10 @@ impl ConvertController {
                 let refusal = self.options.refusal(c);
                 let outcome = match &refusal {
                     Some(why) => format!("Skipped: {why}"),
-                    None => self
-                        .dest_for(c)
+                    // The de-duplicated name `ready` writes, or the plain one for an unselected row.
+                    None => dest
+                        .cloned()
+                        .or_else(|| self.dest_for(c))
                         .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
                         .map(|n| format!("-> {n}"))
                         .unwrap_or_default(),
@@ -604,7 +611,8 @@ impl ConvertController {
 
     /// The selected items that will convert, with their outputs.
     fn ready(&self) -> Vec<(usize, PathBuf)> {
-        self.items
+        let mut ready: Vec<(usize, PathBuf)> = self
+            .items
             .iter()
             .enumerate()
             .filter(|(_, i)| i.selected)
@@ -615,7 +623,48 @@ impl ConvertController {
                 }
                 Some((n, self.dest_for(c)?))
             })
-            .collect()
+            .collect();
+        // `disk.vhd` and `disk.qcow2` both became `disk.img`, the second overwriting the first (MJB-003).
+        // Folded, as macOS and Windows match names regardless of case.
+        let key = |p: &PathBuf| p.to_string_lossy().to_lowercase();
+        let mut seen = std::collections::HashSet::new();
+        for (n, dest) in ready.iter_mut() {
+            if seen.insert(key(dest)) {
+                continue;
+            }
+            let src_ext = self.items[*n]
+                .found
+                .as_ref()
+                .ok()
+                .and_then(|c| c.path.extension())
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let stem = dest
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let ext = dest
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let name = |tag: String| match ext.is_empty() {
+                true => format!("{stem}-{tag}"),
+                false => format!("{stem}-{tag}.{ext}"),
+            };
+            let tag = if src_ext.is_empty() {
+                "1".to_string()
+            } else {
+                src_ext
+            };
+            let mut k = 1;
+            let mut candidate = dest.with_file_name(name(tag.clone()));
+            while !seen.insert(key(&candidate)) {
+                k += 1;
+                candidate = dest.with_file_name(name(format!("{tag}-{k}")));
+            }
+            *dest = candidate;
+        }
+        ready
     }
 
     fn sizing(&self) -> Sizing {

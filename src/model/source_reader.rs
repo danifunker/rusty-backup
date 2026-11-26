@@ -628,7 +628,13 @@ impl std::io::Read for CbkLazyReader {
                 }
                 n = n.min((logical_len - off) as usize);
                 let got = self.read_member(member_idx, off, &mut out[..n])?;
-                out[got..n].fill(0); // pad if the member ended early (shouldn't, within logical_len)
+                // A member shorter than its partition is damage, not zeros.
+                if got < n {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "a .cbk member ends before its partition does",
+                    ));
+                }
                 self.pos += n as u64;
                 Ok(n)
             }
@@ -695,7 +701,11 @@ fn try_open_cbk_lazy(path: &Path) -> Result<Option<CbkLazyReader>> {
     };
     let metadata: crate::backup::metadata::BackupMetadata = serde_json::from_slice(&meta_bytes)?;
 
-    // Lazy path covers plain per-partition MBR backups only.
+    // Lazy path covers plain per-partition MBR backups only, gzip or stored: a zstd or lz4
+    // member was served as if it were the partition's bytes (MSR-003).
+    if !matches!(metadata.compression_type.as_str(), "gzip" | "none") {
+        return Ok(None);
+    }
     if metadata.partition_table_type != "MBR"
         || metadata.layout != crate::backup::metadata::BackupLayout::PerPartition
         || metadata.partitions.iter().any(|p| p.start_byte.is_some())
@@ -779,7 +789,8 @@ fn try_open_cbk_lazy(path: &Path) -> Result<Option<CbkLazyReader>> {
 
     // One region per partition, backed by its member; verify the patch no-op.
     for pm in &metadata.partitions {
-        let Some(name) = pm.compressed_files.first() else {
+        // A split partition spans several members; reading the first alone zero-filled the rest (MSR-004).
+        let [name] = pm.compressed_files.as_slice() else {
             return Ok(None);
         };
         let Some(member_idx) = members.iter().position(|m| &m.name == name) else {

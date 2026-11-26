@@ -219,8 +219,23 @@ pub struct CdWritten {
     pub lines: Vec<String>,
 }
 
-/// Lay a blank disc of `size` bytes into `path`, replacing it.
+/// Lay a blank disc of `size` bytes into `path`, replacing it only once the layout is written.
 pub fn write_blank(path: &Path, req: &CdRequest, size: u64) -> Result<CdWritten> {
+    let mut part_name = path.file_name().unwrap_or_default().to_os_string();
+    part_name.push(".rbpart");
+    let part = path.with_file_name(part_name);
+    // A refused size or a failed write leaves the existing output untouched (MSR-016).
+    let result = write_blank_to(&part, req, size).and_then(|w| {
+        std::fs::rename(&part, path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(w)
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    result
+}
+
+fn write_blank_to(path: &Path, req: &CdRequest, size: u64) -> Result<CdWritten> {
     let create = || {
         std::fs::OpenOptions::new()
             .read(true)

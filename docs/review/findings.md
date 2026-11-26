@@ -983,13 +983,13 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | MCM-012 | S2 | confirmed | [mac_archive_read.rs:83](../../src/model/mac_archive_read.rs#L83) | Opening a file as an archive reads it whole (and clones it). | deferred to the slice-4 follow-up PR |
 | MCM-013 | S2 | confirmed | [archive_import.rs:56](../../src/model/archive_import.rs#L56) | Mac-archive extensions skip the `INLINE_MAX` guard. | deferred to the slice-4 follow-up PR |
 | MCM-014 | S2 | confirmed | [extract.rs:175](../../src/model/extract.rs#L175) | `Plan::run` handles only Skip; Fail overwrites files created since the pre-check. | fixed: a Fail run with conflicts stops before writing; Skip reaches the exporter for merged folders |
-| MCM-015 | S2 | confirmed | [commander_ops.rs:867](../../src/model/commander_ops.rs#L867) | Unreadable host folders copy as empty and report success. | deferred to the slice-4 follow-up PR |
+| MCM-015 | S2 | fixed | [commander_ops.rs:867](../../src/model/commander_ops.rs#L867) | Unreadable host folders copy as empty and report success. | an unreadable folder is left out and reported by name; the rest copies |
 | MCM-016 | S2 | confirmed | [edit_queue.rs:286](../../src/model/edit_queue.rs#L286) | MacBinary/BinHex imports never get their preserved Mac dates. | deferred to the slice-4 follow-up PR |
 | MCM-017 | S2 | confirmed | [archive_edit.rs:195](../../src/model/archive_edit.rs#L195) | A checksum failure after recompress is dropped; metadata keeps the old checksum. | fixed: reported as an error |
-| MCM-018 | S2 | confirmed | [text_edit.rs:309](../../src/model/text_edit.rs#L309) | Forced UTF-8 on invalid bytes saves U+FFFD over them. | deferred to the slice-4 follow-up PR |
+| MCM-018 | S2 | fixed | [text_edit.rs:309](../../src/model/text_edit.rs#L309) | Forced UTF-8 on invalid bytes saves U+FFFD over them. | UTF-8 and Shift-JIS (forced or conventional) refuse invalid bytes instead of decoding lossily |
 | MCM-019 | S2 | confirmed | [host_ops.rs:40](../../src/model/host_ops.rs#L40) | A case-only rename on a case-insensitive host fails as "already exists". | fixed: a rename onto the same file (case only) is allowed |
 | MCM-020 | S2 | plausible | [commander_source.rs:216](../../src/model/commander_source.rs#L216) | Backup edit uses the first member only (split backups) and trusts metadata file names. | deferred (plausible): needs a failing case first |
-| MCM-021 | S2 | confirmed | [edit_queue.rs:667](../../src/model/edit_queue.rs#L667) | Space preflight credits nothing for a recursive delete. | deferred to the slice-4 follow-up PR |
+| MCM-021 | S2 | fixed | [edit_queue.rs:667](../../src/model/edit_queue.rs#L667) | Space preflight credits nothing for a recursive delete. | `bytes_needed_on` credits the deleted folder's tree on the volume |
 | MCM-022 | S3 | confirmed | [container_edit.rs:229](../../src/model/container_edit.rs#L229) | The atomic replace doesn't fsync and replaces the original's permissions. | deferred to the slice-4 follow-up PR |
 | MCM-023 | S3 | confirmed | [commander_ops.rs:286](../../src/model/commander_ops.rs#L286) | Staged MacBinary imports hold the data fork in RAM and are cloned for preflight. | deferred to the slice-4 follow-up PR |
 | MCM-024 | S3 | confirmed | [browse_session.rs:777](../../src/model/browse_session.rs#L777) | Alto/Trident packs and NDIF forks are read whole. | deferred to the slice-4 follow-up PR |
@@ -1001,12 +1001,12 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 |---|---|---|---|---|---|
 | MSR-001 | S1 | confirmed | [resize_remote.rs:64](../../src/model/resize_remote.rs#L64) | A remote resize past the partition only warns, then grows metadata into the next partition. | fixed: refused, as the local verb does |
 | MSR-002 | S1 | confirmed | [resize_remote.rs:71](../../src/model/resize_remote.rs#L71) | A remote shrink skips the `last_data_byte` floor. | fixed: the filesystem is asked where its data ends first |
-| MSR-003 | S2 | confirmed | [source_reader.rs:699](../../src/model/source_reader.rs#L699) | The lazy `.cbk` reader serves zstd members as raw partition bytes. | deferred to the slice-4 follow-up PR |
-| MSR-004 | S2 | confirmed | [source_reader.rs:782](../../src/model/source_reader.rs#L782) | The lazy `.cbk` reader zero-fills a short or split member silently. | deferred to the slice-4 follow-up PR |
-| MSR-005 | S2 | confirmed | [source_scan.rs:193](../../src/model/source_scan.rs#L193) | Minimum-size probes read the raw container file, not the decoded disk. | deferred to the slice-4 follow-up PR |
-| MSR-006 | S2 | confirmed | [inspect_runner.rs:255](../../src/model/inspect_runner.rs#L255) | Device probes skip the sector-aligned reader, losing labels on raw devices. | deferred to the slice-4 follow-up PR |
+| MSR-003 | S2 | fixed | [source_reader.rs:699](../../src/model/source_reader.rs#L699) | The lazy `.cbk` reader serves zstd members as raw partition bytes. | only gzip / uncompressed members open lazily; others take the full path |
+| MSR-004 | S2 | fixed | [source_reader.rs:782](../../src/model/source_reader.rs#L782) | The lazy `.cbk` reader zero-fills a short or split member silently. | a split member falls back; a short member is an UnexpectedEof error |
+| MSR-005 | S2 | fixed | [source_scan.rs:193](../../src/model/source_scan.rs#L193) | Minimum-size probes read the raw container file, not the decoded disk. | probes open through the image-format wrapper |
+| MSR-006 | S2 | fixed | [inspect_runner.rs:255](../../src/model/inspect_runner.rs#L255) | Device probes skip the sector-aligned reader, losing labels on raw devices. | device probes go through `SectorAlignedReader` |
 | MSR-007 | S2 | confirmed | [inspect_runner.rs:253](../../src/model/inspect_runner.rs#L253) | Every probe re-decodes a streaming container. | deferred to the slice-4 follow-up PR |
-| MSR-008 | S2 | confirmed | [chd_edit_open.rs:37](../../src/model/chd_edit_open.rs#L37) | A crash mid-copy leaves a truncated `.chd_backup` that the next edit trusts. | deferred to the slice-4 follow-up PR |
+| MSR-008 | S2 | fixed | [chd_edit_open.rs:37](../../src/model/chd_edit_open.rs#L37) | A crash mid-copy leaves a truncated `.chd_backup` that the next edit trusts. | backup copies go through a `.part` name, size-checked, then renamed |
 | MSR-009 | S2 | confirmed | [cache_runner.rs:76](../../src/model/cache_runner.rs#L76) | Cancel leaves the scan thread running; a reopen starts a second one. | deferred to the slice-4 follow-up PR |
 | MSR-010 | S2 | plausible | [cache_runner.rs:112](../../src/model/cache_runner.rs#L112) | The seekable cache is written in place and may swallow a late write error. | deferred (plausible): needs a failing case first |
 | MSR-011 | S2 | plausible | [optical_ops.rs:241](../../src/model/optical_ops.rs#L241) | CHD rips stage to fixed names, so two rips into one folder collide. | deferred (plausible): needs a failing case first |
@@ -1014,7 +1014,7 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | MSR-013 | S3 | confirmed | [source_reader.rs:1232](../../src/model/source_reader.rs#L1232) | Model imports from `crate::cli`. | deferred to the slice-4 follow-up PR |
 | MSR-014 | S3 | confirmed | [source_reader.rs:1033](../../src/model/source_reader.rs#L1033) | `eprintln!` in model code. | fixed: `log::warn!` |
 | MSR-015 | S3 | confirmed | [image_prep.rs:181](../../src/model/image_prep.rs#L181) | The `.hdz` gunzip can't be cancelled. | deferred to the slice-4 follow-up PR |
-| MSR-016 | S3 | confirmed | [cd_build.rs:239](../../src/model/cd_build.rs#L239) | SGI/HFS CD layouts truncate the output before validating. | deferred to the slice-4 follow-up PR |
+| MSR-016 | S3 | fixed | [cd_build.rs:239](../../src/model/cd_build.rs#L239) | SGI/HFS CD layouts truncate the output before validating. | the blank disc is written to `.rbpart` and renamed only when whole |
 | MSR-017 | S3 | plausible | [restore_remote.rs:61](../../src/model/restore_remote.rs#L61) | Remote restore stages to the system temp dir (tmpfs) unchecked. | deferred (plausible): needs a failing case first |
 | MSR-018 | S3 | plausible | [optical_devices.rs:66](../../src/model/optical_devices.rs#L66) | `rb://` device args miss a separator for Windows paths. | deferred (plausible): needs a failing case first |
 | MSR-019 | S4 | confirmed | [backup_loader.rs:146](../../src/model/backup_loader.rs#L146) | Every GPT backup logs "Could not parse mbr.bin". | fixed: a GPT backup's protective-MBR parse failure is not reported |
@@ -1031,17 +1031,17 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | MWR-005 | S1 | plausible | [provision_runner.rs:842](../../src/model/provision_runner.rs#L842) | A file target is truncated before its sources or donor are read; no same-file check. | fixed: refused |
 | MWR-006 | S1 | plausible | [restore_plan.rs:667](../../src/model/restore_plan.rs#L667) | A new disk is sized from a container's file length, not its decoded length. | deferred (plausible): needs a failing case first |
 | MWR-007 | S1 | plausible | [resize_image.rs:663](../../src/model/resize_image.rs#L663) | In-place `apply_resize` has no rollback on an I/O error mid-move. | deferred (plausible): needs a failing case first |
-| MWR-008 | S2 | confirmed | [resize_image.rs:782](../../src/model/resize_image.rs#L782) | CHD copy packs to a stripped-extension sibling that may clobber another file. | deferred to the slice-4 follow-up PR |
+| MWR-008 | S2 | fixed | [resize_image.rs:782](../../src/model/resize_image.rs#L782) | CHD copy packs to a stripped-extension sibling that may clobber another file. | a copy packs to a hidden `.NAME.resize-pack` and renames onto the target |
 | MWR-009 | S2 | plausible | [resize_image.rs:572](../../src/model/resize_image.rs#L572) | A failed Copy step removes a pre-existing target. | fixed: a target that existed before the run is never removed |
 | MWR-010 | S2 | confirmed | [disk_builder.rs:114](../../src/model/disk_builder.rs#L114) | `Donor::read` allocates the donor's head unbounded. | fixed: a head past 256 MiB (or the disk) is refused |
 | MWR-011 | S2 | plausible | [export_runner.rs:868](../../src/model/export_runner.rs#L868) | Shrinking exports run general resizers on a cut file. | deferred (plausible): needs a failing case first |
 | MWR-012 | S2 | confirmed | [export_runner.rs:857](../../src/model/export_runner.rs#L857) | Per-partition export reads at `start_lba*512`, not `byte_offset()`. | fixed for the raw export (`byte_offset`); the HFV branch and HFS-ceiling probe still read at `start_lba*512` |
-| MWR-013 | S2 | confirmed | [partition_editor.rs:419](../../src/model/partition_editor.rs#L419) | A pending row's edited size isn't what is written. | deferred to the slice-4 follow-up PR |
-| MWR-014 | S2 | confirmed | [disk_write_plan.rs:228](../../src/model/disk_write_plan.rs#L228) | Hidden sectors read from the raw container file. | deferred to the slice-4 follow-up PR |
+| MWR-013 | S2 | fixed | [partition_editor.rs:419](../../src/model/partition_editor.rs#L419) | A pending row's edited size isn't what is written. | a new row's size field is parsed and written |
+| MWR-014 | S2 | fixed | [disk_write_plan.rs:228](../../src/model/disk_write_plan.rs#L228) | Hidden sectors read from the raw container file. | hidden sectors read through `open_peeled_read_with_entry` |
 | MWR-015 | S2 | plausible | [swab_runner.rs:44](../../src/model/swab_runner.rs#L44) | No canonical same-file check before `File::create(dst)`. | deferred (plausible): needs a failing case first |
 | MWR-016 | S2 | confirmed | [chd_expand_runner.rs:63](../../src/model/chd_expand_runner.rs#L63) | `old_logical + add_bytes` unchecked. | fixed: checked |
 | MWR-017 | S3 | confirmed | [partition_editor.rs:411](../../src/model/partition_editor.rs#L411) | An unparseable MBR type on a new row becomes 0x83 silently. | deferred to the slice-4 follow-up PR |
-| MWR-018 | S3 | confirmed | [provision_runner.rs:792](../../src/model/provision_runner.rs#L792) | A failed partitioned build leaves its half-built image. | deferred to the slice-4 follow-up PR |
+| MWR-018 | S3 | fixed | [provision_runner.rs:792](../../src/model/provision_runner.rs#L792) | A failed partitioned build leaves its half-built image. | a failed build removes the image it created or truncated |
 | MWR-019 | S3 | plausible | [alto_resize.rs:65](../../src/model/alto_resize.rs#L65) | Files are read whole before validation. | deferred (plausible): needs a failing case first |
 | MWR-020 | S4 | confirmed | [physical_write_runner.rs:100](../../src/model/physical_write_runner.rs#L100) | `target_size_bytes` is never read. | deferred (refactor pass) |
 | MWR-021 | S4 | confirmed | [export_runner.rs:954](../../src/model/export_runner.rs#L954) | A doc comment merged into its neighbour's. | deferred (refactor pass) |
@@ -1052,13 +1052,13 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | ID | Sev | Status | Where | Finding | Fix |
 |---|---|---|---|---|---|
 | MJB-001 | S1 | confirmed | [run.rs:48](../../src/model/convert/run.rs#L48) | A refused output-is-source conversion runs `remove_partial`, deleting the source. | fixed: the cleanup never removes the source or its BIN |
-| MJB-002 | S2 | confirmed | [min_size_runner.rs:142](../../src/model/min_size_runner.rs#L142) | Concurrent minimum calcs share one file cursor through `try_clone`. | deferred to the slice-4 follow-up PR |
-| MJB-003 | S2 | confirmed | [mod.rs:576](../../src/model/convert/mod.rs#L576) | `disk.vhd` and `disk.qcow2` both map to `disk.img`; the second overwrites the first. | deferred to the slice-4 follow-up PR |
-| MJB-004 | S2 | confirmed | [stage_names.rs:83](../../src/model/stage_names.rs#L83) | A legal name isn't checked against names already taken. | deferred to the slice-4 follow-up PR |
+| MJB-002 | S2 | fixed | [min_size_runner.rs:142](../../src/model/min_size_runner.rs#L142) | Concurrent minimum calcs share one file cursor through `try_clone`. | workers read through `os::PositionalFile` (positioned reads, own cursor) |
+| MJB-003 | S2 | fixed | [mod.rs:576](../../src/model/convert/mod.rs#L576) | `disk.vhd` and `disk.qcow2` both map to `disk.img`; the second overwrites the first. | repeated destinations (case-folded) get a `-{srcext}` suffix, shown on the row |
+| MJB-004 | S2 | fixed | [stage_names.rs:83](../../src/model/stage_names.rs#L83) | A legal name isn't checked against names already taken. | a legal name that clashes with an earlier rename in the batch is made unique |
 | MJB-005 | S2 | confirmed | [fs_limits.rs:252](../../src/model/fs_limits.rs#L252) | exFAT limit arithmetic unchecked. | deferred to the slice-4 follow-up PR |
-| MJB-006 | S2 | confirmed | [classify.rs:110](../../src/model/convert/classify.rs#L110) | Kind decided by size alone; a small hard disk is a floppy. | deferred to the slice-4 follow-up PR |
-| MJB-007 | S2 | confirmed | [classify.rs:233](../../src/model/convert/classify.rs#L233) | gzip ISIZE is modulo 4 GiB. | deferred to the slice-4 follow-up PR |
-| MJB-008 | S2 | confirmed | [verify.rs:205](../../src/model/convert/verify.rs#L205) | Disc verify passes when nothing was compared. | deferred to the slice-4 follow-up PR |
+| MJB-006 | S2 | fixed | [classify.rs:110](../../src/model/convert/classify.rs#L110) | Kind decided by size alone; a small hard disk is a floppy. | a floppy-sized image with an MBR / GPT / RDB / APM table is a hard disk |
+| MJB-007 | S2 | fixed | [classify.rs:233](../../src/model/convert/classify.rs#L233) | gzip ISIZE is modulo 4 GiB. | under 4 MiB the trailer is exact; a larger gzip is counted by decoding |
+| MJB-008 | S2 | fixed | [verify.rs:205](../../src/model/convert/verify.rs#L205) | Disc verify passes when nothing was compared. | nothing compared (no filesystem, no files) reports Not verified |
 | MJB-009 | S2 | plausible | [verify.rs:138](../../src/model/convert/verify.rs#L138) | Volume verify skips unopenable partitions and compares names only. | deferred (plausible): needs a failing case first |
 | MJB-010 | S2 | confirmed | [job.rs:245](../../src/model/job.rs#L245) | Rate and ETA freeze during a stall. | deferred to the slice-4 follow-up PR |
 | MJB-011 | S2 | confirmed | [mod.rs:416](../../src/model/convert/mod.rs#L416) | `minimum / 100 * p` unchecked. | fixed: saturating |

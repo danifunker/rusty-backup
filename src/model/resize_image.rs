@@ -808,12 +808,20 @@ fn pack(
     let opts = ChdOptions { hunk_size, codecs };
     let total = req.disk_size;
     let in_place = req.copy_to.is_none();
+    // A copy packs to a hidden name beside its target, never a sibling that may be a user's file (MWR-008).
     let base = match in_place {
         true => scratch_path(req, layout, "pack"),
-        false => req.target().with_extension(""),
+        false => {
+            let stem = req
+                .target()
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
+            req.target().with_file_name(format!(".{stem}-resize-pack"))
+        }
     };
     let packed = base.with_extension("chd");
-    let _gone = Scratch(in_place.then(|| packed.clone()));
+    let _gone = Scratch(Some(packed.clone()));
     let mut reader = std::io::BufReader::new(std::fs::File::open(work)?);
     crate::rbformats::chd::compress_chd_expand(
         &mut reader,
@@ -827,8 +835,7 @@ fn pack(
     match in_place {
         true => crate::os::replace_file(&packed, &req.source)
             .with_context(|| format!("replace {}", req.source.display()))?,
-        false if packed != req.target() => std::fs::rename(&packed, req.target())?,
-        false => {}
+        false => std::fs::rename(&packed, req.target())?,
     }
     Ok(())
 }
