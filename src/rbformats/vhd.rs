@@ -229,7 +229,7 @@ fn rebuild_vhd_ebr_chain(
     // (positions and partition types).
     let source_logicals = match parse_ebr_chain(source, extended_start_lba) {
         Ok(v) if !v.is_empty() => v,
-        Ok(_) => return Ok(None), // empty chain — nothing to update
+        Ok(_) => return Ok(None), // empty chain - nothing to update
         Err(e) => {
             log_cb(&format!("Warning: could not parse source EBR chain: {e}"));
             return Ok(None);
@@ -933,7 +933,7 @@ pub fn export_clonezilla_disk_vhd(
         log_cb("Patched MBR partition table with export sizes");
     }
     // Clonezilla keeps only the first EBR, so the chain is rebuilt as restore does (RBF-009).
-    let ebr_layout = crate::restore::clonezilla_ebr_layout(cz_image, partition_sizes);
+    let ebr_layout = crate::restore::clonezilla_ebr_layout(cz_image, partition_sizes)?;
     if let Some(ref layout) = ebr_layout {
         crate::restore::patch_clonezilla_extended_entry(&mut mbr_buf, cz_image, layout);
     }

@@ -269,7 +269,7 @@ fn read_first_sector<R: Read + Seek>(
     let e = last.expect("loop runs at least once");
     Err(RustyBackupError::DeviceRead(format!(
         "cannot read the first sector after 3 attempts: {e}. \
-         The medium or drive refused the read — this is not a partition-table \
+         The medium or drive refused the read - this is not a partition-table \
          problem. Check the disk is inserted, readable and not still mounted."
     )))
 }
@@ -285,7 +285,7 @@ fn read_first_sector<R: Read + Seek>(
 fn unrecognized_media(size_bytes: u64, mbr_err: &RustyBackupError) -> RustyBackupError {
     RustyBackupError::UnrecognizedMedia(format!(
         "no partition table, and no filesystem signature at offset 0 ({size_bytes} bytes). \
-         Some formats carry no signature at all (CP/M and several 8-bit floppies) — \
+         Some formats carry no signature at all (CP/M and several 8-bit floppies) - \
          open those with `--fs-type <fs>`. Probe detail: {mbr_err}"
     ))
 }
@@ -300,9 +300,9 @@ fn unrecognized_media(size_bytes: u64, mbr_err: &RustyBackupError) -> RustyBacku
 fn is_floppy_size(size: u64) -> bool {
     matches!(
         size,
-        143_360     // 5.25" 140K (35 tracks × 16 sectors × 256 bytes)
-        | 255_488   // 8" SSSD CP/M data area (Altair `altair_8in` DPB: 2 reserved trk + 243 × 1024 B blocks)
-        | 256_256   // 8" SSSD 256K (77 trk × 26 spt × 128 B) — MITS Altair / IBM 3740 CP/M (raw)
+        143_360     // 5.25" 140K (35 tracks x 16 sectors x 256 bytes)
+        | 255_488   // 8" SSSD CP/M data area (Altair `altair_8in` DPB: 2 reserved trk + 243 x 1024 B blocks)
+        | 256_256   // 8" SSSD 256K (77 trk x 26 spt x 128 B) - MITS Altair / IBM 3740 CP/M (raw)
         | 409_600   // 3.5" 400K single-sided GCR
         | 819_200   // 3.5" 800K double-sided GCR
         | 737_280   // 3.5" 720K MFM (PC double-density)
@@ -3154,7 +3154,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/sgi/irix_volhdr.bin");
         let mut buf = std::fs::read(&path).expect("fixture present");
-        buf.resize(1 << 20, 0); // 1 MiB padding — the partition list math
+        buf.resize(1 << 20, 0); // 1 MiB padding - the partition list math
                                 // doesn't need real data past the header.
 
         let mut cursor = Cursor::new(buf);

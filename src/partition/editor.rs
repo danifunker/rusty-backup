@@ -190,6 +190,17 @@ pub fn apply_edits(
     disk_size_bytes: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
+    // Under a sector, a GPT entry ends before it starts (PAR-014).
+    for edit in edits {
+        let size = match edit {
+            PartitionTableEdit::ResizeEntry { new_size_bytes, .. } => *new_size_bytes,
+            PartitionTableEdit::AddEntry { size_bytes, .. } => *size_bytes,
+            _ => continue,
+        };
+        if size < 512 {
+            bail!("a partition must be at least one 512-byte sector, not {size} bytes");
+        }
+    }
     match current_table {
         PartitionTable::Mbr(mbr) => apply_mbr_edits(file, mbr, edits, log_cb),
         PartitionTable::Gpt { gpt, .. } => {
@@ -305,12 +316,9 @@ fn apply_mbr_edits(
                 index,
                 new_size_bytes,
             } => {
+                // A skipped edit used to return Ok, so the caller believed it applied (PAR-013).
                 if *index >= 4 {
-                    log_cb(&format!(
-                        "Skipping resize of logical partition {} (EBR editing not supported)",
-                        index
-                    ));
-                    continue;
+                    bail!("cannot resize logical partition {index}: EBR editing is not supported");
                 }
                 let offset = 446 + index * 16;
                 let start_lba = u32::from_le_bytes(mbr_bytes[offset + 8..offset + 12].try_into()?);
@@ -335,12 +343,9 @@ fn apply_mbr_edits(
                 index,
                 new_start_lba,
             } => {
+                // A skipped edit used to return Ok, so the caller believed it applied (PAR-013).
                 if *index >= 4 {
-                    log_cb(&format!(
-                        "Skipping move of logical partition {} (EBR editing not supported)",
-                        index
-                    ));
-                    continue;
+                    bail!("cannot move logical partition {index}: EBR editing is not supported");
                 }
                 let offset = 446 + index * 16;
                 let total_sectors =
@@ -407,10 +412,7 @@ fn apply_mbr_edits(
                 });
                 let slot = match slot {
                     Some(s) => s,
-                    None => {
-                        log_cb("No empty MBR slot for new partition");
-                        continue;
-                    }
+                    None => bail!("the MBR has no empty slot for a new partition"),
                 };
                 let offset = 446 + slot * 16;
                 let start = fit32(*start_lba, "start LBA")?;
@@ -515,9 +517,7 @@ fn apply_gpt_edits(
                                     index, guid_str
                                 ));
                             }
-                            Err(err) => {
-                                log_cb(&format!("Invalid GUID {}: {}", guid_str, err));
-                            }
+                            Err(err) => bail!("invalid GPT type GUID {guid_str}: {err}"),
                         }
                     }
                 }
@@ -1272,7 +1272,7 @@ fn apply_sgi_dklabel_edits(
             }
             PartitionTableEdit::ChangeType { .. } => {
                 anyhow::bail!(
-                    "SGI disk label: slots have no type field — a slot's role comes from \
+                    "SGI disk label: slots have no type field - a slot's role comes from \
                      d_bootfs / d_swapfs / d_rootfs, not from a per-slot type"
                 );
             }
@@ -1441,7 +1441,7 @@ fn apply_sgi_edits(
                 ..
             } => {
                 // SGI has 16 fixed slots. Find the first empty one — but
-                // refuse to touch slots 8 (VOLUME) and 10 (VOLHDR) since
+                // refuse to touch slots 8 (VOLHDR) and 10 (VOLUME) since
                 // those are reserved disk-wide wrappers. (They're filtered
                 // out of the editor's view by .partitions(), so the user
                 // won't see them, but defensive check anyway.)

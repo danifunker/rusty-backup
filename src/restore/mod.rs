@@ -187,13 +187,6 @@ fn set_progress_bytes(progress: &Arc<Mutex<RestoreProgress>>, current: u64, tota
     }
 }
 
-/// Calculate the final partition layout given alignment, sizing choices, and
-/// target disk size. Returns the computed `PartitionSizeOverride` list.
-///
-/// When the backup contains logical partitions inside an extended container,
-/// this function accounts for EBR overhead (1 sector before each logical
-/// partition) and generates a synthetic override for the extended container
-/// entry so that `patch_mbr_entries` can resize it in the MBR.
 /// Smallest size a partition may be restored to: the number of bytes that
 /// actually have to land inside it.
 ///
@@ -240,20 +233,27 @@ fn is_disk_label_scheme(table_type: &str) -> bool {
 
 /// Extra guidance for an overrun, when the alignment choice is the cause.
 ///
-/// `Original` keeps every partition at its absolute start, so shrinking only
-/// opens gaps and a tail partition still runs off a smaller disk. The other
-/// alignments repack from the front, which is what actually reclaims the space.
+/// `Original` keeps the backup's own alignment: an APM map keeps every absolute
+/// start, and MBR/GPT repack from the original first partition on the original
+/// grid. The other alignments repack on a new grid, which can reclaim more.
 fn repack_hint(alignment: &RestoreAlignment) -> &'static str {
     match alignment {
         RestoreAlignment::Original => {
-            " Original alignment keeps each partition at its original position, \
-             so shrinking only leaves gaps behind them. Choose 1 MB or Custom \
-             alignment to repack the partitions from the start of the disk."
+            " Original alignment keeps the backup's own layout grid (and an APM \
+             map's absolute positions). Choose 1 MB or Custom alignment to repack \
+             the partitions on a new grid."
         }
         _ => "",
     }
 }
 
+/// Calculate the final partition layout given alignment, sizing choices, and
+/// target disk size. Returns the computed `PartitionSizeOverride` list.
+///
+/// When the backup contains logical partitions inside an extended container,
+/// this function accounts for EBR overhead (1 sector before each logical
+/// partition) and generates a synthetic override for the extended container
+/// entry so that `patch_mbr_entries` can resize it in the MBR.
 pub fn calculate_restore_layout(
     metadata: &BackupMetadata,
     alignment: &RestoreAlignment,
@@ -268,11 +268,24 @@ pub fn calculate_restore_layout(
     // Superfloppy: single partition at offset 0, no alignment
     if metadata.partition_table_type == "None" {
         if let Some(pm) = metadata.partitions.first() {
+            // The volume is the disk, so its size choice still applies (RST-012).
+            let choice = partition_sizes
+                .iter()
+                .find(|s| s.index == pm.index)
+                .map(|s| &s.size_choice)
+                .unwrap_or(&RestoreSizeChoice::Original);
+            let size = compute_partition_size(
+                choice,
+                pm,
+                0,
+                target_size,
+                restore_size_floor(metadata, pm),
+            );
             return Ok(vec![PartitionSizeOverride {
                 index: 0,
                 start_lba: 0,
                 original_size: pm.original_size_bytes,
-                export_size: pm.original_size_bytes,
+                export_size: size,
                 new_start_lba: None,
                 heads: 0,
                 sectors_per_track: 0,
@@ -943,7 +956,14 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
             .any(|p| !matches!(p.size_choice, RestoreSizeChoice::Original));
         // A backup-time resize moved the partitions, so their original sizes need the layout rebuilt.
         let any_resized = metadata.partitions.iter().any(|p| p.resized);
-        return if any_non_original || any_resized {
+        crate::backup::single_file_chd::verify_container(
+            &config.backup_folder,
+            &metadata,
+            &mut |m| log(&progress, LogLevel::Info, m),
+        )?;
+        // A verbatim copy keeps the old starts, so a new alignment needs the rebuild too (RST-007).
+        let realigned = !matches!(config.alignment, RestoreAlignment::Original);
+        return if any_non_original || any_resized || realigned {
             run_single_file_chd_restore_resize(&config, progress, &metadata)
         } else {
             run_single_file_chd_restore_as_is(&config, progress, &metadata)
@@ -1002,56 +1022,12 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         }
     };
 
-    // Load GPT data if this is a GPT backup
-    let gpt_data: Option<Gpt> = if is_gpt {
-        let gpt_json_path = config.backup_folder.join("gpt.json");
-        if gpt_json_path.exists() {
-            let gpt_file = File::open(&gpt_json_path)
-                .with_context(|| format!("failed to open {}", gpt_json_path.display()))?;
-            let gpt: Gpt = serde_json::from_reader(gpt_file).context("failed to parse gpt.json")?;
-            log(
-                &progress,
-                LogLevel::Info,
-                format!("Loaded GPT: {} partition entries", gpt.entries.len()),
-            );
-            Some(gpt)
-        } else {
-            log(
-                &progress,
-                LogLevel::Warning,
-                "GPT backup has no gpt.json — GPT structures will not be written",
-            );
-            None
-        }
-    } else {
-        None
-    };
-
-    // Load APM data if this is an APM backup
-    let is_apm = metadata.partition_table_type == "APM";
-    let apm_data: Option<Apm> = if is_apm {
-        let apm_json_path = config.backup_folder.join("apm.json");
-        if apm_json_path.exists() {
-            let apm_file = File::open(&apm_json_path)
-                .with_context(|| format!("failed to open {}", apm_json_path.display()))?;
-            let apm: Apm = serde_json::from_reader(apm_file).context("failed to parse apm.json")?;
-            log(
-                &progress,
-                LogLevel::Info,
-                format!("Loaded APM: {} partition entries", apm.entries.len()),
-            );
-            Some(apm)
-        } else {
-            log(
-                &progress,
-                LogLevel::Warning,
-                "APM backup has no apm.json — APM structures will not be written",
-            );
-            None
-        }
-    } else {
-        None
-    };
+    // A GPT or APM backup without its sidecar would land with no table at all (RST-010).
+    let (gpt_data, apm_data) = crate::rbformats::load_table_sidecars(
+        &config.backup_folder,
+        &metadata.partition_table_type,
+        &mut |m| log(&progress, LogLevel::Info, m),
+    )?;
 
     // Step 4: Calculate partition layout
     set_operation(&progress, "Calculating partition layout...");
@@ -1217,7 +1193,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
             });
             if is_io_stall {
                 return Err(e.context(
-                    "disk write stalled — if another application (e.g. VMware) is \
+                    "disk write stalled - if another application (e.g. VMware) is \
                      accessing the target drive, suspend it and retry",
                 ));
             }
@@ -1276,7 +1252,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                 &progress,
                 LogLevel::Info,
                 format!(
-                    "Partition {}: defragmented HFS+ clone — leaving volume bytes verbatim, \
+                    "Partition {}: defragmented HFS+ clone - leaving volume bytes verbatim, \
                      skipping in-place resize",
                     pm.index
                 ),
@@ -1311,7 +1287,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                     &progress,
                     LogLevel::Info,
                     format!(
-                        "Partition {}: trimmed HFS/HFS+ backup restored to original size — \
+                        "Partition {}: trimmed HFS/HFS+ backup restored to original size - \
                          writing alternate volume header into zero-filled tail",
                         pm.index
                     ),
@@ -1389,9 +1365,16 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         // Validate filesystem integrity after resize
         if export_size != pm.original_size_bytes || pm.compacted {
             let fs_type = detect_partition_fs_type(inner_file, part_offset);
-            let _ = validate_filesystem_for(inner_file, part_offset, fs_type, &mut |msg| {
+            if let Err(e) = validate_filesystem_for(inner_file, part_offset, fs_type, &mut |msg| {
                 log(&progress, LogLevel::Info, msg)
-            });
+            }) {
+                // A failed check used to vanish behind a reported success (RST-011).
+                log(
+                    &progress,
+                    LogLevel::Warning,
+                    format!("Warning: the restored filesystem failed its check: {e:#}"),
+                );
+            }
         }
     }
 
@@ -1649,9 +1632,8 @@ fn run_single_file_chd_restore_as_is(
 /// original — once a backup is committed, its CHD layout is the source
 /// of truth.
 ///
-/// Logical / extended partitions are not yet supported on this path
-/// (the EBR rebuild that the per-partition restore does isn't wired in
-/// here yet). The function bails with a clear error if any are present.
+/// Logical partitions get their EBR chain rebuilt for the new layout, as the
+/// per-partition restore does.
 fn run_single_file_chd_restore_resize(
     config: &RestoreConfig,
     progress: Arc<Mutex<RestoreProgress>>,
@@ -2262,6 +2244,14 @@ pub fn calculate_clonezilla_restore_layout(
         RestoreAlignment::Modern1MB => (2048, 2048, 0, 0),
         RestoreAlignment::Custom(n) => (*n, *n, 0, 0),
     };
+    // Zero geometry leaves CHS stale after a move; the image's or the BIOS's 255/63 fills it (RST-013).
+    let (heads, spt) = match (heads, spt) {
+        (h, s) if h > 0 && s > 0 => (h, s),
+        _ if cz_image.heads > 0 && cz_image.sectors_per_track > 0 => {
+            (cz_image.heads as u16, cz_image.sectors_per_track as u16)
+        }
+        _ => (255, 63),
+    };
 
     let mut overrides = Vec::new();
     let mut current_lba = first_partition_lba;
@@ -2394,15 +2384,17 @@ pub(crate) struct ClonezillaEbrLayout {
 pub(crate) fn clonezilla_ebr_layout(
     cz_image: &ClonezillaImage,
     overrides: &[PartitionSizeOverride],
-) -> Option<ClonezillaEbrLayout> {
-    let ext = cz_image.partitions.iter().find(|p| p.is_extended)?;
+) -> Result<Option<ClonezillaEbrLayout>> {
+    let Some(ext) = cz_image.partitions.iter().find(|p| p.is_extended) else {
+        return Ok(None);
+    };
     let mut logicals: Vec<&dsk_clonezilla::metadata::ClonezillaPartition> = cz_image
         .partitions
         .iter()
         .filter(|p| p.is_logical && !p.is_extended)
         .collect();
     if logicals.is_empty() {
-        return None;
+        return Ok(None);
     }
     logicals.sort_by_key(|p| p.start_lba);
 
@@ -2433,12 +2425,13 @@ pub(crate) fn clonezilla_ebr_layout(
     } else {
         last_end - ext_start
     };
-    Some(ClonezillaEbrLayout {
+    // Without a chain the logicals vanish, so a chain that can't be built stops the restore (RST-006).
+    let ebr_sectors = build_ebr_chain(ext_start, &infos).context("rebuild the EBR chain")?;
+    Ok(Some(ClonezillaEbrLayout {
         ext_start,
         ext_sectors,
-        // None makes the caller keep the image's own chain, as for any layout it cannot rebuild.
-        ebr_sectors: build_ebr_chain(ext_start, &infos).ok()?,
-    })
+        ebr_sectors,
+    }))
 }
 
 /// Point the MBR's extended-container entry at the rebuilt container.
@@ -2641,22 +2634,11 @@ fn run_clonezilla_restore(
                     );
                     Some(gpt)
                 }
-                Err(e) => {
-                    log(
-                        &progress,
-                        LogLevel::Warning,
-                        format!("Failed to parse GPT from raw sectors: {e}"),
-                    );
-                    None
-                }
+                // Falling back to the MBR branch would write a GPT disk as MBR (RST-010).
+                Err(e) => bail!("this Clonezilla image's GPT can't be parsed: {e}"),
             }
         } else {
-            log(
-                &progress,
-                LogLevel::Warning,
-                "GPT image has no raw GPT sectors — GPT structures will not be written",
-            );
-            None
+            bail!("this Clonezilla GPT image has no saved GPT sectors");
         }
     } else {
         None
@@ -2715,67 +2697,35 @@ fn run_clonezilla_restore(
             .inner_mut()
             .context("failed to access device for filesystem operations")?;
 
-        // Resize if partition size changed
+        // One resizer list, as the other restores use (RST-014); it refuses a cut it can't make (RST-002).
         if export_size != cz_part.size_bytes() {
             let fs_type = detect_partition_fs_type(inner_file, part_offset);
-            match fs_type {
-                PartitionFsType::Ntfs => {
-                    let new_sectors = export_size / 512;
-                    resize_ntfs_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
-                }
-                PartitionFsType::Exfat => {
-                    let new_sectors = export_size / 512;
-                    let mut info = |msg: &str| log(&progress, LogLevel::Info, msg);
-                    resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut info)?;
-                    crate::fs::grow_exfat_past_its_fat(
-                        inner_file,
-                        part_offset,
-                        export_size,
-                        &mut info,
-                    )?;
-                }
-                PartitionFsType::Hfs => {
-                    resize_hfs_in_place(inner_file, part_offset, export_size, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
-                }
-                PartitionFsType::HfsPlus => {
-                    resize_hfsplus_in_place(inner_file, part_offset, export_size, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
-                }
-                PartitionFsType::Ext => {
-                    resize_ext_in_place(inner_file, part_offset, export_size, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
-                }
-                PartitionFsType::Btrfs => {
-                    resize_btrfs_in_place(inner_file, part_offset, export_size, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
-                }
-                PartitionFsType::ProDos => {
-                    resize_prodos_in_place(inner_file, part_offset, export_size, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
-                }
-                PartitionFsType::Fat | PartitionFsType::Unknown => {
-                    let new_sectors = (export_size / 512) as u32;
-                    resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
-                }
+            let mut info = |msg: &str| log(&progress, LogLevel::Info, msg);
+            crate::fs::resize_filesystem_from(
+                inner_file,
+                part_offset,
+                cz_part.size_bytes(),
+                export_size,
+                &mut info,
+            )
+            .with_context(|| format!("resize {} filesystem", cz_part.device_name))?;
+            if matches!(fs_type, PartitionFsType::Ntfs) {
+                ensure_backup_boot_sector(inner_file, part_offset, &mut info)?;
             }
         }
 
         // Validate filesystem integrity
         if export_size != cz_part.size_bytes() || !cz_part.partclone_files.is_empty() {
             let fs_type = detect_partition_fs_type(inner_file, part_offset);
-            let _ = validate_filesystem_for(inner_file, part_offset, fs_type, &mut |msg| {
+            if let Err(e) = validate_filesystem_for(inner_file, part_offset, fs_type, &mut |msg| {
                 log(&progress, LogLevel::Info, msg)
-            });
+            }) {
+                log(
+                    &progress,
+                    LogLevel::Warning,
+                    format!("Warning: the restored filesystem failed its check: {e:#}"),
+                );
+            }
         }
     }
 
@@ -2846,7 +2796,7 @@ fn write_clonezilla_disk(
     let target_size = progress.lock().map(|p| p.total_bytes).unwrap_or(0);
     let target_sectors = disk_target_size / 512;
     let ebr_layout = if gpt.is_none() {
-        clonezilla_ebr_layout(cz_image, overrides)
+        clonezilla_ebr_layout(cz_image, overrides)?
     } else {
         None
     };
@@ -3071,17 +3021,6 @@ fn write_clonezilla_disk(
             patch_hidden_sectors_for(writer, part_offset, effective_lba, &mut |msg| {
                 log(progress, LogLevel::Info, msg)
             })?;
-            // A resizer refuses a cut through used blocks; without one a shrink lost them (RST-002).
-            if export_size != cz_part.size_bytes() {
-                crate::fs::resize_filesystem_from(
-                    writer,
-                    part_offset,
-                    cz_part.size_bytes(),
-                    export_size,
-                    &mut |msg| log(progress, LogLevel::Info, msg),
-                )
-                .with_context(|| format!("resize {} filesystem", cz_part.device_name))?;
-            }
             // The patchers seek to the boot sector; the gap fills after this seek relatively
             writer.seek(SeekFrom::Start(total_written))?;
         }
@@ -5064,7 +5003,7 @@ mod clonezilla_layout_tests {
             let ov = ovs.iter().find(|o| o.index == p.index).unwrap();
             assert_eq!(ov.effective_start_lba(), p.start_lba, "{}", p.device_name);
         }
-        let layout = clonezilla_ebr_layout(&cz, &ovs).unwrap();
+        let layout = clonezilla_ebr_layout(&cz, &ovs).unwrap().unwrap();
         assert_eq!((layout.ext_start, layout.ext_sectors), (1001470, 61530114));
         let offsets: Vec<u64> = layout.ebr_sectors.iter().map(|(o, _)| o / 512).collect();
         assert_eq!(offsets, vec![1001470, 60534783]);
@@ -5085,7 +5024,7 @@ mod clonezilla_layout_tests {
         let ovs =
             calculate_clonezilla_restore_layout(&cz, &RestoreAlignment::Original, &sizes, target)
                 .unwrap();
-        let layout = clonezilla_ebr_layout(&cz, &ovs).unwrap();
+        let layout = clonezilla_ebr_layout(&cz, &ovs).unwrap().unwrap();
         assert_eq!(
             layout.ext_start as u64 + layout.ext_sectors as u64,
             70_000_000

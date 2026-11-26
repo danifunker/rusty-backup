@@ -17,24 +17,21 @@
 //!   cylinder 0 and carries the label in its own first sector, so there the
 //!   head is empty already. An Amiga RDB rides the same path — its RDSK, PART,
 //!   FSHD and LSEG blocks are exactly what a re-serialized table would lose.
-//! - **Backup-time resize supported.** When the caller passes
-//!   `resize_targets`, partitions get their new sizes via the same
-//!   `PartitionResizePlan` + `PartitionSizeOverride` machinery the restore
-//!   path uses: assemble the synthesised disk into a sparse temp file,
-//!   write the patched partition table at sector 0, drop each partition
-//!   body at its new offset, run `resize_*_in_place` + hidden-sector
-//!   patching, then hand the temp file to `compress_chd`. With no
-//!   resize requested (or a no-op plan) the cheaper `DiskImageStream`
-//!   path is used.
+//! - **Two-phase staging.** [`run_via_staging`] is the one production path:
+//!   each partition is staged into its own zstd file in a temp dir beside the
+//!   output (raw / compact-reader passthrough, a defrag clone through a
+//!   producer thread, or a per-partition `.raw` resized in place by
+//!   `resize_filesystem_from`), then `assemble_from_staging` folds the stages
+//!   and the patched table into one `.chd`. A backup-time resize reuses the
+//!   restore path's `PartitionResizePlan` + `PartitionSizeOverride` machinery.
 //! - **Smart compaction = layout-preserving compact reader where available**
 //!   (HFS, HFS+, ext, btrfs, ProDOS), raw passthrough otherwise. Adding
 //!   layout-preserving FAT/NTFS/exFAT readers is a future stage.
 //! - **Sector-by-sector mode** = raw passthrough for every partition.
 //!
 //! The output is a real disk image: `chdman info` + MAME load it
-//! correctly. Per-partition checksums are computed by re-reading the CHD
-//! after compression so the metadata.json stays trustable for restore-time
-//! validation.
+//! correctly. Per-partition checksums are hashed as the bytes stream into the
+//! CHD; `rehash_partitions_via_decode` re-reads it only after an in-place edit.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -836,6 +833,30 @@ fn read_container_sha1(chd_path: &Path) -> Result<String> {
     Ok(hex_lower(&sha1_bytes))
 }
 
+/// Check the container against the SHA-1 metadata recorded; the per-partition files the
+/// folder layout verifies don't exist here (BKP-008), and decoding checks each hunk's CRC.
+pub fn verify_container(
+    backup_folder: &Path,
+    metadata: &BackupMetadata,
+    log_cb: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let (Some(name), Some(recorded)) = (&metadata.container, &metadata.container_sha1) else {
+        return Ok(());
+    };
+    let path = backup_folder.join(name);
+    let actual = read_container_sha1(&path)?;
+    if !actual.eq_ignore_ascii_case(recorded) {
+        anyhow::bail!(
+            "{} is not the CHD this backup recorded (SHA-1 {} vs {}); nothing was written to the target",
+            path.display(),
+            actual.get(..16).unwrap_or(&actual),
+            recorded.get(..16).unwrap_or(recorded)
+        );
+    }
+    log_cb(&format!("{name}: SHA-1 matches the backup's record"));
+    Ok(())
+}
+
 /// Rehash every partition's logical-byte range and return the
 /// container SHA-1. Decompresses the entire CHD via [`ChdReader`] —
 /// expensive on multi-GB volumes — so use only when the bytes can't
@@ -1048,7 +1069,7 @@ pub fn assemble_from_staging(
         && inputs.source_head_region.is_empty()
     {
         anyhow::bail!(
-            "assemble_from_staging: APM source requires source_head_region — \
+            "assemble_from_staging: APM source requires source_head_region - \
              caller did not populate it"
         );
     }
@@ -1059,7 +1080,7 @@ pub fn assemble_from_staging(
         && inputs.partitions.iter().all(|p| p.byte_offset() > 0)
     {
         anyhow::bail!(
-            "assemble_from_staging: {} source requires source_head_region — \
+            "assemble_from_staging: {} source requires source_head_region - \
              caller did not populate it",
             inputs.partition_table.type_name(),
         );
@@ -1283,7 +1304,7 @@ fn read_apm_head_region(
         .unwrap_or(64 * 512)
         .min(source_size);
     if head_end == 0 {
-        anyhow::bail!("APM head region computed as 0 bytes — partition table looks empty");
+        anyhow::bail!("APM head region computed as 0 bytes - partition table looks empty");
     }
     let mut clone = source_file
         .try_clone()
@@ -1291,9 +1312,22 @@ fn read_apm_head_region(
     clone
         .seek(SeekFrom::Start(0))
         .context("seek to APM head region")?;
-    let mut buf = vec![0u8; head_end as usize];
+    let mut buf = vec![0u8; head_buffer_len(head_end)?];
     clone.read_exact(&mut buf).context("read APM head region")?;
     Ok(buf)
+}
+
+/// A head region is held in memory, so one sized by a far-off first partition is refused (BKP-007).
+fn head_buffer_len(head_end: u64) -> Result<usize> {
+    const MAX: u64 = 256 << 20;
+    if head_end > MAX {
+        anyhow::bail!(
+            "the first partition starts {} into the disk; a head region past {} MiB is not supported",
+            disk_core::display::format_size(head_end),
+            MAX >> 20
+        );
+    }
+    Ok(head_end as usize)
 }
 
 /// Sun / NeXT: every byte before the first slice, verbatim. That is the disk
@@ -1319,7 +1353,7 @@ fn read_label_head_region(
     clone
         .seek(SeekFrom::Start(0))
         .context("seek to disk-label head region")?;
-    let mut buf = vec![0u8; head_end as usize];
+    let mut buf = vec![0u8; head_buffer_len(head_end)?];
     clone
         .read_exact(&mut buf)
         .context("read disk-label head region")?;
@@ -1756,7 +1790,7 @@ fn stage_partitions_to_zst(
                             )
                             .context("stream_defragmented_pfs3")?;
                             for w in &pr.warnings {
-                                eprintln!("PFS3 clone warning: {w}");
+                                clone_log(&format!("Warning: PFS3 clone: {w}"));
                             }
                             Ok(fs_mac::hfsplus_defrag::DefragReport {
                                 files_copied: pr.files_copied,
@@ -1789,7 +1823,7 @@ fn stage_partitions_to_zst(
                             )
                             .context("stream_defragmented_exfat")?;
                             for w in &pr.warnings {
-                                eprintln!("exFAT clone warning: {w}");
+                                clone_log(&format!("Warning: exFAT clone: {w}"));
                             }
                             Ok(fs_mac::hfsplus_defrag::DefragReport {
                                 files_copied: pr.files_copied,
@@ -1822,7 +1856,7 @@ fn stage_partitions_to_zst(
                             )
                             .context("stream_defragmented_ntfs")?;
                             for w in &pr.warnings {
-                                eprintln!("NTFS clone warning: {w}");
+                                clone_log(&format!("Warning: NTFS clone: {w}"));
                             }
                             Ok(fs_mac::hfsplus_defrag::DefragReport {
                                 files_copied: pr.files_copied,
@@ -1927,6 +1961,8 @@ fn stage_partitions_to_zst(
                 |msg| log_cb(msg),
             );
 
+            // A consumer that stopped early leaves the producer blocked on a full pipe (BKP-005).
+            drop(reader);
             // Always join the producer so its errors surface even when
             // the consumer succeeded (and vice-versa). Mirrors the
             // pattern in `run_backup`'s zstd path.
@@ -2200,7 +2236,7 @@ fn build_patched_head_segments(
 
             let block_size = apm.ddr.block_size as u64;
             if block_size == 0 {
-                anyhow::bail!("APM DDR block_size is 0 — corrupt partition table");
+                anyhow::bail!("APM DDR block_size is 0 - corrupt partition table");
             }
             let target_blocks = u32::try_from(target_size / block_size)
                 .context("the target has more APM blocks than a 32-bit count can hold")?;
@@ -2521,7 +2557,7 @@ mod tests {
         assert_eq!(
             &back[..(FRONT * SECTOR) as usize],
             &data[..(FRONT * SECTOR) as usize],
-            "the whole head region — label copies and boot code — is verbatim"
+            "the whole head region - label copies and boot code - is verbatim"
         );
         assert_eq!(&back[body..], &data[body..], "partition body is verbatim");
 
@@ -3259,7 +3295,7 @@ mod tests {
         let src_free = &data[512 + 4 * 512..512 + (PART_SECTORS as usize) * 512];
         assert!(
             src_free.contains(&0xAB),
-            "test setup failed — source free region must contain garbage",
+            "test setup failed - source free region must contain garbage",
         );
     }
 

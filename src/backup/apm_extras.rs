@@ -40,14 +40,21 @@ pub fn export(source: &mut (impl Read + Seek), apm: &Apm, folder: &Path) -> Resu
     let path = folder.join(FILE_NAME);
     let mut out = std::fs::File::create(&path)
         .with_context(|| format!("failed to create {}", path.display()))?;
-    let mut total = 0;
-    for (start, len) in regions {
-        source.seek(SeekFrom::Start(start))?;
-        let copied = io::copy(&mut (&mut *source).take(len), &mut out)?;
-        anyhow::ensure!(copied == len, "the disk ends inside a driver partition");
-        total += len;
-    }
-    Ok(total)
+    let mut copy = || -> Result<u64> {
+        let mut total = 0;
+        for (start, len) in &regions {
+            source.seek(SeekFrom::Start(*start))?;
+            let copied = io::copy(&mut (&mut *source).take(*len), &mut out)?;
+            anyhow::ensure!(copied == *len, "the disk ends inside a driver partition");
+            total += len;
+        }
+        Ok(total)
+    };
+    // A partial sidecar makes restore bail instead of falling back to the bundled driver (BKP-006).
+    copy().map_err(|e| {
+        let _ = std::fs::remove_file(&path);
+        e
+    })
 }
 
 /// True when this region would land on a restored partition or past the target.

@@ -8,46 +8,17 @@ use anyhow::{bail, Context, Result};
 use crate::backup::metadata::BackupMetadata;
 use crate::backup::LogLevel;
 use crate::fs::patch_hidden_sectors_for;
-use crate::fs::{
-    resize_hfs_in_place, resize_hfsplus_in_place, validate_btrfs_integrity,
-    validate_exfat_integrity, validate_ext_integrity, validate_fat_integrity,
-    validate_hfs_integrity, validate_hfsplus_integrity, validate_ntfs_integrity,
-    validate_prodos_integrity,
-};
+use crate::fs::{resize_hfs_in_place, resize_hfsplus_in_place};
 use crate::os::SectorAlignedWriter;
 use crate::rbformats;
 use part_tables::apm::build_minimal_apm;
 use part_tables::gpt::{build_minimal_gpt, Gpt};
 use part_tables::mbr::build_minimal_mbr;
 
-use super::{detect_partition_fs_type, write_fat_clean_flags, PartitionFsType, RestoreProgress};
-
-// Re-use the existing log/progress helpers from the parent module.
-fn log(progress: &Arc<Mutex<RestoreProgress>>, level: LogLevel, message: impl Into<String>) {
-    if let Ok(mut p) = progress.lock() {
-        p.log_messages.push_back(super::LogMessage {
-            level,
-            message: message.into(),
-        });
-    }
-}
-
-fn set_operation(progress: &Arc<Mutex<RestoreProgress>>, op: impl Into<String>) {
-    if let Ok(mut p) = progress.lock() {
-        p.operation = op.into();
-    }
-}
-
-fn is_cancelled(progress: &Arc<Mutex<RestoreProgress>>) -> bool {
-    progress.lock().map(|p| p.cancel_requested).unwrap_or(false)
-}
-
-fn set_progress_bytes(progress: &Arc<Mutex<RestoreProgress>>, current: u64, total: u64) {
-    if let Ok(mut p) = progress.lock() {
-        p.current_bytes = current;
-        p.total_bytes = total;
-    }
-}
+use super::{
+    detect_partition_fs_type, is_cancelled, log, set_operation, set_progress_bytes,
+    write_fat_clean_flags, PartitionFsType, RestoreProgress,
+};
 
 /// Source for a single-partition restore.
 #[derive(Debug, Clone)]
@@ -289,6 +260,11 @@ pub fn run_single_partition_restore(
         // Calculate partition start LBA and size in sectors
         let start_lba = config.target_start_lba;
         let part_size_sectors = write_size / 512;
+        // MBR and APM hold 32-bit fields; past 2 TiB a cast would wrap (RST-009).
+        let fit = |v: u64, what: &str| {
+            u32::try_from(v)
+                .map_err(|_| anyhow::anyhow!("{what} {v} does not fit a 32-bit table field"))
+        };
 
         match new_disk.table_type {
             NewTableType::Mbr => {
@@ -304,8 +280,8 @@ pub fn run_single_partition_restore(
                     0x12345678, // arbitrary disk signature
                     &[(
                         new_disk.partition_type_byte,
-                        start_lba as u32,
-                        part_size_sectors as u32,
+                        fit(start_lba, "start LBA")?,
+                        fit(part_size_sectors, "partition size")?,
                         new_disk.bootable,
                     )],
                     255,
@@ -322,6 +298,11 @@ pub fn run_single_partition_restore(
                 });
                 let end_lba = start_lba + part_size_sectors - 1;
                 let disk_sectors = new_disk.disk_size_bytes / 512;
+                if end_lba + 34 > disk_sectors {
+                    bail!(
+                        "the partition ends at LBA {end_lba}, inside the backup GPT of a {disk_sectors}-sector disk"
+                    );
+                }
 
                 log(
                     &progress,
@@ -360,7 +341,7 @@ pub fn run_single_partition_restore(
                     .unwrap_or("Apple_HFS")
                     .to_string();
                 let block_size = 512u32;
-                let total_blocks = (new_disk.disk_size_bytes / block_size as u64) as u32;
+                let total_blocks = fit(new_disk.disk_size_bytes / block_size as u64, "disk size")?;
 
                 log(
                     &progress,
@@ -372,7 +353,11 @@ pub fn run_single_partition_restore(
                 );
 
                 let apm = build_minimal_apm(
-                    &[(type_string, start_lba as u32, part_size_sectors as u32)],
+                    &[(
+                        type_string,
+                        fit(start_lba, "start LBA")?,
+                        fit(part_size_sectors, "partition size")?,
+                    )],
                     block_size,
                     total_blocks,
                 );
@@ -528,12 +513,14 @@ pub fn run_single_partition_restore(
             | PartitionFsType::Exfat
             | PartitionFsType::Hfs
             | PartitionFsType::HfsPlus => {
-                let _ = patch_hidden_sectors_for(
+                // A moved DOS volume that keeps its old hidden sectors won't boot (RST-008).
+                patch_hidden_sectors_for(
                     inner_file,
                     config.target_offset_bytes,
                     config.target_start_lba,
                     &mut |msg| log(&progress, LogLevel::Info, msg),
-                );
+                )
+                .context("patch the boot sector's hidden sectors")?;
             }
             _ => {}
         }
@@ -611,57 +598,20 @@ pub fn run_single_partition_restore(
             .context("failed to access device for validation")?;
 
         let fs_type = detect_partition_fs_type(inner_file, config.target_offset_bytes);
-        match fs_type {
-            PartitionFsType::Fat => {
-                let _ =
-                    validate_fat_integrity(inner_file, config.target_offset_bytes, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-            }
-            PartitionFsType::Ntfs => {
-                let _ =
-                    validate_ntfs_integrity(inner_file, config.target_offset_bytes, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-            }
-            PartitionFsType::Exfat => {
-                let _ =
-                    validate_exfat_integrity(inner_file, config.target_offset_bytes, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-            }
-            PartitionFsType::Hfs => {
-                let _ =
-                    validate_hfs_integrity(inner_file, config.target_offset_bytes, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-            }
-            PartitionFsType::HfsPlus => {
-                let _ = validate_hfsplus_integrity(
-                    inner_file,
-                    config.target_offset_bytes,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
+        // The shared validator, not a copy of it (RST-024); a failed check is a warning (RST-011).
+        if !matches!(fs_type, PartitionFsType::Unknown) {
+            if let Err(e) = super::validate_filesystem_for(
+                inner_file,
+                config.target_offset_bytes,
+                fs_type,
+                &mut |msg| log(&progress, LogLevel::Info, msg),
+            ) {
+                log(
+                    &progress,
+                    LogLevel::Warning,
+                    format!("Warning: the restored filesystem failed its check: {e:#}"),
                 );
             }
-            PartitionFsType::Ext => {
-                let _ =
-                    validate_ext_integrity(inner_file, config.target_offset_bytes, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-            }
-            PartitionFsType::Btrfs => {
-                let _ =
-                    validate_btrfs_integrity(inner_file, config.target_offset_bytes, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-            }
-            PartitionFsType::ProDos => {
-                let _ =
-                    validate_prodos_integrity(inner_file, config.target_offset_bytes, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-            }
-            PartitionFsType::Unknown => {}
         }
     }
 

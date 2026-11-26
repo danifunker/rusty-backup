@@ -1065,7 +1065,7 @@ mod tests {
                 bootable: false,
                 alignment: WrapAlignment::Modern1MB,
             },
-            partition_size_bytes: DISK_8M, // entire disk — no room for the table prefix
+            partition_size_bytes: DISK_8M, // entire disk - no room for the table prefix
             target_size_bytes: DISK_8M,
             source_fs_hint: "NTFS".into(),
         };

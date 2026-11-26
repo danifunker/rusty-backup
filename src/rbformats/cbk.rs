@@ -368,6 +368,11 @@ fn read_index(f: &mut File) -> Result<Vec<MemberIn>> {
     }
     let index_offset = read_u64(&footer, 4);
     let index_len = read_u32(&footer, 12) as usize;
+    // The footer's numbers are checked against the file before they size anything (RBF-013).
+    let index_end = index_offset.checked_add(index_len as u64);
+    if index_len < 8 || !matches!(index_end, Some(e) if e <= file_len - FOOTER_LEN) {
+        bail!("cbk: index ({index_len} bytes at {index_offset}) lies outside the file");
+    }
 
     f.seek(SeekFrom::Start(index_offset))?;
     let mut idx = vec![0u8; index_len];
@@ -382,9 +387,17 @@ fn read_index(f: &mut File) -> Result<Vec<MemberIn>> {
     let member_count = read_u16(&idx, 6) as usize;
     let mut pos = 8;
     let mut members = Vec::with_capacity(member_count);
+    let need = |pos: usize, n: usize| -> Result<()> {
+        if !matches!(pos.checked_add(n), Some(e) if e <= idx.len()) {
+            bail!("cbk: index truncated");
+        }
+        Ok(())
+    };
     for _ in 0..member_count {
+        need(pos, 2)?;
         let name_len = read_u16(&idx, pos) as usize;
         pos += 2;
+        need(pos, name_len + 7)?;
         let name = String::from_utf8(idx[pos..pos + name_len].to_vec())
             .context("cbk: member name not UTF-8")?;
         pos += name_len;
@@ -394,6 +407,7 @@ fn read_index(f: &mut File) -> Result<Vec<MemberIn>> {
         pos += 2;
         let chunk_count = read_u32(&idx, pos) as usize;
         pos += 4;
+        need(pos, chunk_count.saturating_mul(8))?;
         let mut chunk_offsets = Vec::with_capacity(chunk_count);
         for _ in 0..chunk_count {
             chunk_offsets.push(read_u64(&idx, pos));
@@ -439,7 +453,8 @@ pub fn materialize_cbk_to_folder(cbk: &Path, out_folder: &Path) -> Result<()> {
 
     for m in &members {
         // Guard against path traversal in member names.
-        if m.name.contains('/') || m.name.contains('\\') || m.name.contains("..") {
+        // A ':' would make `C:x` a drive-relative path on Windows (RBF-014).
+        if m.name.contains(['/', '\\', ':']) || m.name.contains("..") || m.name.is_empty() {
             bail!("cbk: refusing unsafe member name {:?}", m.name);
         }
         let out_path = out_folder.join(&m.name);
@@ -833,5 +848,19 @@ mod tests {
         fs::write(&bogus, b"not a container at all, just some bytes here.").unwrap();
         let out = tmp.path().join("x");
         assert!(materialize_cbk_to_folder(&bogus, &out).is_err());
+    }
+
+    /// RBF-013: a footer's index length used to size a buffer before anything checked it.
+    #[test]
+    fn a_footer_pointing_outside_the_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.cbk");
+        let mut bytes = vec![0u8; 64];
+        bytes.extend_from_slice(&FOOTER_MAGIC.to_be_bytes());
+        bytes.extend_from_slice(&0u64.to_be_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = read_index(&mut File::open(&path).unwrap()).err().unwrap();
+        assert!(err.to_string().contains("outside the file"), "{err}");
     }
 }

@@ -253,7 +253,7 @@ pub fn load_table_sidecars(
                 ));
                 gpt = Some(parsed);
             } else {
-                log_cb("GPT backup has no gpt.json; GPT structures will not be written");
+                bail!("this GPT backup has no gpt.json, so its partition table cannot be written");
             }
         }
         "APM" => {
@@ -269,7 +269,7 @@ pub fn load_table_sidecars(
                 ));
                 apm = Some(parsed);
             } else {
-                log_cb("APM backup has no apm.json; APM structures will not be written");
+                bail!("this APM backup has no apm.json, so its partition map cannot be written");
             }
         }
         _ => {}
@@ -430,7 +430,7 @@ fn reconstruct_disk_inner(
              restored: re-take it with CHD output, which keeps the RDSK/PART/FSHD \
              blocks verbatim. To resize an Amiga disk, export directly from the \
              source image (Inspect tab -> Export to Raw or VHD with size \
-             overrides) — that path is RDB-aware and patches the table for you."
+             overrides) - that path is RDB-aware and patches the table for you."
         );
     } else if is_superfloppy {
         // Superfloppy: no partition table to write — data starts at offset 0
@@ -805,15 +805,13 @@ fn reconstruct_disk_inner(
             .collect();
         let data_path = members[0].clone();
 
+        // Zeros in its place would be reported as a good restore (RBF-012).
         if let Some(missing) = members.iter().find(|p| !p.exists()) {
-            log_cb(&format!(
-                "partition-{}: data file not found: {}, filling with zeros",
+            bail!(
+                "partition-{}: data file {} is missing from the backup",
                 pm.index,
                 missing.display()
-            ));
-            write_zeros(writer, export_size)?;
-            total_written += export_size;
-            continue;
+            );
         }
 
         log_cb(&format!(
@@ -860,7 +858,7 @@ fn reconstruct_disk_inner(
             // Progress is reported chunk-by-chunk since the tail can be substantial.
             if pm.compacted || pm.defragmented_clone {
                 log_cb(&format!(
-                    "partition-{}: trimmed backup — zero-filling {} bytes to complete partition \
+                    "partition-{}: trimmed backup - zero-filling {} bytes to complete partition \
                      (filesystem headers finalized in post-processing)",
                     pm.index, pad
                 ));
@@ -1629,6 +1627,22 @@ pub fn detect_image_format(file: File) -> Result<ImageFormat> {
 
 /// Like [`detect_image_format`] but with an optional filesystem path for
 /// extension-based detection of headerless formats.
+/// The most a floppy container decoded in memory may be; a bigger file with the magic is not one (RBF-016).
+const SMALL_CONTAINER_MAX: u64 = 64 << 20;
+
+/// Read a floppy-sized container whole, refusing one past [`SMALL_CONTAINER_MAX`].
+fn read_small_container(r: &mut impl Read, what: &str) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    r.take(SMALL_CONTAINER_MAX + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > SMALL_CONTAINER_MAX {
+        bail!(
+            "{what} image is larger than {} MiB, too big for a floppy container",
+            SMALL_CONTAINER_MAX >> 20
+        );
+    }
+    Ok(raw)
+}
+
 pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<ImageFormat> {
     let file_size = file.metadata()?.len();
     let mut file = file;
@@ -1687,8 +1701,7 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         if file.read_exact(&mut magic).is_ok() && woz::is_woz(&magic) {
             // Read entire file and decode — floppy images are small (< 1MB)
             file.seek(SeekFrom::Start(0))?;
-            let mut raw = Vec::new();
-            file.read_to_end(&mut raw)?;
+            let raw = read_small_container(&mut file, "WOZ")?;
             match woz::WozReader::from_bytes(raw) {
                 Ok(reader) => return Ok(ImageFormat::Woz(reader)),
                 Err(_) => {
@@ -1705,8 +1718,7 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         let mut magic = [0u8; 8];
         if file.read_exact(&mut magic).is_ok() && moof::is_moof(&magic) {
             file.seek(SeekFrom::Start(0))?;
-            let mut raw = Vec::new();
-            file.read_to_end(&mut raw)?;
+            let raw = read_small_container(&mut file, "MOOF")?;
             match moof::MoofReader::from_bytes(raw) {
                 Ok(reader) => return Ok(ImageFormat::Moof(reader)),
                 Err(_) => {
@@ -2033,10 +2045,9 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             Ok((Box::new(reader), size))
         }
         ImageFormat::DosOrder => {
-            let mut raw = Vec::new();
             let mut reader = BufReader::new(file);
             reader.seek(SeekFrom::Start(0))?;
-            reader.read_to_end(&mut raw)?;
+            let raw = read_small_container(&mut reader, "floppy")?;
             let dos_reader = interleave::DosOrderReader::new(raw)
                 .map_err(|e| anyhow::anyhow!("failed to read DOS-order image: {e}"))?;
             let size = dos_reader.len();
@@ -2070,10 +2081,9 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             // Decode the whole DART file into memory (floppies are <= ~1.5 MB):
             // a Lisa disk becomes a DiskCopy 4.2 stream *with* tags, everything
             // else its block data. Either way it's a flat, seekable image.
-            let mut raw = Vec::new();
             let mut reader = BufReader::new(file);
             reader.seek(SeekFrom::Start(0))?;
-            reader.read_to_end(&mut raw)?;
+            let raw = read_small_container(&mut reader, "floppy")?;
             let image = dart::decode_dart_to_image(&raw)
                 .map_err(|e| anyhow::anyhow!("decode DART: {e}"))?;
             let size = image.len() as u64;
@@ -2082,10 +2092,9 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
         ImageFormat::TwiggyDc42(hdr) => {
             // Read the whole Twiggy image (< ~1 MB) and de-interleave its two
             // sides into a flat MFS/HFS volume the superfloppy path can mount.
-            let mut raw = Vec::new();
             let mut reader = BufReader::new(file);
             reader.seek(SeekFrom::Start(0))?;
-            reader.read_to_end(&mut raw)?;
+            let raw = read_small_container(&mut reader, "floppy")?;
             let image = dc42::deinterleave_twiggy(&raw)
                 .ok_or_else(|| anyhow::anyhow!("{}", hdr.twiggy_unsupported_message()))?;
             let size = image.len() as u64;
@@ -2315,7 +2324,8 @@ pub fn reconstruct_raw_label_disk(
     writer
         .write_all(&patched.head)
         .context("write the rewritten head")?;
-    if source_data_size > 0 {
+    // Only a short image is extended; a body running to the end keeps its last byte (RBF-011).
+    if source_data_size > 0 && writer.seek(SeekFrom::End(0))? < source_data_size {
         writer.seek(SeekFrom::Start(source_data_size - 1))?;
         writer.write_all(&[0u8]).context("size the image")?;
     }
@@ -2510,14 +2520,12 @@ mod table_sidecar_tests {
         assert!(log.iter().all(|l| l.starts_with("Loaded ")), "{log:?}");
     }
 
+    /// RST-010: without its sidecar a GPT backup would be written with no table at all.
     #[test]
-    fn a_gpt_backup_without_its_sidecar_warns_instead_of_failing() {
+    fn a_gpt_backup_without_its_sidecar_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = Vec::new();
-        let (g, a) =
-            load_table_sidecars(dir.path(), "GPT", &mut |m: &str| log.push(m.to_string())).unwrap();
-        assert!(g.is_none() && a.is_none());
-        assert!(log.iter().any(|l| l.contains("no gpt.json")), "{log:?}");
+        let err = load_table_sidecars(dir.path(), "GPT", &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("no gpt.json"), "{err}");
     }
 }
 

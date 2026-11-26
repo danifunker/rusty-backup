@@ -245,6 +245,9 @@ fn run_preset(
                 system_disk.as_deref(),
                 BootSectorSource::None,
             )?;
+            for w in &s.warnings {
+                log(&format!("Warning: {w}"));
+            }
             log(&format!(
                 "Wrote a {} X68000 disk: {} Human68k partition(s) of {}",
                 s.variant.name(),

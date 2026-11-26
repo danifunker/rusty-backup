@@ -173,9 +173,9 @@ pub fn build_print_ipl_stub_with_partitions(partitions: &[(char, u64)]) -> Vec<u
     let mut code = vec![
         0x60, 0x02, // bra.s fall_through (jump to byte 4)
         b'R', b'B', // 2-byte "RB" tag (could be version / magic in future)
-        0x43, 0xFA, 0x00, 0x08, // lea msg(pc), a1 — disp=8, PC=6, target=14
-        0x70, 0x21, // moveq #$21, d0 — IOCS B_PRINT function code
-        0x4E, 0x4F, // trap #15 — IOCS dispatch
+        0x43, 0xFA, 0x00, 0x08, // lea msg(pc), a1 - disp=8, PC=6, target=14
+        0x70, 0x21, // moveq #$21, d0 - IOCS B_PRINT function code
+        0x4E, 0x4F, // trap #15 - IOCS dispatch
         0x60, 0xFE, // bra.s halt (loop at byte 12)
     ];
     code.extend_from_slice(&msg);

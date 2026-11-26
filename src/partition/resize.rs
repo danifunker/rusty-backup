@@ -290,19 +290,13 @@ pub fn apply_resize(
     // own size in step with its partition entry.
     preflight_resizable(file, plans, table, log_cb)?;
 
-    // Calculate new disk size: find the furthest end of any partition
-    let new_data_end = plans
-        .iter()
-        .map(|p| p.new_start_lba * 512 + p.new_size_bytes)
-        .max()
-        .unwrap_or(old_disk_size);
-
     // For VHD, the "disk size" is the data portion (excluding 512-byte footer)
     let old_data_size = if is_vhd {
         old_disk_size.saturating_sub(512)
     } else {
         old_disk_size
     };
+    let new_data_end = resized_data_end(plans, table, old_data_size);
 
     let new_data_size = new_data_end.max(old_data_size);
     let new_file_size = if is_vhd {
@@ -480,6 +474,23 @@ pub fn apply_resize(
     file.flush()?;
     log_cb("Resize complete.");
     Ok(())
+}
+
+/// Where the disk's data ends after `plans`. GPT keeps its size: its backup table sits at the end (PAR-006).
+pub fn resized_data_end(
+    plans: &[PartitionResizePlan],
+    table: &PartitionTable,
+    old_data_size: u64,
+) -> u64 {
+    let end = plans
+        .iter()
+        .map(|p| p.new_start_lba * 512 + p.new_size_bytes)
+        .max()
+        .unwrap_or(old_data_size);
+    match table {
+        PartitionTable::Gpt { .. } => end.max(old_data_size),
+        _ => end,
+    }
 }
 
 /// Refuse the whole operation when any partition being resized holds a
@@ -701,7 +712,7 @@ mod tests {
                 .fs_size;
         assert!(
             after > before,
-            "the EFS superblock was not patched ({before} -> {after}) — \
+            "the EFS superblock was not patched ({before} -> {after}) - \
              the GUI resize path still skips it"
         );
     }
@@ -1021,5 +1032,34 @@ mod tests {
             "{err:#}"
         );
         assert!(disk == before, "no byte moved");
+    }
+
+    /// PAR-006: a shrink cut the image at the last partition, taking the backup GPT with it.
+    #[test]
+    fn a_shrunk_gpt_disk_keeps_its_backup_table() {
+        use part_tables::gpt::{build_minimal_gpt, Gpt, Guid};
+        let disk = 100_000u64 * 512;
+        let guid = Guid::from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7").unwrap();
+        let gpt = build_minimal_gpt(&[(guid, 2048, 99_000, "a".into())], disk);
+        let pmbr = Gpt::build_protective_mbr(disk / 512);
+        let gpt_table = PartitionTable::Gpt {
+            protective_mbr: part_tables::mbr::Mbr::parse(&pmbr).unwrap(),
+            gpt,
+        };
+        let plans = [PartitionResizePlan {
+            index: 0,
+            old_start_lba: 2048,
+            old_size_bytes: (99_001 - 2048) * 512,
+            new_start_lba: 2048,
+            new_size_bytes: 10_000 * 512,
+            needs_data_move: false,
+            move_delta_bytes: 0,
+        }];
+        assert_eq!(resized_data_end(&plans, &gpt_table, disk), disk);
+        let none = PartitionTable::None {
+            size_bytes: disk,
+            fs_hint: "Unknown".into(),
+        };
+        assert_eq!(resized_data_end(&plans, &none, disk), 12_048 * 512);
     }
 }

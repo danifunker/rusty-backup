@@ -605,7 +605,7 @@ pub fn run_backup_from(
 /// the `is_file` gate first and the `Raw` check last.
 pub(crate) fn container_needing_decode(path: &std::path::Path) -> Option<&'static str> {
     if !path.is_file() {
-        return None; // a device, or nothing we can stat — leave it alone
+        return None; // a device, or nothing we can stat - leave it alone
     }
     if crate::model::source_reader::is_container_path(path) {
         return Some("wrapped");
@@ -669,6 +669,10 @@ fn materialize_container_to_temp(
         let mut buf = vec![0u8; 4 * 1024 * 1024];
         let mut done: u64 = 0;
         loop {
+            // A multi-GB decode used to ignore Cancel (BKP-011).
+            if is_cancelled(progress) {
+                bail!("backup cancelled");
+            }
             let n = reader.read(&mut buf).context("reading the container")?;
             if n == 0 {
                 break;
@@ -766,7 +770,7 @@ fn materialize_remote_to_temp(
                     .with_context(|| format!("reading remote disk at offset {offset}"))?
             };
             if chunk.is_empty() {
-                break; // short of `total` — the daemon hit EOF
+                break; // short of `total` - the daemon hit EOF
             }
             writer
                 .write_all(&chunk)
@@ -1110,7 +1114,7 @@ fn run_backup_inner(
                 log(
                     &progress,
                     LogLevel::Info,
-                    "Exported MBR (mbr.json only — raw bytes live in disk.chd)",
+                    "Exported MBR (mbr.json only - raw bytes live in disk.chd)",
                 );
             } else {
                 format::export_mbr(mbr, &mbr_bytes, &backup_folder)?;
@@ -1132,7 +1136,7 @@ fn run_backup_inner(
                 log(
                     &progress,
                     LogLevel::Info,
-                    "Exported GPT (gpt.json only — raw sectors live in disk.chd)",
+                    "Exported GPT (gpt.json only - raw sectors live in disk.chd)",
                 );
             } else {
                 format::export_gpt(gpt, &mbr_bytes, &backup_folder)?;
@@ -1167,7 +1171,7 @@ fn run_backup_inner(
                 log(
                     &progress,
                     LogLevel::Info,
-                    "Exported APM (apm.json only — raw blocks live in disk.chd)",
+                    "Exported APM (apm.json only - raw blocks live in disk.chd)",
                 );
             } else {
                 format::export_apm(apm, &backup_folder)?;
@@ -1470,7 +1474,7 @@ fn run_backup_inner(
                         &progress,
                         LogLevel::Info,
                         format!(
-                            "partition-{}: shrink-to-minimum skipped — no defragmented \
+                            "partition-{}: shrink-to-minimum skipped - no defragmented \
                              minimum size available",
                             part.index
                         ),
@@ -1502,7 +1506,7 @@ fn run_backup_inner(
                         &progress,
                         LogLevel::Info,
                         format!(
-                            "partition-{}: streaming defragmented {} — \
+                            "partition-{}: streaming defragmented {} - \
                              source {} -> {}",
                             part.index,
                             shape_label,
@@ -1537,7 +1541,7 @@ fn run_backup_inner(
                         &progress,
                         LogLevel::Warning,
                         format!(
-                            "partition-{}: skipping shrink-to-minimum — {e}. \
+                            "partition-{}: skipping shrink-to-minimum - {e}. \
                              This partition keeps its original size; other \
                              partitions are unaffected.",
                             part.index,
@@ -2068,6 +2072,8 @@ fn run_backup_inner(
                 &|| is_cancelled(&progress_clone),
                 &mut |msg| log(&progress_log, LogLevel::Info, msg),
             );
+            // A consumer that stopped early leaves the producer blocked on a full pipe (BKP-005).
+            drop(reader);
             // Always join the producer so its errors surface even if the
             // consumer succeeded (e.g. partial pipe).
             let producer_result = producer
@@ -2406,7 +2412,7 @@ fn run_backup_inner(
 /// through `single_file_chd::run_via_staging`, which stages each
 /// partition's bytes as zstd into a temp dir, then folds the staging
 /// files into the final CHD without a whole-disk scratch image.
-#[allow(clippy::too_many_arguments)] // intentional — pulls run_backup's locals
+#[allow(clippy::too_many_arguments)] // intentional - pulls run_backup's locals
 #[cfg(feature = "chd")]
 fn run_single_file_chd_path(
     config: &BackupConfig,
@@ -2516,7 +2522,8 @@ fn run_single_file_chd_path(
         _ => source_size,
     };
     {
-        let mut p = progress.lock().expect("backup progress mutex poisoned");
+        // A panicked worker poisons the lock; the progress total is still worth setting (BKP-012).
+        let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
         p.total_bytes = envelope_total;
         p.full_size_bytes = envelope_total;
         p.current_bytes = 0;
@@ -2677,7 +2684,9 @@ fn run_single_file_chd_path(
                 minimum_size_bytes: minimum_size,
                 defragmented_min_size_bytes: defragmented_min,
                 hfsplus_signature,
-                defragmented_clone: false,
+                // Restore leaves a cloned volume verbatim; a constant `false` re-grew it (BKP-013).
+                defragmented_clone: clone_targets_slice
+                    .is_some_and(|t| t.iter().any(|(i, _, _)| *i == part.index)),
             })
         })
         .collect();
@@ -2841,7 +2850,7 @@ impl Read for ChannelPipeReader {
                     self.chunk = next;
                     self.pos = 0;
                 }
-                Err(_) => return Ok(0), // sender dropped — clean EOF
+                Err(_) => return Ok(0), // sender dropped - clean EOF
             }
         }
         let avail = self.chunk.len() - self.pos;

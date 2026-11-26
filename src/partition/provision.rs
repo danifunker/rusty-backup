@@ -592,6 +592,20 @@ pub fn write_table<W: Write + Seek>(
     disk_size: u64,
     geometry: Geometry,
 ) -> Result<()> {
+    // Every start and size lies under the disk size, so one check covers each table's fields (PAR-009).
+    let field_max = match kind {
+        TableKind::Gpt => u64::MAX,
+        // X68k entries keep their flags in the start word's high byte (PAR-008).
+        TableKind::X68k => 0x00FF_FFFF,
+        _ => u64::from(u32::MAX),
+    };
+    if disk_size / SECTOR > field_max {
+        bail!(
+            "a {} disk this large ({}) does not fit the table's sector fields",
+            kind.label(),
+            disk_core::display::format_size(disk_size)
+        );
+    }
     match kind {
         TableKind::Mbr => write_mbr(out, placed),
         TableKind::Gpt => write_gpt(out, placed, disk_size),
@@ -1064,7 +1078,7 @@ fn write_sun<W: Write + Seek>(
     }
     if ncyl > u64::from(u16::MAX) {
         bail!(
-            "Sun labels count cylinders in 16 bits; {ncyl} is too many — raise --heads/--sectors"
+            "Sun labels count cylinders in 16 bits; {ncyl} is too many - raise --heads/--sectors"
         );
     }
 

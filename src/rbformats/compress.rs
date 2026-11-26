@@ -431,7 +431,7 @@ pub fn decompress_members_to_writer(
             if members.len() > 1 {
                 bail!(
                     "CHD backup lists {} data files, but a .chd is always a single \
-                     container — this is not a backup folder we wrote",
+                     container - this is not a backup folder we wrote",
                     members.len()
                 );
             }
@@ -870,7 +870,7 @@ mod tests {
         )
         .unwrap();
         let round_in = fs::read(&raw_path).unwrap();
-        assert_eq!(round_in, input, "WOZ → raw round-trip failed");
+        assert_eq!(round_in, input, "WOZ -> raw round-trip failed");
 
         let out_base = tmp.path().join("disk");
         let files = compress_file_to_archive(

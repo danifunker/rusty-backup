@@ -1238,6 +1238,8 @@ fn convert_from_vhd_temp(
 
     // WOZ / DC42 path: read the stripped data into memory, encode, write.
     if format == ExportFormat::Woz || format == ExportFormat::Moof || format == ExportFormat::Dc42 {
+        // A whole Clonezilla disk would otherwise be read into memory (RBF-015).
+        check_floppy_export_size(data_size)?;
         let mut f = File::open(vhd_path)
             .with_context(|| format!("failed to open {}", vhd_path.display()))?;
         let mut buf = vec![0u8; data_size as usize];
@@ -1334,6 +1336,8 @@ fn export_whole_disk_vhd_dynamic(
             &mut log_cb,
         )?;
         tmp.flush()?;
+        // The backup GPT sits past the last partition, so the disk is the whole temp file (RBF-010).
+        let written = written.max(tmp.seek(SeekFrom::End(0))?);
         tmp.seek(SeekFrom::Start(0))?;
         super::vhd::export_whole_disk_vhd_dynamic(
             &mut tmp,
@@ -1413,6 +1417,8 @@ fn export_whole_disk_qcow2(
             &mut log_cb,
         )?;
         tmp.flush()?;
+        // The backup GPT sits past the last partition, so the disk is the whole temp file (RBF-010).
+        let written = written.max(tmp.seek(SeekFrom::End(0))?);
         tmp.seek(SeekFrom::Start(0))?;
         dsk_vm::qcow2::export_qcow2(
             &mut tmp,
@@ -1481,6 +1487,8 @@ fn export_whole_disk_vmdk_flat(
             &mut log_cb,
         )?;
         tmp.flush()?;
+        // The backup GPT sits past the last partition, so the disk is the whole temp file (RBF-010).
+        let written = written.max(tmp.seek(SeekFrom::End(0))?);
         tmp.seek(SeekFrom::Start(0))?;
         dsk_vm::vmdk::export_vmdk_flat(
             &mut tmp,
@@ -1555,6 +1563,8 @@ fn export_whole_disk_vmdk_sparse(
             &mut log_cb,
         )?;
         tmp.flush()?;
+        // The backup GPT sits past the last partition, so the disk is the whole temp file (RBF-010).
+        let written = written.max(tmp.seek(SeekFrom::End(0))?);
         tmp.seek(SeekFrom::Start(0))?;
         dsk_vm::vmdk_sparse::export_vmdk_sparse(
             &mut tmp,
