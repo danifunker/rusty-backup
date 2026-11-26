@@ -365,8 +365,13 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
         // Unmount this device's partitions, for real where possible: a lazy
         // detach leaves an open filesystem writing back under the restore.
         for (dev_path, mount_point) in &mounts {
-            let dev_part_name = dev_path.trim_start_matches("/dev/");
-            if parent_device_name(dev_part_name) == parent {
+            // Compared resolved, as the target was: mountinfo says /dev/mapper/x, not /dev/dm-3.
+            let real = fs::canonicalize(dev_path).unwrap_or_else(|_| PathBuf::from(dev_path));
+            let dev_part_name = real
+                .to_string_lossy()
+                .trim_start_matches("/dev/")
+                .to_string();
+            if parent_device_name(&dev_part_name) == parent {
                 unmount_now_or_lazily(mount_point.as_str());
             }
         }

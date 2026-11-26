@@ -591,7 +591,12 @@ impl SectorAlignedWriter {
     fn flush_sectors(&mut self) -> io::Result<()> {
         let aligned_len = (self.buf.len() / SECTOR_SIZE) * SECTOR_SIZE;
         if aligned_len > 0 {
-            self.inner.write_all(&self.buf[..aligned_len])?;
+            // After a partial failure the cursor has moved; rewriting the buffer later would
+            // shift it, so it is dropped with the error (review of OSC-011).
+            if let Err(e) = self.inner.write_all(&self.buf[..aligned_len]) {
+                self.buf.clear();
+                return Err(e);
+            }
             self.buf.drain(..aligned_len);
         }
         Ok(())
@@ -613,9 +618,9 @@ impl SectorAlignedWriter {
             self.buf
                 .resize(self.buf.len() + (SECTOR_SIZE - remainder), 0);
         }
-        self.inner.write_all(&self.buf)?;
+        let result = self.inner.write_all(&self.buf);
         self.buf.clear();
-        Ok(())
+        result
     }
 
     /// Get mutable access to the inner File for operations requiring random access.
@@ -1042,8 +1047,10 @@ pub fn args_for_relaunch() -> Vec<std::ffi::OsString> {
         .skip(1)
         .map(|a| {
             let p = Path::new(&a);
+            // Only file names: a verb or flag value that matches a folder stays as typed.
+            let file_like = p.is_file() && p.extension().is_some();
             match &cwd {
-                Some(dir) if p.is_relative() && p.exists() => dir.join(p).into_os_string(),
+                Some(dir) if p.is_relative() && file_like => dir.join(p).into_os_string(),
                 _ => a,
             }
         })
