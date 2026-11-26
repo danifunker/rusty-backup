@@ -73,7 +73,7 @@ impl VolumeLockSet {
 /// keeping the handles open so Windows cannot re-mount the filesystems
 /// while we write to the physical drive.
 fn lock_and_dismount_volumes(drive_num: u32) -> Result<VolumeLockSet> {
-    let volumes = enumerate_volumes();
+    let volumes = enumerate_volumes_checked()?;
     let target_volumes: Vec<_> = volumes
         .iter()
         .filter(|v| v.disk_numbers.contains(&drive_num))
@@ -95,33 +95,44 @@ fn lock_and_dismount_volumes(drive_num: u32) -> Result<VolumeLockSet> {
             volume_path
         );
 
-        let handle = match open_device(&volume_path, GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS) {
-            Some(h) => h,
-            None => {
-                log::warn!("Could not open volume {}, skipping", volume_path);
-                continue;
-            }
+        // A volume left mounted makes Windows refuse writes inside it partway through (OSW-001).
+        let Some(handle) = open_device(&volume_path, GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS)
+        else {
+            bail!(
+                "cannot open volume {} on PhysicalDrive{drive_num} to dismount it; nothing was written",
+                vol.display_name()
+            );
         };
 
         // Lock the volume for exclusive access
         // Win7 writes through lpBytesReturned unconditionally; a NULL there access-violates.
         let mut returned = 0u32;
-        let lock_result = unsafe {
-            DeviceIoControl(
-                handle.0,
-                FSCTL_LOCK_VOLUME,
-                None,
-                0,
-                None,
-                0,
-                Some(&mut returned),
-                None,
-            )
-        };
+        // A scanner or Explorer often holds the volume a moment; a few tries usually win the lock.
+        let mut lock_result = Ok(());
+        for attempt in 0..10 {
+            lock_result = unsafe {
+                DeviceIoControl(
+                    handle.0,
+                    FSCTL_LOCK_VOLUME,
+                    None,
+                    0,
+                    None,
+                    0,
+                    Some(&mut returned),
+                    None,
+                )
+            };
+            if lock_result.is_ok() {
+                break;
+            }
+            if attempt < 9 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
         match lock_result {
             Ok(_) => log::info!("Volume {} locked successfully", volume_path),
             Err(e) => log::warn!(
-                "FSCTL_LOCK_VOLUME failed for {}: {} (continuing anyway)",
+                "FSCTL_LOCK_VOLUME failed for {}: {} (forcing the dismount)",
                 volume_path,
                 e
             ),
@@ -142,10 +153,10 @@ fn lock_and_dismount_volumes(drive_num: u32) -> Result<VolumeLockSet> {
         };
         match dismount_result {
             Ok(_) => log::info!("Volume {} dismounted successfully", volume_path),
-            Err(e) => log::warn!(
-                "FSCTL_DISMOUNT_VOLUME failed for {}: {} (continuing anyway)",
-                volume_path,
-                e
+            Err(e) => bail!(
+                "cannot dismount volume {} on PhysicalDrive{drive_num} ({e}); close what is \
+                 using it and retry. Nothing was written",
+                vol.display_name()
             ),
         }
 
@@ -308,11 +319,16 @@ unsafe fn shell_execute_ex_w(info: *mut SHELLEXECUTEINFOW) -> windows::core::Res
 /// Map STORAGE_BUS_TYPE value to a readable string.
 fn bus_type_to_string(bus_type: u32) -> String {
     match bus_type {
+        1 => "SCSI".to_string(),
         3 => "ATA".to_string(),
         7 => "USB".to_string(),
+        8 => "RAID".to_string(),
+        9 => "iSCSI".to_string(),
+        10 => "SAS".to_string(),
         11 => "SATA".to_string(),
         12 => "SD".to_string(),
         13 => "MMC".to_string(),
+        14 | 15 => "Virtual".to_string(),
         17 => "NVMe".to_string(),
         _ => String::new(),
     }
@@ -591,12 +607,15 @@ fn volume_mount_paths(guid_path: &str) -> Vec<String> {
 
 /// Enumerate every mount-manager volume and map each to its physical drives.
 fn enumerate_volumes() -> Vec<VolumeInfo> {
+    enumerate_volumes_checked().unwrap_or_default()
+}
+
+/// [`enumerate_volumes`], failing when the volume list itself can't be read (OSW-005).
+fn enumerate_volumes_checked() -> Result<Vec<VolumeInfo>> {
     let mut volumes = Vec::new();
     let mut name = [0u16; 64];
-    let find = match unsafe { FindFirstVolumeW(&mut name) } {
-        Ok(h) => h,
-        Err(_) => return volumes,
-    };
+    let find = unsafe { FindFirstVolumeW(&mut name) }
+        .map_err(|e| anyhow::anyhow!("cannot list the mounted volumes: {e}"))?;
     loop {
         let guid_path = wide_to_string(&name);
         if let Some(v) = query_volume(&guid_path) {
@@ -609,7 +628,7 @@ fn enumerate_volumes() -> Vec<VolumeInfo> {
     unsafe {
         let _ = FindVolumeClose(find);
     }
-    volumes
+    Ok(volumes)
 }
 
 /// Describe one volume; `None` when it has no extent on a physical drive (optical, RAM disk).
@@ -668,8 +687,9 @@ fn physical_drive_numbers() -> Vec<u32> {
         if len > 0 {
             return physical_drive_numbers_from_names(&buf[..len as usize]);
         }
-        // ERROR_INSUFFICIENT_BUFFER is the only retryable failure; cap the growth.
-        if buf.len() >= 8 * 1024 * 1024 {
+        // ERROR_INSUFFICIENT_BUFFER is the only retryable failure; cap the growth (OSW-008).
+        let short = std::io::Error::last_os_error().raw_os_error() == Some(122);
+        if !short || buf.len() >= 8 * 1024 * 1024 {
             break;
         }
         let grown = buf.len() * 4;
@@ -886,59 +906,6 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
         file: crate::os::SourceHandle::File(file),
         temp_path: None,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Privileged disk access implementation (Windows)
-// ---------------------------------------------------------------------------
-
-use crate::privileged::{AccessStatus, DiskHandle, PrivilegedDiskAccess};
-
-/// Windows implementation of privileged disk access.
-///
-/// Uses direct file I/O. The app should be launched with UAC elevation
-/// (which it already requests via manifest).
-pub struct WindowsDiskAccess {
-    // TODO: Track open handles
-}
-
-impl WindowsDiskAccess {
-    pub fn new() -> Result<Self> {
-        Ok(Self {})
-    }
-}
-
-impl PrivilegedDiskAccess for WindowsDiskAccess {
-    fn check_status(&self) -> Result<AccessStatus> {
-        // The GUI launches `asInvoker`; elevation is on-demand via the top-bar
-        // "Show Physical Devices" button. Report NeedsElevation when not admin
-        // so callers can surface that path instead of treating it as an error.
-        if is_elevated() {
-            Ok(AccessStatus::Ready)
-        } else {
-            Ok(AccessStatus::NeedsElevation)
-        }
-    }
-
-    fn open_disk_read(&mut self, _path: &Path) -> Result<DiskHandle> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
-
-    fn open_disk_write(&mut self, _path: &Path) -> Result<DiskHandle> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
-
-    fn read_sectors(&mut self, _handle: DiskHandle, _lba: u64, _count: u32) -> Result<Vec<u8>> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
-
-    fn write_sectors(&mut self, _handle: DiskHandle, _lba: u64, _data: &[u8]) -> Result<()> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
-
-    fn close_disk(&mut self, _handle: DiskHandle) -> Result<()> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
 }
 
 #[cfg(test)]

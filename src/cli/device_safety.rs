@@ -108,6 +108,9 @@ pub struct PreflightOk {
 /// - The target has any mounted partition (refuse with mount list)
 pub fn preflight(device_path: &Path, allow_system_disk: bool) -> Result<PreflightOk> {
     crate::os::ensure_physical_enabled()?;
+    // Compared under one spelling: a lower-case drive path missed the system-disk lookup (OSW-003).
+    let normalized = crate::os::normalize_device_path(device_path);
+    let device_path = normalized.as_path();
     if !looks_like_device_path(device_path) {
         // Mount points sneak in as plain file paths. Be strict here:
         // if the user passed --device / used the `write` verb the

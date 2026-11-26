@@ -95,14 +95,24 @@ impl<R: Seek> Seek for KnownLen<R> {
 /// Wrap a raw source so `SeekFrom::End` works even when the OS will not report a
 /// device's length, and every read reaches the device sector-sized (R19).
 pub fn known_len_reader(file: File, path: &Path) -> SectorAlignedReader<KnownLen<File>> {
-    let len = get_file_size(&file, path).unwrap_or(0);
+    // The cause is logged: a silent 0 read later as an empty device (OSC-009).
+    let len = get_file_size(&file, path).unwrap_or_else(|e| {
+        log::warn!(
+            "{}: size unknown ({e}); treating it as empty",
+            path.display()
+        );
+        0
+    });
     SectorAlignedReader::new(KnownLen::new(file, len))
 }
 
 /// [`known_len_reader`] for an elevated handle, which on macOS may be a shared
 /// authopen descriptor rather than an owned `File`.
 pub fn known_len_source(handle: SourceHandle, path: &Path) -> KnownLen<SourceHandle> {
-    let len = handle.byte_len(path).unwrap_or(0);
+    let len = handle.byte_len(path).unwrap_or_else(|| {
+        log::warn!("{}: size unknown; treating it as empty", path.display());
+        0
+    });
     KnownLen::new(handle, len)
 }
 
@@ -119,7 +129,7 @@ pub enum SourceHandle {
 }
 
 impl SourceHandle {
-    /// An independent handle onto the same source, with its own file offset.
+    /// Another handle onto the same source; a `File` clone shares its offset, a macOS device's doesn't.
     pub fn try_clone(&self) -> io::Result<SourceHandle> {
         match self {
             SourceHandle::File(f) => f.try_clone().map(SourceHandle::File),
@@ -319,6 +329,8 @@ impl<R: Read + Seek> Read for SectorAlignedReader<R> {
             // on a sector boundary is safe to surface to the caller. Round
             // down so the next call still starts sector-aligned.
             let aligned_n = n - (n % SECTOR_SIZE);
+            // A file's tail under a sector rounded to 0, which callers took for EOF (OSC-001).
+            let aligned_n = if aligned_n == 0 { n } else { aligned_n };
             self.pos += aligned_n as u64;
             // Cached sector is now stale relative to the new position;
             // force the slow path to re-fill on the next sub-sector read.
@@ -367,10 +379,6 @@ impl<R: Read + Seek> Seek for SectorAlignedReader<R> {
         Ok(new_pos)
     }
 }
-
-// SAFETY: SectorAlignedReader<R> only contains R and stack-local buffers.
-// If R is Send, the whole wrapper is Send.
-unsafe impl<R: Send> Send for SectorAlignedReader<R> {}
 
 // Windows-specific aligned buffer implementation
 #[cfg(target_os = "windows")]
@@ -509,14 +517,6 @@ mod aligned_buffer {
     unsafe impl Sync for AlignedBuffer {}
 }
 
-/// Buffered writer that ensures all writes to the underlying file are
-/// multiples of the sector size (512 bytes).
-///
-/// On macOS, raw character devices (`/dev/rdiskN`) reject writes that are not
-/// sector-aligned with `EINVAL`. On Windows with FILE_FLAG_NO_BUFFERING, both
-/// buffer addresses and sizes must be sector-aligned. This wrapper accumulates
-/// writes and only flushes complete sectors to the device.
-///
 /// Commit a target to stable storage, tolerating descriptors that cannot be told to.
 ///
 /// macOS implements `File::sync_all` as `fcntl(F_FULLFSYNC)`, which a raw `/dev/rdiskN`
@@ -559,19 +559,31 @@ fn sync_fallback(_file: &File, original: io::Error) -> io::Result<()> {
     Err(original)
 }
 
+/// Buffered writer that ensures all writes to the underlying file are
+/// multiples of the sector size (512 bytes).
+///
+/// On macOS, raw character devices (`/dev/rdiskN`) reject writes that are not
+/// sector-aligned with `EINVAL`. On Windows with FILE_FLAG_NO_BUFFERING, both
+/// buffer addresses and sizes must be sector-aligned. This wrapper accumulates
+/// writes and only flushes complete sectors to the device.
+///
 /// `Read` and `Seek` flush the write buffer before delegating to the inner file.
 #[cfg(not(target_os = "windows"))]
 pub struct SectorAlignedWriter {
     inner: File,
     buf: Vec<u8>,
+    /// A regular file takes any write as is; padding one would zero the bytes after it (OSC-002).
+    passthrough: bool,
 }
 
 #[cfg(not(target_os = "windows"))]
 impl SectorAlignedWriter {
     pub fn new(file: File) -> Self {
+        let passthrough = file.metadata().map(|m| m.is_file()).unwrap_or(false);
         Self {
             inner: file,
             buf: Vec::with_capacity(WRITE_BUF_CAPACITY),
+            passthrough,
         }
     }
 
@@ -619,6 +631,9 @@ impl SectorAlignedWriter {
 #[cfg(not(target_os = "windows"))]
 impl Write for SectorAlignedWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.passthrough {
+            return self.inner.write(data);
+        }
         self.buf.extend_from_slice(data);
         if self.buf.len() >= WRITE_BUF_CAPACITY {
             self.flush_sectors()?;
@@ -679,15 +694,15 @@ impl SectorAlignedWriter {
     fn flush_sectors(&mut self) -> io::Result<()> {
         let aligned_len = (self.buf.len() / SECTOR_SIZE) * SECTOR_SIZE;
         if aligned_len > 0 {
-            // Ensure we're at a sector-aligned position
-            let current_pos = self.inner.stream_position()?;
-            if current_pos % SECTOR_SIZE as u64 != 0 {
+            // Written at the tracked position, as the other paths are; the handle's cursor
+            // can be elsewhere after `inner_mut()` (OSC-004).
+            if !self.position.is_multiple_of(SECTOR_SIZE as u64) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("file position {} is not sector-aligned", current_pos),
+                    format!("file position {} is not sector-aligned", self.position),
                 ));
             }
-
+            self.inner.seek(std::io::SeekFrom::Start(self.position))?;
             self.inner.write_all(&self.buf.as_slice()[..aligned_len])?;
             self.buf.drain(aligned_len);
             self.position += aligned_len as u64;
@@ -804,19 +819,34 @@ impl Seek for SectorAlignedWriter {
         self.flush_padded()?;
 
         // Calculate target position
+        let out_of_range = || io::Error::new(io::ErrorKind::InvalidInput, "seek out of range");
         let target = match pos {
             SeekFrom::Start(n) => n,
             SeekFrom::End(offset) => {
+                // A drive handle reports length 0, so End(0) would land on the MBR (OSC-008).
                 let size = self.inner.metadata()?.len();
-                (size as i64 + offset) as u64
+                if size == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "this handle reports no length to seek from the end of",
+                    ));
+                }
+                size.checked_add_signed(offset).ok_or_else(out_of_range)?
             }
-            SeekFrom::Current(offset) => (self.position as i64 + offset) as u64,
+            SeekFrom::Current(offset) => self
+                .position
+                .checked_add_signed(offset)
+                .ok_or_else(out_of_range)?,
         };
+        // Rounding down used to write over the bytes before the target (OSC-003, OSC-008).
+        if !target.is_multiple_of(SECTOR_SIZE as u64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("seek to {target} is not sector-aligned"),
+            ));
+        }
 
-        // Align down to sector boundary
-        let aligned_target = (target / SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
-
-        let new_pos = self.inner.seek(SeekFrom::Start(aligned_target))?;
+        let new_pos = self.inner.seek(SeekFrom::Start(target))?;
         self.position = new_pos;
 
         Ok(new_pos)
@@ -996,9 +1026,41 @@ pub fn is_device_path(path: &Path) -> bool {
     s.starts_with("/dev/") || s.starts_with("\\\\.\\")
 }
 
+/// The one name a device goes by: symlinks resolved and Windows drive paths spelled
+/// `\\.\PhysicalDriveN`, so every check and lookup sees the same path (OSC-005, OSW-003).
+pub fn normalize_device_path(path: &Path) -> PathBuf {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    for prefix in [r"\\.\physicaldrive", r"\\?\physicaldrive"] {
+        if let Some(n) = lower
+            .strip_prefix(prefix)
+            .and_then(|n| n.parse::<u32>().ok())
+        {
+            return PathBuf::from(format!(r"\\.\PhysicalDrive{n}"));
+        }
+    }
+    #[cfg(unix)]
+    if is_physical_device(path) {
+        if let Ok(real) = fs::canonicalize(path) {
+            if real.starts_with("/dev/") {
+                return real;
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 fn open_target_for_writing_inner(path: &Path, truncate: bool) -> Result<DeviceWriteHandle> {
     ensure_physical_allowed(path)?;
+    let normalized = normalize_device_path(path);
+    let path = normalized.as_path();
     let is_device = is_device_path(path);
+    // Opened as a file, a device would be written with no unmount, claim or volume lock.
+    if !is_device && is_physical_device(path) {
+        anyhow::bail!(
+            "{} is a device; write to it through its /dev or \\\\.\\PhysicalDriveN path",
+            path.display()
+        );
+    }
 
     if !is_device && !truncate {
         let file = std::fs::OpenOptions::new()
@@ -1328,6 +1390,17 @@ mod tests {
     use std::fs::OpenOptions;
     // Read/Seek/SeekFrom/Write come in via the parent module's
     // `use std::io::{self, Read, Seek, SeekFrom, Write}` at the top of the file.
+
+    /// OSC-001: a tail under one sector came back as 0, so a .d64 lost its last 256 bytes.
+    #[test]
+    fn a_file_tail_under_one_sector_is_not_taken_for_eof() {
+        let data: Vec<u8> = (0..174_848u32).map(|i| i as u8).collect();
+        let mut reader = SectorAlignedReader::new(std::io::Cursor::new(data.clone()));
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out.len(), data.len());
+        assert_eq!(out, data);
+    }
 
     /// A device that fails any read larger than `limit` with EIO, the way a
     /// USB floppy drive does, and fails `bad_sector` at any size (R19).

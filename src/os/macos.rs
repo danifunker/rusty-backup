@@ -21,8 +21,6 @@
 //! `couldn't open <path>: <text>` for the root open. The earlier cancel check
 //! compared our own error text against "cancelled" and never matched.
 
-mod sudo;
-
 use std::ffi::{c_void, CString};
 use std::fs::File;
 use std::mem::ManuallyDrop;
@@ -34,8 +32,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-
-pub use sudo::{request_app_elevation, sudo_execute};
 
 use libc::statfs;
 use objc2_core_foundation::{
@@ -525,7 +521,7 @@ fn da_unmount_disk_attempt(bsd_name: &str, attempt: u32) -> Result<()> {
     let state = unsafe { Box::from_raw(state) };
 
     if !callback_fired {
-        if attempt < 5 {
+        if attempt + 1 < 5 {
             log::warn!(
                 "DA unmount of {} timed out (attempt {}), retrying...",
                 bsd_name,
@@ -584,7 +580,7 @@ unsafe extern "C-unwind" fn claim_release_deny(
     _disk: NonNull<DADisk>,
     _context: *mut c_void,
 ) -> *const DADissenter {
-    log::warn!("DA: another client tried to steal our disk claim — denied");
+    log::warn!("DA: another client tried to steal our disk claim - denied");
     let reason = CFString::from_str("Rusty Backup has exclusive access");
     let dissenter = unsafe { DADissenter::new(None, kDAReturnExclusiveAccess, Some(&reason)) };
     objc2_core_foundation::CFRetained::into_raw(dissenter).as_ptr()
@@ -618,7 +614,7 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
     // another DA client could take the disk mid-read. That is strictly better
     // than holding no claim at all, which is what the timeout used to leave us
     // with.
-    log::debug!("DA: main run loop is not being pumped — claiming on this thread instead");
+    log::debug!("DA: main run loop is not being pumped - claiming on this thread instead");
     da_claim_disk_on(bsd_name, RunLoopTarget::Current, Duration::from_secs(5))
 }
 
@@ -706,7 +702,7 @@ fn da_claim_disk_on(
                     "DA claim of {bsd_name} saw no main-loop callback within {timeout:?}"
                 ),
                 RunLoopTarget::Current => log::warn!(
-                    "DA claim of {bsd_name} timed out — proceeding without exclusive access"
+                    "DA claim of {bsd_name} timed out - proceeding without exclusive access"
                 ),
             }
             return Ok(None);
@@ -725,7 +721,7 @@ fn da_claim_disk_on(
     if !state.ok.load(Ordering::SeqCst) {
         unsafe { session.unschedule_from_run_loop(&main_run_loop, mode) };
         log::warn!(
-            "DA claim of {} failed — proceeding without exclusive access",
+            "DA claim of {} failed - proceeding without exclusive access",
             bsd_name
         );
         return Ok(None);
@@ -806,6 +802,7 @@ impl SharedDevice {
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
+        set_cloexec(fd);
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
@@ -1150,6 +1147,11 @@ fn drain_stderr_pipe(fd: libc::c_int) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Mark `fd` close-on-exec: a raw-disk handle or helper pipe must not leak into
+/// diskutil, hdiutil or a concurrent authopen (OSD-001, OSD-002).
+fn set_cloexec(fd: i32) {
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+}
 /// Open a device using `/usr/libexec/authopen`.
 ///
 /// `authopen` is a macOS system binary that opens a device with root privileges
@@ -1173,6 +1175,7 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
         bail!("socketpair failed: {}", std::io::Error::last_os_error());
     }
+    sv.iter().for_each(|&fd| set_cloexec(fd));
 
     // The helper's stderr says why it refused (R11); it writes a line or two,
     // far below the pipe buffer, so it is drained after the exit.
@@ -1185,6 +1188,7 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
         }
         bail!("pipe failed: {err}");
     }
+    errp.iter().for_each(|&fd| set_cloexec(fd));
 
     // Bound the parent's wait so a helper that never answers surfaces as an
     // error instead of wedging the caller forever.
@@ -1248,7 +1252,8 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
                 libc::close(errp[1]);
 
                 libc::execv(authopen_path.as_ptr(), argv.as_ptr());
-                libc::exit(-1); // exec failed
+                // `exit` runs atexit handlers in a forked copy of a threaded parent (OSD-012).
+                libc::_exit(127);
             }
         }
         child_pid => {
@@ -1304,6 +1309,7 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
 
             // 5. Bypass the buffer cache (equivalent to O_DIRECT on Linux)
             unsafe { libc::fcntl(received_fd, F_NOCACHE, 1) };
+            set_cloexec(received_fd);
 
             Ok(unsafe { File::from_raw_fd(received_fd) })
         }
@@ -1334,7 +1340,7 @@ fn open_device(path: &str, flags: libc::c_int) -> Result<File> {
                 if is_authorization_cancelled(&e) {
                     return Err(e);
                 }
-                log::warn!("authopen warning: {} — falling back to direct open", e);
+                log::warn!("authopen warning: {} - falling back to direct open", e);
             }
         },
     }
@@ -1352,6 +1358,7 @@ fn open_device(path: &str, flags: libc::c_int) -> Result<File> {
         let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
         if fd >= 0 {
             unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
+            set_cloexec(fd);
             log::info!("Opened {} directly (attempt {})", path, attempt + 1);
             return Ok(unsafe { File::from_raw_fd(fd) });
         }
@@ -1501,6 +1508,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
             let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
             if fd >= 0 {
                 unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
+                set_cloexec(fd);
                 let file = unsafe { File::from_raw_fd(fd) };
                 if let Some(rw_errno) = rw_errno {
                     log_read_only_open(&raw_device, &file, rw_errno);
@@ -1635,7 +1643,7 @@ pub(crate) fn claim_optical_disc(device_path: &str) -> Option<DiskClaim> {
     let bsd = bsd_name_from_path(Path::new(device_path));
 
     if let Err(e) = da_unmount_disk(bsd) {
-        log::info!("{device_path}: could not unmount before claiming ({e}) — continuing shared");
+        log::info!("{device_path}: could not unmount before claiming ({e}) - continuing shared");
     }
 
     match da_claim_disk(bsd) {
@@ -1644,11 +1652,11 @@ pub(crate) fn claim_optical_disc(device_path: &str) -> Option<DiskClaim> {
             Some(claim)
         }
         Ok(None) => {
-            log::info!("{device_path}: exclusive claim declined — continuing shared");
+            log::info!("{device_path}: exclusive claim declined - continuing shared");
             None
         }
         Err(e) => {
-            log::info!("{device_path}: exclusive claim failed ({e}) — continuing shared");
+            log::info!("{device_path}: exclusive claim failed ({e}) - continuing shared");
             None
         }
     }

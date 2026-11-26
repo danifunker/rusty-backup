@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::device::{DiskDevice, MountedPartition};
 
@@ -76,7 +76,8 @@ fn unescape_mountinfo(s: &str) -> String {
             // Try to read 3 octal digits
             let mut octal = String::with_capacity(3);
             for _ in 0..3 {
-                if let Some(&next) = chars.as_str().chars().collect::<Vec<_>>().first() {
+                // A peek; collecting the rest for each digit made this quadratic (OSL-013).
+                if let Some(next) = chars.as_str().chars().next() {
                     if next.is_ascii_digit() && next < '8' {
                         octal.push(next);
                         chars.next();
@@ -131,18 +132,38 @@ fn parse_mountinfo_from_str(content: &str) -> HashMap<String, MountInfoEntry> {
 
         // Only track entries with real block device sources
         if source.starts_with("/dev/") {
-            map.insert(
-                source.clone(),
-                MountInfoEntry {
-                    mount_point,
-                    fs_type,
-                    _source: source,
-                },
-            );
+            // One source can be mounted many times (btrfs subvolumes); `/` must win (OSL-001).
+            let keep_old = map.get(&source).is_some_and(|old: &MountInfoEntry| {
+                old.mount_point == "/" || old.mount_point.len() <= mount_point.len()
+            });
+            if !keep_old {
+                map.insert(
+                    source.clone(),
+                    MountInfoEntry {
+                        mount_point,
+                        fs_type,
+                        _source: source,
+                    },
+                );
+            }
         }
     }
 
     map
+}
+
+/// Every `(source, mount point)` pair, where the map above keeps one per source.
+fn all_mounts_from_str(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let dash = fields.iter().position(|f| *f == "-")?;
+            let source = fields.get(dash + 2)?;
+            (fields.len() >= 5 && source.starts_with("/dev/"))
+                .then(|| (source.to_string(), unescape_mountinfo(fields[4])))
+        })
+        .collect()
 }
 
 /// Detect bus protocol by resolving the sysfs device symlink and checking
@@ -167,10 +188,49 @@ fn detect_bus_protocol(sysfs_dev: &Path) -> String {
     }
 }
 
+/// The kernel names of the block devices under `name`, through device-mapper and md layers.
+fn backing_devices(name: &str, depth: usize, out: &mut Vec<String>) {
+    let slaves = Path::new("/sys/class/block").join(name).join("slaves");
+    let Ok(entries) = fs::read_dir(slaves) else {
+        out.push(name.to_string());
+        return;
+    };
+    let mut any = false;
+    for e in entries.flatten() {
+        any = true;
+        if depth < 8 {
+            backing_devices(&e.file_name().to_string_lossy(), depth + 1, out);
+        }
+    }
+    if !any {
+        out.push(name.to_string());
+    }
+}
+
+/// Whole disks holding the root filesystem, even through LVM, LUKS or md (OSL-002).
+fn root_disks(mountinfo: &str) -> Vec<String> {
+    let mut disks = Vec::new();
+    for (source, mount_point) in all_mounts_from_str(mountinfo) {
+        if mount_point != "/" {
+            continue;
+        }
+        let real = fs::canonicalize(&source).unwrap_or_else(|_| PathBuf::from(&source));
+        let name = real
+            .to_string_lossy()
+            .trim_start_matches("/dev/")
+            .to_string();
+        let mut leaves = Vec::new();
+        backing_devices(&name, 0, &mut leaves);
+        disks.extend(leaves.iter().map(|l| parent_device_name(l).to_string()));
+    }
+    disks
+}
+
 /// Enumerate devices using sysfs and /proc/self/mountinfo.
 pub fn enumerate_devices() -> Vec<DiskDevice> {
     let mountinfo_content = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     let mounts = parse_mountinfo_from_str(&mountinfo_content);
+    let system_disks = root_disks(&mountinfo_content);
 
     let block_dir = Path::new("/sys/block");
     let entries = match fs::read_dir(block_dir) {
@@ -202,7 +262,7 @@ pub fn enumerate_devices() -> Vec<DiskDevice> {
 
         // Discover partitions
         let mut partitions = Vec::new();
-        let mut is_system = false;
+        let mut is_system = system_disks.iter().any(|d| d == dev_name.as_str());
 
         if let Ok(sub_entries) = fs::read_dir(&sysfs_dev) {
             for sub in sub_entries.flatten() {
@@ -298,14 +358,16 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
 
         // Read mountinfo to find actually-mounted partitions
         let mountinfo_content = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-        let mounts = parse_mountinfo_from_str(&mountinfo_content);
+        // Every mount, deepest first: a subvolume or nested mount must go before its parent.
+        let mut mounts = all_mounts_from_str(&mountinfo_content);
+        mounts.sort_by_key(|(_, mp)| std::cmp::Reverse(mp.len()));
 
         // Unmount this device's partitions, for real where possible: a lazy
         // detach leaves an open filesystem writing back under the restore.
-        for (dev_path, mi) in &mounts {
+        for (dev_path, mount_point) in &mounts {
             let dev_part_name = dev_path.trim_start_matches("/dev/");
             if parent_device_name(dev_part_name) == parent {
-                unmount_now_or_lazily(mi.mount_point.as_str());
+                unmount_now_or_lazily(mount_point.as_str());
             }
         }
         // Whatever the old filesystems still had dirty lands before our first write.
@@ -463,6 +525,21 @@ mod tests {
         assert_eq!(parent_device_name("something"), "something");
     }
 
+    /// OSL-001: btrfs `/` and `/home` on one partition kept only the last, so root was missed.
+    #[test]
+    fn a_source_mounted_twice_keeps_root_and_unmounts_both() {
+        let content = "\
+22 1 0:30 /@ / rw - btrfs /dev/nvme0n1p3 rw
+23 22 0:30 /@home /home rw - btrfs /dev/nvme0n1p3 rw
+";
+        assert_eq!(
+            parse_mountinfo_from_str(content)["/dev/nvme0n1p3"].mount_point,
+            "/"
+        );
+        let all = all_mounts_from_str(content);
+        assert_eq!(all.len(), 2);
+    }
+
     #[test]
     fn test_parse_mountinfo() {
         let content = "\
@@ -517,154 +594,8 @@ mod tests {
 // Privileged disk access implementation
 // ---------------------------------------------------------------------------
 
-use std::fs::OpenOptions;
-use std::io::{ErrorKind, Read, Seek, Write};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-
-use crate::privileged::{AccessStatus, DiskHandle, PrivilegedDiskAccess};
-
-/// Linux implementation of privileged disk access.
-///
-/// Uses direct file I/O when running as root. If not root, the app should
-/// be relaunched with pkexec via `relaunch_with_elevation()`.
-pub struct LinuxDiskAccess {
-    open_handles: HashMap<u64, File>,
-    next_handle: u64,
-}
-
-impl LinuxDiskAccess {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            open_handles: HashMap::new(),
-            next_handle: 1,
-        })
-    }
-}
-
-impl PrivilegedDiskAccess for LinuxDiskAccess {
-    fn check_status(&self) -> Result<AccessStatus> {
-        // Check if we're running as root
-        if sys::is_root() {
-            Ok(AccessStatus::Ready)
-        } else {
-            Ok(AccessStatus::NeedsElevation)
-        }
-    }
-
-    fn open_disk_read(&mut self, path: &Path) -> Result<DiskHandle> {
-        match File::open(path) {
-            Ok(file) => {
-                let handle = self.next_handle;
-                self.next_handle += 1;
-                self.open_handles.insert(handle, file);
-                Ok(DiskHandle(handle))
-            }
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                anyhow::bail!(
-                    "Permission denied accessing {}. Please restart with elevated privileges.",
-                    path.display()
-                )
-            }
-            Err(e) => Err(e).context(format!("Failed to open {} for reading", path.display())),
-        }
-    }
-
-    fn open_disk_write(&mut self, path: &Path) -> Result<DiskHandle> {
-        // Unmount volumes first (reuse existing unmount logic)
-        let path_str = path.to_string_lossy();
-        if path_str.starts_with("/dev/") {
-            let device_name = path_str.trim_start_matches("/dev/");
-            let parent = parent_device_name(device_name);
-
-            let mountinfo_content = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-            let mounts = parse_mountinfo_from_str(&mountinfo_content);
-
-            for (dev_path, mi) in &mounts {
-                let dev_part_name = dev_path.trim_start_matches("/dev/");
-                if parent_device_name(dev_part_name) == parent {
-                    unmount_now_or_lazily(mi.mount_point.as_str());
-                }
-            }
-            unsafe { libc::sync() };
-        }
-
-        // Open for writing; a block device is claimed exclusively so a
-        // filesystem still live on it makes this fail instead of racing us.
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true);
-        if path_str.starts_with("/dev/") {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.custom_flags(libc::O_EXCL);
-        }
-        match opts.open(path) {
-            Ok(file) => {
-                let handle = self.next_handle;
-                self.next_handle += 1;
-                self.open_handles.insert(handle, file);
-                Ok(DiskHandle(handle))
-            }
-            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                anyhow::bail!(
-                    "{} is still in use: a filesystem on it is mounted or held open by \
-                     another process. Close what uses it (or unmount it) and try again.",
-                    path.display()
-                )
-            }
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                anyhow::bail!(
-                    "Permission denied accessing {}. Please restart with elevated privileges.",
-                    path.display()
-                )
-            }
-            Err(e) => Err(e).context(format!("Failed to open {} for writing", path.display())),
-        }
-    }
-
-    fn read_sectors(&mut self, handle: DiskHandle, lba: u64, count: u32) -> Result<Vec<u8>> {
-        let file = self
-            .open_handles
-            .get_mut(&handle.0)
-            .ok_or_else(|| anyhow::anyhow!("Invalid disk handle: {}", handle.0))?;
-
-        let offset = lba * 512;
-        let size = count as usize * 512;
-
-        file.seek(std::io::SeekFrom::Start(offset))?;
-
-        let mut buffer = vec![0u8; size];
-        file.read_exact(&mut buffer)?;
-
-        Ok(buffer)
-    }
-
-    fn write_sectors(&mut self, handle: DiskHandle, lba: u64, data: &[u8]) -> Result<()> {
-        if !data.len().is_multiple_of(512) {
-            anyhow::bail!(
-                "Data size must be a multiple of 512 bytes, got {}",
-                data.len()
-            );
-        }
-
-        let file = self
-            .open_handles
-            .get_mut(&handle.0)
-            .ok_or_else(|| anyhow::anyhow!("Invalid disk handle: {}", handle.0))?;
-
-        let offset = lba * 512;
-        file.seek(std::io::SeekFrom::Start(offset))?;
-        file.write_all(data)?;
-
-        Ok(())
-    }
-
-    fn close_disk(&mut self, handle: DiskHandle) -> Result<()> {
-        self.open_handles
-            .remove(&handle.0)
-            .ok_or_else(|| anyhow::anyhow!("Invalid disk handle: {}", handle.0))?;
-        Ok(())
-    }
-}
 
 /// Pick the binary pkexec should elevate: `$APPIMAGE` when set, because inside
 /// an AppImage `current_exe()` is a /tmp FUSE mount root cannot read.
@@ -686,15 +617,14 @@ fn elevation_target_path() -> Result<PathBuf> {
 pub fn relaunch_with_elevation() -> Result<()> {
     super::ensure_physical_enabled()?;
     let target = elevation_target_path()?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `args()` panics on a non-UTF-8 argument, such as a Latin-1 file name (OSL-005).
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
 
     // Check if pkexec is available
-    let pkexec_check = Command::new("which")
-        .arg("pkexec")
-        .output()
-        .context("Failed to check for pkexec")?;
-
-    if !pkexec_check.status.success() {
+    // Searched on PATH directly; minimal distros ship no `which` (OSL-011).
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("pkexec").is_file()));
+    if !on_path {
         anyhow::bail!(
             "pkexec not found. Please install policykit-1 or run manually: sudo {}",
             target.display()

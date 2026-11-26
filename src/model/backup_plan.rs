@@ -357,8 +357,7 @@ pub fn remote_min_plan(
 
 /// A device node rather than an image file (the scan elevates and the preview skips it).
 pub fn is_device_path(path: &std::path::Path) -> bool {
-    let s = path.to_string_lossy();
-    s.starts_with("/dev/") || s.starts_with("\\\\.\\")
+    crate::os::is_device_path(path)
 }
 
 #[cfg(test)]
