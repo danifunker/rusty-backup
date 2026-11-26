@@ -27,6 +27,7 @@ mod short_source_warning;
 mod split_backup_roundtrip;
 mod superfloppy_compression;
 mod timestamp_preservation;
+mod vhd_export_from_backup;
 mod wave2_dispatch_e2e;
 
 /// Decode a zstd fixture into `out`, seeking over all-zero runs so the file stays sparse.

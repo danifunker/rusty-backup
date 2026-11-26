@@ -281,6 +281,16 @@ fn rebuild_vhd_ebr_chain(
     }))
 }
 
+/// Write the fixed-VHD footer at `data_len`, wherever the cursor was left: reconstruction ends
+/// on a seek-back write (the hidden-sector patch), so the cursor is not the data's end (RBF-001).
+fn append_vhd_footer(file: &mut File, data_len: u64) -> Result<()> {
+    file.seek(SeekFrom::Start(data_len))?;
+    file.write_all(&build_vhd_footer(data_len))
+        .context("failed to write VHD footer")?;
+    file.set_len(data_len + 512)?;
+    Ok(())
+}
+
 /// Export a whole disk image as a Fixed VHD file.
 ///
 /// For raw image files or devices: reconstructs the disk with partition size overrides.
@@ -333,9 +343,7 @@ pub fn export_whole_disk_vhd(
         )?;
 
         // Append VHD footer
-        let footer = build_vhd_footer(total_written);
-        file.write_all(&footer)
-            .context("failed to write VHD footer")?;
+        append_vhd_footer(&mut file, total_written)?;
         file.flush()?;
 
         log_cb(&format!(
@@ -506,9 +514,7 @@ pub fn export_whole_disk_vhd(
                 )?
             };
 
-            let footer = build_vhd_footer(total_written);
-            file.write_all(&footer)
-                .context("failed to write VHD footer")?;
+            append_vhd_footer(&mut file, total_written)?;
             file.flush()?;
 
             let table_kind = if is_apm {
@@ -1039,9 +1045,7 @@ pub fn export_clonezilla_disk_vhd(
     }
 
     // Append VHD footer
-    let footer = build_vhd_footer(total_written);
-    file.write_all(&footer)
-        .context("failed to write VHD footer")?;
+    append_vhd_footer(&mut file, total_written)?;
     file.flush()?;
 
     log_cb(&format!(
