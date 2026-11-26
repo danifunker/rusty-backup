@@ -908,6 +908,16 @@ pub(crate) fn write_fat_clean_flags(
 
 /// Main restore orchestrator. Runs on a background thread.
 pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>) -> Result<()> {
+    let device = config.target_is_device.then(|| config.target_path.clone());
+    let result = run_restore_inner(config, progress);
+    // The cached authopen descriptor kept the disk open, so its new map was never re-probed (OSD-004).
+    if let Some(path) = device {
+        crate::os::release_elevated_devices(Some(&path.to_string_lossy()));
+    }
+    result
+}
+
+fn run_restore_inner(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>) -> Result<()> {
     log(
         &progress,
         LogLevel::Info,

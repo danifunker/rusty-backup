@@ -2,7 +2,6 @@
 #![allow(clippy::incompatible_msrv)]
 
 pub mod backup;
-pub mod bulk_buf_reader;
 pub mod cli;
 // Always-compiled std-API shims that differ between the modern toolchain and the
 // Rust 1.73 vintage (macOS 10.7) build. Keeps lint-discouraged fallbacks out of
@@ -16,7 +15,6 @@ pub mod model;
 pub mod optical;
 pub mod os;
 pub mod partition;
-pub mod privileged;
 pub mod rbformats;
 // Network daemon + client (`rb-cli serve`, `rb://` refs). std::net + serde
 // only — gated so the slim build can drop it, but cheap enough to keep on.

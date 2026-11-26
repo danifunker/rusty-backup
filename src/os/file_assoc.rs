@@ -85,7 +85,7 @@ pub fn launch_hooks() {
     use crate::update::UpdateConfig;
 
     let version = env!("APP_VERSION");
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let register = args.iter().any(|a| a == "--register-file-associations");
     let unregister = args.iter().any(|a| a == "--unregister-file-associations");
 
@@ -93,23 +93,27 @@ pub fn launch_hooks() {
     if !register && !unregister {
         if cfg.file_associations_enabled && cfg.assoc_registered_version.as_deref() != Some(version)
         {
-            let _ = register_file_associations();
-            cfg.assoc_registered_version = Some(version.to_string());
-            let _ = cfg.save();
+            // Recorded only on success, so a failed registry write is retried next launch (OSC-013).
+            if register_file_associations().is_ok() {
+                cfg.assoc_registered_version = Some(version.to_string());
+                let _ = cfg.save();
+            }
         }
         // self_replace bypasses the installer, so its DisplayVersion goes stale (no-op when portable).
         let _ = crate::os::win_install::refresh_arp_display_version(version);
         return;
     }
-    if register {
-        let _ = register_file_associations();
+    let ok = if register {
+        let ok = register_file_associations().is_ok();
         cfg.file_associations_enabled = true;
-        cfg.assoc_registered_version = Some(version.to_string());
+        cfg.assoc_registered_version = ok.then(|| version.to_string());
+        ok
     } else {
-        let _ = unregister_file_associations();
         cfg.file_associations_enabled = false;
         cfg.assoc_registered_version = None;
-    }
+        unregister_file_associations().is_ok()
+    };
     let _ = cfg.save();
-    std::process::exit(0);
+    // A failed registry write exits non-zero for any caller that checks (Inno ignores it).
+    std::process::exit(if ok { 0 } else { 1 });
 }

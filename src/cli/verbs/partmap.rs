@@ -454,8 +454,7 @@ fn open_table(image: &std::path::Path) -> Result<PartitionTable> {
 
 /// Is `image` a raw device node rather than a file on disk?
 fn is_device_path(image: &std::path::Path) -> bool {
-    let s = image.to_string_lossy();
-    s.starts_with("/dev/") || s.starts_with(r"\\.\")
+    crate::os::is_device_path(image)
 }
 
 /// Total addressable size of the disk behind `image`.

@@ -56,14 +56,18 @@ pub fn run_resize(
     disk_size: u64,
     status: &Arc<Mutex<ResizeStatus>>,
 ) -> anyhow::Result<()> {
-    let mut file = if is_device {
-        crate::os::open_target_for_writing(path)?.file
+    // The handle lives to the end, so its volume locks and disk claim do too (OSW-002).
+    let handle = if is_device {
+        crate::os::open_target_for_writing(path)?
     } else {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?
+        crate::os::DeviceWriteHandle::from_file(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?,
+        )
     };
+    let mut file = handle.file;
 
     let file_size = file.seek(std::io::SeekFrom::End(0))?;
     file.seek(std::io::SeekFrom::Start(0))?;

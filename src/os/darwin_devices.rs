@@ -75,8 +75,8 @@ fn split_digits(s: &str) -> (&str, &str) {
 pub struct DiskProbe {
     /// Byte size, or 0 when the device could not be opened.
     pub size_bytes: u64,
-    /// From `DKIOCISWRITABLE`; `false` when unknown, which is the safer
-    /// default for a flag the UI uses to decide whether a write can proceed.
+    /// From `DKIOCISWRITABLE`; `false` (writable) when unknown, so an unreadable
+    /// flag never blocks a write the device would take.
     pub is_read_only: bool,
 }
 

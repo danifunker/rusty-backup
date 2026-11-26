@@ -760,3 +760,91 @@ backup/single_file_chd.rs (3); allocations sized from input listed under RBF.
 | BKP-019 | S4 | confirmed | [single_file_chd.rs:20](../../src/backup/single_file_chd.rs#L20) | Stale module docs (sparse temp path, direct stream, re-reading for checksums). | fixed (this branch): the module docs describe the staging path and streamed hashing |
 | BKP-020 | S4 | confirmed | [single_file_chd.rs:1397](../../src/backup/single_file_chd.rs#L1397) | Dead code: `staging_path_unsupported_reason` (its DVD gate never runs), `let _ = is_superfloppy`, an unreachable `SolarisX86` arm, unread `mbr-min.bin`. | deferred (refactor pass) |
 | BKP-021 | S4 | confirmed | [mod.rs:242](../../src/backup/mod.rs#L242) | `log` / `is_cancelled` duplicated across five units. | deferred (refactor pass) |
+
+# src/ review, slice 2 (branch `review-src-2`, started 2026-11-26)
+
+os, privileged, device.rs. Mechanical: no `eprintln!`; input-sized allocations are fixed-size; em dashes in eight `macos.rs` log lines (OSD-013).
+
+## src/os common, privileged, device.rs
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| OSC-001 | S1 | confirmed | [mod.rs:321](../../src/os/mod.rs#L321) | `SectorAlignedReader`'s fast path rounds a short read down to a whole sector, so a tail under 512 bytes returns `Ok(0)`: backing up an image whose length isn't a sector multiple (a 174848-byte .d64) drops the last 256 bytes. | fixed: a sub-sector tail is returned as read; test `a_file_tail_under_one_sector_is_not_taken_for_eof` |
+| OSC-002 | S1 | plausible | [mod.rs:595](../../src/os/mod.rs#L595) | Unix `flush_padded` zero-pads a partial last sector on every seek/read/flush, overwriting up to 511 following bytes on a preserving target and moving the cursor. | fixed: a regular file passes straight through on Unix; only devices are padded |
+| OSC-003 | S1 | plausible | [mod.rs:817](../../src/os/mod.rs#L817) | Windows `SectorAlignedWriter::seek` silently aligns the target down; `Seek(1000)` + write lands at 512. Unix passes it through. | fixed: an unaligned Windows seek is refused instead of rounded down |
+| OSC-004 | S1 | plausible | [mod.rs:683](../../src/os/mod.rs#L683) | Windows `flush_sectors` writes at the handle's cursor while the other paths seek to `self.position`; after `inner_mut()` the two diverge. | fixed: `flush_sectors` writes at the tracked position |
+| OSC-005 | S2 | confirmed | [mod.rs:1001](../../src/os/mod.rs#L1001) | `is_device_path` only knows `/dev/` and `\\.\`; a symlink to a device, `\\?\PhysicalDriveN` or a GLOBALROOT path takes the regular-file branch (create+truncate, no unmount/claim/lock). | fixed: `normalize_device_path` resolves symlinks and spells drive paths `\\.\PhysicalDriveN`; a device that still isn't one is refused, not opened as a file |
+| OSC-006 | S2 | plausible | [mod.rs:352](../../src/os/mod.rs#L352) | `SeekFrom::End` goes to the inner reader; on a bare macOS raw device it resolves to 0. | deferred (plausible): needs a device-size source in `browse_session`; the backup and inspect paths already wrap with `KnownLen` |
+| OSC-007 | S2 | plausible | [mod.rs:1206](../../src/os/mod.rs#L1206) | `get_file_size` falls back to `seek(End)` = 0 on a macOS device, giving an empty source instead of an error. | deferred (plausible): logged by OSC-009; making it an error needs the macOS size path to never return None for a real disk |
+| OSC-008 | S2 | plausible | [mod.rs:810](../../src/os/mod.rs#L810) | Windows `seek(End)` uses `metadata().len()` = 0 on a physical drive and wraps signed offsets unchecked. | fixed: a Windows End-seek with no length is refused; offsets are checked |
+| OSC-009 | S3 | confirmed | [mod.rs:98](../../src/os/mod.rs#L98) | `known_len_reader` / `known_len_source` turn a failed size query into 0. | fixed: the failure is logged; callers still see 0 (a Result would ripple through seven callers) |
+| OSC-010 | S3 | confirmed | [mod.rs:622](../../src/os/mod.rs#L622) | Unix `write` buffers then errors with the bytes still queued; a retry writes them twice. | deferred: a failed `write_all` mid-flush leaves an unknown amount on the device, so there is no correct retry state to restore |
+| OSC-011 | S3 | plausible | [mod.rs:564](../../src/os/mod.rs#L564) | No `Drop` on `SectorAlignedWriter`: an unflushed buffer is silently lost. | fixed: `Drop` flushes what is buffered |
+| OSC-012 | S3 | confirmed | [bulk_buf_reader.rs:137](../../src/bulk_buf_reader.rs#L137) | `set_len` on uninitialised memory handed to an arbitrary `Read` (UB); the type has no users. | fixed: `bulk_buf_reader.rs` removed (no users) |
+| OSC-013 | S3 | confirmed | [file_assoc.rs:96](../../src/os/file_assoc.rs#L96) | A failed association registration still records the version, so it is never retried. | fixed: the version is recorded only on success; the installer verbs exit 1 on failure |
+| OSC-014 | S4 | plausible | [wakelock.rs:80](../../src/os/wakelock.rs#L80) | Windows execution state is per-thread; a guard dropped on another thread, or nested guards, release wrongly. | deferred (plausible): every guard is created and dropped on one thread today |
+| OSC-015 | S4 | confirmed | [privileged/mod.rs:81](../../src/privileged/mod.rs#L81) | The `privileged` module is dead, with a fixed /tmp progress path and unchecked `count*512` allocations. | fixed: `src/privileged` removed with the Linux and Windows impls |
+| OSC-016 | S4 | confirmed | [mod.rs:512](../../src/os/mod.rs#L512) | The writer's doc paragraph sits on `sync_committed`. | fixed |
+| OSC-017 | S4 | confirmed | [mod.rs:122](../../src/os/mod.rs#L122) | `SourceHandle::try_clone` claims an independent offset; `File::try_clone` shares it. | fixed: the doc says a File clone shares its offset |
+| OSC-018 | S4 | confirmed | [mod.rs:373](../../src/os/mod.rs#L373) | Redundant `unsafe impl Send for SectorAlignedReader`. | fixed: removed |
+
+## src/os macOS
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| OSD-001 | S2 | plausible | [macos.rs:1180](../../src/os/macos.rs#L1180) | Socketpair and stderr pipe lack `FD_CLOEXEC`; a concurrent child inherits them and `drain_stderr_pipe` blocks until it exits. | fixed: the socketpair and stderr pipe are close-on-exec |
+| OSD-002 | S2 | confirmed | [macos.rs:1306](../../src/os/macos.rs#L1306) | Raw-device fds (SCM_RIGHTS, direct opens, dup) lack `FD_CLOEXEC`; diskutil/hdiutil children inherit a root O_RDWR disk handle. | fixed: every raw-device fd (received, opened, dup) is close-on-exec |
+| OSD-003 | S2 | plausible | [macos.rs:696](../../src/os/macos.rs#L696) | Main-target claim timeout frees the callback state while the main thread may be inside `claim_callback`. | deferred (plausible): needs a DA unschedule that waits for an in-flight callback; tracked for a macOS device pass |
+| OSD-004 | S2 | plausible | [macos.rs:1331](../../src/os/macos.rs#L1331) | Restore's authopen fd stays in `ELEVATED_DEVICES` for the app's life: no re-probe, volumes don't mount, eject says busy. | fixed: `run_restore` releases the device's cached descriptor when it ends |
+| OSD-005 | S2 | plausible | [macos.rs:804](../../src/os/macos.rs#L804) | Every `dup_as_file` shares one offset; two concurrent File users of one device seek under each other. | deferred (plausible): no concurrent File users of one device today |
+| OSD-006 | S2 | plausible | [macos.rs:875](../../src/os/macos.rs#L875) | The elevated-fd cache is keyed by path only; a new card on the same diskN gets the revoked fd. | deferred (plausible): needs media identity on the cache key (DA media UUID) |
+| OSD-007 | S3 | confirmed | [macos.rs:1337](../../src/os/macos.rs#L1337) | A failed unmount only warns; the user then sees "Permission denied" instead of "busy". | deferred: the busy cause is in the log; surfacing it needs `open_device` to carry the unmount error |
+| OSD-008 | S2 | plausible | [macos_stub.rs:290](../../src/os/macos_stub.rs#L290) | The stub reads a mounted volume through `/dev/diskN` without unmounting (PowerPC backups image a live volume). | deferred: the stub serves PowerPC/10.5 builds, which need their own test machine |
+| OSD-009 | S2 | plausible | [darwin_devices.rs:168](../../src/os/darwin_devices.rs#L168) | Nested slices (`disk2s2s1`) are skipped by `mounts_to_unmount`. | deferred (plausible): nested-slice parsing in `darwin_devices`, stub builds only |
+| OSD-010 | S3 | confirmed | [sudo.rs:138](../../src/os/macos/sudo.rs#L138) | Predictable /tmp askpass path through a symlink-following create (module dead, OSD-016). | fixed: `sudo.rs` removed |
+| OSD-011 | S3 | plausible | [sudo.rs:126](../../src/os/macos/sudo.rs#L126) | A cancelled askpass reads as an auth failure; `sudo` resolved via PATH with `-E`. | fixed: `sudo.rs` removed |
+| OSD-012 | S3 | confirmed | [macos.rs:1251](../../src/os/macos.rs#L1251) | The forked child calls `exit(-1)` after a failed `execv`; must be `_exit(127)`. | fixed: `_exit(127)` |
+| OSD-013 | S3 | confirmed | [macos.rs:587](../../src/os/macos.rs#L587) | Em dashes in eight log messages. | fixed |
+| OSD-014 | S3 | confirmed | [macos.rs:1538](../../src/os/macos.rs#L1538) | Two 7-line comment blocks added after the comment cap; one is wrong. | fixed: both blocks cut to two lines; the wrong claim is gone |
+| OSD-015 | S4 | confirmed | [macos.rs:537](../../src/os/macos.rs#L537) | Unmount retries 6 times, not the documented 5. | fixed: five attempts, as documented |
+| OSD-016 | S4 | confirmed | [sudo.rs:53](../../src/os/macos/sudo.rs#L53) | `sudo.rs` is dead. | fixed: `sudo.rs` removed |
+| OSD-017 | S4 | confirmed | [macos_stub.rs:211](../../src/os/macos_stub.rs#L211) | Stub and real module public surfaces have drifted. | deferred (refactor pass) |
+| OSD-018 | S4 | confirmed | [darwin_devices.rs:78](../../src/os/darwin_devices.rs#L78) | `is_read_only` doc calls `false` the safer default. | fixed: the doc says false means writable |
+| OSD-019 | S4 | plausible | [macos.rs:144](../../src/os/macos.rs#L144) | `dict_get_*` cast CF values with no type-ID check. | deferred (plausible): IOKit returns the documented types for the keys read |
+| OSD-020 | S4 | plausible | [macos.rs:888](../../src/os/macos.rs#L888) | The cache lock is dropped between lookup and insert; two dialogs, duplicate entries. | deferred (plausible): concurrent escalations of one device are not issued today |
+| OSD-021 | S4 | confirmed | [macos.rs:1287](../../src/os/macos.rs#L1287) | authopen's stderr is discarded when the reply fails. | deferred |
+
+## src/os Windows
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| OSW-001 | S1 | confirmed | [windows.rs:121](../../src/os/windows.rs#L121) | A volume that fails to open, lock or dismount only warns and the write goes ahead; Windows then refuses sectors inside the still-mounted volume partway through. | fixed: a volume that can't be opened or dismounted stops the write; the lock is retried for 2.5 s and a failed lock forces the dismount |
+| OSW-002 | S1 | confirmed | [partition_resize.rs:60](../../src/model/partition_resize.rs#L60) | `open_target_for_writing(path)?.file` drops the handle (and its volume locks) before any write. | fixed: the handle lives to the end of the resize |
+| OSW-003 | S1 | confirmed | [windows.rs:337](../../src/os/windows.rs#L337) | Lower-case `\\.\physicaldrive0` passes the device checks but misses the case-sensitive preflight lookup, skipping the system-disk refusal. | fixed: preflight compares the normalized path |
+| OSW-004 | S1 | plausible | [mod.rs:996](../../src/os/mod.rs#L996) | `\\?\PhysicalDriveN` is accepted by preflight but written as a regular file (no lock/dismount); same as OSC-005. | fixed with OSC-005 |
+| OSW-005 | S1 | plausible | [windows.rs:546](../../src/os/windows.rs#L546) | A failed volume enumeration or extents query drops the volume silently, so "No volumes found" lets the write proceed. | fixed: a failed volume listing stops the write |
+| OSW-006 | S2 | plausible | [windows.rs:267](../../src/os/windows.rs#L267) | The runas relaunch passes no working directory; relative arguments resolve against System32. | fixed: `args_for_relaunch` makes existing relative paths absolute before runas |
+| OSW-007 | S4 | confirmed | [windows.rs:285](../../src/os/windows.rs#L285) | `shell_execute_ex_w` calls `ShellExecuteW`; the error comes from `last_os_error` and always blames UAC. | deferred (refactor pass): the misnamed wrapper works; only its error text is off |
+| OSW-008 | S4 | confirmed | [windows.rs:664](../../src/os/windows.rs#L664) | `QueryDosDeviceW` retries on any error, growing to 32 MB. | fixed: only ERROR_INSUFFICIENT_BUFFER retries |
+| OSW-009 | S4 | confirmed | [windows.rs:846](../../src/os/windows.rs#L846) | Four disagreeing "is a physical drive" tests (root of OSW-003/004). | partly fixed: the duplicate `is_device_path`s delegate to `os`; normalization covers the casings |
+| OSW-010 | S4 | confirmed | [windows.rs:901](../../src/os/windows.rs#L901) | `WindowsDiskAccess` is an all-bail stub; docs claim automatic elevation. | fixed: `WindowsDiskAccess` removed |
+| OSW-011 | S4 | confirmed | [windows.rs:309](../../src/os/windows.rs#L309) | `bus_type_to_string` misses SCSI, RAID, iSCSI, SAS, virtual. | fixed |
+
+## src/os Linux, Solaris
+
+| ID | Sev | Status | Where | Finding | Fix |
+|---|---|---|---|---|---|
+| OSL-001 | S2 | confirmed | [linux.rs:134](../../src/os/linux.rs#L134) | The mount map keeps one mount per device: btrfs `/` + `/home` on one partition loses `/`, so `is_system` is false and only one mount is unmounted. | fixed: `/` wins per source; the unmount walks every mount, deepest first; test `a_source_mounted_twice_keeps_root_and_unmounts_both` |
+| OSL-002 | S2 | confirmed | [linux.rs:232](../../src/os/linux.rs#L232) | A root on LVM/LUKS or on a whole disk is never flagged as the system disk. | fixed: the root's source is traced through `/sys/class/block/*/slaves` to its disks |
+| OSL-003 | S2 | confirmed | [linux.rs:305](../../src/os/linux.rs#L305) | Every mount on the parent disk is detached before `O_EXCL` decides; a partition target unmounts its siblings. | deferred: refusing before unmounting needs a mounted-but-not-held probe; O_EXCL still blocks a live write |
+| OSL-004 | S2 | confirmed | [linux.rs:296](../../src/os/linux.rs#L296) | `/dev/disk/by-id/...` isn't canonicalised, so nothing is unmounted and the open fails EBUSY. | fixed with OSC-005 (by-id symlinks resolve before the unmount) |
+| OSL-005 | S2 | confirmed | [linux.rs:689](../../src/os/linux.rs#L689) | `std::env::args()` panics on a non-UTF-8 argument during relaunch. | fixed: `args_os` |
+| OSL-006 | S2 | plausible | [linux.rs:740](../../src/os/linux.rs#L740) | pkexec changes to /root, so relative arguments resolve wrongly. | fixed: the same helper before pkexec |
+| OSL-007 | S2 | plausible | [solaris.rs:299](../../src/os/solaris.rs#L299) | ZFS/SVM roots never flag the boot disk (display only; writes refused on Solaris). | deferred: Solaris writes are refused, display only |
+| OSL-008 | S2 | plausible | [solaris.rs:147](../../src/os/solaris.rs#L147) | SPARC whole disk is `s2`; EFI disks skipped; size from kstat can exceed `s2`. | deferred: needs a SPARC/EFI test machine |
+| OSL-009 | S2 | plausible | [solaris.rs:300](../../src/os/solaris.rs#L300) | `is_removable` opens every disk, contradicting the no-open enumeration. | deferred (plausible) |
+| OSL-010 | S3 | confirmed | [linux.rs:783](../../src/os/linux.rs#L783) | Elevated runs `umask(0)`: backups are world-writable. | deferred: the fix is handing files to `SUDO_UID`, not a tighter umask (which would leave the user unable to delete their own backups) |
+| OSL-011 | S4 | confirmed | [linux.rs:692](../../src/os/linux.rs#L692) | pkexec lookup shells out to `which`. | fixed: PATH is searched directly |
+| OSL-012 | S4 | confirmed | [linux.rs:531](../../src/os/linux.rs#L531) | `LinuxDiskAccess` is dead and duplicates the unmount loop. | fixed: `LinuxDiskAccess` removed |
+| OSL-013 | S4 | confirmed | [linux.rs:79](../../src/os/linux.rs#L79) | `unescape_mountinfo` is quadratic. | fixed: a peek |
+| OSL-014 | S4 | plausible | [linux.rs:59](../../src/os/linux.rs#L59) | eMMC boot partitions, md, mtdblock, zd listed as disks; Solaris `is_read_only` hard-coded. | deferred (plausible): extra rows, no wrong writes |
