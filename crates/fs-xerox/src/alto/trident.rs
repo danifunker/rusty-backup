@@ -160,10 +160,10 @@ pub fn read(bytes: &[u8]) -> Result<Disk, FilesystemError> {
 /// (the same placement [`read`] makes, last record wins), then sectors are read on demand.
 pub fn open_file(mut file: std::fs::File) -> Result<Disk, FilesystemError> {
     use std::io::{Read, Seek, SeekFrom};
-    let len = file.metadata().map_err(FilesystemError::Io)?.len() as usize;
+    let len = file.metadata().map_err(FilesystemError::Io)?.len();
     let (model, sectors_n) = match len {
-        T80_BYTES => (80u16, T80_SECTORS),
-        T300_BYTES => (300u16, T300_SECTORS),
+        n if n == T80_BYTES as u64 => (80u16, T80_SECTORS),
+        n if n == T300_BYTES as u64 => (300u16, T300_SECTORS),
         n => {
             return Err(FilesystemError::Parse(format!(
             "Trident pack: file is {n} bytes, expected {T80_BYTES} (T-80) or {T300_BYTES} (T-300)"
@@ -399,6 +399,12 @@ mod tests {
         let resident = backed.to_resident();
         assert!(!resident.is_file_backed());
         assert_eq!(resident.sectors.len(), T80_SECTORS);
+        // A pack whose file stops reading reports the failure instead of exporting zeros.
+        assert!(backed.check_reads().is_ok());
+        tmp.as_file().set_len(1024).unwrap();
+        let _ = backed.sector(T80_SECTORS - 1);
+        assert!(backed.check_reads().is_err());
+        assert!(crate::alto::write_pack(&backed, crate::alto::PackFormat::Trident).is_err());
     }
 
     #[test]

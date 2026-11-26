@@ -377,6 +377,8 @@ impl<'a> Bfs<'a> {
         }
 
         let repairable = errors.iter().any(|e| e.repairable);
+        // An I/O failure is reported as one, not as the broken chains its zeroed pages look like.
+        self.disk.check_reads()?;
         Ok(FsckResult {
             errors,
             warnings: Vec::new(),

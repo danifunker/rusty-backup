@@ -69,33 +69,31 @@ pub enum PackFormat {
 /// [`open_pack`] for a file: a Trident pack (76 or 289 MB) is read from the file on demand,
 /// every other container (a few MB at most) is read whole as before (MCM-024).
 pub fn open_pack_file(path: &std::path::Path) -> Result<Disk, FilesystemError> {
-    let file = std::fs::File::open(path).map_err(FilesystemError::Io)?;
-    let len = file.metadata().map_err(FilesystemError::Io)?.len() as usize;
-    let mut magic = [0u8; 16];
-    let got = std::io::Read::read(&mut &file, &mut magic).map_err(FilesystemError::Io)?;
-    let head = &magic[..got];
-    let other_magic = head.starts_with(pdi::MAGIC) || zdisk::is_zdisk(head);
-    if (len == trident::T80_BYTES || len == trident::T300_BYTES) && !other_magic {
+    let len = std::fs::metadata(path).map_err(FilesystemError::Io)?.len();
+    if is_trident_file(path, len) {
+        let file = std::fs::File::open(path).map_err(FilesystemError::Io)?;
         return trident::open_file(file);
     }
-    drop(file);
     open_pack(&std::fs::read(path).map_err(FilesystemError::Io)?)
+}
+
+/// A Trident-sized file that is not a PDI or a zdisk (64 KiB, as browse sniffs, lets a zlib
+/// stream yield its signature), in the order [`open_pack`] tries them.
+fn is_trident_file(path: &std::path::Path, len: u64) -> bool {
+    if len != trident::T80_BYTES as u64 && len != trident::T300_BYTES as u64 {
+        return false;
+    }
+    let mut head = Vec::new();
+    let read = std::fs::File::open(path).and_then(|f| {
+        std::io::Read::read_to_end(&mut std::io::Read::take(f, 64 * 1024), &mut head)
+    });
+    read.is_ok() && !head.starts_with(pdi::MAGIC) && !zdisk::is_zdisk(&head)
 }
 
 /// The [`PackFormat`] of the pack file at `path`, reading only what the choice needs.
 pub fn pack_format_of_file(path: &std::path::Path) -> PackFormat {
-    let len = std::fs::metadata(path)
-        .map(|m| m.len() as usize)
-        .unwrap_or(0);
-    let head = std::fs::File::open(path)
-        .and_then(|f| {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::Read::take(f, 16), &mut buf)?;
-            Ok(buf)
-        })
-        .unwrap_or_default();
-    let other_magic = head.starts_with(pdi::MAGIC) || zdisk::is_zdisk(&head);
-    match (len == trident::T80_BYTES || len == trident::T300_BYTES) && !other_magic {
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    match is_trident_file(path, len) {
         true => PackFormat::Trident,
         false => std::fs::read(path)
             .map(|b| pack_format(&b))
@@ -124,6 +122,12 @@ pub fn pack_format(bytes: &[u8]) -> PackFormat {
 
 /// Encode `disk` in `format`, for writing an edited pack back.
 pub fn write_pack(disk: &Disk, format: PackFormat) -> Result<Vec<u8>, FilesystemError> {
+    let bytes = write_pack_unchecked(disk, format)?;
+    disk.check_reads()?;
+    Ok(bytes)
+}
+
+fn write_pack_unchecked(disk: &Disk, format: PackFormat) -> Result<Vec<u8>, FilesystemError> {
     match format {
         PackFormat::Pdi => Ok(pdi::write(disk)),
         PackFormat::Salto => salto::write(disk),
@@ -506,6 +510,9 @@ pub struct Disk {
     /// The sectors of an in-memory pack; empty while the pack is file-backed.
     pub sectors: Vec<Sector>,
     backing: Option<Backing>,
+    /// The first failed read of a file-backed pack: a check, export or rebuild that read a
+    /// zeroed stand-in fails on it instead of reporting the blank page as data.
+    read_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Where a file-backed pack's sectors come from.
@@ -530,6 +537,7 @@ impl Disk {
             geometry,
             sectors,
             backing: None,
+            read_error: Default::default(),
         }
     }
 
@@ -547,6 +555,7 @@ impl Disk {
                 records: std::sync::Arc::new(records),
                 read,
             }),
+            read_error: Default::default(),
         }
     }
 
@@ -559,7 +568,7 @@ impl Disk {
     }
 
     /// The sector at virtual disk address `vda`, if in range: borrowed in memory, read from the file
-    /// otherwise (a read error reads as a zeroed page, which every caller already treats as unwritten).
+    /// otherwise. A failed read stands in as a zeroed page and is kept for [`Self::check_reads`].
     pub fn sector(&self, vda: usize) -> Option<std::borrow::Cow<'_, Sector>> {
         let Some(b) = &self.backing else {
             return self.sectors.get(vda).map(std::borrow::Cow::Borrowed);
@@ -575,9 +584,24 @@ impl Disk {
             return Some(std::borrow::Cow::Owned(zeroed()));
         }
         let mut file = b.file.lock().unwrap_or_else(|p| p.into_inner());
-        Some(std::borrow::Cow::Owned(
-            (b.read)(&mut file, rec).unwrap_or_else(|_| zeroed()),
-        ))
+        let sector = (b.read)(&mut file, rec).unwrap_or_else(|e| {
+            let mut err = self.read_error.lock().unwrap_or_else(|p| p.into_inner());
+            err.get_or_insert_with(|| format!("reading page {vda} of the pack: {e}"));
+            zeroed()
+        });
+        Some(std::borrow::Cow::Owned(sector))
+    }
+
+    /// `Err` once any read of this pack's file has failed, so results built on it are not trusted.
+    pub fn check_reads(&self) -> Result<(), FilesystemError> {
+        let err = self.read_error.lock().unwrap_or_else(|p| p.into_inner());
+        match err.as_ref() {
+            None => Ok(()),
+            Some(e) => Err(FilesystemError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.clone(),
+            ))),
+        }
     }
 
     /// Every sector in VDA order, read one at a time from a file-backed pack.
