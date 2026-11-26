@@ -1342,31 +1342,21 @@ pub fn reconstruct_raw_rdb_disk(
         if clone_emitted.contains(&p.dest_lba) {
             continue;
         }
-        if p.export_size == (p.copy_size).max(p.export_size).min(p.export_size)
-            && p.source_lba == p.dest_lba
-            && {
-                // size unchanged AND no offset change → nothing to fix
-                let orig_size = plan
-                    .partition_plans
-                    .iter()
-                    .find(|q| q.source_lba == p.source_lba)
-                    .map(|q| q.copy_size)
-                    .unwrap_or(p.copy_size);
-                orig_size == p.export_size
-            }
-        {
+        // Unchanged size at an unchanged place: nothing to fix. `copy_size` is
+        // min(original, export), so only `original_size` tells a shrink apart (RBF-004).
+        if p.original_size == p.export_size && p.source_lba == p.dest_lba {
             continue;
         }
         let part_offset = p.dest_lba * 512;
         let mut local_log = |m: &str| log_cb(&format!("  [{}] {m}", p.dos_type_string));
-        if let Err(e) =
-            crate::fs::resize_filesystem_for(writer, part_offset, p.export_size, &mut local_log)
-        {
-            log_cb(&format!(
-                "RDB export: resize for partition '{}' ({}) failed: {e}",
-                p.drv_name, p.dos_type_string
-            ));
-        }
+        // A volume left at its old size past a shrunk partition is corrupt: stop, as restore does.
+        crate::fs::resize_filesystem_for(writer, part_offset, p.export_size, &mut local_log)
+            .with_context(|| {
+                format!(
+                    "RDB export: resizing partition '{}' ({})",
+                    p.drv_name, p.dos_type_string
+                )
+            })?;
     }
 
     // --- 5. Pad to the declared target size. ---
