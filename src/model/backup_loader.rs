@@ -143,6 +143,8 @@ pub fn load_backup_metadata(folder: &Path) -> Result<BackupLoadOutcome> {
                         partition_table = Some(table);
                         true
                     }
+                    // A GPT backup's mbr.bin is the protective MBR alone, which can't parse (MSR-019).
+                    Err(_) if metadata.partition_table_type == "GPT" => false,
                     Err(e) => {
                         warnings.push(format!("Could not parse mbr.bin: {e}"));
                         false

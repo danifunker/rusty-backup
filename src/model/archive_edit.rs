@@ -152,18 +152,16 @@ pub fn start_compress(
             // Compute checksum of the temp file before compressing.
             let checksum_result = compute_file_checksum(&temp_path, &checksum_type);
 
-            let archive_base = archive_path.with_extension("");
             log::info!(
                 "Compressing {} -> {} (type={})",
                 temp_path.display(),
-                archive_base.display(),
+                archive_path.display(),
                 compression_type
             );
-            let result = compress_file_to_archive(
+            let result = compress_staged(
                 &temp_path,
-                &archive_base,
+                &archive_path,
                 &compression_type,
-                None,
                 &mut |bytes| {
                     if let Ok(mut p) = progress_thread.lock() {
                         p.current = bytes;
@@ -192,6 +190,11 @@ pub fn start_compress(
                         // Update metadata checksum (skip for standalone container
                         // files where metadata_path is empty).
                         if !metadata_path.as_os_str().is_empty() {
+                            // The old checksum against new data reads as corruption later (MCM-017).
+                            if let Err(e) = &checksum_result {
+                                p.error =
+                                    Some(format!("Saved archive but could not checksum it: {e}"));
+                            }
                             if let Ok(checksum) = checksum_result {
                                 if let Err(e) = backup_metadata::update_partition_checksum(
                                     &metadata_path,
@@ -313,6 +316,64 @@ pub fn extract_partition_sync(
     Ok(())
 }
 
+/// Compress `temp_path` to a staging name beside `archive_path`, renaming the result into place
+/// only once it is whole: writing the real name first destroyed the backup on a failure (MCM-001).
+fn compress_staged(
+    temp_path: &Path,
+    archive_path: &Path,
+    compression_type: &str,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<Vec<String>> {
+    let dir = archive_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let base = archive_path.with_extension("");
+    let stem = base
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let staging = format!(".{stem}-rbnew");
+    let clean = |dir: &Path| {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&staging) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    };
+    // The `.x` is what the codecs strip, so a dotted stem survives as `.stem-rbnew` (review).
+    let staged = compress_file_to_archive(
+        temp_path,
+        &dir.join(format!("{staging}.x")),
+        compression_type,
+        None,
+        progress_cb,
+        cancel_check,
+        log_cb,
+    );
+    let names = match staged {
+        Ok(n) => n,
+        Err(e) => {
+            clean(&dir);
+            return Err(e);
+        }
+    };
+    let mut finals = Vec::with_capacity(names.len());
+    for n in &names {
+        let fin = n.replacen(&staging, &stem, 1);
+        if let Err(e) = std::fs::rename(dir.join(n), dir.join(&fin)) {
+            clean(&dir);
+            return Err(e.into());
+        }
+        finals.push(fin);
+    }
+    Ok(finals)
+}
+
 /// Synchronous recompress of `temp_path` back into `ctx.archive_path`, plus the
 /// `metadata.json` checksum + file-list update (skipped when
 /// `ctx.metadata_path` is empty). Mirrors the body of [`start_compress`] minus
@@ -332,12 +393,10 @@ pub fn recompress_partition_sync(
     let checksum = compute_file_checksum(temp_path, &ctx.checksum_type)
         .map_err(|e| anyhow::anyhow!("computing {} checksum: {e}", ctx.checksum_type))?;
 
-    let archive_base = ctx.archive_path.with_extension("");
-    let new_files = compress_file_to_archive(
+    let new_files = compress_staged(
         temp_path,
-        &archive_base,
+        &ctx.archive_path,
         &ctx.compression_type,
-        None,
         progress_cb,
         cancel_check,
         log_cb,

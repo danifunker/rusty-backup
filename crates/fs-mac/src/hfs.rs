@@ -3872,6 +3872,19 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         type_code: &str,
         creator_code: &str,
     ) -> Result<(), FilesystemError> {
+        let (tc, cc) = (
+            hfs_common::encode_fourcc(type_code),
+            hfs_common::encode_fourcc(creator_code),
+        );
+        self.set_type_creator_raw(entry, tc, cc)
+    }
+
+    fn set_type_creator_raw(
+        &mut self,
+        entry: &FileEntry,
+        tc: [u8; 4],
+        cc: [u8; 4],
+    ) -> Result<(), FilesystemError> {
         let snap = self.snapshot();
         let result = (|| {
             let frec_start = self.locate_record_data(entry.location as u32)?;
@@ -3882,8 +3895,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             }
 
             // Write type at FInfo+0 (rec offset 4), creator at FInfo+4 (rec offset 8)
-            let tc = hfs_common::encode_fourcc(type_code);
-            let cc = hfs_common::encode_fourcc(creator_code);
             self.catalog_data[frec_start + 4..frec_start + 8].copy_from_slice(&tc);
             self.catalog_data[frec_start + 8..frec_start + 12].copy_from_slice(&cc);
 
@@ -5821,6 +5832,31 @@ mod tests {
 
         assert!(fe.type_code.is_some());
         assert_eq!(fe.type_code, Some(*b"TEXT"));
+    }
+
+    /// High-bit MacRoman codes survive as bytes; a `&str` path turned them into U+FFFD.
+    #[test]
+    fn high_bit_type_and_creator_codes_are_written_verbatim() {
+        let mut fs = HfsFilesystem::open(Cursor::new(make_editable_hfs_image()), 0).unwrap();
+        let root = fs.root().unwrap();
+        let fe = fs
+            .create_file(
+                &root,
+                "app",
+                &mut Cursor::new(b"x".as_slice()),
+                1,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let (tc, cc) = (*b"APPL", [0xC4, b'r', b'o', b'b']);
+        fs.set_type_creator_raw(&fe, tc, cc).unwrap();
+        let back = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "app")
+            .unwrap();
+        assert_eq!((back.type_code, back.creator_code), (Some(tc), Some(cc)));
     }
 
     /// Helper: run fsck on an HfsFilesystem and panic if any errors are found.

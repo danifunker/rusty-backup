@@ -111,6 +111,12 @@ impl Donor {
             .min()
             .unwrap_or(512)
             .max(512);
+        // The donor's table sets this; a first partition far out would ask for terabytes (MWR-010).
+        if head_len > disk_size.min(256 << 20) {
+            anyhow::bail!(
+                "the donor's first partition starts {head_len} bytes in, past what a head can hold"
+            );
+        }
         let mut head = vec![0u8; head_len as usize];
         r.seek(SeekFrom::Start(0))?;
         r.read_exact(&mut head)?;

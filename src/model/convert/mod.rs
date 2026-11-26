@@ -413,7 +413,9 @@ impl Sizing {
             Sizing::Minimum => minimum,
             Sizing::Extra(Extra::Mib(n)) => minimum.saturating_add(n as u64 * 1024 * 1024),
             Sizing::Extra(Extra::Percent(p)) => {
-                minimum.saturating_add(minimum / 100 * p as u64 + minimum % 100 * p as u64 / 100)
+                // Saturating: a large percentage overflowed the product (MJB-011).
+                let whole = (minimum / 100).saturating_mul(p as u64);
+                minimum.saturating_add(whole.saturating_add(minimum % 100 * p as u64 / 100))
             }
         };
         let limit = cap.map_or(original, |c| c.min(original)).max(minimum);

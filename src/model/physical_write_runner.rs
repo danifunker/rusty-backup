@@ -173,6 +173,14 @@ pub fn run_worker(
         }
     };
 
+    // The target is truncated before the source is read (MWR-001).
+    let PhysicalWriteSource::Image(src) = &req.source;
+    if crate::model::same_file(src, &req.target_device_path) {
+        anyhow::bail!(
+            "{} is the source image; choose another target",
+            src.display()
+        );
+    }
     // A partition write must leave the rest of the target intact.
     let open_target = if req.extent.is_whole_disk() {
         open_target_for_writing

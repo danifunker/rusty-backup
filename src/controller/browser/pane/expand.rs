@@ -386,7 +386,7 @@ impl BrowserPaneController {
     }
 
     /// The names already in `folder` (listed or staged), for name checks.
-    pub(super) fn names_in(&self, folder: &str) -> Vec<String> {
+    pub fn names_in(&self, folder: &str) -> Vec<String> {
         let listed: Vec<String> = if folder == self.listing.cwd_path() {
             self.listing
                 .entries()

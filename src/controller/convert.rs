@@ -902,7 +902,8 @@ impl ConvertController {
                         }
                         Err(e) => {
                             result.failed += 1;
-                            remove_partial(dest.as_path());
+                            // A refused output that is the source must not be "cleaned up" (MJB-001).
+                            remove_partial(dest.as_path(), &found.path);
                             say(LogLevel::Warning, format!("  Failed: {name}: {e:#}"));
                         }
                     }
@@ -947,13 +948,22 @@ impl ConvertController {
 }
 
 /// A failed output is removed, with a BIN/CUE's .bin.
-fn remove_partial(dest: &Path) {
-    let _ = std::fs::remove_file(dest);
+fn remove_partial(dest: &Path, source: &Path) {
+    let same = |a: &Path, b: &Path| {
+        a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+    };
+    let source_bin = source.with_extension("bin");
+    let mut doomed = vec![dest.to_path_buf()];
     if dest
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
     {
-        let _ = std::fs::remove_file(dest.with_extension("bin"));
+        doomed.push(dest.with_extension("bin"));
+    }
+    for p in doomed {
+        if !same(&p, source) && !same(&p, &source_bin) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 

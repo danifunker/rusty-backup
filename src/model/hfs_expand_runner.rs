@@ -296,6 +296,10 @@ fn run_expand(
             Ok((clone_report, None))
         }
         ExpandOutput::ApmDisk => {
+            // This truncates the output and then reads the source's drivers from it (MWR-003).
+            if crate::model::same_file(&source.source_path, &output_path) {
+                anyhow::bail!("the output is the source; write the APM disk to a new file");
+            }
             step("Writing new APM disk image...");
             let output_file = std::fs::OpenOptions::new()
                 .read(true)

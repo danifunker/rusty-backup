@@ -80,3 +80,9 @@ pub mod swab_runner;
 pub mod text_edit;
 pub mod volume_label_runner;
 pub mod worker;
+
+/// Whether two paths name one file, spelled alike or resolved: a runner that truncates its output
+/// first must refuse an output that is one of its inputs (MWR-001, MWR-003, MWR-005).
+pub fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+}

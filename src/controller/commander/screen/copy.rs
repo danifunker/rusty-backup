@@ -131,12 +131,17 @@ impl CommanderController {
         let Some(dest_addr) = self.pane(to).remote_addr() else {
             return "The remote connection is unavailable; reconnect first.".to_string();
         };
+        // The daemon's files go through the same review a local copy gets (MCM-002).
+        let existing = self.pane(to).names_in(&parent.path);
+        let forks = (!self.pane(from).is_host_pane()).then_some(self.export_fork_mode);
+        let conflicts = commander_ops::remote_copy_conflicts(&entries, &existing, forks);
         let dest_parent = parent.path;
         let job = if self.pane(from).is_host_pane() {
             HostCopyJob::HostToRemoteHost {
                 entries,
                 dest_addr,
                 dest_parent,
+                on_conflict: OnConflict::Fail,
             }
         } else if let Some(source) = self.pane(from).copy_stage_source() {
             HostCopyJob::ImageToRemoteHost {
@@ -145,16 +150,14 @@ impl CommanderController {
                 dest_addr,
                 dest_parent,
                 fork_mode: self.export_fork_mode,
+                on_conflict: OnConflict::Fail,
             }
         } else {
             return "Source volume is not open.".to_string();
         };
         let reads = self.reads(from);
         let where_to = format!("{} (remote) folder", to.label());
-        match self.spawn_host(job, Some(to), reads, where_to.clone()) {
-            Ok(()) => format!("Uploading to the {where_to}..."),
-            Err(e) => e,
-        }
+        self.start_host_copy(job, Some(to), conflicts, reads, where_to)
     }
 
     #[cfg(not(feature = "remote"))]

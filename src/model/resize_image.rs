@@ -557,9 +557,12 @@ pub fn run(req: &ResizeImageRequest, ctx: &JobCtx, shared: &SharedProgress) -> R
         None => Scratch(None),
     };
     let work_path = work.0.clone().unwrap_or_else(|| req.target().to_path_buf());
+    // A copy that refused to overwrite an existing file must not remove it on the way out (MWR-009).
+    let preexisting = req.copy_to.is_some() && req.target().exists();
     let mut rebuilt = Vec::new();
     for step in steps {
         if ctx.is_cancelled() {
+            settle_rebuilt(req, shared, &rebuilt);
             bail!("cancelled before \"{}\"", step.label());
         }
         set_state(shared, step, StepState::Running);
@@ -569,7 +572,11 @@ pub fn run(req: &ResizeImageRequest, ctx: &JobCtx, shared: &SharedProgress) -> R
             Err(e) => {
                 let msg = format!("{e:#}");
                 set_state(shared, step, StepState::Failed(msg.clone()));
-                if req.copy_to.is_some() && (layout.chd.is_none() || step == Step::Pack) {
+                settle_rebuilt(req, shared, &rebuilt);
+                if !preexisting
+                    && req.copy_to.is_some()
+                    && (layout.chd.is_none() || step == Step::Pack)
+                {
                     let _ = std::fs::remove_file(req.target());
                     line(
                         shared,
@@ -581,6 +588,29 @@ pub fn run(req: &ResizeImageRequest, ctx: &JobCtx, shared: &SharedProgress) -> R
         }
     }
     Ok(())
+}
+
+/// After a stopped run: a copy's rebuilt volumes go (the original is whole); in place they are
+/// the only copy of the volume, so they stay and are named.
+fn settle_rebuilt(
+    req: &ResizeImageRequest,
+    shared: &SharedProgress,
+    rebuilt: &[(usize, std::fs::File, PathBuf)],
+) {
+    for (index, _, path) in rebuilt {
+        if req.copy_to.is_some() {
+            let _ = std::fs::remove_file(path);
+        } else {
+            line(
+                shared,
+                &format!(
+                    "The rebuilt volume of partition {} is kept at {}.",
+                    index + 1,
+                    path.display()
+                ),
+            );
+        }
+    }
 }
 
 /// A file the run makes for itself, removed when the run ends.
@@ -612,7 +642,7 @@ fn run_step(
     target: &Path,
     ctx: &JobCtx,
     shared: &SharedProgress,
-    rebuilt: &mut Vec<(usize, std::fs::File)>,
+    rebuilt: &mut Vec<(usize, std::fs::File, PathBuf)>,
 ) -> Result<String> {
     let mut log = |m: &str| line(shared, m);
     match step {
@@ -630,16 +660,17 @@ fn run_step(
         }
         Step::Rebuild => {
             for &(index, block) in &req.rebuild {
-                let volume = rebuild_hfs(req, layout, target, index, block, &mut log)?;
-                rebuilt.push((index, volume));
+                let (volume, path) = rebuild_hfs(req, layout, target, index, block, &mut log)?;
+                rebuilt.push((index, volume, path));
             }
             Ok(format!("{} volume(s)", rebuilt.len()))
         }
         Step::Place => {
-            for (index, volume) in rebuilt.iter_mut() {
+            for (index, volume, path) in rebuilt.iter_mut() {
                 let plan = layout.plans.iter().find(|r| r.index == *index);
                 let start = plan.map_or(0, |r| r.new_start_lba * SECTOR);
                 place_volume(volume, target, start, ctx)?;
+                let _ = std::fs::remove_file(path);
                 log(&format!("Partition {}: rebuilt volume written", *index + 1));
             }
             Ok(format!("{} volume(s)", rebuilt.len()))
@@ -822,7 +853,7 @@ fn rebuild_hfs(
     index: usize,
     block: u32,
     log: &mut impl FnMut(&str),
-) -> Result<std::fs::File> {
+) -> Result<(std::fs::File, PathBuf)> {
     let part = req
         .partitions
         .iter()
@@ -837,15 +868,29 @@ fn rebuild_hfs(
     let mut fs = fs_mac::hfs::HfsFilesystem::open(source, part.byte_offset())
         .map_err(|e| anyhow::anyhow!("open the HFS volume: {e}"))?;
     let name = fs.volume_summary().volume_name;
-    let mut out = tempfile::tempfile_in(&layout.space.dir)?;
+    // Named and kept until placed: the old volume's head is zeroed below, so if a later step
+    // fails this file is the only copy of the volume (MWR-002).
+    let kept = scratch_path(req, layout, &format!("rebuilt-{}.hfs", index + 1));
+    let mut out = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&kept)
+        .with_context(|| format!("creating {}", kept.display()))?;
     log(&format!(
         "Partition {}: rebuilding \"{name}\" at {} with {} KiB blocks",
         index + 1,
         format_size(size),
         block / 1024
     ));
-    let (_, report) = fs_mac::hfs_clone::clone_hfs_at(&mut fs, &mut out, 0, size, block, &name)
-        .map_err(|e| anyhow::anyhow!("rebuild: {e}"))?;
+    let (_, report) =
+        match fs_mac::hfs_clone::clone_hfs_at(&mut fs, &mut out, 0, size, block, &name) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = std::fs::remove_file(&kept);
+                bail!("rebuild: {e}");
+            }
+        };
     for (path, why) in report.errors.iter().chain(report.skipped.iter()) {
         log(&format!("  {path}: {why}"));
     }
@@ -858,7 +903,7 @@ fn rebuild_hfs(
     let mut target = open_rw(work)?;
     target.seek(SeekFrom::Start(part.byte_offset()))?;
     target.write_all(&[0u8; 3 * SECTOR as usize])?;
-    Ok(out)
+    Ok((out, kept))
 }
 
 /// Stream a rebuilt volume into the image at `start`.

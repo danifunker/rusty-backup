@@ -52,17 +52,38 @@ pub fn resize_remote_partition(
 ) -> Result<RemoteResizeOutcome> {
     // One read-write reader serves both the table parse (reads) and the resize
     // (reads + writes). Dropping it sends CloseBlock, which syncs on the daemon.
-    let mut reader = RemoteBlockReader::open_rw(conn, path)?;
+    let mut reader = RemoteBlockReader::open_rw(Arc::clone(&conn), path)?;
 
     let ctx = resolve_partition_in_reader(&mut reader, partition)
         .map_err(|e| anyhow!("resolving the remote partition: {e:#}"))?;
 
+    // The in-place resizers have no bound but the size given: growing past the partition wrote
+    // into the next one, which the local verb refuses (MSR-001).
     if new_size_bytes > ctx.size {
-        log_cb(&format!(
-            "warning: requested size {new_size_bytes} bytes exceeds partition capacity \
-             {} bytes; the filesystem may refuse",
+        anyhow::bail!(
+            "{new_size_bytes} bytes is larger than the partition ({} bytes); grow the partition first",
             ctx.size
-        ));
+        );
+    }
+    // A shrink below the last allocated byte cut cluster chains and still said done (MSR-002).
+    if new_size_bytes < ctx.size {
+        let probe = RemoteBlockReader::open(conn, path)?;
+        let mut fs = crate::fs::open_filesystem(
+            probe,
+            ctx.offset,
+            ctx.type_byte,
+            ctx.type_string.as_deref(),
+        )
+        .map_err(|e| anyhow!("opening the filesystem to check what a shrink would cut: {e}"))?;
+        let floor = fs
+            .last_data_byte()
+            .map_err(|e| anyhow!("asking {} where its data ends: {e}", ctx.type_name))?;
+        if new_size_bytes < floor {
+            anyhow::bail!(
+                "refusing to shrink {} to {new_size_bytes} bytes: its data extends to {floor} bytes",
+                ctx.type_name
+            );
+        }
     }
 
     resize_filesystem_for(&mut reader, ctx.offset, new_size_bytes, log_cb)

@@ -542,6 +542,27 @@ pub trait EditableFilesystem: Filesystem {
         ))
     }
 
+    /// [`Self::set_type_creator`] with the raw `OSType` bytes, which may be high-bit MacRoman
+    /// a `&str` can't carry. The default takes the text path when both codes are ASCII.
+    fn set_type_creator_raw(
+        &mut self,
+        entry: &FileEntry,
+        type_code: [u8; 4],
+        creator_code: [u8; 4],
+    ) -> Result<(), FilesystemError> {
+        match (
+            std::str::from_utf8(&type_code),
+            std::str::from_utf8(&creator_code),
+        ) {
+            (Ok(t), Ok(c)) if type_code.is_ascii() && creator_code.is_ascii() => {
+                self.set_type_creator(entry, t, c)
+            }
+            _ => Err(FilesystemError::Unsupported(
+                "high-bit type/creator codes are not supported for this filesystem".into(),
+            )),
+        }
+    }
+
     /// Set ProDOS file type byte and aux type on an existing file.
     /// Default returns `Unsupported` — override on ProDOS.
     fn set_prodos_type(

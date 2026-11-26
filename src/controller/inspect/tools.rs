@@ -49,7 +49,7 @@ pub(super) struct ToolState {
     expand: Option<Job<u64>>,
     expand_chd: bool,
     repack: Option<Job<()>>,
-    pending_repack: Option<(u64, String)>,
+    pending_repack: Option<(u64, u64, String)>,
     swab: Option<Job<()>>,
     hfs_summary: Option<Job<Result<crate::model::hfs_expand_runner::ExpandSource, String>>>,
     /// The partition Expand HFS reads, named for its dialog.
@@ -979,7 +979,7 @@ impl InspectController {
             return Vec::new();
         }
         let label = part.type_name.clone();
-        self.tools.pending_repack = Some((part.byte_offset(), label.clone()));
+        self.tools.pending_repack = Some((part.byte_offset(), part.size_bytes, label.clone()));
         vec![Effect::Confirm(ConfirmSpec {
             purpose: purpose::DEFRAGMENT,
             title: "Defragment Human68k partition".into(),
@@ -994,7 +994,7 @@ impl InspectController {
     }
 
     pub(super) fn defragment_answered(&mut self, yes: bool) {
-        let Some((offset, _)) = self.tools.pending_repack.take() else {
+        let Some((offset, size, _)) = self.tools.pending_repack.take() else {
             return;
         };
         if !yes {
@@ -1010,7 +1010,7 @@ impl InspectController {
         let sink = Arc::clone(&self.log);
         self.tools.repack = Some(self.spawn("Defragmenting...", move |job| {
             job.set_can_cancel(false);
-            let status = crate::model::repack_runner::spawn(path, offset);
+            let status = crate::model::repack_runner::spawn(path, offset, size);
             let mut err = None;
             crate::model::worker::wait_spawned(job, &status, |s, ctx| {
                 drain(&sink, &mut s.log_messages);

@@ -49,6 +49,9 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "moof",
     "chd",
     "adf",
+    // Atari ST: MSA archives (decoded by `image_prep`) and the raw `.st` they produce (MJB-016).
+    "msa",
+    "st",
     "hdf",
     "adz",
     "hdz",
@@ -114,7 +117,7 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
 /// `.zip` holding a RAW disk image, but it must not become the system
 /// handler for *every* `.zip` the user double-clicks. Filtered out of
 /// [`association_exts`].
-pub const NON_ASSOCIATED_EXTS: &[&str] = &["zip", "gz", "xz"];
+pub const NON_ASSOCIATED_EXTS: &[&str] = &["zip", "gz", "xz", "st"];
 
 /// Extensions excluded from OS file-association registration **on macOS only**,
 /// because macOS itself owns the format. `.dmg` is Apple's disk-image type
@@ -241,6 +244,11 @@ mod tests {
         assert!(DISK_IMAGE_EXTS.contains(&"ssd"));
         assert!(DISK_IMAGE_EXTS.contains(&"dsd"));
         assert!(association_exts().contains(&"dsd".to_string()));
+    }
+
+    #[test]
+    fn atari_st_extensions_present() {
+        assert!(DISK_IMAGE_EXTS.contains(&"msa") && DISK_IMAGE_EXTS.contains(&"st"));
     }
 
     #[test]
