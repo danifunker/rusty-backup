@@ -664,7 +664,24 @@ impl<'a> PartitionSource<'a> {
     /// The bytes to write: the partition's imaged size, or the image file's length.
     pub fn data_size(&self) -> Option<u64> {
         match self {
-            PartitionSource::Image(path) => std::fs::metadata(path).ok().map(|m| m.len()),
+            // A VHD or 2MG holds a disk of another size than its file (MWR-006); header-only,
+            // as this is read each redraw.
+            PartitionSource::Image(path) => {
+                let open = || std::fs::File::open(path).ok();
+                let ext = path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_ascii_lowercase());
+                let headed = matches!(ext.as_deref(), Some("vhd" | "2mg" | "2img"));
+                let file_len = || std::fs::metadata(path).ok().map(|m| m.len());
+                if !headed {
+                    return file_len();
+                }
+                crate::rbformats::detect_image_format_with_path(open()?, Some(path))
+                    .ok()
+                    .and_then(|fmt| crate::rbformats::wrap_image_reader(open()?, fmt).ok())
+                    .map(|(_, size)| size)
+                    .or_else(file_len)
+            }
             PartitionSource::Backup { .. } => self.partition().map(|p| p.imaged_size_bytes),
         }
     }

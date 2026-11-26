@@ -611,7 +611,10 @@ fn walk(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> std::io::Result<
             continue;
         }
         if path.is_dir() {
-            if recursive {
+            // A linked folder is not followed: a link to an ancestor would loop forever (MJB-021).
+            let real =
+                matches!(std::fs::symlink_metadata(&path), Ok(m) if !m.file_type().is_symlink());
+            if recursive && real {
                 walk(path.as_path(), true, out)?;
             }
             continue;

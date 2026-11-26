@@ -55,10 +55,12 @@ impl OpticalTarget {
         if let Some(rref) = crate::remote::protocol::RemoteRef::parse(device) {
             let conn = crate::remote::connection::RemoteConnection::connect_shared(&rref.addr())
                 .with_context(|| format!("connecting to {}", rref.addr()))?;
-            return Ok(OpticalTarget::Remote {
-                conn,
-                device_path: rref.path,
-            });
+            // A Windows device (`\\.\CdRom0`) rides after a `/` separator; drop it again.
+            let device_path = match rref.path.strip_prefix('/') {
+                Some(win) if win.starts_with('\\') => win.to_string(),
+                _ => rref.path,
+            };
+            return Ok(OpticalTarget::Remote { conn, device_path });
         }
         #[cfg(not(feature = "remote"))]
         if device.starts_with("rb://") || device.starts_with("rb:/") {
@@ -77,9 +79,17 @@ impl OpticalTarget {
                     .lock()
                     .map(|c| c.addr().to_string())
                     .unwrap_or_default();
-                format!("rb://{addr}{device_path}")
+                remote_device_url(&addr, device_path)
             }
         }
+    }
+}
+
+/// `rb://host:port/dev/sr0`, with a `/` before a Windows device path so the URL still parses (MSR-018).
+pub fn remote_device_url(addr: &str, device_path: &str) -> String {
+    match device_path.starts_with('/') {
+        true => format!("rb://{addr}{device_path}"),
+        false => format!("rb://{addr}/{device_path}"),
     }
 }
 

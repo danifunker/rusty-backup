@@ -41,6 +41,11 @@ pub fn spawn(input: PathBuf, output: Option<PathBuf>) -> Arc<Mutex<SwabStatus>> 
         };
 
         let result = match &output {
+            // Creating the output first would truncate the input it names (MWR-015).
+            Some(o) if crate::model::same_file(&input, o) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the output is the input; leave the output empty to swap in place",
+            )),
             Some(o) => swab::swab16_file(&input, o, &mut progress),
             None => swab::swab16_file_in_place(&input, &mut progress),
         };

@@ -56,6 +56,8 @@ pub fn register_file_associations() -> io::Result<()> {
         let (key, _) = classes.create_subkey(format!(".{ext}\\OpenWithProgids"))?;
         key.set_value(id, &String::new())?;
     }
+    // An older build listed us under extensions we no longer claim (`.iso`, `.bin`); drop those.
+    drop_markers(&classes, id, crate::model::file_types::NON_ASSOCIATED_EXTS);
 
     Ok(())
 }
@@ -68,14 +70,22 @@ pub fn unregister_file_associations() -> io::Result<()> {
     let (id, _) = gui.progid();
     let _ = classes.delete_subkey_all(id);
     let _ = classes.delete_subkey_all(format!("Applications\\{}", gui.exe_name()));
-    for ext in association_exts() {
-        if let Ok(key) =
-            classes.open_subkey_with_flags(format!(".{ext}\\OpenWithProgids"), KEY_WRITE)
-        {
+    // Every extension we ever offered, so markers from older builds go too.
+    let all: Vec<String> = crate::model::file_types::DISK_IMAGE_EXTS
+        .iter()
+        .map(|e| e.to_ascii_lowercase())
+        .collect();
+    drop_markers(&classes, id, &all);
+    Ok(())
+}
+
+fn drop_markers<S: AsRef<str>>(classes: &RegKey, id: &str, exts: &[S]) {
+    for ext in exts {
+        let path = format!(".{}\\OpenWithProgids", ext.as_ref());
+        if let Ok(key) = classes.open_subkey_with_flags(path, KEY_WRITE) {
             let _ = key.delete_value(id);
         }
     }
-    Ok(())
 }
 
 /// Launch hooks for an installed GUI, run before any window: the installer's and uninstaller's

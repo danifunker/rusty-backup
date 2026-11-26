@@ -238,8 +238,10 @@ pub fn rip_to_chd(
     use crate::optical::{convert, rip};
 
     let parent = chd_path.parent().unwrap_or_else(|| Path::new("."));
-    let temp_cue = parent.join(".rusty-backup-rip-temp.cue");
-    let temp_bin = parent.join(".rusty-backup-rip-temp.bin");
+    // Named after the CHD, so two rips into one folder don't share a temp (MSR-011).
+    let stem = chd_path.file_stem().unwrap_or_default().to_string_lossy();
+    let temp_cue = parent.join(format!(".{stem}-rbrip.cue"));
+    let temp_bin = temp_cue.with_extension("bin");
 
     let rip_config = RipConfig {
         device: target,

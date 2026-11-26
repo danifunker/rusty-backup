@@ -181,7 +181,7 @@ pub fn prepare_disk_image_path_reporting(
         progress,
         cancel,
     };
-    let mut decoder = flate2::read::GzDecoder::new(counted);
+    let mut decoder = crate::model::source_reader::gz_members(counted);
     let mut out = std::fs::File::create(&out_path)?;
     std::io::copy(&mut decoder, &mut out)?;
     out.sync_all()?;
