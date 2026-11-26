@@ -117,7 +117,8 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
 /// `.zip` holding a RAW disk image, but it must not become the system
 /// handler for *every* `.zip` the user double-clicks. Filtered out of
 /// [`association_exts`].
-pub const NON_ASSOCIATED_EXTS: &[&str] = &["zip", "gz", "xz", "st"];
+// `.iso` and `.bin` belong to the OS disc mounter and to every firmware dump (MJB-018).
+pub const NON_ASSOCIATED_EXTS: &[&str] = &["zip", "gz", "xz", "st", "iso", "bin"];
 
 /// Extensions excluded from OS file-association registration **on macOS only**,
 /// because macOS itself owns the format. `.dmg` is Apple's disk-image type

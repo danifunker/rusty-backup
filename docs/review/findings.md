@@ -975,11 +975,11 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | MCM-004 | S1 | confirmed | [commander_ops.rs:1286](../../src/model/commander_ops.rs#L1286) | Host-to-host conflict check follows symlinks; a dangling link reads as no conflict and the copy writes through it. | fixed: the check uses `symlink_metadata`, and Replace removes the link rather than writing through it |
 | MCM-005 | S1 | plausible | [archive_import.rs:221](../../src/model/archive_import.rs#L221) | A failed tar import returns without `sync_metadata`, leaving cached bitmap/directory state unwritten. | fixed: a failed import syncs and commits what landed and says so |
 | MCM-006 | S2 | confirmed | [edit_queue.rs:385](../../src/model/edit_queue.rs#L385) | Staged SetTypeCreator goes through `from_utf8_lossy`; high-bit OSTypes become U+FFFD. | fixed: `disk-core` 0.3.3 adds `set_type_creator_raw` (ASCII default delegates to the text method); HFS, HFS+ and MFS write the bytes verbatim (`fs-mac` 0.2.2); the edit queue applies through it; test `high_bit_type_and_creator_codes_are_written_verbatim` |
-| MCM-007 | S2 | plausible | [commander_ops.rs:1595](../../src/model/commander_ops.rs#L1595) | Remote directory paths are built from unsanitized image folder names (`..`, `/`). | deferred (plausible): needs a failing case first |
+| MCM-007 | S2 | fixed | [commander_ops.rs:1595](../../src/model/commander_ops.rs#L1595) | Remote directory paths are built from unsanitized image folder names (`..`, `/`). | image folder names are host-sanitized before the remote mkdir |
 | MCM-008 | S2 | plausible | [edit_queue.rs:361](../../src/model/edit_queue.rs#L361) | Delete and metadata edits use the entry captured at staging; after an earlier Replace it is stale. | deferred (plausible): needs a failing case first |
 | MCM-009 | S2 | plausible | [dir_listing.rs:485](../../src/model/dir_listing.rs#L485) | Selection is by name, so duplicate names select and act on every match. | deferred (plausible): needs a failing case first |
-| MCM-010 | S2 | plausible | [multi_volume_fs.rs:191](../../src/model/multi_volume_fs.rs#L191) | A malformed path lists the adapter root, which walkers re-enter forever. | deferred (plausible): needs a failing case first |
-| MCM-011 | S2 | plausible | [commander_ops.rs:633](../../src/model/commander_ops.rs#L633) | Image walkers recurse with no depth cap. | deferred (plausible): needs a failing case first |
+| MCM-010 | S2 | fixed | [multi_volume_fs.rs:191](../../src/model/multi_volume_fs.rs#L191) | A malformed path lists the adapter root, which walkers re-enter forever. | a malformed path is NotFound, not the adapter root |
+| MCM-011 | S2 | fixed | [commander_ops.rs:633](../../src/model/commander_ops.rs#L633) | Image walkers recurse with no depth cap. | walkers, the remote upload included, stop past 256 folders deep |
 | MCM-012 | S2 | fixed | [mac_archive_read.rs:83](../../src/model/mac_archive_read.rs#L83) | Opening a file as an archive reads it whole (and clones it). | archives over `DECODE_MAX` (512 MiB) are refused before the whole read |
 | MCM-013 | S2 | fixed | [archive_import.rs:56](../../src/model/archive_import.rs#L56) | Mac-archive extensions skip the `INLINE_MAX` guard. | a named archive over `DECODE_MAX` is staged as a plain file |
 | MCM-014 | S2 | confirmed | [extract.rs:175](../../src/model/extract.rs#L175) | `Plan::run` handles only Skip; Fail overwrites files created since the pre-check. | fixed: a Fail run with conflicts stops before writing; Skip reaches the exporter for merged folders |
@@ -1008,15 +1008,15 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | MSR-007 | S2 | fixed | [inspect_runner.rs:253](../../src/model/inspect_runner.rs#L253) | Every probe re-decodes a streaming container. | probes share one decoder; each handle seeks to its own position |
 | MSR-008 | S2 | fixed | [chd_edit_open.rs:37](../../src/model/chd_edit_open.rs#L37) | A crash mid-copy leaves a truncated `.chd_backup` that the next edit trusts. | backup copies go through a `.part` name, size-checked, then renamed |
 | MSR-009 | S2 | fixed | [cache_runner.rs:76](../../src/model/cache_runner.rs#L76) | Cancel leaves the scan thread running; a reopen starts a second one. | dsk-clonezilla 0.2.2 `scan_metadata_cancellable`; a cancel stops the scan and waits for it |
-| MSR-010 | S2 | plausible | [cache_runner.rs:112](../../src/model/cache_runner.rs#L112) | The seekable cache is written in place and may swallow a late write error. | deferred (plausible): needs a failing case first |
-| MSR-011 | S2 | plausible | [optical_ops.rs:241](../../src/model/optical_ops.rs#L241) | CHD rips stage to fixed names, so two rips into one folder collide. | deferred (plausible): needs a failing case first |
-| MSR-012 | S2 | plausible | [source_reader.rs:1178](../../src/model/source_reader.rs#L1178) | Single-member gzip decoders read only the first member of a multi-member file. | deferred (plausible): needs a failing case first |
+| MSR-010 | S2 | fixed | [cache_runner.rs:112](../../src/model/cache_runner.rs#L112) | The seekable cache is written in place and may swallow a late write error. | the cache is built under `.part`, synced, then renamed |
+| MSR-011 | S2 | fixed | [optical_ops.rs:241](../../src/model/optical_ops.rs#L241) | CHD rips stage to fixed names, so two rips into one folder collide. | rip temps are named after the CHD |
+| MSR-012 | S2 | fixed | [source_reader.rs:1178](../../src/model/source_reader.rs#L1178) | Single-member gzip decoders read only the first member of a multi-member file. | `source_reader::gz_members` reads every member and stops at trailing padding |
 | MSR-013 | S3 | fixed | [source_reader.rs:1232](../../src/model/source_reader.rs#L1232) | Model imports from `crate::cli`. | `looks_like_device_path` moved to `os`; the CLI re-exports it |
 | MSR-014 | S3 | confirmed | [source_reader.rs:1033](../../src/model/source_reader.rs#L1033) | `eprintln!` in model code. | fixed: `log::warn!` |
 | MSR-015 | S3 | fixed | [image_prep.rs:181](../../src/model/image_prep.rs#L181) | The `.hdz` gunzip can't be cancelled. | the gunzip checks the job's cancel per read |
 | MSR-016 | S3 | fixed | [cd_build.rs:239](../../src/model/cd_build.rs#L239) | SGI/HFS CD layouts truncate the output before validating. | the blank disc is written to `.rbpart` and renamed only when whole |
-| MSR-017 | S3 | plausible | [restore_remote.rs:61](../../src/model/restore_remote.rs#L61) | Remote restore stages to the system temp dir (tmpfs) unchecked. | deferred (plausible): needs a failing case first |
-| MSR-018 | S3 | plausible | [optical_devices.rs:66](../../src/model/optical_devices.rs#L66) | `rb://` device args miss a separator for Windows paths. | deferred (plausible): needs a failing case first |
+| MSR-017 | S3 | fixed | [restore_remote.rs:61](../../src/model/restore_remote.rs#L61) | Remote restore stages to the system temp dir (tmpfs) unchecked. | free space is checked against the backup's imaged data (the stage is sparse) |
+| MSR-018 | S3 | fixed | [optical_devices.rs:66](../../src/model/optical_devices.rs#L66) | `rb://` device args miss a separator for Windows paths. | `remote_device_url` puts a `/` before a Windows device; `resolve` drops it again |
 | MSR-019 | S4 | confirmed | [backup_loader.rs:146](../../src/model/backup_loader.rs#L146) | Every GPT backup logs "Could not parse mbr.bin". | fixed: a GPT backup's protective-MBR parse failure is not reported |
 | MSR-020 | S4 | confirmed | [checksum.rs:188](../../src/model/checksum.rs#L188) | `checksum::spawn` is dead; `hash_reader` aborts on Interrupted. | deferred (refactor pass) |
 
@@ -1029,7 +1029,7 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | MWR-003 | S1 | confirmed | [hfs_expand_runner.rs:300](../../src/model/hfs_expand_runner.rs#L300) | APM output truncates before the source is reopened; output = source destroys it. | fixed: refused |
 | MWR-004 | S1 | confirmed | [repack_runner.rs:68](../../src/model/repack_runner.rs#L68) | The Human68k defragment writes the BPB's size, unbounded by the partition. | fixed: the partition size is passed and enforced |
 | MWR-005 | S1 | plausible | [provision_runner.rs:842](../../src/model/provision_runner.rs#L842) | A file target is truncated before its sources or donor are read; no same-file check. | fixed: refused |
-| MWR-006 | S1 | plausible | [restore_plan.rs:667](../../src/model/restore_plan.rs#L667) | A new disk is sized from a container's file length, not its decoded length. | deferred (plausible): needs a failing case first |
+| MWR-006 | S1 | fixed | [restore_plan.rs:667](../../src/model/restore_plan.rs#L667) | A new disk is sized from a container's file length, not its decoded length. | a VHD / 2MG source is sized from its header; other files by length |
 | MWR-007 | S1 | plausible | [resize_image.rs:663](../../src/model/resize_image.rs#L663) | In-place `apply_resize` has no rollback on an I/O error mid-move. | deferred (plausible): needs a failing case first |
 | MWR-008 | S2 | fixed | [resize_image.rs:782](../../src/model/resize_image.rs#L782) | CHD copy packs to a stripped-extension sibling that may clobber another file. | a copy packs to a hidden `.NAME.resize-pack` and renames onto the target |
 | MWR-009 | S2 | plausible | [resize_image.rs:572](../../src/model/resize_image.rs#L572) | A failed Copy step removes a pre-existing target. | fixed: a target that existed before the run is never removed |
@@ -1038,11 +1038,11 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | MWR-012 | S2 | confirmed | [export_runner.rs:857](../../src/model/export_runner.rs#L857) | Per-partition export reads at `start_lba*512`, not `byte_offset()`. | fixed for the raw export (`byte_offset`); the HFV branch and HFS-ceiling probe still read at `start_lba*512` |
 | MWR-013 | S2 | fixed | [partition_editor.rs:419](../../src/model/partition_editor.rs#L419) | A pending row's edited size isn't what is written. | a new row's size field is parsed and written |
 | MWR-014 | S2 | fixed | [disk_write_plan.rs:228](../../src/model/disk_write_plan.rs#L228) | Hidden sectors read from the raw container file. | hidden sectors read through `open_peeled_read_with_entry` |
-| MWR-015 | S2 | plausible | [swab_runner.rs:44](../../src/model/swab_runner.rs#L44) | No canonical same-file check before `File::create(dst)`. | deferred (plausible): needs a failing case first |
+| MWR-015 | S2 | fixed | [swab_runner.rs:44](../../src/model/swab_runner.rs#L44) | No canonical same-file check before `File::create(dst)`. | an output that is the input is refused before it is created |
 | MWR-016 | S2 | confirmed | [chd_expand_runner.rs:63](../../src/model/chd_expand_runner.rs#L63) | `old_logical + add_bytes` unchecked. | fixed: checked |
 | MWR-017 | S3 | fixed | [partition_editor.rs:411](../../src/model/partition_editor.rs#L411) | An unparseable MBR type on a new row becomes 0x83 silently. | an unparseable MBR type on a new row is an error |
 | MWR-018 | S3 | fixed | [provision_runner.rs:792](../../src/model/provision_runner.rs#L792) | A failed partitioned build leaves its half-built image. | a failed build removes the image it created or truncated |
-| MWR-019 | S3 | plausible | [alto_resize.rs:65](../../src/model/alto_resize.rs#L65) | Files are read whole before validation. | deferred (plausible): needs a failing case first |
+| MWR-019 | S3 | fixed | [alto_resize.rs:65](../../src/model/alto_resize.rs#L65) | Files are read whole before validation. | a file over 512 MiB (past a Trident T-300) is refused before it is read |
 | MWR-020 | S4 | confirmed | [physical_write_runner.rs:100](../../src/model/physical_write_runner.rs#L100) | `target_size_bytes` is never read. | deferred (refactor pass) |
 | MWR-021 | S4 | confirmed | [export_runner.rs:954](../../src/model/export_runner.rs#L954) | A doc comment merged into its neighbour's. | deferred (refactor pass) |
 | MWR-022 | S4 | confirmed | [hfs_expand_runner.rs:121](../../src/model/hfs_expand_runner.rs#L121) | `lock().expect` on a status mutex. | deferred (refactor pass) |
@@ -1059,17 +1059,17 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | MJB-006 | S2 | fixed | [classify.rs:110](../../src/model/convert/classify.rs#L110) | Kind decided by size alone; a small hard disk is a floppy. | a floppy-sized image with an MBR / GPT / RDB / APM table is a hard disk |
 | MJB-007 | S2 | fixed | [classify.rs:233](../../src/model/convert/classify.rs#L233) | gzip ISIZE is modulo 4 GiB. | under 4 MiB the trailer is exact; a larger gzip is counted by decoding |
 | MJB-008 | S2 | fixed | [verify.rs:205](../../src/model/convert/verify.rs#L205) | Disc verify passes when nothing was compared. | nothing compared (no filesystem, no files) reports Not verified |
-| MJB-009 | S2 | plausible | [verify.rs:138](../../src/model/convert/verify.rs#L138) | Volume verify skips unopenable partitions and compares names only. | deferred (plausible): needs a failing case first |
+| MJB-009 | S2 | fixed | [verify.rs:138](../../src/model/convert/verify.rs#L138) | Volume verify skips unopenable partitions and compares names only. | contents compared by CRC-32 where readable, cancellable per file; unreadable partitions are reported |
 | MJB-010 | S2 | fixed | [job.rs:245](../../src/model/job.rs#L245) | Rate and ETA freeze during a stall. | snapshots re-read the rate as of now (`rate_as_of`) |
 | MJB-011 | S2 | confirmed | [mod.rs:416](../../src/model/convert/mod.rs#L416) | `minimum / 100 * p` unchecked. | fixed: saturating |
-| MJB-012 | S2 | plausible | [disk_tree.rs:53](../../src/model/disk_tree.rs#L53) | One unresolvable position fails the whole tree. | deferred (plausible): needs a failing case first |
+| MJB-012 | S2 | fixed | [disk_tree.rs:53](../../src/model/disk_tree.rs#L53) | One unresolvable position fails the whole tree. | an unresolvable position is reported on its row |
 | MJB-013 | S3 | partly fixed | [disk_tree.rs:9](../../src/model/disk_tree.rs#L9) | Model imports `crate::cli` and logs to stderr. | the stderr print is a `log::warn!`; the `cli::resolve` imports remain (a larger move) |
 | MJB-014 | S3 | fixed | [min_size_runner.rs:104](../../src/model/min_size_runner.rs#L104) | Raw `thread::spawn` instead of a Job; poison leaves it unfinished. | `spawn_guarded`, and every status lock survives poison |
-| MJB-015 | S3 | plausible | [job.rs:298](../../src/model/job.rs#L298) | `ask` spins forever if the Job handle is dropped without cancel. | deferred (plausible): needs a failing case first |
+| MJB-015 | S3 | fixed | [job.rs:298](../../src/model/job.rs#L298) | `ask` spins forever if the Job handle is dropped without cancel. | `ask` gives up once no `Job` handle is left |
 | MJB-016 | S4 | confirmed | [file_types.rs:25](../../src/model/file_types.rs#L25) | `DISK_IMAGE_EXTS` lacks `msa` and `st`. | fixed: `msa` and `st` added with a regression test |
 | MJB-017 | S4 | confirmed | [classify.rs:67](../../src/model/convert/classify.rs#L67) | A third extension list drifting from the others. | deferred (refactor pass) |
-| MJB-018 | S4 | plausible | [file_types.rs:123](../../src/model/file_types.rs#L123) | `.iso`/`.bin` registered as associations. | deferred (plausible): needs a failing case first |
-| MJB-019 | S4 | plausible | [disk_tree.rs:160](../../src/model/disk_tree.rs#L160) | Remote tree omits LVM rows. | deferred (plausible): needs a failing case first |
+| MJB-018 | S4 | fixed | [file_types.rs:123](../../src/model/file_types.rs#L123) | `.iso`/`.bin` registered as associations. | `.iso` and `.bin` are not associations (Windows, AppKit plist); unregister clears every old marker |
+| MJB-019 | S4 | fixed | [disk_tree.rs:160](../../src/model/disk_tree.rs#L160) | Remote tree omits LVM rows. | the remote count includes LVM volumes |
 | MJB-020 | S4 | confirmed | [run.rs:536](../../src/model/convert/run.rs#L536) | HFS ceiling probed through container bytes. | deferred (refactor pass) |
-| MJB-021 | S4 | plausible | [mod.rs:611](../../src/model/convert/mod.rs#L611) | Folder walk follows symlink loops. | deferred (plausible): needs a failing case first |
+| MJB-021 | S4 | fixed | [mod.rs:611](../../src/model/convert/mod.rs#L611) | Folder walk follows symlink loops. | linked folders are not followed |
 | MJB-022 | S4 | confirmed | [classify.rs:151](../../src/model/convert/classify.rs#L151) | The text size gate is dead. | deferred (refactor pass) |

@@ -240,6 +240,11 @@ impl Filesystem for MultiVolumeFilesystem {
 
     fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
         match split_volume(&entry.path) {
+            // Anything else malformed is an error, not the root again, which walkers re-enter (MCM-010).
+            None if entry.path != "/" => Err(FilesystemError::NotFound(format!(
+                "no volume path {}",
+                entry.path
+            ))),
             // The adapter root: one directory per volume, in enumeration order.
             None => Ok(self
                 .volumes

@@ -38,7 +38,13 @@ src, out, name, version = sys.argv[1:5]
 text = open(src, encoding="utf-8").read()
 body = text.split("pub const DISK_IMAGE_EXTS: &[&str] = &[", 1)[1].split("];", 1)[0]
 body = "\n".join(l.split("//", 1)[0] for l in body.splitlines())
-exts = sorted({e.lower() for e in re.findall(r'"([^"]+)"', body)})
+def consts(name):
+    b = text.split(f"pub const {name}: &[&str] = &[", 1)[1].split("];", 1)[0]
+    b = "\n".join(l.split("//", 1)[0] for l in b.splitlines())
+    return {e.lower() for e in re.findall(r'"([^"]+)"', b)}
+# Same rule as association_exts(): never claim what the OS or every other tool owns.
+skip = consts("NON_ASSOCIATED_EXTS") | {"dmg", "sparseimage"}
+exts = sorted({e.lower() for e in re.findall(r'"([^"]+)"', body)} - skip)
 plist = {
     "CFBundleName": name,
     "CFBundleDisplayName": name,

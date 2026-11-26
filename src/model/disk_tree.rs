@@ -50,9 +50,15 @@ pub fn trees(
     if selector.is_some() || count == 0 {
         return Ok(vec![one(path, selector, opts)?]);
     }
-    (1..=count as u32)
-        .map(|n| one(path, Some(PartSelector::Position(n)), opts))
-        .collect()
+    // One position that won't resolve is reported on its row, not fatal to the rest (MJB-012).
+    Ok((1..=count as u32)
+        .map(|n| {
+            one(path, Some(PartSelector::Position(n)), opts).unwrap_or_else(|e| VolumeTree {
+                label: format!("Partition @{n}"),
+                tree: Err(format!("{e:#}")),
+            })
+        })
+        .collect())
 }
 
 /// How many partitions `@N` numbers on this disk; 0 for a bare volume.
@@ -156,11 +162,16 @@ fn remote_trees(
         Some(sel) => vec![Some(sel)],
         None => {
             let mut reader = RemoteBlockReader::open(std::sync::Arc::clone(&conn), &r.path)?;
-            match crate::partition::PartitionTable::detect(&mut reader) {
-                Ok(t) if !t.partitions().is_empty() => (1..=t.partitions().len() as u32)
+            // LVM logical volumes number after the table's rows, as the local listing has (MJB-019).
+            let count = match crate::partition::PartitionTable::detect(&mut reader) {
+                Ok(t) => crate::partition::partitions_with_volumes(&mut reader, &t).len(),
+                Err(_) => 0,
+            };
+            match count {
+                0 => vec![None],
+                n => (1..=n as u32)
                     .map(|n| Some(PartSelector::Position(n)))
                     .collect(),
-                _ => vec![None],
             }
         }
     };

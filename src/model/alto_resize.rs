@@ -50,6 +50,22 @@ impl AltoTarget {
     }
 }
 
+/// A Trident T-300 pack is about 289 MB; anything past this is no pack, refused before the read (MWR-019).
+const MAX_PACK_BYTES: u64 = 512 * 1024 * 1024;
+
+fn read_pack(path: &Path) -> Result<Vec<u8>, String> {
+    let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if len > MAX_PACK_BYTES {
+        return Err(format!(
+            "{} is {} MiB; an Alto disk pack is at most {} MiB",
+            path.display(),
+            len >> 20,
+            MAX_PACK_BYTES >> 20
+        ));
+    }
+    std::fs::read(path).map_err(|e| e.to_string())
+}
+
 /// What the dialog shows about the source pack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AltoSummary {
@@ -62,7 +78,7 @@ pub struct AltoSummary {
 
 /// Read the pack's geometry and used-page count.
 pub fn summarize(path: &Path) -> Result<AltoSummary, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let bytes = read_pack(path)?;
     let disk = open_pack(bytes.as_slice()).map_err(|e| format!("{e}"))?;
     let g = &disk.geometry;
     let total = g.total_sectors();
@@ -87,7 +103,7 @@ pub fn summarize(path: &Path) -> Result<AltoSummary, String> {
 
 /// Clone the pack at `source` onto `target` and write it to `out` as a PDI; "Saved ... (N pages).".
 pub fn resize_to(source: &Path, target: AltoTarget, out: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(source).map_err(|e| e.to_string())?;
+    let bytes = read_pack(source)?;
     let src = open_pack(bytes.as_slice()).map_err(|e| format!("{e}"))?;
     let resized = write::clone_to(&src, target.geometry()).map_err(|e| format!("{e}"))?;
     std::fs::write(out, pdi::write(&resized)).map_err(|e| e.to_string())?;

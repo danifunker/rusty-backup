@@ -613,6 +613,7 @@ fn scan_image_entries_stage(
     let mut bytes = 0u64;
     for entry in entries {
         if entry.is_directory() {
+            too_deep(entry)?;
             let children = fs
                 .list_directory(entry)
                 .with_context(|| format!("listing '{}' for scan", entry.name))?;
@@ -644,6 +645,7 @@ fn stage_copy_into(
         }
         match entry.entry_type {
             EntryType::Directory => {
+                too_deep(entry)?;
                 edits.push(StagedEdit::CreateDirectory {
                     parent: dest_parent.clone(),
                     name: entry.name.clone(),
@@ -1362,11 +1364,24 @@ fn cancelled_err() -> anyhow::Error {
 
 /// Recursively tally `entries`' file count + byte count on the source
 /// filesystem, so the modal can render a meaningful percentage.
+/// Folders that loop back on themselves nest without end; stop past any real tree (MCM-011).
+fn too_deep(entry: &FileEntry) -> Result<()> {
+    const MAX_DEPTH: usize = 256;
+    if entry.path.split('/').filter(|c| !c.is_empty()).count() > MAX_DEPTH {
+        anyhow::bail!(
+            "'{}' is nested over {MAX_DEPTH} folders deep; the image may be corrupt",
+            entry.name
+        );
+    }
+    Ok(())
+}
+
 fn scan_image_entries(fs: &mut dyn Filesystem, entries: &[FileEntry]) -> Result<(usize, u64)> {
     let mut files = 0usize;
     let mut bytes = 0u64;
     for entry in entries {
         if entry.is_directory() {
+            too_deep(entry)?;
             let children = fs
                 .list_directory(entry)
                 .with_context(|| format!("listing '{}'", entry.name))?;
@@ -1647,7 +1662,10 @@ fn upload_image_entries_to_remote_host(
             return Err(cancelled_err());
         }
         if entry.is_directory() {
-            let sub = join_remote(dest_parent, &entry.name);
+            too_deep(entry)?;
+            // An image folder named `..` or holding `/` must not reach outside `dest_parent` (MCM-007).
+            let name = fs_mac::resource_fork::sanitize_filename(&entry.name);
+            let sub = join_remote(dest_parent, &name);
             conn.mkdir_host(&sub)
                 .with_context(|| format!("creating remote directory '{}'", entry.name))?;
             let children = fs

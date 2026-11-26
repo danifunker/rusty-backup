@@ -206,6 +206,8 @@ struct Shared<R> {
     state: Mutex<State<R>>,
     cancel: Arc<AtomicBool>,
     notify: Arc<dyn Notify>,
+    /// Live `Job` handles; with none, nobody can answer a question (MJB-015).
+    handles: AtomicUsize,
 }
 
 impl<R> Shared<R> {
@@ -299,7 +301,8 @@ impl<R: Send> CtxTarget for Shared<R> {
             {
                 let mut st = lock_status(&self.state);
                 let answered = st.answer.filter(|(a, _)| *a == id).map(|(_, c)| c);
-                let cancelled = self.cancel.load(Ordering::Relaxed);
+                let cancelled = self.cancel.load(Ordering::Relaxed)
+                    || self.handles.load(Ordering::Relaxed) == 0;
                 if answered.is_some() || cancelled {
                     st.question = None;
                     st.answer = None;
@@ -377,8 +380,15 @@ pub struct Job<R> {
     shared: Arc<Shared<R>>,
 }
 
+impl<R> Drop for Job<R> {
+    fn drop(&mut self) {
+        self.shared.handles.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl<R> Clone for Job<R> {
     fn clone(&self) -> Self {
+        self.shared.handles.fetch_add(1, Ordering::Relaxed);
         Job {
             shared: Arc::clone(&self.shared),
         }
@@ -426,6 +436,7 @@ impl<R: Send + 'static> Job<R> {
             }),
             cancel: Arc::clone(&cancel),
             notify,
+            handles: AtomicUsize::new(1),
         });
         let worker = Arc::clone(&shared);
         std::thread::spawn(move || {
@@ -674,6 +685,21 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(10), "no question");
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn a_question_nobody_can_answer_ends_when_the_last_handle_drops() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = Job::spawn("ask", quiet(), move |ctx| {
+            tx.send(ctx.ask("conflict", "a", "b")).unwrap();
+            Ok(())
+        });
+        wait_for_question(&job);
+        drop(job);
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ask returned");
+        assert_eq!(got, None);
     }
 
     #[test]

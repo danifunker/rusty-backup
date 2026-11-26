@@ -34,6 +34,14 @@ use crate::restore::{run_restore, LogMessage, RestoreConfig, RestoreProgress};
 /// daemon's `MAX_RANGE_WRITE` cap.
 const PUSH_CHUNK: usize = 1024 * 1024;
 
+/// What a restore writes into its sparse stage: the backup's imaged partitions and 16 MiB of slack.
+fn staged_bytes(backup_folder: &Path) -> Option<u64> {
+    let f = File::open(backup_folder.join("metadata.json")).ok()?;
+    let meta: crate::backup::metadata::BackupMetadata = serde_json::from_reader(f).ok()?;
+    let data: u64 = meta.partitions.iter().map(|p| p.imaged_size_bytes).sum();
+    Some(data.saturating_add(16 << 20))
+}
+
 /// Restore the backup folder named in `config` to a remote target.
 ///
 /// `config.target_path` / `config.target_is_device` are overridden internally (a
@@ -54,6 +62,20 @@ pub fn restore_to_remote(
     let target_size = config.target_size;
 
     // --- 1. Materialize the restore into a local staging image. ---
+    // The system temp may be a small tmpfs; a stage that can't fit fails now, not mid-write (MSR-017).
+    // The stage is sparse, so only the imaged partitions (plus slack) land in it.
+    let stage_dir = scratch_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
+    let written = staged_bytes(&config.backup_folder).map(|n| n.min(target_size));
+    if let (Some(free), Some(need)) = (crate::os::available_space(&stage_dir), written) {
+        if free < need {
+            anyhow::bail!(
+                "{} has {} free but the restore stages {}; pick a scratch folder with room",
+                stage_dir.display(),
+                disk_core::display::format_size(free),
+                disk_core::display::format_size(need)
+            );
+        }
+    }
     let mut builder = tempfile::Builder::new();
     builder.prefix("rb-restore-").suffix(".img");
     let staging = match scratch_dir {

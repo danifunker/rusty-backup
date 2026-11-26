@@ -247,7 +247,7 @@ fn gzip_size(path: &Path, file_size: u64) -> Option<u64> {
     // Deflate packs at most ~1032:1, so under 4 MiB the modulo-4-GiB ISIZE is exact.
     if file_size > 4 << 20 {
         let f = std::fs::File::open(path).ok()?;
-        let mut gz = flate2::read::GzDecoder::new(std::io::BufReader::new(f));
+        let mut gz = crate::model::source_reader::gz_members(f);
         return std::io::copy(&mut gz, &mut std::io::sink()).ok();
     }
     let mut f = std::fs::File::open(path).ok()?;

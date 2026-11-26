@@ -71,12 +71,27 @@ fn same_sectors(src: &Path, dest: &Path, hooks: &Hooks<'_>) -> Result<String, St
 }
 
 /// Each volume's files, by path, with their sizes.
-type Listing = BTreeMap<String, u64>;
+/// Path to (size, CRC-32 of the contents when they could be read).
+type Listing = BTreeMap<String, (u64, Option<u32>)>;
+
+/// A `Write` that only hashes, so a file's contents are compared without holding them.
+struct Crc(crc32fast::Hasher);
+
+impl std::io::Write for Crc {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Each volume on both sides lists the same files, and the output's filesystem checks clean.
 fn volume_files(src: &Path, dest: &Path, hooks: &Hooks<'_>) -> Result<String, String> {
-    let before = volumes(src, false)?;
-    let after = volumes(dest, true)?;
+    let (before, unopened) = volumes(src, false, hooks.cancelled)?;
+    let (after, _) = volumes(dest, true, hooks.cancelled)?;
     let mut files = 0usize;
     for (index, (name, listing)) in &before {
         if (hooks.cancelled)() {
@@ -92,17 +107,27 @@ fn volume_files(src: &Path, dest: &Path, hooks: &Hooks<'_>) -> Result<String, St
         }
         files += listing.len();
     }
+    // A source volume no filesystem opens was not compared; say so rather than pass it (MJB-009).
+    let skipped = match unopened {
+        0 => String::new(),
+        n => format!(
+            " {n} partition(s) with no readable filesystem (swap, blank) were not compared."
+        ),
+    };
     Ok(format!(
-        "Verified: {} volume(s), {files} file(s) match and check clean.",
+        "Verified: {} volume(s), {files} file(s) match and check clean.{skipped}",
         before.len()
     ))
 }
 
 fn compare(a: &Listing, b: &Listing) -> Option<String> {
-    for (path, size) in a {
+    for (path, (size, crc)) in a {
         match b.get(path) {
             None => return Some(format!("{path} is missing")),
-            Some(s) if s != size => return Some(format!("{path} is {s} bytes, was {size}")),
+            Some((s, _)) if s != size => return Some(format!("{path} is {s} bytes, was {size}")),
+            Some((_, Some(c))) if crc.is_some_and(|x| x != *c) => {
+                return Some(format!("{path} has different contents"))
+            }
             _ => {}
         }
     }
@@ -112,7 +137,14 @@ fn compare(a: &Listing, b: &Listing) -> Option<String> {
 }
 
 /// Every volume the engine can open: index to (filesystem name, files).
-fn volumes(path: &Path, check: bool) -> Result<BTreeMap<usize, (String, Listing)>, String> {
+type Volumes = BTreeMap<usize, (String, Listing)>;
+
+/// The volumes, and how many partitions no filesystem opened.
+fn volumes(
+    path: &Path,
+    check: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(Volumes, usize), String> {
     let (mut reader, _) =
         super::open_disk(path).map_err(|e| format!("cannot reopen {}: {e:#}", path.display()))?;
     let table = PartitionTable::detect(&mut reader).map_err(|e| e.to_string())?;
@@ -133,15 +165,20 @@ fn volumes(path: &Path, check: bool) -> Result<BTreeMap<usize, (String, Listing)
             .collect(),
     };
     let mut out = BTreeMap::new();
+    let mut unopened = 0;
     for (index, offset, gate, type_string) in parts {
         let (r, _) = super::open_disk(path).map_err(|e| format!("{e:#}"))?;
         let Ok(mut fs) = crate::fs::open_filesystem(r, offset, gate, type_string.as_deref()) else {
+            unopened += 1;
             continue;
         };
         let name = fs.fs_type().to_string();
         let mut listing = Listing::new();
         let root = fs.root().map_err(|e| format!("{name}: {e}"))?;
-        walk(fs.as_mut(), &root, &mut listing).map_err(|e| format!("{name}: {e}"))?;
+        walk(fs.as_mut(), &root, &mut listing, cancelled).map_err(|e| match cancelled() {
+            true => "cancelled".to_string(),
+            false => format!("{name}: {e}"),
+        })?;
         if check {
             if let Some(Ok(r)) = fs.fsck() {
                 if !r.is_clean() {
@@ -159,23 +196,35 @@ fn volumes(path: &Path, check: bool) -> Result<BTreeMap<usize, (String, Listing)
         }
         out.insert(index, (name, listing));
     }
-    Ok(out)
+    Ok((out, unopened))
 }
 
 fn walk(
     fs: &mut dyn disk_core::filesystem::Filesystem,
     dir: &disk_core::entry::FileEntry,
     out: &mut Listing,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(), disk_core::filesystem::FilesystemError> {
     use disk_core::entry::EntryType;
     for child in fs.list_directory(dir)? {
         match child.entry_type {
             EntryType::Directory => {
-                out.insert(format!("{}/", child.path), 0);
-                walk(fs, &child, out)?;
+                out.insert(format!("{}/", child.path), (0, None));
+                walk(fs, &child, out, cancelled)?;
             }
             EntryType::File => {
-                out.insert(child.path.clone(), child.size);
+                if cancelled() {
+                    return Err(disk_core::filesystem::FilesystemError::Unsupported(
+                        "cancelled".into(),
+                    ));
+                }
+                // A file the engine can't read back (encrypted, odd compression) keeps a size check.
+                let mut crc = Crc(crc32fast::Hasher::new());
+                let read = fs
+                    .write_file_to(&child, &mut crc)
+                    .ok()
+                    .map(|_| crc.0.finalize());
+                out.insert(child.path.clone(), (child.size, read));
             }
             _ => {}
         }
@@ -223,10 +272,10 @@ fn disc_walk(
     use opticaldiscs::browse::entry::EntryType;
     for child in fs.list_directory(dir).map_err(|e| e.to_string())? {
         if child.entry_type == EntryType::Directory {
-            out.insert(format!("{}/", child.path), 0);
+            out.insert(format!("{}/", child.path), (0, None));
             disc_walk(fs, &child, out)?;
         } else {
-            out.insert(child.path.clone(), child.size);
+            out.insert(child.path.clone(), (child.size, None));
         }
     }
     Ok(())

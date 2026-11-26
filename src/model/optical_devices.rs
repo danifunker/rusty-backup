@@ -63,7 +63,9 @@ impl RipDevice {
         match &self.location {
             DeviceLocation::Local => self.device_path.clone(),
             #[cfg(feature = "remote")]
-            DeviceLocation::Remote { label, .. } => format!("rb://{}{}", label, self.device_path),
+            DeviceLocation::Remote { label, .. } => {
+                crate::optical::rip::remote_device_url(label, &self.device_path)
+            }
         }
     }
 
@@ -197,5 +199,16 @@ mod tests {
             location: DeviceLocation::Local,
         };
         assert_eq!(d.picker_label(), "HL-DT-ST DVDRAM GP65NW60 (no disc)");
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn a_windows_remote_drive_url_parses_back() {
+        let url = crate::optical::rip::remote_device_url("host:7341", r"\\.\CdRom0");
+        let r = crate::remote::protocol::RemoteRef::parse(&url).expect("parses");
+        assert_eq!(
+            (r.addr().as_str(), r.path.as_str()),
+            ("host:7341", r"/\\.\CdRom0")
+        );
     }
 }

@@ -70,7 +70,7 @@ impl ContainerEditSession {
         if crate::model::source_reader::is_gzip_image_path(path) {
             let input =
                 std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-            let mut decoder = flate2::read::GzDecoder::new(BufReader::new(input));
+            let mut decoder = crate::model::source_reader::gz_members(input);
             let mut out = std::fs::File::create(temp.path())
                 .with_context(|| format!("write decoded flat to {}", temp.path().display()))?;
             let n = std::io::copy(&mut decoder, &mut out)

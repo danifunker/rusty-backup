@@ -99,6 +99,27 @@ pub fn build_seekable_zstd(
     job: &crate::model::job::JobCtx,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
+    // Built under `.part` and renamed when whole, so a cut-short cache is never opened (MSR-010).
+    let mut part_name = cache_path.file_name().unwrap_or_default().to_os_string();
+    part_name.push(".part");
+    let part = cache_path.with_file_name(part_name);
+    let built = encode_seekable(data_path, &part, job).and_then(|()| {
+        std::fs::rename(&part, cache_path)
+            .with_context(|| format!("failed to place cache file: {}", cache_path.display()))
+    });
+    if built.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    built
+}
+
+#[cfg(feature = "seekable-zstd")]
+fn encode_seekable(
+    data_path: &std::path::Path,
+    cache_path: &std::path::Path,
+    job: &crate::model::job::JobCtx,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
     use std::io::{BufReader, BufWriter, Read};
 
     struct Counting<R> {
@@ -126,7 +147,7 @@ pub fn build_seekable_zstd(
     let opts = zeekstd::EncodeOptions::new()
         .frame_size_policy(zeekstd::FrameSizePolicy::Uncompressed(2 * 1024 * 1024));
     let mut encoder = opts
-        .into_encoder(BufWriter::new(output))
+        .into_encoder(BufWriter::new(&output))
         .map_err(|e| anyhow::anyhow!("failed to create zeekstd encoder: {e}"))?;
     let mut buf = vec![0u8; 256 * 1024];
     loop {
@@ -143,6 +164,7 @@ pub fn build_seekable_zstd(
     encoder
         .finish()
         .map_err(|e| anyhow::anyhow!("zeekstd finish error: {e}"))?;
+    output.sync_all().context("failed to sync cache file")?;
     Ok(())
 }
 

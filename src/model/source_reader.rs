@@ -394,12 +394,41 @@ fn has_gzip_magic(path: &Path) -> bool {
     matches!(f.read(&mut magic), Ok(n) if n == 2) && magic == [0x1f, 0x8b]
 }
 
+/// Every gzip member of `inner`, stopping at padding or junk after the last one; `MultiGzDecoder`
+/// errors there and `GzDecoder` stops after the first member (MSR-012).
+pub fn gz_members<R: std::io::Read>(inner: R) -> GzMembers<R> {
+    GzMembers {
+        member: Some(flate2::bufread::GzDecoder::new(BufReader::new(inner))),
+    }
+}
+
+pub struct GzMembers<R: std::io::Read> {
+    member: Option<flate2::bufread::GzDecoder<BufReader<R>>>,
+}
+
+impl<R: std::io::Read> std::io::Read for GzMembers<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::BufRead;
+        while let Some(member) = self.member.as_mut() {
+            let n = member.read(buf)?;
+            if n > 0 || buf.is_empty() {
+                return Ok(n);
+            }
+            let mut rest = self.member.take().expect("checked above").into_inner();
+            if rest.fill_buf()?.starts_with(&[0x1F, 0x8B]) {
+                self.member = Some(flate2::bufread::GzDecoder::new(rest));
+            }
+        }
+        Ok(0)
+    }
+}
+
 /// Fully decompress a gzip file into memory. Used for the small gzip-wrapped
 /// Alto / Pilot packs (`.pdi.gz`, gzipped CopyDisk) that must be parsed as a
 /// whole [`fs_xerox::alto::Disk`] rather than streamed as flat sectors.
 pub fn gunzip_to_vec(path: &Path) -> std::io::Result<Vec<u8>> {
     let input = File::open(path)?;
-    let mut decoder = flate2::read::GzDecoder::new(BufReader::new(input));
+    let mut decoder = gz_members(input);
     let mut out = Vec::new();
     decoder.read_to_end(&mut out)?;
     Ok(out)
@@ -410,7 +439,7 @@ pub fn gunzip_to_vec(path: &Path) -> std::io::Result<Vec<u8>> {
 /// decompressed stream is shorter.
 pub fn gunzip_prefix(path: &Path, n: usize) -> std::io::Result<Vec<u8>> {
     let input = File::open(path)?;
-    let mut decoder = flate2::read::GzDecoder::new(BufReader::new(input));
+    let mut decoder = gz_members(input);
     let mut out = vec![0u8; n];
     let mut filled = 0;
     while filled < n {
@@ -1186,7 +1215,8 @@ fn open_read_dispatch(
         // can be large, so don't hold it all in RAM) and read from there.
         let input =
             File::open(path).with_context(|| format!("open gzip image {}", path.display()))?;
-        let mut decoder = flate2::read::GzDecoder::new(BufReader::new(input));
+        // Every member: a concatenated .gz (pigz, split-and-cat) is one image (MSR-012).
+        let mut decoder = gz_members(input);
         let mut temp = tempfile::Builder::new()
             .prefix(".rb-gzip-image-")
             .tempfile()
@@ -1717,6 +1747,24 @@ pub fn is_container_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_gzip_member_is_read_and_trailing_padding_ends_it() {
+        use std::io::{Read, Write};
+        let member = |b: &[u8]| {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        };
+        let mut file = member(b"first ");
+        file.extend(member(b"second"));
+        file.extend([0u8; 512]);
+        let mut out = String::new();
+        gz_members(file.as_slice())
+            .read_to_string(&mut out)
+            .unwrap();
+        assert_eq!(out, "first second");
+    }
 
     /// A Disk Copy 6 (NDIF) image as a data fork plus an AppleDouble `._`
     /// sidecar whose resource fork holds a one-chunk `bcem` map of `ty`.
