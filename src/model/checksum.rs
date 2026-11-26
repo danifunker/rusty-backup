@@ -123,10 +123,13 @@ pub fn hash_reader<R: Read>(reader: &mut R, progress: &dyn Fn(u64)) -> io::Resul
     let mut hasher = ChecksumHasher::new();
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
+        // A signal-interrupted read is retried, as `read_to_end` would (MSR-020).
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         hasher.update(&buf[..n]);
         progress(hasher.total());
     }
@@ -180,22 +183,6 @@ pub enum ChecksumJob {
     },
     /// Host-OS files referenced by their absolute path.
     Host { entries: Vec<FileEntry> },
-}
-
-/// Run a [`ChecksumJob`] on a worker thread. Directories in the selection are
-/// skipped (only files are hashed). The returned status flips `finished` when
-/// done.
-pub fn spawn(job: ChecksumJob) -> Arc<Mutex<ChecksumStatus>> {
-    let status = Arc::new(Mutex::new(ChecksumStatus::default()));
-    let status_thread = Arc::clone(&status);
-    crate::model::worker::spawn_guarded(Arc::clone(&status), "checksum", move || {
-        run(job, &status_thread, &AtomicBool::new(false));
-        if let Ok(mut g) = status_thread.lock() {
-            g.finished = true;
-        }
-        Ok(())
-    });
-    status
 }
 
 /// Run a [`ChecksumJob`] as a job body; `total_bytes` (the selected files' sizes) drives the bar.

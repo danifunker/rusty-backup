@@ -118,7 +118,7 @@ pub fn start_hfs_expand(
             output,
             &status_thread,
         );
-        let mut s = status_thread.lock().expect("expand status lock");
+        let mut s = crate::model::worker::lock_status(&status_thread);
         s.finished = true;
         match result {
             Ok((clone, emit)) => {

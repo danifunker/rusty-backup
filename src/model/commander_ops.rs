@@ -453,7 +453,7 @@ impl StageSource {
     /// Open the owned source filesystem this describes, on the calling (worker)
     /// thread. Every variant reopens *fresh*, so the pane's own handle is never
     /// touched. Shared by the copy ([`spawn_stage_copy`], [`spawn_host_copy`])
-    /// and checksum ([`crate::model::checksum::spawn`]) workers.
+    /// and checksum ([`crate::model::checksum::checksum_in_job`]) workers.
     pub fn open(self) -> Result<Box<dyn Filesystem>> {
         match self {
             StageSource::Session(session) => Ok(session.open().context("opening source image")?),

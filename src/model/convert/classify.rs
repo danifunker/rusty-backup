@@ -67,12 +67,13 @@ impl Classified {
 pub fn kind_of_extension(path: &Path) -> Option<ImageKind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     Some(match ext.as_str() {
-        "iso" | "cue" | "toast" | "cdr" | "nrg" | "gdi" | "ccd" | "mds" | "cso" => ImageKind::Disc,
+        // Only extensions something here opens; a test keeps this inside the picker lists.
+        "iso" | "cue" | "toast" | "nrg" | "gdi" | "ccd" | "mds" | "cso" => ImageKind::Disc,
         "adf" | "adz" | "st" | "msa" | "d64" | "d71" | "d81" | "g64" | "woz" | "moof" | "dc42"
-        | "xdf" | "hdm" | "dim" | "d88" | "d77" | "fdi" | "atr" | "dsd" | "edsk" | "ima"
-        | "fdd" | "do" | "po" | "trd" | "ssd" | "dsk" => ImageKind::Floppy,
-        "vhd" | "vhdx" | "vmdk" | "qcow2" | "qcow" | "hdf" | "hdz" | "hfv" | "hda" | "hdd"
-        | "hds" | "gho" | "vdi" | "dmg" => ImageKind::HardDisk,
+        | "xdf" | "hdm" | "dim" | "d88" | "atr" | "dsd" | "ima" | "do" | "po" | "trd" | "ssd"
+        | "dsk" => ImageKind::Floppy,
+        "vhd" | "vmdk" | "qcow2" | "qcow" | "hdf" | "hdz" | "hfv" | "hda" | "hds" | "gho"
+        | "dmg" => ImageKind::HardDisk,
         _ => return None,
     })
 }
@@ -149,7 +150,9 @@ fn is_cue_sheet(path: &Path, head: &[u8]) -> bool {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("cue"));
-    let text = head.len() < 64 * 1024
+    // A cue sheet is a few KB; the size comes from the file, as `head` is capped below it (MJB-022).
+    let small = std::fs::metadata(path).is_ok_and(|m| m.len() < 64 * 1024);
+    let text = small
         && head
             .iter()
             .all(|&b| b == b'\t' || b == b'\r' || b == b'\n' || (0x20..0x7f).contains(&b));
@@ -269,5 +272,27 @@ pub fn size_text(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / (KB * KB) as f64)
     } else {
         format!("{} KB", bytes / KB)
+    }
+}
+
+#[cfg(test)]
+mod extension_drift {
+    /// Every extension classified here is one the engine opens, so the lists can't drift (MJB-017).
+    #[cfg(feature = "optical")]
+    #[test]
+    fn every_kind_extension_is_a_picker_extension() {
+        use crate::model::file_types::{DISK_IMAGE_EXTS, OPTICAL_EXTS};
+        let src = include_str!("classify.rs");
+        let body = src.split("Some(match ext.as_str() {").nth(1).unwrap();
+        let body = body.split("_ => return None").next().unwrap();
+        for ext in body.split('"').skip(1).step_by(2) {
+            let disc_crate = opticaldiscs::formats::supported_extensions();
+            let known = DISK_IMAGE_EXTS
+                .iter()
+                .chain(OPTICAL_EXTS)
+                .chain(disc_crate)
+                .any(|e| e.eq_ignore_ascii_case(ext));
+            assert!(known, ".{ext} is classified but not in the picker lists");
+        }
     }
 }

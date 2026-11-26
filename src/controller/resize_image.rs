@@ -60,6 +60,10 @@ pub mod labels {
     pub const CHECK: &str = "Check the volumes before and after resizing";
     pub const CONTINUE_ANYWAY: &str = "Resize anyway";
     pub const IN_PLACE: &str = "Change this file in place (no copy)";
+    /// In place is not crash-safe; every shell shows this on Review and in the confirm (MWR-007).
+    pub const IN_PLACE_RISK: &str = "An in-place resize is not crash-safe: if it stops part way \
+        (a read or write error, a crash, a power cut) the image is left half changed. Write a \
+        resized copy to keep the original safe.";
     pub const START: &str = "Resize";
     pub const OPEN_RESULT: &str = "Open in Inspect";
     pub const SIZE_HINT: &str = "Accepts K / M / G suffixes, e.g. 512M or 2G.";
@@ -710,7 +714,10 @@ impl ResizeImageController {
             Some(out) if !self.in_place => {
                 lines.push(format!("Copy the image to {}", out.display()))
             }
-            _ => lines.push("Change the image in place (no copy)".to_string()),
+            _ => {
+                lines.push("Change the image in place (no copy)".to_string());
+                lines.push(format!("Warning: {}", labels::IN_PLACE_RISK));
+            }
         }
         if disk != self.old_disk {
             lines.push(format!(
@@ -1037,8 +1044,9 @@ impl ResizeImageController {
             purpose: purpose::IN_PLACE,
             title: labels::TITLE.to_string(),
             message: format!(
-                "Resize {} in place? There is no copy to go back to if it fails part way.",
-                name.unwrap_or_default()
+                "Resize {} in place?\n\n{}",
+                name.unwrap_or_default(),
+                labels::IN_PLACE_RISK
             ),
             confirm_label: "Resize in Place".to_string(),
             destructive: true,
