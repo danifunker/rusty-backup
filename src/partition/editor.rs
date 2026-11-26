@@ -76,10 +76,16 @@ pub fn validate_edits(
                 index,
                 new_start_lba,
             } => {
-                if let Some(p) = partitions.iter_mut().find(|p| p.index == *index) {
-                    p.start_lba = *new_start_lba;
-                } else {
+                let Some(p) = partitions.iter_mut().find(|p| p.index == *index) else {
                     bail!("partition index {} not found", index);
+                };
+                let (old, container) = (p.start_lba, p.is_extended_container);
+                p.start_lba = *new_start_lba;
+                // EBR addresses are container-relative, so the logicals travel with it.
+                if container {
+                    for l in partitions.iter_mut().filter(|l| l.is_logical) {
+                        l.start_lba = (l.start_lba + *new_start_lba).saturating_sub(old);
+                    }
                 }
             }
             PartitionTableEdit::ChangeType { index, .. } => {

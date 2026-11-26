@@ -1062,4 +1062,42 @@ mod tests {
         };
         assert_eq!(resized_data_end(&plans, &none, disk), 12_048 * 512);
     }
+
+    /// Review of PAR-001: the rehearsal left logicals at their old LBAs while their container moved.
+    #[test]
+    fn growing_a_primary_moves_the_extended_container_with_its_logicals() {
+        let sectors = 40_000u64;
+        let mut disk = vec![0u8; (sectors * 512) as usize];
+        let entry = |d: &mut [u8], at: usize, ty: u8, start: u32, len: u32| {
+            d[at + 4] = ty;
+            d[at + 8..at + 12].copy_from_slice(&start.to_le_bytes());
+            d[at + 12..at + 16].copy_from_slice(&len.to_le_bytes());
+        };
+        entry(&mut disk, 446, 0x06, 63, 1985);
+        entry(&mut disk, 462, 0x05, 2048, 8192);
+        disk[510] = 0x55;
+        disk[511] = 0xAA;
+        let ebr = 2048 * 512;
+        entry(&mut disk[ebr..], 446, 0x06, 63, 4000);
+        disk[ebr + 510] = 0x55;
+        disk[ebr + 511] = 0xAA;
+        let table = PartitionTable::detect(&mut Cursor::new(&disk[..])).unwrap();
+        let parts = table.partitions();
+        assert!(parts.iter().any(|p| p.is_logical), "{parts:?}");
+        let plans = compute_resize_plan(&parts, &[(0, 4000 * 512)], 0, sectors * 512).unwrap();
+        let edits: Vec<_> = plans
+            .iter()
+            .filter(|p| p.new_start_lba != p.old_start_lba)
+            .map(|p| PartitionTableEdit::MoveEntry {
+                index: p.index,
+                new_start_lba: p.new_start_lba,
+            })
+            .chain(std::iter::once(PartitionTableEdit::ResizeEntry {
+                index: 0,
+                new_size_bytes: 4000 * 512,
+            }))
+            .collect();
+        editor::validate_edits(&table, &edits, sectors * 512)
+            .expect("the logical moves with its container");
+    }
 }

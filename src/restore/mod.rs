@@ -231,11 +231,8 @@ fn is_disk_label_scheme(table_type: &str) -> bool {
     )
 }
 
-/// Extra guidance for an overrun, when the alignment choice is the cause.
-///
-/// `Original` keeps the backup's own alignment: an APM map keeps every absolute
-/// start, and MBR/GPT repack from the original first partition on the original
-/// grid. The other alignments repack on a new grid, which can reclaim more.
+/// Extra guidance for an overrun: Original keeps the backup's grid (and an APM map's
+/// absolute starts); the other alignments repack on a new grid, which can reclaim more.
 fn repack_hint(alignment: &RestoreAlignment) -> &'static str {
     match alignment {
         RestoreAlignment::Original => {
@@ -807,12 +804,15 @@ fn plan_restore_ebr_chain(
             }
         })
         .collect();
-    // `calculate_restore_layout` already placed every logical (EBR sector, then aligned), and
-    // the resize, validate and boot-flag steps use those starts; repacking here would put the
-    // data and the EBRs somewhere else (RST-001). Repack only logicals the layout never placed.
-    let laid_out = logical_pms
-        .iter()
-        .all(|pm| overrides.iter().any(|o| o.index == pm.index));
+    // Starts the layout placed are kept, as the later steps use them (RST-001); size-only or
+    // overlapping ones, each needing an EBR sector before it, are repacked instead.
+    let laid_out = logical_pms.iter().all(|pm| pm.is_logical)
+        && items
+            .first()
+            .is_some_and(|f| f.start_lba > extended_start_lba)
+        && items
+            .windows(2)
+            .all(|w| w[0].start_lba as u64 + w[0].new_bytes / 512 < w[1].start_lba as u64);
     let logical_infos = if laid_out {
         items
             .iter()
@@ -4987,6 +4987,33 @@ mod clonezilla_layout_tests {
             assert_eq!(*start, ov.effective_start_lba(), "logical {idx}");
             assert_eq!(start % 2048, 0, "logical {idx} keeps 1 MiB alignment");
         }
+    }
+
+    /// Review of RST-001: an export's size-only overrides grow a logical in place, so it is repacked.
+    #[test]
+    fn a_grown_logical_with_a_size_only_override_is_repacked() {
+        let meta = logical_backup_metadata();
+        let ovs: Vec<PartitionSizeOverride> = meta
+            .partitions
+            .iter()
+            .map(|pm| {
+                let grow = if pm.index == 4 { 2 } else { 1 };
+                PartitionSizeOverride::size_only(
+                    pm.index,
+                    pm.start_lba,
+                    pm.original_size_bytes,
+                    pm.original_size_bytes * grow,
+                )
+            })
+            .collect();
+        let ebr = build_restore_ebr_chain(&meta, &ovs, None)
+            .unwrap()
+            .expect("a chain");
+        let start = |i: usize| ebr.logical_starts.iter().find(|(x, _)| *x == i).unwrap().1;
+        assert!(
+            start(5) > start(4) + 2 * 20480,
+            "partition 5 clears the grown 4"
+        );
     }
 
     #[test]

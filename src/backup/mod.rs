@@ -28,6 +28,15 @@ pub mod single_file_chd {
     pub fn run_export(_inputs: SingleFileChdExportInputs) -> Result<()> {
         bail!("chd feature not built into this binary")
     }
+
+    /// Nothing to check: a build without `chd` can't open the container at all.
+    pub fn verify_container(
+        _backup_folder: &std::path::Path,
+        _metadata: &crate::backup::metadata::BackupMetadata,
+        _log_cb: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 mod sizes;
 pub mod verify;

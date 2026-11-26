@@ -833,8 +833,8 @@ fn read_container_sha1(chd_path: &Path) -> Result<String> {
     Ok(hex_lower(&sha1_bytes))
 }
 
-/// Check the container against the SHA-1 metadata recorded; the per-partition files the
-/// folder layout verifies don't exist here (BKP-008), and decoding checks each hunk's CRC.
+/// Compare the container's SHA-1 with the one recorded (BKP-008); a mismatch warns, since an
+/// edit whose metadata refresh failed leaves it stale, and decoding checks each hunk's CRC.
 pub fn verify_container(
     backup_folder: &Path,
     metadata: &BackupMetadata,
@@ -845,15 +845,17 @@ pub fn verify_container(
     };
     let path = backup_folder.join(name);
     let actual = read_container_sha1(&path)?;
-    if !actual.eq_ignore_ascii_case(recorded) {
-        anyhow::bail!(
-            "{} is not the CHD this backup recorded (SHA-1 {} vs {}); nothing was written to the target",
+    if actual.eq_ignore_ascii_case(recorded) {
+        log_cb(&format!("{name}: SHA-1 matches the backup's record"));
+    } else {
+        log_cb(&format!(
+            "Warning: {} has SHA-1 {}, not the {} this backup recorded; it was replaced or \
+             edited without a metadata refresh",
             path.display(),
             actual.get(..16).unwrap_or(&actual),
             recorded.get(..16).unwrap_or(recorded)
-        );
+        ));
     }
-    log_cb(&format!("{name}: SHA-1 matches the backup's record"));
     Ok(())
 }
 
