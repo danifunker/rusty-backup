@@ -4274,8 +4274,21 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         type_code: &str,
         creator_code: &str,
     ) -> Result<(), FilesystemError> {
+        let (tc, cc) = (
+            hfs_common::encode_fourcc(type_code),
+            hfs_common::encode_fourcc(creator_code),
+        );
+        self.set_type_creator_raw(entry, tc, cc)
+    }
+
+    fn set_type_creator_raw(
+        &mut self,
+        entry: &FileEntry,
+        tc: [u8; 4],
+        cc: [u8; 4],
+    ) -> Result<(), FilesystemError> {
         let snap = self.snapshot();
-        let result = self.set_type_creator_inner(entry, type_code, creator_code);
+        let result = self.set_type_creator_inner(entry, tc, cc);
         if result.is_err() {
             self.restore_snapshot(snap);
         }
@@ -5304,8 +5317,8 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
     fn set_type_creator_inner(
         &mut self,
         entry: &FileEntry,
-        type_code: &str,
-        creator_code: &str,
+        tc: [u8; 4],
+        cc: [u8; 4],
     ) -> Result<(), FilesystemError> {
         let cnid = entry.location as u32;
 
@@ -5346,8 +5359,6 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         }
 
         // Write type and creator at offsets 48-52 and 52-56
-        let tc = hfs_common::encode_fourcc(type_code);
-        let cc = hfs_common::encode_fourcc(creator_code);
         self.catalog_data[frec_start + 48..frec_start + 52].copy_from_slice(&tc);
         self.catalog_data[frec_start + 52..frec_start + 56].copy_from_slice(&cc);
 

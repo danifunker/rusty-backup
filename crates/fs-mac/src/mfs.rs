@@ -1413,6 +1413,19 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
                 "Mac OSType / creator must be exactly 4 chars".into(),
             ));
         }
+        let mut tc = [0u8; 4];
+        let mut cc = [0u8; 4];
+        tc.copy_from_slice(type_code.as_bytes());
+        cc.copy_from_slice(creator_code.as_bytes());
+        self.set_type_creator_raw(entry, tc, cc)
+    }
+
+    fn set_type_creator_raw(
+        &mut self,
+        entry: &FileEntry,
+        tc: [u8; 4],
+        cc: [u8; 4],
+    ) -> Result<(), FilesystemError> {
         let fnum = entry.location as u32;
         let de = self
             .entries
@@ -1421,8 +1434,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
             .ok_or_else(|| {
                 FilesystemError::NotFound(format!("file number {fnum} not in directory"))
             })?;
-        de.finder_info[0..4].copy_from_slice(type_code.as_bytes());
-        de.finder_info[4..8].copy_from_slice(creator_code.as_bytes());
+        de.finder_info[0..4].copy_from_slice(&tc);
+        de.finder_info[4..8].copy_from_slice(&cc);
         Ok(())
     }
 

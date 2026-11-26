@@ -3,6 +3,13 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.2.2
+
+### Fixed
+- HFS, HFS+ and MFS implement `set_type_creator_raw`, writing the four OSType bytes as given, so
+  high-bit MacRoman type and creator codes survive an edit (MCM-006); `set_type_creator` now
+  converts and calls it.
+
 ## 0.2.1
 
 ### Fixed

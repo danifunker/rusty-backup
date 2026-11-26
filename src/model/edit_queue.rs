@@ -380,11 +380,8 @@ pub fn apply_edit(
             entry,
             type_code,
             creator_code,
-        } => efs.set_type_creator(
-            entry,
-            &String::from_utf8_lossy(type_code),
-            &String::from_utf8_lossy(creator_code),
-        ),
+            // Raw bytes: a high-bit MacRoman code went through `from_utf8_lossy` as U+FFFD (MCM-006).
+        } => efs.set_type_creator_raw(entry, *type_code, *creator_code),
         StagedEdit::SetPermissions { entry, mode } => efs.set_permissions(entry, *mode),
         StagedEdit::SetOwner { entry, uid, gid } => efs.set_owner(entry, *uid, *gid),
         StagedEdit::SetXattr { entry, name, value } => efs.set_xattr(entry, name, value),
