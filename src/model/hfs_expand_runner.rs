@@ -146,6 +146,9 @@ fn run_expand(
     output: ExpandOutput,
     status: &Arc<Mutex<ExpandStatus>>,
 ) -> anyhow::Result<(CloneReport, Option<EmitReport>)> {
+    if crate::model::same_file(&source.source_path, &output_path) {
+        anyhow::bail!("the output is the source; an expand always writes a new file");
+    }
     let push = |s: &str| {
         if let Ok(mut g) = status.lock() {
             g.log_messages.push(s.to_string());

@@ -839,6 +839,16 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
     // A regular-file target has to exist at full length before the table is
     // written, or GPT's backup header lands past EOF in a sparse hole the
     // reparse can't find.
+    let inputs = req.sources.iter().flatten().chain(req.donor.iter());
+    if let Some(p) = inputs
+        .into_iter()
+        .find(|p| crate::model::same_file(p, &req.target_path))
+    {
+        anyhow::bail!(
+            "{} is both a source and the target; build onto another file",
+            p.display()
+        );
+    }
     if !crate::os::is_device_path(&req.target_path) {
         let file = std::fs::OpenOptions::new()
             .read(true)

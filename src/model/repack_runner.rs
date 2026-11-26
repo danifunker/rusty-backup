@@ -27,11 +27,15 @@ use fs_pc::human68k_clone::stream_defragmented_human68k;
 /// Spawn a worker that defragments the Human68k partition at
 /// `partition_offset` inside the image at `path`, in place. Returns a
 /// shared status the caller polls each frame.
-pub fn spawn(path: PathBuf, partition_offset: u64) -> Arc<Mutex<RepackStatus>> {
+pub fn spawn(
+    path: PathBuf,
+    partition_offset: u64,
+    partition_size: u64,
+) -> Arc<Mutex<RepackStatus>> {
     let status = Arc::new(Mutex::new(RepackStatus::default()));
     let status_clone = Arc::clone(&status);
     crate::model::worker::spawn_guarded(Arc::clone(&status), "repack", move || {
-        if let Err(e) = run_repack(&path, partition_offset, &status_clone) {
+        if let Err(e) = run_repack(&path, partition_offset, partition_size, &status_clone) {
             if let Ok(mut s) = status_clone.lock() {
                 s.error = Some(format!("{e}"));
             }
@@ -53,6 +57,7 @@ fn log(status: &Arc<Mutex<RepackStatus>>, msg: impl Into<String>) {
 fn run_repack(
     path: &Path,
     partition_offset: u64,
+    partition_size: u64,
     status: &Arc<Mutex<RepackStatus>>,
 ) -> anyhow::Result<()> {
     // Read-only source handle. Opening the filesystem also validates that
@@ -66,6 +71,14 @@ fn run_repack(
     // sector size), which is always a whole number of FS sectors — unlike
     // the partition-table length on 256-byte-SASI disks.
     let fs_size = source.total_size();
+    // The repack writes all of it, so a BPB claiming more than its partition would run into the next (MWR-004).
+    if partition_size > 0 && fs_size > partition_size {
+        anyhow::bail!(
+            "the volume claims {} but its partition is {}; refusing to write past it",
+            format_size(fs_size),
+            format_size(partition_size)
+        );
+    }
     if let Ok(mut s) = status.lock() {
         s.total_bytes = fs_size;
     }
