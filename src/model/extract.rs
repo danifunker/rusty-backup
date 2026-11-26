@@ -172,7 +172,11 @@ impl Plan<'_> {
         entry: &FileEntry,
         status: &Arc<Mutex<HostCopyStatus>>,
     ) -> Result<usize> {
-        let opts = Options::new(self.options.fork_mode);
+        let mut opts = Options::new(self.options.fork_mode);
+        // Skip holds for children of a merged folder too; the exporter defaulted to Overwrite (MCM-014).
+        if self.on_conflict == OnConflict::Skip {
+            opts.existing = rb_fsexporter::Existing::Skip;
+        }
         let label = fs.volume_label().map(str::to_string);
         let conflicts = extraction_conflicts(
             entry,
@@ -181,6 +185,9 @@ impl Plan<'_> {
             self.forks,
             label.as_deref(),
         );
+        if !conflicts.is_empty() && self.on_conflict == OnConflict::Fail {
+            anyhow::bail!("{} already exists in {}", entry.name, self.dest.display());
+        }
         if !conflicts.is_empty() && self.on_conflict == OnConflict::Skip {
             if let Ok(mut g) = status.lock() {
                 g.skipped.push(format!("{} (already exists)", entry.name));

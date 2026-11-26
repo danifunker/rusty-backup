@@ -220,7 +220,19 @@ pub fn tar_import_step(
     };
     let stats = match tar_import::import_tar_from_path(&mut *efs, dest, &archive, &opts, &report) {
         Ok(s) => s,
-        Err(e) => return TarStep::Finished(format!("Import failed: {e:#}"), false),
+        Err(e) => {
+            // What landed is synced and committed, as `apply_edits_reporting` does: dropping the
+            // cached bitmap and directories left the files already written unaccounted for (MCM-005).
+            let synced = efs.sync_metadata().is_ok();
+            drop(efs);
+            let kept = synced && commit.commit().is_ok();
+            let note = if kept {
+                "; the files imported before it are kept"
+            } else {
+                ""
+            };
+            return TarStep::Finished(format!("Import failed: {e:#}{note}"), false);
+        }
     };
     if let Err(e) = efs.sync_metadata() {
         return TarStep::Finished(format!("Error saving to disk: {e}"), false);

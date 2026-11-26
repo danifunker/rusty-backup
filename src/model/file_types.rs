@@ -49,6 +49,9 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "moof",
     "chd",
     "adf",
+    // Atari ST: MSA archives (decoded by `image_prep`) and the raw `.st` they produce (MJB-016).
+    "msa",
+    "st",
     "hdf",
     "adz",
     "hdz",
@@ -241,6 +244,11 @@ mod tests {
         assert!(DISK_IMAGE_EXTS.contains(&"ssd"));
         assert!(DISK_IMAGE_EXTS.contains(&"dsd"));
         assert!(association_exts().contains(&"dsd".to_string()));
+    }
+
+    #[test]
+    fn atari_st_extensions_present() {
+        assert!(DISK_IMAGE_EXTS.contains(&"msa") && DISK_IMAGE_EXTS.contains(&"st"));
     }
 
     #[test]

@@ -557,6 +557,8 @@ pub fn run(req: &ResizeImageRequest, ctx: &JobCtx, shared: &SharedProgress) -> R
         None => Scratch(None),
     };
     let work_path = work.0.clone().unwrap_or_else(|| req.target().to_path_buf());
+    // A copy that refused to overwrite an existing file must not remove it on the way out (MWR-009).
+    let preexisting = req.copy_to.is_some() && req.target().exists();
     let mut rebuilt = Vec::new();
     for step in steps {
         if ctx.is_cancelled() {
@@ -579,7 +581,10 @@ pub fn run(req: &ResizeImageRequest, ctx: &JobCtx, shared: &SharedProgress) -> R
                         ),
                     );
                 }
-                if req.copy_to.is_some() && (layout.chd.is_none() || step == Step::Pack) {
+                if !preexisting
+                    && req.copy_to.is_some()
+                    && (layout.chd.is_none() || step == Step::Pack)
+                {
                     let _ = std::fs::remove_file(req.target());
                     line(
                         shared,

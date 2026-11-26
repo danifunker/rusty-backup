@@ -854,7 +854,8 @@ fn run_per_partition(
                 .copied()
                 .unwrap_or(part.size_bytes);
             let dest_path = dest_folder.join(format!("partition-{}.{}", part.index, ext));
-            let offset = part.start_lba * 512;
+            // `byte_offset`: X68k SASI partitions start on 256-byte sectors (MWR-012).
+            let offset = part.byte_offset();
 
             if let Ok(mut s) = status.lock() {
                 s.log_messages.push(format!(

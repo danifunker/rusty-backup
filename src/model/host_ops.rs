@@ -37,7 +37,8 @@ pub fn delete_paths(paths: &[PathBuf], mut on_item: impl FnMut(usize, &Path)) ->
 pub fn rename_entry(old: &Path, new_name: &str) -> io::Result<PathBuf> {
     check_name(new_name)?;
     let new = old.with_file_name(new_name);
-    if new.symlink_metadata().is_ok() {
+    // On a case-insensitive host `A.txt` finds `a.txt` itself; that is a rename, not a clash (MCM-019).
+    if new.symlink_metadata().is_ok() && !crate::model::same_file(old, &new) {
         return Err(exists(new_name));
     }
     std::fs::rename(old, &new)?;

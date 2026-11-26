@@ -60,7 +60,9 @@ fn run_expand(
 
     let reader = ChdReader::open(path)?;
     let old_logical = reader.logical_size();
-    let new_logical = old_logical + add_bytes;
+    let new_logical = old_logical
+        .checked_add(add_bytes)
+        .ok_or_else(|| anyhow::anyhow!("adding {add_bytes} bytes overflows the CHD's size"))?;
 
     log(
         status,

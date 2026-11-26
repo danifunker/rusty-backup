@@ -1283,11 +1283,19 @@ fn resolve_host_conflict(
     on_conflict: OnConflict,
     status: &Arc<Mutex<HostCopyStatus>>,
 ) -> Result<bool> {
-    if !target.exists() {
+    // `exists` follows links: a dangling one read as free and the copy wrote through it (MCM-004).
+    let Ok(meta) = std::fs::symlink_metadata(target) else {
         return Ok(true);
-    }
+    };
     match on_conflict {
-        OnConflict::Replace => Ok(true),
+        OnConflict::Replace => {
+            // The link itself is replaced, never the file it points at.
+            if meta.file_type().is_symlink() {
+                std::fs::remove_file(target)
+                    .with_context(|| format!("removing the link at {}", target.display()))?;
+            }
+            Ok(true)
+        }
         OnConflict::Skip => {
             note_skipped(status, target, "already exists");
             Ok(false)

@@ -1030,7 +1030,7 @@ fn open_read_dispatch(
         let disk = dsk_flux::flux::decode_disk(&tracks)
             .with_context(|| format!("no MFM sectors in the KryoFlux set {}", path.display()))?;
         if let Some(faults) = disk.fault_summary() {
-            eprintln!("KryoFlux: {faults}; unreadable sectors are zero-filled");
+            log::warn!("KryoFlux: {faults}; unreadable sectors are zero-filled");
         }
         dsk_flux::flux::record_faults(path, &disk);
         Ok(Box::new(std::io::Cursor::new(disk.image)))
@@ -1042,7 +1042,7 @@ fn open_read_dispatch(
         let disk = dsk_flux::flux::mfm_emu::decode_to(&mut src, &mut out)
             .with_context(|| format!("decode MFM capture {}", path.display()))?;
         if let Some(faults) = disk.fault_summary() {
-            eprintln!("MFM capture: {faults}; unreadable sectors are zero-filled");
+            log::warn!("MFM capture: {faults}; unreadable sectors are zero-filled");
         }
         dsk_flux::flux::record_faults(path, &disk);
         out.seek(SeekFrom::Start(0))?;
@@ -1054,7 +1054,7 @@ fn open_read_dispatch(
         let disk = dsk_flux::flux::decode_disk(&tracks)
             .with_context(|| format!("no MFM sectors in {}", path.display()))?;
         if let Some(faults) = disk.fault_summary() {
-            eprintln!("Flux: {faults}; unreadable sectors are zero-filled");
+            log::warn!("Flux: {faults}; unreadable sectors are zero-filled");
         }
         dsk_flux::flux::record_faults(path, &disk);
         Ok(Box::new(std::io::Cursor::new(disk.image)))
