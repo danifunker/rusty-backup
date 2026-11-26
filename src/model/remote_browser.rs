@@ -31,7 +31,7 @@ pub enum BrowseMode {
     /// Inside a disk image opened on the daemon.
     Image {
         path: String,
-        partition: Option<crate::cli::img_at::PartSelector>,
+        partition: Option<crate::model::img_at::PartSelector>,
     },
 }
 
@@ -141,7 +141,7 @@ impl RemoteBrowser {
     pub fn open_image(
         &mut self,
         path: &str,
-        partition: Option<crate::cli::img_at::PartSelector>,
+        partition: Option<crate::model::img_at::PartSelector>,
         opened_from: &str,
     ) -> anyhow::Result<BrowseTarget> {
         let (fs, root, entries) =

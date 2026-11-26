@@ -6,6 +6,7 @@
 pub mod alto_resize;
 pub mod archive_edit;
 pub mod archive_import;
+pub mod backup_edit;
 pub mod backup_loader;
 pub mod backup_plan;
 #[cfg(feature = "remote")]
@@ -34,6 +35,7 @@ pub mod edit_queue;
 pub mod entry_detail;
 pub mod export_runner;
 pub mod extract;
+pub mod fault;
 pub mod file_types;
 pub mod format;
 pub mod fs_limits;
@@ -41,17 +43,21 @@ pub mod fsck_runner;
 pub mod hfs_expand_runner;
 pub mod host_ops;
 pub mod image_backup;
+pub mod image_io;
 pub mod image_prep;
+pub mod img_at;
 pub mod inspect_runner;
 pub mod job;
 pub mod mac_archive_extract;
 pub mod mac_archive_read;
 pub mod min_size_runner;
 pub mod multi_volume_fs;
+pub mod notice;
 #[cfg(feature = "optical")]
 pub mod optical_browse;
 #[cfg(feature = "optical")]
 pub mod optical_devices;
+pub mod optical_hint;
 #[cfg(feature = "optical")]
 pub mod optical_ops;
 pub mod partition_editor;
@@ -59,6 +65,7 @@ pub mod partition_resize;
 pub mod physical_write_runner;
 pub mod provision_runner;
 pub mod rate_tracker;
+pub mod resolve;
 pub mod wrapper_tree;
 // The remote file-browser core depends on `crate::remote`, which is itself
 // behind the `remote` feature.

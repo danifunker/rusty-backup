@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 
-use crate::cli::resolve::resolve_partition_in_reader;
 use crate::fs::resize_filesystem_for;
+use crate::model::resolve::resolve_partition_in_reader;
 use crate::remote::{RemoteBlockReader, RemoteConnection};
 
 /// What a remote resize touched, for the caller's log line.
@@ -46,7 +46,7 @@ pub struct RemoteResizeOutcome {
 pub fn resize_remote_partition(
     conn: Arc<Mutex<RemoteConnection>>,
     path: &str,
-    partition: Option<crate::cli::img_at::PartSelector>,
+    partition: Option<crate::model::img_at::PartSelector>,
     new_size_bytes: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<RemoteResizeOutcome> {

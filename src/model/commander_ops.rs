@@ -277,7 +277,7 @@ pub fn preflight_apply(session: &BrowseSession, edits: &[StagedEdit]) -> Result<
 pub fn preflight_remote_apply(
     addr: &str,
     image_path: &str,
-    partition: Option<crate::cli::img_at::PartSelector>,
+    partition: Option<crate::model::img_at::PartSelector>,
     edits: &[StagedEdit],
 ) -> Result<ApplyPreflight> {
     let (mut fs, _, _) = crate::remote::fs::RemoteFilesystem::open(addr, image_path, partition)
@@ -441,7 +441,7 @@ pub enum StageSource {
     Remote {
         addr: String,
         path: String,
-        partition: Option<crate::cli::img_at::PartSelector>,
+        partition: Option<crate::model::img_at::PartSelector>,
     },
     /// Reopen a session-less local source — a Mac archive or an inline-expanded
     /// disk-image / optical wrapper mount — fresh from a
@@ -1943,7 +1943,7 @@ fn job_progress<'a>(
 pub fn remote_apply_in_job(
     addr: &str,
     image_path: &str,
-    partition: Option<crate::cli::img_at::PartSelector>,
+    partition: Option<crate::model::img_at::PartSelector>,
     edits: &[StagedEdit],
     job: &crate::model::job::JobCtx,
 ) -> Result<ApplyOutcome> {
@@ -1980,7 +1980,7 @@ fn os4_to_string(code: &[u8; 4]) -> String {
 fn remote_apply(
     addr: &str,
     image_path: &str,
-    partition: Option<crate::cli::img_at::PartSelector>,
+    partition: Option<crate::model::img_at::PartSelector>,
     edits: &[StagedEdit],
     mut on_progress: impl FnMut(EditProgress<'_>),
 ) -> Result<()> {
@@ -2065,7 +2065,7 @@ fn wire_parent_path(path: &str) -> String {
 pub fn apply_edits_to_remote_image(
     addr: &str,
     image_path: &str,
-    partition: Option<crate::cli::img_at::PartSelector>,
+    partition: Option<crate::model::img_at::PartSelector>,
     edits: &[StagedEdit],
 ) -> Result<()> {
     remote_apply(addr, image_path, partition, edits, |_| {})

@@ -135,7 +135,7 @@ pub(crate) fn run(
     if let Some(disc) = source.disc() {
         let path = disc.src.path.clone();
         return run_disc(disc, entry.path.as_str(), plan, status).map_err(|e| {
-            let msg = crate::cli::optical_hint::with_nkit_hint(e, path.as_path());
+            let msg = crate::model::optical_hint::with_nkit_hint(e, path.as_path());
             anyhow::anyhow!("{msg:#}")
         });
     }

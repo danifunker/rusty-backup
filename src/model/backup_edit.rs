@@ -11,7 +11,7 @@
 //! `recompress_partition_sync`), so the byte semantics match the GUI exactly.
 //!
 //! Single-file-CHD backups are NOT handled here — that layout stores one `.chd`
-//! the user edits directly (the CHD path in [`crate::cli::resolve`] already
+//! the user edits directly (the CHD path in [`crate::model::resolve`] already
 //! covers it).
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -20,13 +20,13 @@ use std::path::Path;
 use crate::backup::metadata::{
     update_partition_checksum, BackupLayout, BackupMetadata, PartitionMetadata,
 };
-use crate::cli::img_at::PartSelector;
-use crate::cli::io::open_image_rw;
-use crate::cli::logging::log_stderr;
-use crate::cli::resolve::{PartitionContext, RwCommit};
 use crate::model::archive_edit::{
     compute_file_checksum, extract_partition_sync, recompress_partition_sync, ArchiveEditContext,
 };
+use crate::model::image_io::open_image_rw;
+use crate::model::img_at::PartSelector;
+use crate::model::notice::emit as log_stderr;
+use crate::model::resolve::{PartitionContext, RwCommit};
 use crate::rbformats::{BoxReadSeek, BoxRwSeek};
 
 /// A backup folder is a directory containing a `metadata.json`.

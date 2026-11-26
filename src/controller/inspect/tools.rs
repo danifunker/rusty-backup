@@ -414,12 +414,18 @@ impl InspectController {
             .as_ref()
             .map(|r| r.errors.iter().filter(|e| e.repairable).count())
             .unwrap_or(0);
+        // A repaired WOZ / D88 / DIM is re-encoded from its sectors, like a save (MCM-003).
+        let loss = self
+            .image_path()
+            .and_then(crate::model::container_edit::reencode_loss)
+            .map(|l| format!("\n\n{l}"))
+            .unwrap_or_default();
         vec![Effect::Confirm(ConfirmSpec {
             purpose: purpose::REPAIR,
             title: "Repair Filesystem?".into(),
             message: format!(
                 "This will attempt to fix {count} repairable error(s). Unrepairable issues \
-                 (B-tree structural damage) will be skipped.\n\nContinue?"
+                 (B-tree structural damage) will be skipped.{loss}\n\nContinue?"
             ),
             confirm_label: "OK".into(),
             destructive: true,

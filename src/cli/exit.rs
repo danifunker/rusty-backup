@@ -80,9 +80,17 @@ pub fn permission_denied(message: impl Into<String>) -> anyhow::Error {
 /// Walks the whole `anyhow` chain, so adding `.context(..)` to a coded error
 /// does not silently downgrade it back to 1.
 pub fn code_for(err: &anyhow::Error) -> i32 {
-    err.chain()
+    use crate::model::fault::{kind_of, FaultKind};
+    let coded = err
+        .chain()
         .find_map(|e| e.downcast_ref::<CodedError>())
-        .map(|c| c.code)
+        .map(|c| c.code);
+    // A model refusal carries a kind, not a CLI code; this is where it becomes one.
+    coded
+        .or_else(|| match kind_of(err)? {
+            FaultKind::NotFound => Some(NOT_FOUND),
+            FaultKind::PermissionDenied => Some(PERMISSION_DENIED),
+        })
         .unwrap_or(GENERIC_FAILURE)
 }
 

@@ -913,7 +913,8 @@ impl CommanderController {
             return;
         };
         let wrote = wrote || self.left.applying().is_some();
-        if self.left.is_busy() || self.left.apply_review().is_some() {
+        let waiting = self.left.awaiting_save_answer();
+        if self.left.is_busy() || self.left.apply_review().is_some() || waiting {
             self.modes.follow = Some((follow, total, wrote));
             return;
         }
