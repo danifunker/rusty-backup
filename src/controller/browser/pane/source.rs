@@ -544,7 +544,8 @@ impl BrowserPaneController {
         // Parked first, so an open that fails at once still hands them back (CBR-001).
         self.src.reopen_restore = Some((keep, cwd));
         let fx = self.open_partition(i);
-        if self.src.opening.is_none() {
+        // A deferred open still lands later and takes the parked edits then.
+        if !self.is_opening() {
             if let Some((edits, _)) = self.src.reopen_restore.take() {
                 edits.into_iter().for_each(|e| self.queue.push(e));
             }
@@ -713,8 +714,7 @@ impl BrowserPaneController {
     fn request_switch(&mut self, sw: Switch) -> Vec<Effect> {
         // A write in flight, or the reopen that follows it, owns the staged edits: switching then
         // dropped the write's outcome, or landed partition i's edits on partition j (CBR-001, CBR-007).
-        let writing = self.checking().is_some() || self.applying().is_some() || self.tool_busy();
-        if writing || self.src.reopen_restore.is_some() {
+        if self.writing_now() || self.src.reopen_restore.is_some() {
             return vec![message(
                 "wait for the write to finish before switching.".into(),
             )];
@@ -780,6 +780,7 @@ impl BrowserPaneController {
         s.reopen_restore = None;
         self.ed.reset();
         self.listing = DirListing::new();
+        self.forget_old_source();
         self.source_changed();
         self.queue.clear();
     }
@@ -799,6 +800,9 @@ impl BrowserPaneController {
 
     /// Clears the listing for a partition or disc filesystem about to open.
     fn clear_for_partition(&mut self, idx: usize) {
+        if self.src.selected != Some(idx) {
+            self.forget_old_source();
+        }
         self.src.selected = Some(idx);
         self.clear_for_open();
     }

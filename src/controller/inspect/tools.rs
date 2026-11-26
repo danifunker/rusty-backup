@@ -80,6 +80,7 @@ impl ToolState {
     pub fn writing(&self) -> bool {
         self.repairing
             || self.bootable.is_some()
+            || self.boot_pending.is_some()
             || self.table_apply.is_some()
             || self.expand.is_some()
             || self.repack.is_some()
@@ -630,6 +631,10 @@ impl InspectController {
     }
 
     fn write_bootable(&mut self, path: PathBuf, donor: Option<PathBuf>) {
+        // The write itself is gated too: the assess may have waited on a donor meanwhile.
+        if !self.ready_to_write() {
+            return;
+        }
         let opts = MakeBootableOptions {
             donor,
             driver: DriverSource::Builtin,
@@ -1115,7 +1120,9 @@ impl InspectController {
             return;
         }
         let sink = Arc::clone(&self.log);
-        if !self.ready_to_write() {
+        // A separate output: only another write is in the way, not an open browse.
+        if self.tools.writing() {
+            self.error("Another tool is writing to this disk; wait for it to finish.");
             return;
         }
         self.tools.swab = Some(self.spawn("Swapping word order...", move |job| {

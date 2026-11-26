@@ -596,10 +596,15 @@ impl BrowserPaneController {
     }
 
     /// Drops expanded wrappers, the tree selection and the cursor after the view swaps the source.
-    pub fn source_changed(&mut self) {
+    /// A different source or partition: what was pending against the old one goes (CBR-005).
+    /// A reopen of the same volume after an apply keeps it.
+    pub(super) fn forget_old_source(&mut self) {
         self.tl.forget_source();
         self.vol.forget_source();
         self.arc.forget_source();
+    }
+
+    pub fn source_changed(&mut self) {
         self.collapse_wrappers();
         self.folders.clear();
         self.folders_source_changed();

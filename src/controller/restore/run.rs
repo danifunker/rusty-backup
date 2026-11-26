@@ -145,7 +145,13 @@ impl RestoreController {
                 format_size(row.effective_size())
             };
             msg.push_str(
-                format!("\n  Partition {}: {} -> {}", row.index, row.type_name, size).as_str(),
+                format!(
+                    "\n  Partition {}: {} -> {}",
+                    row.index + 1,
+                    row.type_name,
+                    size
+                )
+                .as_str(),
             );
         }
         msg

@@ -391,6 +391,16 @@ impl BrowserPaneController {
         self.tl.job.is_some()
     }
 
+    /// Something is writing this pane's image or folder now: an apply, a Repair, a tar import or
+    /// a host write. Closing or switching then would cut it off; read jobs can just be cancelled.
+    pub fn writing_now(&self) -> bool {
+        self.checking().is_some()
+            || self.applying().is_some()
+            || matches!(self.tl.job, Some(ToolJob::Repair { .. }))
+            || self.archive_busy()
+            || self.host_writing().is_some()
+    }
+
     /// A file read for the text editor, handed over once; the view keeps the buffer.
     pub fn take_text_doc(&mut self) -> Option<TextDoc> {
         self.tl.text.take()
