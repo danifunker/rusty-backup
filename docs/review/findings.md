@@ -639,3 +639,124 @@ Review by a separate agent (with two sub-forks), 2026-11-21, read-only.
 | QN2-004 | S2 | confirmed | qnx2fs lib.rs `deleted_state`, `claim` | Per-block loops over 2^32 spans: billions of iterations / issue strings. | fixed (1dbd1562) |
 | QN2-005 | S2 | confirmed | qnx2fs lib.rs `copy_entry` | Recursive copy has no depth / visited guard. | fixed (1dbd1562) |
 | QN2-006 | S3 | confirmed | qnx2fs lib.rs `create_file`, `free_slot`, `delete` | Data allocated before the slot; spill relink before failure; delete frees before rewriting. | fixed (1dbd1562) |
+
+---
+
+# src/ review (branch `review-src`, started 2026-11-25)
+
+Slices, write paths first: (1) restore, partition, rbformats, backup; (2) os,
+privileged, device.rs; (3) fs glue, optical, remote; (4) model; (5) controller;
+(6) cli; (7) gui (light, egui is retiring) and root files. Frontends come last, on
+their own OSes. Findings come from one read-only review agent per module and are
+re-checked before they are fixed; "confirmed" here is the reviewer's verdict until
+a status says otherwise.
+
+Mechanical (slice 1): `eprintln!` in partition/x68k_hdd_builder.rs (3) and
+backup/single_file_chd.rs (3); allocations sized from input listed under RBF.
+
+## src/restore
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| RST-001 | S1 | confirmed | [mod.rs:1218](../../src/restore/mod.rs#L1218) | Step 8 resizes at the layout's start (`ov.effective_start_lba()`), but the EBR plan repacked logicals one sector apart once any resized, so data and EBRs went elsewhere: the resize read the wrong sectors (FAT `Ok(false)`, BPB left at the old size, overrunning the next logical), and Modern 1 MiB alignment was lost for logicals. | fixed (this branch): the EBR plan uses the layout's starts; test `logical_partitions_keep_their_laid_out_starts_after_a_shrink` (32769 vs 34816 before) |
+| RST-002 | S1 | confirmed | [mod.rs:2990](../../src/restore/mod.rs#L2990) | Clonezilla: Minimum = partclone `used_size()`, received as `Custom`; `copy_limit = export_size.min(size)` cuts a block-positioned partclone stream, dropping every used block past it, with no floor check. An fs the resizer doesn't know (XFS, JFS, UFS) then hits `resize_fat_in_place` → `Ok(false)`: silent loss. | open |
+| RST-003 | S1 | confirmed | [mod.rs:527](../../src/restore/mod.rs#L527) | APM Original alignment keeps every start but never checks a grown partition against the next; Custom on a non-tail row, or FillRemaining on the last row by index when index order differs from LBA order, overlaps entries and the grow writes over the neighbour. | open |
+| RST-004 | S1 | confirmed | [superfloppy_wrap.rs:124](../../src/restore/superfloppy_wrap.rs#L124) | GPT fit check `end_byte > target_size_bytes` ignores the 33-sector backup GPT; FillRemaining (`disk_write_plan.rs:137`) sizes to `target - first_byte`, so `write_backup_gpt` overwrites the partition's last 33 sectors and the entry passes the last usable LBA. | open |
+| RST-005 | S2 | confirmed | [single.rs:352](../../src/restore/single.rs#L352) | New-disk GPT on an image: disk sized `data + 2048*512`, start 2048, so the partition ends on the last sector; the backup GPT (written first) is overwritten by data and `end_lba` passes the last usable LBA. | open |
+| RST-006 | S2 | plausible | [mod.rs:2410](../../src/restore/mod.rs#L2410) | `build_ebr_chain(..).ok()?` swallows the error PT-011 made fatal; on `None` `write_clonezilla_disk` writes no EBRs, so logicals vanish. | open |
+| RST-007 | S2 | confirmed | [mod.rs:911](../../src/restore/mod.rs#L911) | Single-file CHD as-is vs resize looks only at size choices: all rows Original plus Modern1MB/Custom alignment copies the image verbatim, silently ignoring the alignment. | open |
+| RST-008 | S2 | confirmed | [single.rs:531](../../src/restore/single.rs#L531) | `let _ = patch_hidden_sectors_for(..)`: a failed patch after a move leaves DOS/Win9x unbootable with nothing logged (the CHD and wrap paths propagate it). | open |
+| RST-009 | S2 | confirmed | [single.rs:307](../../src/restore/single.rs#L307) | New-disk MBR writes `start_lba as u32, part_size_sectors as u32` and APM `(disk_size_bytes / 512) as u32` (L363): wraps past 2 TiB (the CHD path uses `u32::try_from`). | open |
+| RST-010 | S2 | confirmed | [mod.rs:990](../../src/restore/mod.rs#L990) | A GPT/APM backup missing gpt.json/apm.json only warns, then writes every partition onto a disk with no table; a Clonezilla GPT parse failure (L2614) also falls into the MBR branch. Should bail. | open |
+| RST-011 | S3 | confirmed | [mod.rs:1363](../../src/restore/mod.rs#L1363) | `let _ = validate_filesystem_for(..)` (also L2746, single.rs:615-660): a validator error after a resize is dropped and the restore reports complete. | open |
+| RST-012 | S2 | plausible | [mod.rs:269](../../src/restore/mod.rs#L269) | Superfloppy layout returns `pm.original_size_bytes`, ignoring Custom / FillRemaining / Minimum. Confirm whether the controller offers size modes for a table-less backup. | open |
+| RST-013 | S3 | confirmed | [mod.rs:2232](../../src/restore/mod.rs#L2232) | Clonezilla Modern1MB/Custom pass heads 0 / spt 0; the per-partition path falls back to 255/63 because zero geometry leaves CHS stale after a move. | open |
+| RST-014 | S3 | confirmed | [mod.rs:2691](../../src/restore/mod.rs#L2691) | The Clonezilla resize ladder drifted from `run_restore`'s: NTFS skips `ensure_backup_boot_sector`, FAT skips `resize_human68k_in_place`, no `needs_resize` guard. | open |
+| RST-015 | S3 | confirmed | [mod.rs:993](../../src/restore/mod.rs#L993) | Em-dash glyphs in user-visible log/error strings (L993, 1019, 1191, 1250, 1285, 2627). | open |
+| RST-016 | S4 | confirmed | [mod.rs:1623](../../src/restore/mod.rs#L1623) | Doc says logicals are unsupported and bail; the code rebuilds the EBR chain (L1900) and is tested. | open |
+| RST-017 | S4 | confirmed | [mod.rs:190](../../src/restore/mod.rs#L190) | `calculate_restore_layout`'s doc sits on `restore_size_floor`. | open |
+| RST-018 | S4 | confirmed | [mod.rs:249](../../src/restore/mod.rs#L249) | `repack_hint` says Original keeps positions; only APM does, MBR/GPT repack from `first_partition_lba`. | open |
+| RST-019 | S4 | confirmed | [mod.rs:1686](../../src/restore/mod.rs#L1686) | The CHD-resize floor pre-flight can never fire (`calculate_restore_layout` already bailed on a stricter floor). | open |
+| RST-020 | S4 | confirmed | [single.rs:25](../../src/restore/single.rs#L25) | Says it re-uses the log/progress helpers; copies them from mod.rs:116-188. | open |
+| RST-021 | S4 | confirmed | [mod.rs:1292](../../src/restore/mod.rs#L1292) | Three hand-written FS-resize ladders (L1292, 1560, 2691) beside `crate::fs::resize_filesystem_for`; RST-014 is the drift. | open |
+| RST-022 | S4 | confirmed | [mod.rs:1086](../../src/restore/mod.rs#L1086) | The open-target block (device vs R+W truncate) is pasted five times. | open |
+| RST-023 | S4 | confirmed | [mod.rs:1923](../../src/restore/mod.rs#L1923) | The extended-entry `total_sectors` patch loop duplicates `rbformats/mod.rs:552`. | open |
+| RST-024 | S4 | confirmed | [single.rs:613](../../src/restore/single.rs#L613) | Per-FS validate match re-implements `validate_filesystem_for`. | open |
+| RST-025 | S3 | plausible | [mod.rs:760](../../src/restore/mod.rs#L760) | `plan_restore_ebr_chain` treats `index >= 4` as logical, `calculate_restore_layout` only `is_logical`; matters only for metadata older than 7e4ff1a9. | open |
+
+## src/partition
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| PAR-001 | S1 | confirmed | [resize.rs:412](../../src/partition/resize.rs#L412) | `apply_resize` moves data (`shift_region`) before `editor::apply_edits` writes the table; the editor refuses AHDI, X68k, Sun, TS, BSD, LVM (and RDB except SetBootable), and `validate_edits` is never called first. Shrinking partition 0 of an AHDI disk moves partition 1, then the editor bails and the table points at stale data. | open |
+| PAR-002 | S1 | confirmed | [editor.rs:519](../../src/partition/editor.rs#L519) | GPT/APM `DeleteEntry` uses `entries.remove(i)`, shifting later indices; edits after it in one Apply land on the wrong partition (APM L642). | open |
+| PAR-003 | S1 | confirmed | [resize.rs:91](../../src/partition/resize.rs#L91) | `compute_resize_plan` bounds by the disk size only, ignoring GPT's backup area and last usable LBA: growing the last GPT partition lets `apply_gpt_edits` write the backup array inside it. | open |
+| PAR-004 | S1 | confirmed | [editor.rs:317](../../src/partition/editor.rs#L317) | Unchecked `as u32` on MBR entries (`new_size_bytes / 512`, starts at L351/416); same in SGI, SGI-DkLabel, APM edits (L1188, 1356, 605): wraps past 2 TiB. | open |
+| PAR-005 | S2 | confirmed | [restore_patch.rs:59](../../src/partition/restore_patch.rs#L59) | `layout_limits` reports tail 0 for Sun and nothing for SGI-DkLabel, while the patchers reserve `acyl` / cap at `altstart`; a builder "rest" row is then refused on every Sun donor with alternate cylinders. | open |
+| PAR-006 | S2 | confirmed | [resize.rs:445](../../src/partition/resize.rs#L445) | A shrink truncates the image to `new_data_end`, cutting off the backup GPT just written and any tail. | open |
+| PAR-007 | S2 | confirmed | [restore_patch.rs:316](../../src/partition/restore_patch.rs#L316) | Restore patchers write `as u32` unchecked: SGI, SGI-DkLabel, AHDI, TS, Sun (X68k and NeXT refuse). | open |
+| PAR-008 | S2 | confirmed | [x68k_hdd_builder.rs:485](../../src/partition/x68k_hdd_builder.rs#L485) | `entry_start as u32` into a word whose high byte is flags, no 0xFFFFFF check: 8 GiB SASI disks corrupt the flags of partitions 5-8. | open |
+| PAR-009 | S2 | confirmed | [provision.rs:624](../../src/partition/provision.rs#L624) | `place` doesn't cap MBR, APM, AHDI or X68k at their field widths (`as u32` wraps); BSD and SGI use `try_from`. | open |
+| PAR-010 | S2 | confirmed | [editor.rs:571](../../src/partition/editor.rs#L571) | The GPT parser drops empty entries and `apply_gpt_edits` rebuilds from the compacted list: any edit renumbers partitions after a gap. | open |
+| PAR-011 | S2 | plausible | [restore_patch.rs:90](../../src/partition/restore_patch.rs#L90) | `repack` lays out only given overrides; an unrestored listed slot (Sun, SGI, AHDI) keeps its extent and a moved neighbour can overlap it. | open |
+| PAR-012 | S3 | confirmed | [x68k_hdd_builder.rs:459](../../src/partition/x68k_hdd_builder.rs#L459) | `eprintln!` (L459, 725, 791) carries warnings the user must act on, invisible in the GUI; belongs in a log callback or `BuildSummary.warnings`. | open |
+| PAR-013 | S3 | confirmed | [editor.rs:511](../../src/partition/editor.rs#L511) | Unapplicable edits are logged and skipped and `apply_edits` returns Ok (bad GUID, no free MBR slot, logical resize, SetBootable on MBR/APM). | open |
+| PAR-014 | S3 | confirmed | [editor.rs:474](../../src/partition/editor.rs#L474) | A size under 512 bytes gives `last_lba < first_lba`; `validate_edits` accepts 0. | open |
+| PAR-015 | S3 | confirmed | [x68k_hdd_builder.rs:418](../../src/partition/x68k_hdd_builder.rs#L418) | U+2014 in user-visible strings (also L436, 607, 623; editor.rs:1242; provision.rs:1067; resize.rs:692; mod.rs:271, 287). | open |
+| PAR-016 | S3 | plausible | [x68k_hdd_builder.rs:679](../../src/partition/x68k_hdd_builder.rs#L679) | `start_sector as usize * sector_size` overflows on 32-bit Win32. | open |
+| PAR-017 | S4 | confirmed | [mod.rs:439](../../src/partition/mod.rs#L439) | mod.rs (3,632 lines) has several jobs; split the 560-line `detect_superfloppy` and the per-scheme row builders. | open |
+| PAR-018 | S4 | confirmed | [editor.rs:1411](../../src/partition/editor.rs#L1411) | Comment swaps SGI slots 8 and 10. | open |
+| PAR-019 | S4 | confirmed | [mac_cd_builder.rs:243](../../src/partition/mac_cd_builder.rs#L243) | `build_mac_hfs_cd` and `build_sgi_efs_hdd` are public in-RAM builders used only by tests. | open |
+
+## src/rbformats
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| RBF-001 | S1 | confirmed | [vhd.rs:336](../../src/rbformats/vhd.rs#L336) | The fixed-VHD footer is written at the cursor; after `reconstruct_disk_from_backup`'s `patch_hidden_sectors_for` the cursor sits at last partition + 512, so a backup-folder VHD export writes `conectix` over the last partition's sector 1 and EOF has no footer (also the label path, vhd.rs:510, and RDB without tail pad). | open |
+| RBF-002 | S1 | confirmed | [export.rs:748](../../src/rbformats/export.rs#L748) | 2MG export from a backup folder writes a 64-byte placeholder, but reconstruct places data at absolute offsets: the volume overwrites the placeholder and `patch_header_length` then overwrites the volume's first 64 bytes. | open |
+| RBF-003 | S1 | confirmed | [mod.rs:735](../../src/rbformats/mod.rs#L735) | Exports from a backup folder never resize the filesystem; data is cut to `export_size` and the table patched, so "Minimum" on a compacted FAT gives a partition smaller than its BPB (`SIZES_HINT` promises a resize). | open |
+| RBF-004 | S1 | confirmed | [mod.rs:1345](../../src/rbformats/mod.rs#L1345) | RDB skip test is always true, so every in-place shrink skips `resize_filesystem_for`; resize errors only logged. | open |
+| RBF-005 | S1 | confirmed | [mod.rs:1009](../../src/rbformats/mod.rs#L1009) | APM raw export resizes only `Apple_HFS` and only logs a failure; shrinking HFS+ copies `min(original, export)` and leaves the header at the old size. | open |
+| RBF-006 | S1 | confirmed | [compress.rs:345](../../src/rbformats/compress.rs#L345) | On i686 Windows, `(remaining as usize).min(CHUNK)` truncates: remaining = 4 GiB reads 0 and stops (8 GiB partition stops at 4 GiB); same at vhd.rs:693/721, mod.rs:985/1309/2195, export.rs:969/1237; mod.rs:2213 loops forever. | open |
+| RBF-007 | S1 | confirmed | [export.rs:1148](../../src/rbformats/export.rs#L1148) | Clonezilla whole-disk export to QCOW2 / dynamic VHD / VMDK goes through `convert_from_vhd_temp`, which writes raw bytes: a raw image named `.qcow2`/`.vmdk`. | open |
+| RBF-008 | S1 | confirmed | [mod.rs:690](../../src/rbformats/mod.rs#L690) | No overlap check: if a partition grew past the next start, the next is written at the cursor (prev + 512) instead of its LBA (VHD raw path at `total_written`). | open |
+| RBF-009 | S1 | plausible | [vhd.rs:954](../../src/rbformats/vhd.rs#L954) | Clonezilla EBR written at `part_offset - 512`; for the extended container the first EBR lands one sector early and its real LBA is zero-filled. | open |
+| RBF-010 | S2 | confirmed | [export.rs:1289](../../src/rbformats/export.rs#L1289) | Dynamic VHD / QCOW2 / VMDK exports from a backup size the disk at the last partition's end: the GPT backup header is dropped and the primary's alternate LBA points past the end. | open |
+| RBF-011 | S2 | confirmed | [mod.rs:2226](../../src/rbformats/mod.rs#L2226) | `seek(source_data_size - 1); write_all(&[0])` zeroes the last byte of a partition running to the disk end. | open |
+| RBF-012 | S2 | confirmed | [mod.rs:711](../../src/rbformats/mod.rs#L711) | A missing partition data file is replaced by zeros with a log line; restore/export reports success. | open |
+| RBF-013 | S2 | confirmed | [cbk.rs:373](../../src/rbformats/cbk.rs#L373) | `vec![0u8; index_len]` and `with_capacity(chunk_count)` from footer u32s before any check; short index panics. | open |
+| RBF-014 | S2 | plausible | [cbk.rs:442](../../src/rbformats/cbk.rs#L442) | Traversal guard doesn't reject `:` (Windows `C:x` drive-relative join). | open |
+| RBF-015 | S2 | confirmed | [export.rs:1211](../../src/rbformats/export.rs#L1211) | WOZ/MOOF/DC42 from Clonezilla allocate `data_size` with no `check_floppy_export_size`. | open |
+| RBF-016 | S2 | confirmed | [mod.rs:1598](../../src/rbformats/mod.rs#L1598) | WOZ/MOOF, Twiggy (L1995) and DART (L1983) detection `read_to_end` the whole file once the magic matches. | open |
+| RBF-017 | S2 | confirmed | [gz_index.rs:75](../../src/rbformats/gz_index.rs#L75) | `with_capacity(count)` from the `.idx` sidecar before the truncation check. | open |
+| RBF-018 | S2 | plausible | [chd_edit.rs:109](../../src/rbformats/chd_edit.rs#L109) | `position / sector_size` would panic on a CHD unit size of 0. | open |
+| RBF-019 | S2 | plausible | [chd_edit.rs:503](../../src/rbformats/chd_edit.rs#L503) | `flatten_to_parent` re-encodes without geometry / ident (custom GDDD/IDNT lost) and loses codecs/hunk when `opts` is None. | open |
+| RBF-020 | S3 | confirmed | [chd.rs:560](../../src/rbformats/chd.rs#L560) | Model returns `crate::cli::exit::usage(..)`: model depends on the CLI. | open |
+| RBF-021 | S4 | confirmed | [export.rs:1265](../../src/rbformats/export.rs#L1265) | Four near-copies of open → sidecars → reconstruct → encode (RBF-010 in all four). | open |
+| RBF-022 | S4 | confirmed | [vhd.rs:619](../../src/rbformats/vhd.rs#L619) | The extended-entry patch loop and reconstruct re-implementations (VHD raw, Clonezilla VHD) differ in gap/overlap/resize rules; `zstd_compat.rs` and `qemu_img_test.rs` duplicate crate code. | open |
+
+## src/backup
+
+| ID | Sev | Verdict | Where | Finding | Status |
+|---|---|---|---|---|---|
+| BKP-001 | S1 | confirmed | [single_file_chd.rs:552](../../src/backup/single_file_chd.rs#L552) | With a CHD resize plan, `compute_resize_plan` plans primaries only, so staging skips logicals: an MBR disk with a logical swap gets zeros there in the CHD and metadata omits it, reported as success. | open |
+| BKP-002 | S2 | confirmed | [single_file_chd.rs:2121](../../src/backup/single_file_chd.rs#L2121) | MBR head segments are sector 0 plus the pre-primary gap; no EBRs are written, so the CHD's extended partition is empty for chdman/MAME, and metadata writes `extended_container: None`. | open |
+| BKP-003 | S2 | confirmed | [single_file_chd.rs:2016](../../src/backup/single_file_chd.rs#L2016) | Staging resize cuts the body to `target_len` then calls `resize_filesystem_for`, which is Ok and a no-op for UFS, XFS, minix...: the table shrinks, the superblock doesn't. | open |
+| BKP-004 | S1 | plausible | [single_file_chd.rs:411](../../src/backup/single_file_chd.rs#L411) | `run_export`'s resize path decodes only `.chd`; dynamic VHD, 2MG, QCOW2 sources are read raw while sector 0 came through the decoding `open_disk`. | open |
+| BKP-005 | S2 | confirmed | [mod.rs:2073](../../src/backup/mod.rs#L2073) | Defrag-clone pipe deadlocks if the consumer stops early: `reader` is alive at `producer.join()`, so cancel or disk-full hangs (also single_file_chd.rs:1933). | open |
+| BKP-006 | S2 | confirmed | [apm_extras.rs:47](../../src/backup/apm_extras.rs#L47) | A failed `apm-extras.bin` export leaves a partial file (only a warning); restore then bails and the bundled-driver fallback is skipped. | open |
+| BKP-007 | S2 | confirmed | [single_file_chd.rs:1294](../../src/backup/single_file_chd.rs#L1294) | `vec![0u8; head_end]` sized by the first partition's offset (also L1322 for label schemes): a multi-GB allocation. | open |
+| BKP-008 | S3 | confirmed | [verify.rs:433](../../src/backup/verify.rs#L433) | Single-file CHD partitions have empty `compressed_files`, so their recorded checksums are never verified. | open |
+| BKP-009 | S3 | plausible | [single_file_chd.rs:1164](../../src/backup/single_file_chd.rs#L1164) | A short staged `.zst` is zero-padded by `DiskImageStream` but the hash covers fewer bytes, unwarned. | open |
+| BKP-010 | S3 | confirmed | [single_file_chd.rs:1759](../../src/backup/single_file_chd.rs#L1759) | `eprintln!` clone warnings (L1759, 1792, 1825) bypass the progress log. | open |
+| BKP-011 | S3 | confirmed | [mod.rs:671](../../src/backup/mod.rs#L671) | Container-decode loop has no cancel check; `sizes.rs` none at all (minute-long HFS+ walks). | open |
+| BKP-012 | S3 | confirmed | [mod.rs:2519](../../src/backup/mod.rs#L2519) | `progress.lock().expect(..)` panics on poison where every other lock tolerates it. | open |
+| BKP-013 | S3 | plausible | [mod.rs:2680](../../src/backup/mod.rs#L2680) | CHD metadata always writes `defragmented_clone: false`; restore uses it to skip `rebuild_outgrown_hfs`. | open |
+| BKP-014 | S3 | plausible | [mod.rs:2688](../../src/backup/mod.rs#L2688) | CHD path records `config.source_path` where per-partition uses `source_display` (the `rb://` label). | open |
+| BKP-015 | S3 | confirmed | [sizes.rs:261](../../src/backup/sizes.rs#L261) | Glyphs in log text (ellipsis sizes.rs:261/269; em dashes mod.rs:1113, 1135, 1170, 1473, 1505, 1540). | open |
+| BKP-016 | S4 | confirmed | [mod.rs:2540](../../src/backup/mod.rs#L2540) | Three identical push closures, all at Info, so staging warnings lose their level. | open |
+| BKP-017 | S4 | confirmed | [mod.rs:1877](../../src/backup/mod.rs#L1877) | The 5-shape clone producer is duplicated in single_file_chd.rs:1738; the shape-label match thrice. | open |
+| BKP-018 | S4 | confirmed | [mod.rs:1106](../../src/backup/mod.rs#L1106) | 11 copy-pasted sidecar arms; `run_backup_inner` is ~1,600 lines. | open |
+| BKP-019 | S4 | confirmed | [single_file_chd.rs:20](../../src/backup/single_file_chd.rs#L20) | Stale module docs (sparse temp path, direct stream, re-reading for checksums). | open |
+| BKP-020 | S4 | confirmed | [single_file_chd.rs:1397](../../src/backup/single_file_chd.rs#L1397) | Dead code: `staging_path_unsupported_reason` (its DVD gate never runs), `let _ = is_superfloppy`, an unreachable `SolarisX86` arm, unread `mbr-min.bin`. | open |
+| BKP-021 | S4 | confirmed | [mod.rs:242](../../src/backup/mod.rs#L242) | `log` / `is_cancelled` duplicated across five units. | open |

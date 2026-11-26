@@ -782,7 +782,24 @@ fn plan_restore_ebr_chain(
             }
         })
         .collect();
-    let logical_infos = pack_logical_partitions(&items);
+    // `calculate_restore_layout` already placed every logical (EBR sector, then aligned), and
+    // the resize, validate and boot-flag steps use those starts; repacking here would put the
+    // data and the EBRs somewhere else (RST-001). Repack only logicals the layout never placed.
+    let laid_out = logical_pms
+        .iter()
+        .all(|pm| overrides.iter().any(|o| o.index == pm.index));
+    let logical_infos = if laid_out {
+        items
+            .iter()
+            .map(|it| LogicalPartitionInfo {
+                start_lba: it.start_lba,
+                total_sectors: (it.new_bytes / 512) as u32,
+                partition_type: it.partition_type,
+            })
+            .collect()
+    } else {
+        pack_logical_partitions(&items)
+    };
     let logical_starts = logical_pms
         .iter()
         .zip(&logical_infos)
@@ -4923,6 +4940,89 @@ mod clonezilla_layout_tests {
             gpt_disk_guid: None,
             gpt_first_lba: None,
             gpt_last_lba: None,
+        }
+    }
+
+    /// A per-partition MBR backup: one primary, then two logicals in an extended container.
+    fn logical_backup_metadata() -> BackupMetadata {
+        use crate::backup::metadata::{
+            AlignmentMetadata, BackupLayout, ExtendedContainerMetadata, PartitionMetadata,
+        };
+        let pm = |index: usize, start_lba: u64, sectors: u64, is_logical: bool| PartitionMetadata {
+            index,
+            type_name: "FAT32".to_string(),
+            partition_type_byte: 0x0C,
+            start_lba,
+            start_byte: None,
+            original_size_bytes: sectors * 512,
+            imaged_size_bytes: 4096 * 512,
+            compressed_files: vec![],
+            checksum: String::new(),
+            resized: false,
+            compacted: false,
+            is_logical,
+            partition_type_string: None,
+            minimum_size_bytes: Some(4096 * 512),
+            defragmented_min_size_bytes: None,
+            hfsplus_signature: None,
+            defragmented_clone: false,
+        };
+        BackupMetadata {
+            version: 1,
+            created: "2026-11-25T00:00:00Z".to_string(),
+            source_device: "src.img".to_string(),
+            source_size_bytes: 200_000 * 512,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "zstd".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::PerPartition,
+            container: None,
+            container_logical_size: None,
+            container_sha1: None,
+            size_policy: None,
+            alignment: AlignmentMetadata {
+                detected_type: "Modern1MB".to_string(),
+                first_partition_lba: 2048,
+                alignment_sectors: 2048,
+                heads: 255,
+                sectors_per_track: 63,
+            },
+            partitions: vec![
+                pm(0, 2048, 20480, false),
+                pm(4, 24577, 20480, true),
+                pm(5, 47105, 20480, true),
+            ],
+            bad_sectors: vec![],
+            extended_container: Some(ExtendedContainerMetadata {
+                mbr_index: 1,
+                partition_type_byte: 0x0F,
+                start_lba: 24576,
+                size_bytes: (200_000 - 24576) * 512,
+            }),
+        }
+    }
+
+    /// RST-001: once a logical shrinks, the EBRs and the data must sit where the layout put
+    /// them (aligned), since the resize and boot-flag steps use the layout's starts.
+    #[test]
+    fn logical_partitions_keep_their_laid_out_starts_after_a_shrink() {
+        let meta = logical_backup_metadata();
+        let sizes = [RestorePartitionSize {
+            index: 4,
+            size_choice: RestoreSizeChoice::Custom(8192 * 512),
+        }];
+        let ovs =
+            calculate_restore_layout(&meta, &RestoreAlignment::Modern1MB, &sizes, 200_000 * 512)
+                .unwrap();
+        let ebr = build_restore_ebr_chain(&meta, &ovs, None)
+            .unwrap()
+            .expect("a chain");
+        for (idx, start) in &ebr.logical_starts {
+            let ov = ovs.iter().find(|o| o.index == *idx).unwrap();
+            assert_eq!(*start, ov.effective_start_lba(), "logical {idx}");
+            assert_eq!(start % 2048, 0, "logical {idx} keeps 1 MiB alignment");
         }
     }
 
