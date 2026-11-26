@@ -98,6 +98,9 @@ pub fn run_repair(
             .open(session.flat_path())
             .with_context(|| format!("failed to open {} for repair", path.display()))?;
         let report = run_repair_reader(file, offset, ptype, type_string)?;
+        if let Some(loss) = session.loss() {
+            crate::model::notice::emit(format!("Warning: {loss}"));
+        }
         session
             .commit()
             .map_err(|e| anyhow!("re-encoding container after repair: {e:#}"))?;

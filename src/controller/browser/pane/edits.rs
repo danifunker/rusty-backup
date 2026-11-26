@@ -153,6 +153,8 @@ pub(super) struct EditState {
     log: Vec<String>,
     /// The user saw what saving drops from this container (MCM-003); asked once per source.
     loss_accepted: bool,
+    /// That question is on screen; a caller waiting on the apply keeps waiting.
+    loss_asking: bool,
 }
 
 impl EditState {
@@ -168,6 +170,7 @@ impl EditState {
             wrapper: None,
             log: Vec::new(),
             loss_accepted: false,
+            loss_asking: false,
         }
     }
 
@@ -636,20 +639,9 @@ impl BrowserPaneController {
                 self.ed.show_edits = on;
                 Vec::new()
             }
-            A::Apply => match self.loss_note() {
-                // Saving is allowed, but the user hears first what a flat re-encode drops (MCM-003).
-                Some(note) if !self.ed.loss_accepted && self.can_apply() => {
-                    vec![Effect::Confirm(ConfirmSpec {
-                        purpose: purpose::LOSSY_SAVE,
-                        title: "Save edits".to_string(),
-                        message: note.to_string(),
-                        confirm_label: "Save Anyway".to_string(),
-                        destructive: true,
-                    })]
-                }
-                _ => self.start_check(),
-            },
+            A::Apply => self.start_check(),
             A::Confirmed { purpose, yes } if purpose == purpose::LOSSY_SAVE => {
+                self.ed.loss_asking = false;
                 if !yes {
                     return Ok(msg("nothing was written; the edits stay staged."));
                 }
@@ -1139,6 +1131,11 @@ impl BrowserPaneController {
         self.session().cloned().map(ApplyTarget::Session)
     }
 
+    /// The re-encode warning is waiting on an answer, so the apply it guards hasn't started.
+    pub fn awaiting_save_answer(&self) -> bool {
+        self.ed.loss_asking
+    }
+
     /// What saving would drop from this source's container, if anything.
     fn loss_note(&self) -> Option<&'static str> {
         crate::model::container_edit::reencode_loss(self.source_path()?)
@@ -1147,6 +1144,21 @@ impl BrowserPaneController {
     pub(super) fn start_check(&mut self) -> Vec<Effect> {
         if !self.can_apply() {
             return Vec::new();
+        }
+        // Every write path comes here (Apply, a no-staging pane's immediate write), so the
+        // warning of what a flat re-encode drops can't be skipped (MCM-003).
+        if let Some(note) = self.loss_note().filter(|_| !self.ed.loss_accepted) {
+            if self.ed.loss_asking {
+                return Vec::new();
+            }
+            self.ed.loss_asking = true;
+            return vec![Effect::Confirm(ConfirmSpec {
+                purpose: purpose::LOSSY_SAVE,
+                title: "Save edits".to_string(),
+                message: note.to_string(),
+                confirm_label: "Save Anyway".to_string(),
+                destructive: true,
+            })];
         }
         let Some(target) = self.apply_target() else {
             return msg("no source to apply to.");
@@ -1476,6 +1488,46 @@ mod tests {
         assert!(vm.apply_report().is_none() && vm.apply_review().is_none());
         assert!(!names(&vm).contains(&victim), "{:?}", names(&vm));
         assert!(vm.take_log().iter().any(|l| l == "applied 1 edit(s)."));
+    }
+
+    #[test]
+    fn saving_a_woz_first_says_what_the_re_encode_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = fs_apple2::prodos::create_blank_prodos(143_360, "WOZTEST").unwrap();
+        let woz = dir.path().join("disk.woz");
+        std::fs::write(&woz, dsk_apple::woz_write::sectors_to_woz(&flat).unwrap()).unwrap();
+        let mut vm = BrowserPaneController::new();
+        vm.apply(A::OpenImage(woz));
+        settle(&mut vm);
+        assert!(vm.listing.is_loaded(), "{:?}", vm.source_error());
+        let cwd = vm.listing.cwd().unwrap().clone();
+        let folder = StagedEdit::CreateDirectory {
+            parent: cwd,
+            name: "NEW".into(),
+            qnx2_attrs: None,
+        };
+        vm.stage_edits(vec![folder]);
+        let fx = vm.apply(A::Apply);
+        let asked =
+            matches!(fx.as_slice(), [Effect::Confirm(c)] if c.purpose == purpose::LOSSY_SAVE);
+        assert!(asked, "{fx:?}");
+        assert!(vm.awaiting_save_answer());
+        // Asking again while the question is up shows nothing new; "no" keeps the edits staged.
+        assert!(vm.apply(A::Apply).is_empty());
+        vm.apply(A::Confirmed {
+            purpose: purpose::LOSSY_SAVE,
+            yes: false,
+        });
+        assert!(!vm.awaiting_save_answer());
+        assert_eq!(vm.queue.len(), 1);
+        // "Save anyway" starts the apply, and the question is not asked again for this image.
+        vm.apply(A::Apply);
+        vm.apply(A::Confirmed {
+            purpose: purpose::LOSSY_SAVE,
+            yes: true,
+        });
+        settle(&mut vm);
+        assert!(vm.ed.loss_accepted);
     }
 
     #[test]

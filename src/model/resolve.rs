@@ -235,6 +235,10 @@ impl RwCommit {
         match self {
             RwCommit::None => Ok(()),
             RwCommit::Container(session) => {
+                // Said when something is saved, not on every open (MCM-003).
+                if let Some(loss) = session.loss() {
+                    crate::model::notice::emit(format!("Warning: {loss}"));
+                }
                 let fmt = session.format_name();
                 session
                     .commit()
@@ -328,7 +332,7 @@ pub fn resolve_partition_rw(
 /// As [`resolve_partition_rw`], but a `--fs-type` override (`fs_override`)
 /// makes a partition-table detection failure non-fatal — see
 /// [`resolve_with_override`]. Used by `put` / `rm`, which then call
-/// [`FsDispatchOverride::apply`] to install the override.
+/// [`apply_fs_type`] to install the override.
 pub fn resolve_partition_rw_forced(
     path: &std::path::Path,
     selector: Option<PartSelector>,
@@ -482,9 +486,6 @@ pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit, 
         // the raw path would, so downstream dispatch is identical.
         let session = crate::model::container_edit::ContainerEditSession::open(path)
             .map_err(|e| anyhow!("opening container for edit: {e:#}"))?;
-        if let Some(loss) = crate::model::container_edit::reencode_loss(path) {
-            crate::model::notice::emit(format!("Warning: {loss}"));
-        }
         let file = open_image_rw(session.flat_path())?;
         Ok((
             Box::new(file),
@@ -590,7 +591,7 @@ pub fn resolve_partition_streaming_with_password(
 /// As [`resolve_partition_streaming_with_password`], but a `--fs-type`
 /// override (`fs_override`) makes a partition-table detection failure
 /// non-fatal — see [`resolve_with_override`]. Used by `ls` / `get`, which
-/// then call [`FsDispatchOverride::apply`] to install the override.
+/// then call [`apply_fs_type`] to install the override.
 pub fn resolve_partition_streaming_forced(
     path: &std::path::Path,
     selector: Option<PartSelector>,
@@ -654,7 +655,7 @@ pub fn resolve_partition_in_reader<R: Read + Seek>(
 /// table nor an on-disk FS signature (the defining shape of a flat CP/M
 /// floppy — the BIOS holds the DPB out-of-band) is treated as a raw FS at
 /// byte 0. The override itself is applied by the caller afterwards via
-/// [`FsDispatchOverride::apply`].
+/// [`apply_fs_type`].
 fn resolve_with_override<R: Read + Seek>(
     reader: &mut R,
     selector: Option<PartSelector>,

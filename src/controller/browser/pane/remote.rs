@@ -16,11 +16,11 @@ use crate::model::job::Snapshot;
 #[cfg(feature = "remote")]
 use super::VolumeInfo;
 #[cfg(feature = "remote")]
-use crate::cli::img_at::PartSelector;
-#[cfg(feature = "remote")]
 use crate::controller::browser::rows::remote_parent_dir;
 #[cfg(feature = "remote")]
 use crate::model::edit_queue::StagedEdit;
+#[cfg(feature = "remote")]
+use crate::model::img_at::PartSelector;
 #[cfg(feature = "remote")]
 use crate::model::job::{Job, JobCtx, Resource, Status};
 #[cfg(feature = "remote")]

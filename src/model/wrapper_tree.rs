@@ -223,14 +223,13 @@ impl WrapperTree {
             .map_err(|e| anyhow::anyhow!("read '{}': {e:#}", row.entry.name))?;
             return Ok(WrapperSource::TempFile(dir, path));
         }
+        if let Some(bcem) = bcem {
+            return ndif_to_temp(fs, row, &bcem)
+                .map_err(|e| anyhow::anyhow!("NDIF '{}': {e:#}", row.entry.name));
+        }
         let mut data = Vec::new();
         fs.write_file_to(&row.entry, &mut data)
             .map_err(|e| anyhow::anyhow!("read '{}': {e}", row.entry.name))?;
-        if let Some(bcem) = bcem {
-            return dsk_dmg::ndif::reconstruct(&data, &bcem)
-                .map(WrapperSource::Bytes)
-                .map_err(|e| anyhow::anyhow!("NDIF '{}': {e:#}", row.entry.name));
-        }
         Ok(WrapperSource::Bytes(data))
     }
 
@@ -415,6 +414,41 @@ pub fn tree_range(rows: &[TreeRow], anchor: &str, clicked: &str) -> Vec<String> 
         .filter(|r| &r.mount == mount && r.depth == depth)
         .map(|r| r.node_id.clone())
         .collect()
+}
+
+/// A nested NDIF rebuilt through temp files, chunk by chunk: its data fork and the disk it
+/// holds can each be hundreds of MB, so neither is read into memory (MCM-024).
+fn ndif_to_temp(
+    fs: &mut dyn disk_core::filesystem::Filesystem,
+    row: &TreeRow,
+    bcem: &[u8],
+) -> anyhow::Result<WrapperSource> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (dir, data_path) = commander_descend::materialize_streamed("ndif-data-fork", |f| {
+        let mut w = std::io::BufWriter::new(f);
+        fs.write_file_to(&row.entry, &mut w)?;
+        std::io::Write::flush(&mut w)?;
+        Ok(())
+    })?;
+    let image_path = dir
+        .path()
+        .join(crate::model::host_component(&row.entry.name, "ndif.img"));
+    let mut data = std::fs::File::open(&data_path)?;
+    let mut out = std::fs::File::create(&image_path)?;
+    let len = dsk_dmg::ndif::reconstruct_to(
+        &mut |off, len| {
+            let mut buf = vec![0u8; len];
+            data.seek(SeekFrom::Start(off as u64))?;
+            data.read_exact(&mut buf)?;
+            Ok(buf)
+        },
+        bcem,
+        &mut out,
+    )?;
+    out.set_len(len)?;
+    drop(data);
+    let _ = std::fs::remove_file(&data_path);
+    Ok(WrapperSource::TempFile(dir, image_path))
 }
 
 #[cfg(test)]

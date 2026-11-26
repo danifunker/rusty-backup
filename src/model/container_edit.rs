@@ -158,6 +158,11 @@ impl ContainerEditSession {
         self.temp.path()
     }
 
+    /// What committing drops from this container ([`reencode_loss`]).
+    pub fn loss(&self) -> Option<&'static str> {
+        reencode_loss(&self.original_path)
+    }
+
     /// A short display name for the wrapper format (for logging / errors).
     pub fn format_name(&self) -> &'static str {
         match self.format {
