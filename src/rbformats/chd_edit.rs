@@ -342,13 +342,23 @@ pub fn make_backup_copy(chd_path: &Path) -> Result<PathBuf> {
     if backup.exists() {
         return Ok(backup);
     }
-    fs::copy(chd_path, &backup).with_context(|| {
-        format!(
-            "failed to copy {} -> {}",
-            chd_path.display(),
-            backup.display()
-        )
-    })?;
+    // Through a `.part` name, so an interrupted copy is never taken for a finished backup.
+    let mut part_name = backup.file_name().unwrap_or_default().to_os_string();
+    part_name.push(".part");
+    let part = backup.with_file_name(part_name);
+    let copied = fs::copy(chd_path, &part)
+        .and_then(|_| fs::OpenOptions::new().write(true).open(&part)?.sync_all())
+        .and_then(|_| fs::rename(&part, &backup));
+    if let Err(e) = copied {
+        let _ = fs::remove_file(&part);
+        return Err(e).with_context(|| {
+            format!(
+                "failed to copy {} -> {}",
+                chd_path.display(),
+                backup.display()
+            )
+        });
+    }
     Ok(backup)
 }
 

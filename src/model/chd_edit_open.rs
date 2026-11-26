@@ -106,13 +106,17 @@ pub fn flatten_in_job(
     Ok(said)
 }
 
-/// Copy `from` to `to` in 4 MiB chunks, reporting bytes; a partial copy is removed on failure.
+/// Copy `from` to `to` in 4 MiB chunks through a `.part` name renamed at the end, so a crash
+/// never leaves a short `to` that a later edit trusts (MSR-008).
 fn copy_with_progress(from: &Path, to: &Path, job: &JobCtx) -> std::io::Result<()> {
     use std::io::{Read, Write};
+    let mut part_name = to.file_name().unwrap_or_default().to_os_string();
+    part_name.push(".part");
+    let part = to.with_file_name(part_name);
     let run = || -> std::io::Result<()> {
         let mut src = std::fs::File::open(from)?;
         let total = src.metadata()?.len();
-        let mut dst = std::fs::File::create(to)?;
+        let mut dst = std::fs::File::create(&part)?;
         let mut buf = vec![0u8; 4 << 20];
         let mut done = 0u64;
         loop {
@@ -124,11 +128,19 @@ fn copy_with_progress(from: &Path, to: &Path, job: &JobCtx) -> std::io::Result<(
             done += n as u64;
             job.set_bytes(done, total);
         }
-        dst.sync_all()
+        dst.sync_all()?;
+        if done != total {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the CHD changed size while it was being backed up",
+            ));
+        }
+        drop(dst);
+        std::fs::rename(&part, to)
     };
     let result = run();
     if result.is_err() {
-        let _ = std::fs::remove_file(to);
+        let _ = std::fs::remove_file(&part);
     }
     result
 }

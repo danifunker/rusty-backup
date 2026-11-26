@@ -54,9 +54,14 @@ impl CommanderController {
         match (src_host, dest.is_host_pane()) {
             // host -> image: stage the host paths themselves, nothing to extract.
             (true, false) => {
-                let edits = commander_ops::stage_host_to_image(&entries, &dest_parent);
-                let out = self.pane_mut(to).stage_edits(edits);
-                self.note_staged(to, out)
+                let staged = commander_ops::stage_host_to_image(&entries, &dest_parent);
+                let out = self.pane_mut(to).stage_edits(staged.edits);
+                let said = self.note_staged(to, out);
+                match staged.unreadable.as_slice() {
+                    [] => said,
+                    [(path, e)] => format!("{said} Left out {path}: {e}"),
+                    many => format!("{said} Left out {} unreadable folders.", many.len()),
+                }
             }
             (false, false) => {
                 let Some(source) = self.pane(from).copy_stage_source() else {

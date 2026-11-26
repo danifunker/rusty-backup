@@ -827,7 +827,7 @@ impl BrowserPaneController {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let host = FileEntry::new_file(name, path.display().to_string(), meta.len(), 0);
-        let out = self.stage_edits(stage_host_to_image(&[host], &parent));
+        let out = self.stage_edits(stage_host_to_image(&[host], &parent).edits);
         if out.staged == 0 {
             return msg("nothing to import.");
         }
@@ -870,7 +870,9 @@ impl BrowserPaneController {
             }
         }
         let fs_type = self.volume().fs_type.clone();
-        let out = self.stage_edits(stage_host_for(&hosts, &parent, &fs_type));
+        let staged = stage_host_for(&hosts, &parent, &fs_type);
+        errors.extend(staged.unreadable);
+        let out = self.stage_edits(staged.edits);
         errors.extend(out.dropped.iter().cloned());
         let mut said = vec![match (out.staged, errors.len()) {
             (n, 0) => format!("staged {n} item(s)."),

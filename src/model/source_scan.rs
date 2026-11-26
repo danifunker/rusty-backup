@@ -188,11 +188,20 @@ pub fn scan_image(path: &Path, ctx: &JobCtx) -> anyhow::Result<SourceScan> {
         table.type_name().to_string()
     };
     let partitions = table.partitions();
-    // Each probe gets its own handle; DMG / VHDX wrapping is skipped, as raw tables sit where expected.
+    // Each probe gets its own handle through the container's decoder: a raw read of a VHD, QCOW2
+    // or CHD file measured container bytes, not the disk (MSR-005).
     let owned: PathBuf = path.to_path_buf();
     let probes = probe_all(&partitions, ctx, |_| {
-        let f = File::open(&owned).ok()?;
-        Some(Box::new(BufReader::new(f)) as Box<dyn ReadSeek>)
+        let fmt =
+            crate::rbformats::detect_image_format_with_path(File::open(&owned).ok()?, Some(&owned));
+        // A container that won't wrap is read raw, as the table detection above falls back to.
+        let wrapped = fmt.ok().and_then(|fmt| {
+            crate::rbformats::wrap_image_reader(File::open(&owned).ok()?, fmt).ok()
+        });
+        match wrapped {
+            Some((r, _)) => Some(Box::new(BufReader::new(r)) as Box<dyn ReadSeek>),
+            None => Some(Box::new(BufReader::new(File::open(&owned).ok()?)) as Box<dyn ReadSeek>),
+        }
     })?;
     Ok(SourceScan {
         partitions,

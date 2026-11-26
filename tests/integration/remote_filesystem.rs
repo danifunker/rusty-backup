@@ -2746,7 +2746,7 @@ fn sync_apply_edits_to_remote_image_uploads_a_file() {
         19,
         0,
     )];
-    let edits = commander_ops::stage_host_to_image(&entries, &image_root);
+    let edits = commander_ops::stage_host_to_image(&entries, &image_root).edits;
     commander_ops::apply_edits_to_remote_image(&addr, "/disk.img", None, &edits).unwrap();
 
     // Read it back through a fresh RemoteFilesystem view of the image.
@@ -3075,7 +3075,7 @@ mod commander_remote {
         let cwd = vm.listing.cwd().unwrap().clone();
         let stage = |vm: &mut BrowserPaneController| {
             let edits =
-                rusty_backup::model::commander_ops::stage_host_to_image(&root.entries, &cwd);
+                rusty_backup::model::commander_ops::stage_host_to_image(&root.entries, &cwd).edits;
             vm.stage_edits(edits);
         };
         stage(&mut vm);

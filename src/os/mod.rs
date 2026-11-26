@@ -1057,6 +1057,50 @@ pub fn args_for_relaunch() -> Vec<std::ffi::OsString> {
         .collect()
 }
 
+/// A read-only `File` view with its own cursor, reading at explicit offsets: clones made with
+/// `try_clone` share one kernel offset, so two of them seeking at once read each other's bytes (MJB-002).
+pub struct PositionalFile {
+    file: File,
+    pos: u64,
+    len: u64,
+}
+
+impl PositionalFile {
+    pub fn new(file: File) -> Self {
+        // A device has no metadata length, so seek to its end as a plain File would (reads ignore
+        // the shared cursor); a macOS raw disk still reports 0 there.
+        let len = match file.metadata().map(|m| m.len()) {
+            Ok(n) if n > 0 => n,
+            _ => (&file).seek(SeekFrom::End(0)).unwrap_or(0),
+        };
+        Self { file, pos: 0, len }
+    }
+}
+
+impl Read for PositionalFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(&self.file, buf, self.pos)?;
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(&self.file, buf, self.pos)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for PositionalFile {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let next = match to {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        };
+        self.pos =
+            next.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek out of range"))?;
+        Ok(self.pos)
+    }
+}
+
 /// The one name a device goes by: symlinks resolved and Windows drive paths spelled
 /// `\\.\PhysicalDriveN`, so every check and lookup sees the same path (OSC-005, OSW-003).
 pub fn normalize_device_path(path: &Path) -> PathBuf {

@@ -416,9 +416,24 @@ impl PartitionEditor {
                 } else {
                     None
                 };
+                // The row's size field is what the user sees, so it is what gets written (MWR-013).
+                let shown = format!("{:.2}", entry.size_bytes as f64 / (1024.0 * 1024.0));
+                let size_bytes = match entry.size_text.trim() == shown {
+                    true => entry.size_bytes,
+                    false => match parse_mib(&entry.size_text) {
+                        Some(n) => n,
+                        None => {
+                            self.errors.push(format!(
+                                "Invalid size for the new partition at LBA {}: '{}'",
+                                entry.start_lba, entry.size_text
+                            ));
+                            continue;
+                        }
+                    },
+                };
                 self.edits.push(PartitionTableEdit::AddEntry {
                     start_lba: entry.start_lba,
-                    size_bytes: entry.size_bytes,
+                    size_bytes,
                     partition_type: type_byte,
                     type_string,
                     bootable: entry.bootable,
@@ -675,6 +690,23 @@ mod tests {
         editor.build_and_validate(&table);
         assert!(editor.errors.is_empty(), "errors: {:?}", editor.errors);
         assert_eq!(editor.edits.len(), 1);
+    }
+
+    #[test]
+    fn a_new_rows_edited_size_is_the_one_written() {
+        let (mut editor, parts) = seeded_editor();
+        let table = mbr_table(&parts);
+        editor.add_start_lba = format!("{}", 2048 + (50 * MIB / 512));
+        editor.add_size_mb = "40".to_string();
+        editor.add_type = "AF".to_string();
+        assert!(editor.add_entry_from_inputs(TableKind::Mbr));
+        editor.entries.last_mut().unwrap().size_text = "20".to_string();
+        editor.build_and_validate(&table);
+        assert!(editor.errors.is_empty(), "errors: {:?}", editor.errors);
+        assert!(matches!(
+            editor.edits[..],
+            [PartitionTableEdit::AddEntry { size_bytes, .. }] if size_bytes == 20 * MIB
+        ));
     }
 }
 

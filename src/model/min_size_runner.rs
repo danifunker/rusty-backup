@@ -151,7 +151,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                     };
                     if use_sector_aligned {
                         fs::partition_minimum_size_cancellable(
-                            SectorAlignedReader::new(clone),
+                            SectorAlignedReader::new(crate::os::PositionalFile::new(clone)),
                             req.partition_offset,
                             req.partition_type,
                             req.partition_type_string.as_deref(),
@@ -163,7 +163,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                         )
                     } else {
                         fs::partition_minimum_size_cancellable(
-                            BufReader::new(clone),
+                            BufReader::new(crate::os::PositionalFile::new(clone)),
                             req.partition_offset,
                             req.partition_type,
                             req.partition_type_string.as_deref(),

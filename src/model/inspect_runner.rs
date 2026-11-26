@@ -252,11 +252,15 @@ pub fn inspect_source(
         } else if uses_streaming_reader || is_chd {
             crate::model::source_reader::open_read(path).ok()
         } else {
-            device_file
-                .as_ref()?
-                .try_clone()
-                .ok()
-                .map(|f| Box::new(BufReader::new(f)) as Box<dyn ReadSeek>)
+            let f = device_file.as_ref()?.try_clone().ok()?;
+            // A raw device needs aligned reads and a known length, as the minimum loop has (MSR-006).
+            Some(if is_device {
+                Box::new(crate::os::SectorAlignedReader::new(
+                    crate::os::known_len_source(f, path),
+                )) as Box<dyn ReadSeek>
+            } else {
+                Box::new(BufReader::new(f)) as Box<dyn ReadSeek>
+            })
         }
     };
 

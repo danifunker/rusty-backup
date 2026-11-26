@@ -295,7 +295,7 @@ fn preflight_fs(fs: &mut dyn Filesystem, edits: &[StagedEdit]) -> ApplyPreflight
     ApplyPreflight {
         fs_type: fs.fs_type().to_string(),
         scan,
-        bytes_needed: queue.bytes_needed(unit),
+        bytes_needed: queue.bytes_needed_on(fs, unit),
         bytes_free: fs.total_size().saturating_sub(fs.used_size()),
     }
 }
@@ -757,10 +757,18 @@ fn join_path(parent: &str, name: &str) -> String {
 /// pane's queue. Unlike the image->image path this needs no temp extraction:
 /// each `AddFile` references the real host file by path; directories recurse
 /// over the host tree. Symlinks / special files are skipped.
-pub fn stage_host_to_image(entries: &[FileEntry], dest_parent: &FileEntry) -> Vec<StagedEdit> {
-    let mut edits = Vec::new();
-    stage_host_into(entries, dest_parent, &mut edits);
-    edits
+pub fn stage_host_to_image(entries: &[FileEntry], dest_parent: &FileEntry) -> HostStaging {
+    let mut out = HostStaging::default();
+    stage_host_into(entries, dest_parent, &mut out);
+    out
+}
+
+/// A host copy's staged edits, and the folders left out because they can't be listed (MCM-015).
+#[derive(Default)]
+pub struct HostStaging {
+    pub edits: Vec<StagedEdit>,
+    /// `(host path, why)`.
+    pub unreadable: Vec<(String, String)>,
 }
 
 /// Stage host files for a volume of `fs_type`: forks only into HFS / HFS+, and ProDOS takes
@@ -769,10 +777,10 @@ pub fn stage_host_for(
     entries: &[FileEntry],
     dest_parent: &FileEntry,
     fs_type: &str,
-) -> Vec<StagedEdit> {
-    let mut edits = stage_host_to_image(entries, dest_parent);
+) -> HostStaging {
+    let mut staged = stage_host_to_image(entries, dest_parent);
     let forks = matches!(fs_type, "HFS" | "HFS+" | "HFSX");
-    for edit in edits.iter_mut() {
+    for edit in staged.edits.iter_mut() {
         let StagedEdit::AddFile {
             name,
             host_path,
@@ -803,13 +811,20 @@ pub fn stage_host_for(
             }
         }
     }
-    edits
+    staged
 }
 
-fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, edits: &mut Vec<StagedEdit>) {
+fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, out: &mut HostStaging) {
     for entry in entries {
         if entry.is_directory() {
-            edits.push(StagedEdit::CreateDirectory {
+            let children = match host_children(&entry.path) {
+                Ok(children) => children,
+                Err(e) => {
+                    out.unreadable.push((entry.path.clone(), e.to_string()));
+                    continue;
+                }
+            };
+            out.edits.push(StagedEdit::CreateDirectory {
                 parent: dest_parent.clone(),
                 name: entry.name.clone(),
                 qnx2_attrs: None,
@@ -819,8 +834,7 @@ fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, edits: &mut V
                 join_path(&dest_parent.path, &entry.name),
                 0,
             );
-            let children = host_children(&entry.path);
-            stage_host_into(&children, &child_parent, edits);
+            stage_host_into(&children, &child_parent, out);
         } else if entry.is_file() {
             let host_path = PathBuf::from(&entry.path);
             // A sidecar is consumed as part of its primary file below; staging
@@ -844,7 +858,7 @@ fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, edits: &mut V
                 .and_then(|i| i.data_fork.as_ref())
                 .map(|d| d.len() as u64)
                 .unwrap_or(entry.size);
-            edits.push(StagedEdit::AddFile {
+            out.edits.push(StagedEdit::AddFile {
                 parent: dest_parent.clone(),
                 name,
                 host_path,
@@ -864,12 +878,10 @@ fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, edits: &mut V
 
 /// Minimal host directory listing (name / path / dir-or-file / size) for the
 /// copy walkers. Symlinks and special files are dropped.
-fn host_children(path: &str) -> Vec<FileEntry> {
+fn host_children(path: &str) -> std::io::Result<Vec<FileEntry>> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(path) else {
-        return out;
-    };
-    for dent in rd.flatten() {
+    for dent in std::fs::read_dir(path)? {
+        let dent = dent?;
         let name = dent.file_name().to_string_lossy().to_string();
         let full = dent.path().to_string_lossy().to_string();
         let Ok(meta) = dent.path().symlink_metadata() else {
@@ -882,7 +894,7 @@ fn host_children(path: &str) -> Vec<FileEntry> {
             out.push(FileEntry::new_file(name, full, meta.len(), 0));
         }
     }
-    out
+    Ok(out)
 }
 
 /// An immediate (unstaged) host-write copy, run on a worker thread.
@@ -2081,15 +2093,16 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         let host = FileEntry::new_file("PROG#060800".into(), file.display().to_string(), 1, 0);
         let root = FileEntry::root();
-        let named = |fs: &str| match &stage_host_for(std::slice::from_ref(&host), &root, fs)[0] {
-            StagedEdit::AddFile {
-                name,
-                prodos_type,
-                prodos_aux,
-                ..
-            } => (name.clone(), *prodos_type, *prodos_aux),
-            other => panic!("{other:?}"),
-        };
+        let named =
+            |fs: &str| match &stage_host_for(std::slice::from_ref(&host), &root, fs).edits[0] {
+                StagedEdit::AddFile {
+                    name,
+                    prodos_type,
+                    prodos_aux,
+                    ..
+                } => (name.clone(), *prodos_type, *prodos_aux),
+                other => panic!("{other:?}"),
+            };
         assert_eq!(named("ProDOS"), ("PROG".into(), Some(0x06), Some(0x0800)));
         assert_eq!(named("FAT16"), ("PROG#060800".into(), None, None));
     }
@@ -2617,10 +2630,10 @@ mod tests {
         std::fs::create_dir(base.path().join("SUB")).unwrap();
         std::fs::write(base.path().join("SUB").join("INNER.TXT"), b"inner!").unwrap();
 
-        let host_entries = host_children(&base.path().to_string_lossy());
+        let host_entries = host_children(&base.path().to_string_lossy()).unwrap();
         assert_eq!(host_entries.len(), 2);
 
-        let edits = stage_host_to_image(&host_entries, &FileEntry::root());
+        let edits = stage_host_to_image(&host_entries, &FileEntry::root()).edits;
 
         // Apply onto a blank FAT image.
         let flat = fs_pc::fat::create_blank_fat(737280, Some("DST")).unwrap();
@@ -2717,7 +2730,7 @@ mod tests {
         std::fs::create_dir(src.path().join("dir")).unwrap();
         std::fs::write(src.path().join("dir").join("g.txt"), b"more").unwrap();
         std::fs::write(src.path().join("f.txt"), b"data").unwrap();
-        let entries = host_children(&src.path().to_string_lossy());
+        let entries = host_children(&src.path().to_string_lossy()).unwrap();
         let status = Arc::new(Mutex::new(HostCopyStatus::default()));
 
         let dir_entry: Vec<FileEntry> = entries
@@ -2754,7 +2767,7 @@ mod tests {
         std::fs::create_dir(src.path().join("dir")).unwrap();
         std::fs::write(src.path().join("dir").join("g.txt"), b"more").unwrap();
 
-        let entries = host_children(&src.path().to_string_lossy());
+        let entries = host_children(&src.path().to_string_lossy()).unwrap();
         let dest = tempfile::tempdir().unwrap();
         let status = Arc::new(Mutex::new(HostCopyStatus::default()));
         let n = copy_host_entries_to_host(&entries, dest.path(), OnConflict::Replace, &status)

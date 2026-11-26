@@ -183,7 +183,7 @@ fn walk(
     Ok(())
 }
 
-/// A disc's files on both sides; an audio disc only has to open.
+/// A disc's files on both sides; with none to compare (audio, empty) it says so, not a pass.
 #[cfg(feature = "optical")]
 fn disc_files(src: &Path, dest: &Path) -> Result<String, String> {
     let list = |p: &Path| -> Result<Option<Listing>, String> {
@@ -198,13 +198,18 @@ fn disc_files(src: &Path, dest: &Path) -> Result<String, String> {
         Ok(Some(out))
     };
     match (list(src)?, list(dest)?) {
+        (Some(a), Some(_)) if a.is_empty() => {
+            Ok("Not verified: the disc has no files to compare.".to_string())
+        }
         (Some(a), Some(b)) => match compare(&a, &b) {
             None => Ok(format!("Verified: {} file(s) match.", a.len())),
             Some(problem) => Err(problem),
         },
-        (None, _) => {
-            Ok("Verified: the output opens (the disc has no files to compare).".to_string())
-        }
+        // Nothing was compared, so it must not read as a pass (MJB-008).
+        (None, _) => Ok(
+            "Not verified: the output opens, but the disc has no filesystem to compare."
+                .to_string(),
+        ),
         (Some(_), None) => Err("the output's files cannot be read".to_string()),
     }
 }

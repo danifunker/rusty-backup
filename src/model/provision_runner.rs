@@ -790,6 +790,20 @@ fn import_folder(
 /// Worker function. Public for unit testing — call this inline with a
 /// throwaway Status handle to skip the thread spawn.
 pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>>) -> Result<()> {
+    let mut made_target = false;
+    let result = run_worker_inner(req, status, &mut made_target);
+    if result.is_err() && made_target {
+        // A half-built image is not an image; leave none behind, as `run_cd` does (MWR-018).
+        let _ = std::fs::remove_file(&req.target_path);
+    }
+    result
+}
+
+fn run_worker_inner(
+    req: &ProvisionRequest,
+    status: Arc<Mutex<PhysicalWriteStatus>>,
+    made_target: &mut bool,
+) -> Result<()> {
     let status_progress = Arc::clone(&status);
     let status_cancel = Arc::clone(&status);
     let status_log = Arc::clone(&status);
@@ -850,6 +864,7 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
         );
     }
     if !crate::os::is_device_path(&req.target_path) {
+        let replaces = !req.full_write || !req.target_path.exists();
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -857,6 +872,8 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
             .truncate(!req.full_write)
             .open(&req.target_path)
             .with_context(|| format!("creating {}", req.target_path.display()))?;
+        // Only once the open succeeded: a refused open has touched nothing.
+        *made_target = replaces;
         file.set_len(req.target_size_bytes).with_context(|| {
             format!(
                 "sizing {} to {} bytes",

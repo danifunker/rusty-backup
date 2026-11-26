@@ -1460,7 +1460,7 @@ mod tests {
         std::fs::write(host.path().join(&existing), b"replacement").unwrap();
         let root = crate::model::dir_listing::read_host_root(host.path().to_path_buf()).unwrap();
         let cwd = vm.listing.cwd().unwrap().clone();
-        let edits = commander_ops::stage_host_to_image(&root.entries, &cwd);
+        let edits = commander_ops::stage_host_to_image(&root.entries, &cwd).edits;
         let out = vm.stage_edits(edits);
         assert_eq!((out.staged, out.queue_start), (1, 0));
         vm.apply(A::Apply);
@@ -1474,7 +1474,7 @@ mod tests {
         assert!(!vm.is_busy(), "a review waits on the user");
         assert!(!vm.unstage_since(0) || vm.queue.is_empty());
         // Dismissing writes nothing; asking again and overwriting lands the copy.
-        vm.stage_edits(commander_ops::stage_host_to_image(&root.entries, &cwd));
+        vm.stage_edits(commander_ops::stage_host_to_image(&root.entries, &cwd).edits);
         vm.apply(A::DismissReview);
         assert!(vm.apply_review().is_none());
         vm.apply(A::Apply);

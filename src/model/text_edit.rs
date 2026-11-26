@@ -306,12 +306,25 @@ pub fn decode_for_edit(
     };
 
     let decoded = match encoding {
-        TextEncoding::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+        // A lossy decode would save U+FFFD over the bad bytes (MCM-018).
+        TextEncoding::Utf8 => match std::str::from_utf8(bytes) {
+            Ok(text) => text.to_string(),
+            Err(e) => {
+                return Err(TextEditError::NotText {
+                    reason: format!("not valid UTF-8 at byte {}", e.valid_up_to()),
+                })
+            }
+        },
         TextEncoding::Cp437 => bytes.iter().map(|&b| cp437_to_char(b)).collect(),
         TextEncoding::MacRoman => mac_roman_to_utf8(bytes),
         TextEncoding::Latin1 => bytes.iter().map(|&b| b as char).collect(),
         TextEncoding::ShiftJis => {
-            let (text, _, _) = encoding_rs::SHIFT_JIS.decode(bytes);
+            let (text, _, bad) = encoding_rs::SHIFT_JIS.decode(bytes);
+            if bad {
+                return Err(TextEditError::NotText {
+                    reason: "not valid Shift-JIS".to_string(),
+                });
+            }
             text.into_owned()
         }
     };
@@ -532,6 +545,13 @@ mod tests {
         let d = decode_for_edit(b"README\r", "hfs", None).expect("decode");
         assert_eq!(d.shape.encoding, TextEncoding::MacRoman);
         assert_eq!(d.shape.ending, LineEnding::Cr);
+    }
+
+    #[test]
+    fn forcing_utf8_on_invalid_bytes_is_refused() {
+        let raw = b"caf\xe9\n";
+        assert!(decode_for_edit(raw, "fat32", Some(TextEncoding::Utf8)).is_err());
+        assert!(decode_for_edit(raw, "fat32", None).is_ok());
     }
 
     /// Valid UTF-8 with non-ASCII is self-validating, so it is trusted over the
