@@ -85,10 +85,7 @@ pub fn expand_mac_archive(raw: Vec<u8>, dir: &Path) -> Result<Vec<PathBuf>, Stri
 pub fn unwrap_binhex(raw: &[u8], dir: &Path) -> Result<PathBuf, String> {
     let bh = fs_mac::binhex::parse_binhex(raw).map_err(|e| format!("decode BinHex: {e}"))?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create folder: {e}"))?;
-    let name = match bh.name.is_empty() {
-        true => "archive.sit".to_string(),
-        false => bh.name.replace(['/', '\\'], "_"),
-    };
+    let name = crate::model::host_component(&bh.name, "archive.sit");
     let inner = dir.join(name);
     std::fs::write(&inner, &bh.data_fork).map_err(|e| format!("write inner archive: {e}"))?;
     Ok(inner)

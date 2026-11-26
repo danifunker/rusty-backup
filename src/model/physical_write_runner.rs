@@ -181,6 +181,15 @@ pub fn run_worker(
             src.display()
         );
     }
+    // On a device the region must lie within it (an image file grows); 0 is "size unknown" (MWR-020).
+    let end = req.extent.offset.saturating_add(req.extent.capacity);
+    let device = crate::os::is_device_path(&req.target_device_path);
+    if device && req.target_size_bytes > 0 && end > req.target_size_bytes {
+        anyhow::bail!(
+            "the write region ends at byte {end}, past the {}-byte target",
+            req.target_size_bytes
+        );
+    }
     // A partition write must leave the rest of the target intact.
     let open_target = if req.extent.is_whole_disk() {
         open_target_for_writing

@@ -119,6 +119,17 @@ fn new_status(total_bytes: u64) -> Arc<Mutex<ExportStatus>> {
     }))
 }
 
+/// What the HFS ceiling probe reads: a CHD through its lazy decoder, anything else as is, since
+/// this runs on the UI thread and must never decode a gzip or xz disk whole.
+fn probe_reader(path: &std::path::Path) -> Option<Box<dyn crate::rbformats::ReadSeek>> {
+    match crate::model::source_reader::is_chd_path(path) {
+        true => crate::model::source_reader::open_read(path).ok(),
+        false => File::open(path)
+            .ok()
+            .map(|f| Box::new(f) as Box<dyn crate::rbformats::ReadSeek>),
+    }
+}
+
 /// Build the per-partition config list. For classic HFS partitions, probes
 /// the source image to determine the volume's u16/VBM-derived size ceiling.
 ///
@@ -136,9 +147,8 @@ pub fn build_partition_configs(
     partition_defrag_min_sizes: &HashMap<usize, u64>,
     image_file_path: Option<&PathBuf>,
 ) -> Vec<PartitionExportConfig> {
-    let mut source_reader: Option<BufReader<File>> = image_file_path
-        .and_then(|p| File::open(p).ok())
-        .map(BufReader::new);
+    // Opened only for an HFS partition; a CHD is decoded, as its offsets are into the disk (MJB-020).
+    let mut source_reader: Option<Option<BufReader<Box<dyn crate::rbformats::ReadSeek>>>> = None;
 
     let mut configs = Vec::new();
     for part in partitions {
@@ -163,19 +173,20 @@ pub fn build_partition_configs(
         );
         let min_size = backup_min.or(live_min).unwrap_or(part.size_bytes);
 
-        let max_size = if let Some(reader) = source_reader.as_mut() {
-            let is_hfs_candidate = part
-                .partition_type_string
-                .as_deref()
-                .map(|s| s.eq_ignore_ascii_case("Apple_HFS"))
-                .unwrap_or(false);
-            if is_hfs_candidate {
-                hfs_max_growable_size(reader, part.start_lba * 512)
-            } else {
-                None
-            }
-        } else {
-            None
+        let is_hfs_candidate = part
+            .partition_type_string
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("Apple_HFS"));
+        let max_size = match is_hfs_candidate {
+            true => source_reader
+                .get_or_insert_with(|| {
+                    image_file_path
+                        .and_then(|p| probe_reader(p))
+                        .map(BufReader::new)
+                })
+                .as_mut()
+                .and_then(|reader| hfs_max_growable_size(reader, part.start_lba * 512)),
+            false => None,
         };
 
         configs.push(PartitionExportConfig {
@@ -783,12 +794,20 @@ fn run_per_partition(
             let status_progress = Arc::clone(status);
             let status_cancel = Arc::clone(status);
             let status_log = Arc::clone(status);
+            // A raw shrink writes the whole volume, resizes it, then cuts the file (MWR-011).
+            let shrink_raw = format == ExportFormat::Raw
+                && !pm.defragmented_clone
+                && export_size < pm.original_size_bytes;
+            let written_size = match shrink_raw {
+                true => pm.original_size_bytes,
+                false => export_size,
+            };
             export_partition(
                 format,
                 &members,
                 &meta.compression_type,
                 &dest_path,
-                Some(export_size),
+                Some(written_size),
                 move |bytes| {
                     if let Ok(mut s) = status_progress.lock() {
                         s.current_bytes = base_written + bytes;
@@ -814,9 +833,10 @@ fn run_per_partition(
                 if needs_resize || pm.compacted {
                     let mut rw = OpenOptions::new().read(true).write(true).open(&dest_path)?;
                     let status_log = Arc::clone(status);
+                    let fs_offset = if format == ExportFormat::TwoMg { 64 } else { 0 };
                     let fitted = fit_filesystem_to_export(
                         &mut rw,
-                        0,
+                        fs_offset,
                         export_size,
                         needs_resize,
                         &mut |msg| {
@@ -825,9 +845,12 @@ fn run_per_partition(
                             }
                         },
                     );
-                    drop(rw);
                     if let Err(e) = fitted {
+                        drop(rw);
                         return refuse_unpatched_shrink(&dest_path, pm.index, export_size, e);
+                    }
+                    if shrink_raw {
+                        rw.set_len(export_size)?;
                     }
                 }
             }
@@ -866,7 +889,8 @@ fn run_per_partition(
                 ));
             }
 
-            let read_limit = export_size.min(part.size_bytes);
+            // A shrink copies the whole volume first: the resizer moves data from past the cut (MWR-011).
+            let read_limit = part.size_bytes;
             // Decoded, like the HFV branch: the offset is into the disk the
             // container holds, not into the container file.
             let mut reader = BufReader::new(crate::model::source_reader::open_read(image_path)?);
@@ -929,11 +953,9 @@ fn run_per_partition(
                     drop(writer);
                     return refuse_unpatched_shrink(&dest_path, part.index, export_size, e);
                 }
-                let end = if format == ExportFormat::TwoMg {
-                    64 + total
-                } else {
-                    total
-                };
+                total = export_size;
+                let end = fs_offset + total;
+                writer.get_mut().set_len(end)?;
                 writer.seek(SeekFrom::Start(end))?;
             }
 
@@ -952,8 +974,6 @@ fn run_per_partition(
     Ok(())
 }
 
-/// A per-partition raw export can only shrink FAT in place; any other
-/// filesystem written short is a truncated volume, so remove it and say why.
 /// Bring the filesystem inside a freshly written export to `export_size`.
 /// `needs_resize` false means the size is unchanged and only a trimmed HFS
 /// volume's alternate header in the zero-filled tail has to be rewritten.
@@ -991,6 +1011,8 @@ fn create_export_file(path: &std::path::Path) -> std::io::Result<File> {
         .open(path)
 }
 
+/// A per-partition raw export can only shrink FAT in place; any other
+/// filesystem written short is a truncated volume, so remove it and say why.
 fn refuse_unpatched_shrink(
     dest_path: &std::path::Path,
     index: usize,

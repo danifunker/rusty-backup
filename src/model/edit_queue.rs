@@ -218,6 +218,39 @@ pub fn resolve_dir_in(fs: &mut dyn Filesystem, path: &str) -> Result<FileEntry, 
     })
 }
 
+/// `entry` as the volume has it now: a Replace earlier in the batch gives it a new node, so the one
+/// captured at staging would be stale (MCM-008). A lookup that fails keeps the staged entry.
+fn fresh(
+    efs: &mut dyn EditableFilesystem,
+    entry: &FileEntry,
+) -> Result<FileEntry, FilesystemError> {
+    let (parent, name) = match entry.path.trim_end_matches('/').rsplit_once('/') {
+        Some((p, n)) => (if p.is_empty() { "/" } else { p }, n),
+        None => return Ok(entry.clone()),
+    };
+    let Ok(dir) = resolve_dir_by_path(efs, parent) else {
+        return Ok(entry.clone());
+    };
+    // The staged node first: CP/M user areas and CBM directories hold one name twice.
+    let kids = efs.list_directory(&dir).unwrap_or_default();
+    let same_node = kids
+        .iter()
+        .find(|k| k.name == name && k.location == entry.location);
+    Ok(same_node
+        .or_else(|| kids.iter().find(|k| k.name == name))
+        .cloned()
+        .unwrap_or_else(|| entry.clone()))
+}
+
+fn fresh_pair(
+    efs: &mut dyn EditableFilesystem,
+    parent: &FileEntry,
+    entry: &FileEntry,
+) -> Result<(FileEntry, FileEntry), FilesystemError> {
+    let dir = resolve_dir_by_path(efs, &parent.path).unwrap_or_else(|_| parent.clone());
+    Ok((dir, fresh(efs, entry)?))
+}
+
 /// Apply a single staged edit to `efs`. Pure dispatch — does not call
 /// `sync_metadata`, which the caller is responsible for after the full batch.
 pub fn apply_edit(
@@ -364,40 +397,73 @@ pub fn apply_edit(
             efs.create_directory(&resolved_parent, name, &opts)?;
             Ok(())
         }
-        StagedEdit::DeleteEntry { parent, entry } => efs.delete_entry(parent, entry),
-        StagedEdit::DeleteRecursive { parent, entry } => efs.delete_recursive(parent, entry),
+        StagedEdit::DeleteEntry { parent, entry } => {
+            let (parent, entry) = fresh_pair(efs, parent, entry)?;
+            efs.delete_entry(&parent, &entry)
+        }
+        StagedEdit::DeleteRecursive { parent, entry } => {
+            let (parent, entry) = fresh_pair(efs, parent, entry)?;
+            efs.delete_recursive(&parent, &entry)
+        }
         StagedEdit::Rename {
             parent,
             entry,
             new_name,
         } => {
-            let resolved_parent = resolve_dir_by_path(efs, &parent.path)?;
-            efs.rename(&resolved_parent, entry, new_name)
+            let (resolved_parent, entry) = fresh_pair(efs, parent, entry)?;
+            efs.rename(&resolved_parent, &entry, new_name)
         }
         StagedEdit::SetProdosType {
             entry,
             type_byte,
             aux_type,
-        } => efs.set_prodos_type(entry, *type_byte, *aux_type),
-        StagedEdit::SetProdosAccess { entry, access } => efs.set_prodos_access(entry, *access),
-        StagedEdit::BlessFolder { entry } => efs.set_blessed_folder(entry),
+        } => {
+            let e = fresh(efs, entry)?;
+            efs.set_prodos_type(&e, *type_byte, *aux_type)
+        }
+        StagedEdit::SetProdosAccess { entry, access } => {
+            let e = fresh(efs, entry)?;
+            efs.set_prodos_access(&e, *access)
+        }
+        StagedEdit::BlessFolder { entry } => {
+            let e = fresh(efs, entry)?;
+            efs.set_blessed_folder(&e)
+        }
         StagedEdit::WriteBootBlocks { blocks } => efs.write_boot_blocks(blocks),
         StagedEdit::SetTypeCreator {
             entry,
             type_code,
             creator_code,
             // Raw bytes: a high-bit MacRoman code went through `from_utf8_lossy` as U+FFFD (MCM-006).
-        } => efs.set_type_creator_raw(entry, *type_code, *creator_code),
-        StagedEdit::SetPermissions { entry, mode } => efs.set_permissions(entry, *mode),
-        StagedEdit::SetOwner { entry, uid, gid } => efs.set_owner(entry, *uid, *gid),
-        StagedEdit::SetXattr { entry, name, value } => efs.set_xattr(entry, name, value),
-        StagedEdit::RemoveXattr { entry, name } => efs.remove_xattr(entry, name),
+        } => {
+            let e = fresh(efs, entry)?;
+            efs.set_type_creator_raw(&e, *type_code, *creator_code)
+        }
+        StagedEdit::SetPermissions { entry, mode } => {
+            let e = fresh(efs, entry)?;
+            efs.set_permissions(&e, *mode)
+        }
+        StagedEdit::SetOwner { entry, uid, gid } => {
+            let e = fresh(efs, entry)?;
+            efs.set_owner(&e, *uid, *gid)
+        }
+        StagedEdit::SetXattr { entry, name, value } => {
+            let e = fresh(efs, entry)?;
+            efs.set_xattr(&e, name, value)
+        }
+        StagedEdit::RemoveXattr { entry, name } => {
+            let e = fresh(efs, entry)?;
+            efs.remove_xattr(&e, name)
+        }
         StagedEdit::SetDates {
             entry,
             create,
             modify,
             backup,
-        } => efs.set_dates(entry, *create, *modify, *backup),
+        } => {
+            let e = fresh(efs, entry)?;
+            efs.set_dates(&e, *create, *modify, *backup)
+        }
     }
 }
 

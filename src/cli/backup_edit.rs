@@ -319,12 +319,7 @@ fn build_edit_ctx(
     meta: &BackupMetadata,
     part: &PartitionMetadata,
 ) -> Result<ArchiveEditContext> {
-    let archive_rel = part.compressed_files.first().ok_or_else(|| {
-        anyhow!(
-            "backup partition {} has no compressed file listed in metadata.json",
-            part.index
-        )
-    })?;
+    let archive_rel = crate::model::commander_source::editable_member(part)?;
     Ok(ArchiveEditContext {
         archive_path: folder.join(archive_rel),
         compression_type: meta.compression_type.clone(),

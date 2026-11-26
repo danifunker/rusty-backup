@@ -141,18 +141,7 @@ pub fn materialize_streamed(
 /// Reduce a name to something safe as a single temp-file component while
 /// preserving the extension (which drives content routing).
 fn sanitize_temp_name(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '\0' => '_',
-            c => c,
-        })
-        .collect();
-    if cleaned.is_empty() {
-        "descend.bin".to_string()
-    } else {
-        cleaned
-    }
+    super::host_component(name, "descend.bin")
 }
 
 /// Open an archive file (by path) as a read-only filesystem. `label` is the

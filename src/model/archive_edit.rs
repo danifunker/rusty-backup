@@ -57,21 +57,16 @@ pub fn start_extract(
     ctx: &ArchiveEditContext,
     temp_path: PathBuf,
 ) -> Arc<Mutex<ArchiveEditProgress>> {
-    let archive_path = ctx.archive_path.clone();
-    let compression_type = ctx.compression_type.clone();
-    let original_size = ctx.original_size;
-    let compacted = ctx.compacted;
-
+    let ctx = ctx.clone();
     let progress = Arc::new(Mutex::new(ArchiveEditProgress {
         phase: "Extracting".to_string(),
         current: 0,
-        total: original_size,
+        total: ctx.original_size,
         finished: false,
         error: None,
         cancel_requested: false,
         temp_path: Some(temp_path.clone()),
     }));
-
     let progress_thread = Arc::clone(&progress);
     crate::model::worker::spawn_guarded(
         Arc::clone(&progress),
@@ -79,35 +74,23 @@ pub fn start_extract(
         move || {
             let _wake =
                 crate::os::wakelock::acquire("Rusty Backup: decompress partition for editing");
-            let cancel = {
-                let p = Arc::clone(&progress_thread);
-                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-            };
-            let result = decompress_partition_to_file(
-                &archive_path,
-                &compression_type,
+            let cancel = cancel_of(&progress_thread);
+            // The same body as the sync path, compacted-volume grow included (MCM-025).
+            let result = extract_partition_sync(
+                &ctx,
                 &temp_path,
-                original_size,
-                compacted,
-                &mut |bytes| {
-                    if let Ok(mut p) = progress_thread.lock() {
-                        p.current = bytes;
-                    }
-                },
+                &mut |bytes| crate::model::worker::lock_status(&progress_thread).current = bytes,
                 &cancel,
             );
-            if let Ok(mut p) = progress_thread.lock() {
-                p.finished = true;
-                if let Err(e) = result {
-                    p.error = Some(format!("{e:#}"));
-                    // Clean up temp file on error
-                    let _ = std::fs::remove_file(&temp_path);
-                }
+            let mut p = crate::model::worker::lock_status(&progress_thread);
+            p.finished = true;
+            if let Err(e) = result {
+                p.error = Some(format!("{e:#}"));
+                let _ = std::fs::remove_file(&temp_path);
             }
             Ok(())
         },
     );
-
     progress
 }
 
@@ -119,14 +102,8 @@ pub fn start_compress(
     ctx: &ArchiveEditContext,
     temp_path: PathBuf,
 ) -> Arc<Mutex<ArchiveEditProgress>> {
-    let archive_path = ctx.archive_path.clone();
-    let compression_type = ctx.compression_type.clone();
-    let metadata_path = ctx.metadata_path.clone();
-    let partition_index = ctx.partition_index;
-    let checksum_type = ctx.checksum_type.clone();
-
+    let ctx = ctx.clone();
     let input_size = std::fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);
-
     let progress = Arc::new(Mutex::new(ArchiveEditProgress {
         phase: "Compressing".to_string(),
         current: 0,
@@ -136,7 +113,6 @@ pub fn start_compress(
         cancel_requested: false,
         temp_path: None,
     }));
-
     let progress_thread = Arc::clone(&progress);
     crate::model::worker::spawn_guarded(
         Arc::clone(&progress),
@@ -144,84 +120,32 @@ pub fn start_compress(
         move || {
             let _wake =
                 crate::os::wakelock::acquire("Rusty Backup: recompress partition after editing");
-            let cancel = {
-                let p = Arc::clone(&progress_thread);
-                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-            };
-
-            // Compute checksum of the temp file before compressing.
-            let checksum_result = compute_file_checksum(&temp_path, &checksum_type);
-
-            log::info!(
-                "Compressing {} -> {} (type={})",
-                temp_path.display(),
-                archive_path.display(),
-                compression_type
-            );
-            let result = compress_staged(
+            let cancel = cancel_of(&progress_thread);
+            let result = recompress_partition_sync(
+                &ctx,
                 &temp_path,
-                &archive_path,
-                &compression_type,
-                &mut |bytes| {
-                    if let Ok(mut p) = progress_thread.lock() {
-                        p.current = bytes;
-                    }
-                },
+                &mut |bytes| crate::model::worker::lock_status(&progress_thread).current = bytes,
                 &cancel,
-                &mut |msg| log::info!("{}", msg),
+                &mut |msg| log::info!("{msg}"),
             );
-
-            if let Ok(mut p) = progress_thread.lock() {
-                p.finished = true;
-                match result {
-                    Ok(new_files) => {
-                        log::info!("Compress succeeded: {:?}", new_files);
-                        // Remove old archive file if extension changed.
-                        if archive_path.exists() {
-                            let new_path = archive_path
-                                .parent()
-                                .unwrap_or(Path::new("."))
-                                .join(&new_files[0]);
-                            if new_path != archive_path {
-                                let _ = std::fs::remove_file(&archive_path);
-                            }
-                        }
-
-                        // Update metadata checksum (skip for standalone container
-                        // files where metadata_path is empty).
-                        if !metadata_path.as_os_str().is_empty() {
-                            // The old checksum against new data reads as corruption later (MCM-017).
-                            if let Err(e) = &checksum_result {
-                                p.error =
-                                    Some(format!("Saved archive but could not checksum it: {e}"));
-                            }
-                            if let Ok(checksum) = checksum_result {
-                                if let Err(e) = backup_metadata::update_partition_checksum(
-                                    &metadata_path,
-                                    partition_index,
-                                    &checksum,
-                                    Some(&new_files),
-                                ) {
-                                    p.error = Some(format!(
-                                        "Saved archive but failed to update metadata: {e}"
-                                    ));
-                                }
-                            }
-                        }
-
-                        let _ = std::fs::remove_file(&temp_path);
-                    }
-                    Err(e) => {
-                        p.error = Some(format!("{e:#}"));
-                        // Keep temp file on error so user can retry.
-                    }
+            let mut p = crate::model::worker::lock_status(&progress_thread);
+            p.finished = true;
+            match result {
+                // A failure keeps the temp, so the edit can be retried.
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&temp_path);
                 }
+                Err(e) => p.error = Some(format!("{e:#}")),
             }
             Ok(())
         },
     );
-
     progress
+}
+
+fn cancel_of(progress: &Arc<Mutex<ArchiveEditProgress>>) -> impl Fn() -> bool {
+    let p = Arc::clone(progress);
+    move || crate::model::worker::lock_status(&p).cancel_requested
 }
 
 /// A `.woz` image edited through the decode -> edit -> re-encode flow.
@@ -390,8 +314,13 @@ pub fn recompress_partition_sync(
 ) -> anyhow::Result<()> {
     use anyhow::Context;
 
-    let checksum = compute_file_checksum(temp_path, &ctx.checksum_type)
-        .map_err(|e| anyhow::anyhow!("computing {} checksum: {e}", ctx.checksum_type))?;
+    // Only a backup has a checksum to record; a standalone container (WOZ) has none.
+    let has_metadata = !ctx.metadata_path.as_os_str().is_empty();
+    let checksum = match has_metadata {
+        true => compute_file_checksum(temp_path, &ctx.checksum_type)
+            .map_err(|e| anyhow::anyhow!("computing {} checksum: {e}", ctx.checksum_type))?,
+        false => String::new(),
+    };
 
     let new_files = compress_staged(
         temp_path,
@@ -417,7 +346,7 @@ pub fn recompress_partition_sync(
         }
     }
 
-    if !ctx.metadata_path.as_os_str().is_empty() {
+    if has_metadata {
         backup_metadata::update_partition_checksum(
             &ctx.metadata_path,
             ctx.partition_index,

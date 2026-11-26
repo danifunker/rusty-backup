@@ -380,10 +380,7 @@ fn detect_archive_target(
     }
     .ok_or_else(|| anyhow!("partition {sel} not found in backup metadata"))?;
     let part = pmeta.index;
-    if pmeta.compressed_files.is_empty() {
-        bail!("partition {part} has no compressed_files entry in metadata.json");
-    }
-    let archive_path = target_path.join(&pmeta.compressed_files[0]);
+    let archive_path = target_path.join(crate::model::commander_source::editable_member(pmeta)?);
     if !archive_path.exists() {
         bail!("archive {} missing", archive_path.display());
     }

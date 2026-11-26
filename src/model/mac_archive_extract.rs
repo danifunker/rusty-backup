@@ -112,11 +112,7 @@ pub fn write_payload_to_tempdir(
     let dir = tempfile::Builder::new()
         .prefix("rusty-archive-mount-")
         .tempdir()?;
-    let safe_name = if name.is_empty() {
-        "payload.bin".to_string()
-    } else {
-        name.replace(['/', '\\'], "_")
-    };
+    let safe_name = crate::model::host_component(name, "payload.bin");
     let path = dir.path().join(safe_name);
     std::fs::write(&path, bytes)?;
     Ok((path, dir))

@@ -81,6 +81,15 @@ pub mod text_edit;
 pub mod volume_label_runner;
 pub mod worker;
 
+/// A name from inside an archive or volume as one safe host path component (never `..` or a
+/// path), or `fallback` for an empty name; shared by every temp writer (MCM-025).
+pub fn host_component(name: &str, fallback: &str) -> String {
+    match name.is_empty() {
+        true => fallback.to_string(),
+        false => fs_mac::resource_fork::sanitize_filename(name),
+    }
+}
+
 /// Whether two paths name one file, spelled alike or resolved: a runner that truncates its output
 /// first must refuse an output that is one of its inputs (MWR-001, MWR-003, MWR-005).
 pub fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {

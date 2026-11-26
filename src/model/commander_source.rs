@@ -209,6 +209,28 @@ pub struct ArchiveEditPlan {
     pub checksum_type: String,
 }
 
+/// The one data file an edit rewrites: a split set would be rewritten as its first piece, and a
+/// listed name must stay inside the backup folder (MCM-020). Shared by the GUI and the CLI.
+pub fn editable_member(part: &crate::backup::metadata::PartitionMetadata) -> Result<&str> {
+    let index = part.index;
+    let name = match part.compressed_files.as_slice() {
+        [one] => one.as_str(),
+        [] => anyhow::bail!("partition {index} has no data file listed"),
+        _ => anyhow::bail!("partition {index} is split across files; edit it after a restore"),
+    };
+    let one_component = matches!(
+        std::path::Path::new(name)
+            .components()
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [std::path::Component::Normal(_)]
+    );
+    if !one_component {
+        anyhow::bail!("partition {index} lists an unsafe data file name: {name}");
+    }
+    Ok(name)
+}
+
 /// The editing flow for partition `part_index` of a native backup, derived from
 /// its compression (see [`BackupEdit`]). The companion of
 /// [`session_for_backup_partition`]: that builds the read session, this tells
@@ -226,10 +248,7 @@ pub fn backup_edit_for(
     Ok(match metadata.compression_type.as_str() {
         "none" | "chd" | "chd-dvd" => BackupEdit::InPlace,
         compression @ ("zstd" | "woz") => {
-            let data_file = part
-                .compressed_files
-                .first()
-                .with_context(|| format!("partition {part_index} has no data file listed"))?;
+            let data_file = editable_member(part)?;
             BackupEdit::Archive(ArchiveEditPlan {
                 archive_path: folder.join(data_file),
                 compression_type: compression.to_string(),
