@@ -1562,7 +1562,8 @@ fn test_expand_runner_writes_flat_hfv() {
     // Bounded poll for completion (worker is fast on an 8 MiB volume).
     let mut finished = false;
     let mut err = None;
-    for _ in 0..200 {
+    // 60 s: a loaded Windows CI runner took over the old 5 s.
+    for _ in 0..2400 {
         {
             let g = status.lock().unwrap();
             if g.finished {
@@ -1640,7 +1641,8 @@ fn test_expand_runner_wraps_non_apm_source_in_apm() {
     let mut finished = false;
     let mut err = None;
     let mut emit = None;
-    for _ in 0..200 {
+    // 60 s: a loaded Windows CI runner took over the old 5 s.
+    for _ in 0..2400 {
         {
             let g = status.lock().unwrap();
             if g.finished {
@@ -1732,7 +1734,8 @@ fn test_export_runner_per_partition_hfv() {
 
     let mut finished = false;
     let mut err = None;
-    for _ in 0..200 {
+    // 60 s: a loaded Windows CI runner took over the old 5 s.
+    for _ in 0..2400 {
         {
             let g = status.lock().unwrap();
             if g.finished {
