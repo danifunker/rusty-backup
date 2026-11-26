@@ -562,6 +562,7 @@ pub fn run(req: &ResizeImageRequest, ctx: &JobCtx, shared: &SharedProgress) -> R
     let mut rebuilt = Vec::new();
     for step in steps {
         if ctx.is_cancelled() {
+            settle_rebuilt(req, shared, &rebuilt);
             bail!("cancelled before \"{}\"", step.label());
         }
         set_state(shared, step, StepState::Running);
@@ -571,16 +572,7 @@ pub fn run(req: &ResizeImageRequest, ctx: &JobCtx, shared: &SharedProgress) -> R
             Err(e) => {
                 let msg = format!("{e:#}");
                 set_state(shared, step, StepState::Failed(msg.clone()));
-                for (index, _, path) in &rebuilt {
-                    line(
-                        shared,
-                        &format!(
-                            "The rebuilt volume of partition {} is kept at {}.",
-                            index + 1,
-                            path.display()
-                        ),
-                    );
-                }
+                settle_rebuilt(req, shared, &rebuilt);
                 if !preexisting
                     && req.copy_to.is_some()
                     && (layout.chd.is_none() || step == Step::Pack)
@@ -596,6 +588,29 @@ pub fn run(req: &ResizeImageRequest, ctx: &JobCtx, shared: &SharedProgress) -> R
         }
     }
     Ok(())
+}
+
+/// After a stopped run: a copy's rebuilt volumes go (the original is whole); in place they are
+/// the only copy of the volume, so they stay and are named.
+fn settle_rebuilt(
+    req: &ResizeImageRequest,
+    shared: &SharedProgress,
+    rebuilt: &[(usize, std::fs::File, PathBuf)],
+) {
+    for (index, _, path) in rebuilt {
+        if req.copy_to.is_some() {
+            let _ = std::fs::remove_file(path);
+        } else {
+            line(
+                shared,
+                &format!(
+                    "The rebuilt volume of partition {} is kept at {}.",
+                    index + 1,
+                    path.display()
+                ),
+            );
+        }
+    }
 }
 
 /// A file the run makes for itself, removed when the run ends.
@@ -855,10 +870,7 @@ fn rebuild_hfs(
     let name = fs.volume_summary().volume_name;
     // Named and kept until placed: the old volume's head is zeroed below, so if a later step
     // fails this file is the only copy of the volume (MWR-002).
-    let kept = layout
-        .space
-        .dir
-        .join(format!("rebuilt-partition-{}.hfs", index + 1));
+    let kept = scratch_path(req, layout, &format!("rebuilt-{}.hfs", index + 1));
     let mut out = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -871,8 +883,14 @@ fn rebuild_hfs(
         format_size(size),
         block / 1024
     ));
-    let (_, report) = fs_mac::hfs_clone::clone_hfs_at(&mut fs, &mut out, 0, size, block, &name)
-        .map_err(|e| anyhow::anyhow!("rebuild: {e}"))?;
+    let (_, report) =
+        match fs_mac::hfs_clone::clone_hfs_at(&mut fs, &mut out, 0, size, block, &name) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = std::fs::remove_file(&kept);
+                bail!("rebuild: {e}");
+            }
+        };
     for (path, why) in report.errors.iter().chain(report.skipped.iter()) {
         log(&format!("  {path}: {why}"));
     }

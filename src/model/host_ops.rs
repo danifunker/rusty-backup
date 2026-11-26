@@ -38,7 +38,8 @@ pub fn rename_entry(old: &Path, new_name: &str) -> io::Result<PathBuf> {
     check_name(new_name)?;
     let new = old.with_file_name(new_name);
     // On a case-insensitive host `A.txt` finds `a.txt` itself; that is a rename, not a clash (MCM-019).
-    if new.symlink_metadata().is_ok() && !crate::model::same_file(old, &new) {
+    let is_link = new.symlink_metadata().map(|m| m.file_type().is_symlink());
+    if matches!(is_link, Ok(true)) || (is_link.is_ok() && !crate::model::same_file(old, &new)) {
         return Err(exists(new_name));
     }
     std::fs::rename(old, &new)?;

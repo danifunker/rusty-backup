@@ -345,9 +345,10 @@ fn compress_staged(
             }
         }
     };
+    // The `.x` is what the codecs strip, so a dotted stem survives as `.stem-rbnew` (review).
     let staged = compress_file_to_archive(
         temp_path,
-        &dir.join(&staging),
+        &dir.join(format!("{staging}.x")),
         compression_type,
         None,
         progress_cb,
@@ -364,7 +365,10 @@ fn compress_staged(
     let mut finals = Vec::with_capacity(names.len());
     for n in &names {
         let fin = n.replacen(&staging, &stem, 1);
-        std::fs::rename(dir.join(n), dir.join(&fin))?;
+        if let Err(e) = std::fs::rename(dir.join(n), dir.join(&fin)) {
+            clean(&dir);
+            return Err(e.into());
+        }
         finals.push(fin);
     }
     Ok(finals)
