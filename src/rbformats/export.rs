@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 
 use super::dc42;
 use super::woz_write;
-use super::{decompress_members_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
+use super::{decompress_members_to_writer, reconstruct_disk_for_export, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
 use dsk_apple::twomg::build_twomg_header;
 use dsk_vm::vhd::build_vhd_footer;
@@ -694,7 +694,7 @@ pub fn export_whole_disk(
             let mut buf: Vec<u8> = Vec::new();
             let (gpt_sidecar, apm_sidecar) =
                 super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
-            reconstruct_disk_from_backup(
+            reconstruct_disk_for_export(
                 source_path,
                 meta,
                 mbr_bytes,
@@ -755,7 +755,7 @@ pub fn export_whole_disk(
 
         let (gpt_sidecar, apm_sidecar) =
             super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
-        total_written = reconstruct_disk_from_backup(
+        total_written = reconstruct_disk_for_export(
             source_path,
             meta,
             mbr_bytes,
@@ -1286,7 +1286,7 @@ fn export_whole_disk_vhd_dynamic(
             tempfile::tempfile().context("create tempfile for dynamic VHD reconstruction")?;
         let (gpt_sidecar, apm_sidecar) =
             super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
-        let written = reconstruct_disk_from_backup(
+        let written = reconstruct_disk_for_export(
             source_path,
             meta,
             mbr_bytes,
@@ -1365,7 +1365,7 @@ fn export_whole_disk_qcow2(
         let mut tmp = tempfile::tempfile().context("create tempfile for QCOW2 reconstruction")?;
         let (gpt_sidecar, apm_sidecar) =
             super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
-        let written = reconstruct_disk_from_backup(
+        let written = reconstruct_disk_for_export(
             source_path,
             meta,
             mbr_bytes,
@@ -1433,7 +1433,7 @@ fn export_whole_disk_vmdk_flat(
             tempfile::tempfile().context("create tempfile for VMDK flat reconstruction")?;
         let (gpt_sidecar, apm_sidecar) =
             super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
-        let written = reconstruct_disk_from_backup(
+        let written = reconstruct_disk_for_export(
             source_path,
             meta,
             mbr_bytes,
@@ -1507,7 +1507,7 @@ fn export_whole_disk_vmdk_sparse(
             tempfile::tempfile().context("create tempfile for VMDK sparse reconstruction")?;
         let (gpt_sidecar, apm_sidecar) =
             super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
-        let written = reconstruct_disk_from_backup(
+        let written = reconstruct_disk_for_export(
             source_path,
             meta,
             mbr_bytes,

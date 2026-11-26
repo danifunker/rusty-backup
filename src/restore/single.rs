@@ -572,9 +572,10 @@ pub fn run_single_partition_restore(
         );
         let mut log_cb = |msg: &str| log(&progress, LogLevel::Info, msg);
         if needs_resize {
-            crate::fs::resize_filesystem_for(
+            crate::fs::resize_filesystem_from(
                 inner_file,
                 config.target_offset_bytes,
+                header_size,
                 write_size,
                 &mut log_cb,
             )?;

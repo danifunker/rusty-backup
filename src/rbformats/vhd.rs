@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use super::{decompress_members_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
+use super::{decompress_members_to_writer, reconstruct_disk_for_export, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
-use crate::fs::{patch_hidden_sectors_for, resize_filesystem_for};
+use crate::fs::{patch_hidden_sectors_for, resize_filesystem_from};
 use part_tables::mbr::{build_ebr_chain, parse_ebr_chain, patch_mbr_entries, Mbr};
 use part_tables::PartitionSizeOverride;
 
@@ -326,7 +326,7 @@ pub fn export_whole_disk_vhd(
 
         let (gpt_sidecar, apm_sidecar) =
             super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
-        total_written = reconstruct_disk_from_backup(
+        total_written = reconstruct_disk_for_export(
             source_path,
             meta,
             mbr_bytes,
@@ -759,9 +759,10 @@ pub fn export_whole_disk_vhd(
                 if pw.export_size != pw.original_size {
                     writer.flush()?;
                     let end_pos = total_written;
-                    resize_filesystem_for(
+                    resize_filesystem_from(
                         writer.get_mut(),
                         dest_offset,
+                        pw.original_size,
                         pw.export_size,
                         &mut log_cb,
                     )?;
@@ -1031,7 +1032,13 @@ pub fn export_clonezilla_disk_vhd(
             patch_hidden_sectors_for(&mut file, part_offset, effective_lba, &mut log_cb)?;
 
             if export_size != cz_part.size_bytes() {
-                resize_filesystem_for(&mut file, part_offset, export_size, &mut log_cb)?;
+                resize_filesystem_from(
+                    &mut file,
+                    part_offset,
+                    cz_part.size_bytes(),
+                    export_size,
+                    &mut log_cb,
+                )?;
             }
 
             // Seek back to end for next partition

@@ -301,6 +301,95 @@ pub fn reconstruct_disk_from_backup(
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<u64> {
+    reconstruct_disk_inner(
+        backup_folder,
+        metadata,
+        mbr_bytes,
+        partition_sizes,
+        target_size,
+        writer,
+        is_device,
+        fill_unused_with_zeros,
+        gpt,
+        apm,
+        progress_cb,
+        cancel_check,
+        log_cb,
+        &mut Vec::new(),
+    )
+}
+
+/// [`reconstruct_disk_from_backup`] for an export: each resized volume is then fitted to its partition,
+/// the step restore does itself afterwards (RBF-003).
+pub fn reconstruct_disk_for_export(
+    backup_folder: &Path,
+    metadata: &BackupMetadata,
+    mbr_bytes: Option<&[u8; 512]>,
+    partition_sizes: &[PartitionSizeOverride],
+    target_size: u64,
+    writer: &mut (impl Read + Write + Seek),
+    is_device: bool,
+    fill_unused_with_zeros: bool,
+    gpt: Option<&Gpt>,
+    apm: Option<&Apm>,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<u64> {
+    let mut placed = Vec::new();
+    let written = reconstruct_disk_inner(
+        backup_folder,
+        metadata,
+        mbr_bytes,
+        partition_sizes,
+        target_size,
+        writer,
+        is_device,
+        fill_unused_with_zeros,
+        gpt,
+        apm,
+        progress_cb,
+        cancel_check,
+        log_cb,
+        &mut placed,
+    )?;
+    for p in &placed {
+        if p.defragmented_clone || (p.export_size == p.original_size && !p.compacted) {
+            continue;
+        }
+        crate::fs::resize_filesystem_from(writer, p.offset, p.original_size, p.export_size, log_cb)
+            .with_context(|| format!("resize partition-{} filesystem", p.index))?;
+    }
+    writer.seek(SeekFrom::Start(written))?;
+    Ok(written)
+}
+
+/// Where [`reconstruct_disk_inner`] put a partition's volume.
+struct PlacedVolume {
+    index: usize,
+    offset: u64,
+    original_size: u64,
+    export_size: u64,
+    compacted: bool,
+    defragmented_clone: bool,
+}
+
+fn reconstruct_disk_inner(
+    backup_folder: &Path,
+    metadata: &BackupMetadata,
+    mbr_bytes: Option<&[u8; 512]>,
+    partition_sizes: &[PartitionSizeOverride],
+    target_size: u64,
+    writer: &mut (impl Read + Write + Seek),
+    is_device: bool,
+    fill_unused_with_zeros: bool,
+    gpt: Option<&Gpt>,
+    apm: Option<&Apm>,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+    placed: &mut Vec<PlacedVolume>,
+) -> Result<u64> {
     // EBR chain is built inside the MBR branch (after reading mbr_buf) so we
     // can pass the actual MBR bytes as a fallback for old backup formats that
     // pre-date the `extended_container` metadata field.
@@ -793,6 +882,14 @@ pub fn reconstruct_disk_from_backup(
             }
         }
 
+        placed.push(PlacedVolume {
+            index: pm.index,
+            offset: part_offset,
+            original_size: pm.original_size_bytes,
+            export_size,
+            compacted: pm.compacted,
+            defragmented_clone: pm.defragmented_clone,
+        });
         // Update hidden sectors / partition offset to match the new start LBA
         {
             writer.flush()?;
@@ -920,10 +1017,10 @@ pub fn reconstruct_raw_apm_disk(
     struct PartPlan {
         source_lba: u64,
         dest_lba: u64,
+        original_size: u64,
         copy_size: u64,
         export_size: u64,
         name: String,
-        partition_type: String,
     }
     let mut plans: Vec<PartPlan> = Vec::new();
     for entry in &apm.entries {
@@ -942,10 +1039,10 @@ pub fn reconstruct_raw_apm_disk(
         plans.push(PartPlan {
             source_lba: entry_lba,
             dest_lba,
+            original_size,
             copy_size: original_size.min(export_size),
             export_size,
             name: entry.name.clone(),
-            partition_type: entry.partition_type.clone(),
         });
     }
     plans.sort_by_key(|p| p.dest_lba);
@@ -1005,26 +1102,18 @@ pub fn reconstruct_raw_apm_disk(
             progress_cb(total_written);
         }
 
-        // For HFS partitions that grew, update the MDB in-place on the dest.
-        if plan.partition_type == "Apple_HFS" && plan.export_size != plan.copy_size {
+        // A resized partition's volume must follow it, grown or shrunk, HFS or HFS+ alike
+        // (RBF-005): this used to resize only a grown classic HFS and log any failure.
+        if plan.export_size != plan.original_size {
             let part_offset = plan.dest_lba * 512;
-            writer.seek(SeekFrom::Start(0))?; // ensure writer is flushed/synced
-            match crate::fs::resize_hfs_in_place(writer, part_offset, plan.export_size, &mut |m| {
-                log_cb(&format!("  [hfs] {m}"))
-            }) {
-                Ok(()) => log_cb(&format!(
-                    "Resized HFS in partition '{}' to {} MB",
-                    plan.name,
-                    plan.export_size / 1024 / 1024
-                )),
-                Err(e) => {
-                    log_cb(&format!(
-                        "HFS resize failed for partition '{}': {e}. Note: HFS+ / wrapped-HFS+ \
-                         volumes can share the Apple_HFS type and aren't resized here.",
-                        plan.name
-                    ));
-                }
-            }
+            crate::fs::resize_filesystem_from(
+                writer,
+                part_offset,
+                plan.original_size,
+                plan.export_size,
+                &mut |m| log_cb(&format!("  [{}] {m}", plan.name)),
+            )
+            .with_context(|| format!("APM export: resizing partition '{}'", plan.name))?;
             writer.seek(SeekFrom::Start(total_written))?;
         }
     }
@@ -1350,13 +1439,19 @@ pub fn reconstruct_raw_rdb_disk(
         let part_offset = p.dest_lba * 512;
         let mut local_log = |m: &str| log_cb(&format!("  [{}] {m}", p.dos_type_string));
         // A volume left at its old size past a shrunk partition is corrupt: stop, as restore does.
-        crate::fs::resize_filesystem_for(writer, part_offset, p.export_size, &mut local_log)
-            .with_context(|| {
-                format!(
-                    "RDB export: resizing partition '{}' ({})",
-                    p.drv_name, p.dos_type_string
-                )
-            })?;
+        crate::fs::resize_filesystem_from(
+            writer,
+            part_offset,
+            p.original_size,
+            p.export_size,
+            &mut local_log,
+        )
+        .with_context(|| {
+            format!(
+                "RDB export: resizing partition '{}' ({})",
+                p.drv_name, p.dos_type_string
+            )
+        })?;
     }
 
     // --- 5. Pad to the declared target size. ---
@@ -2110,7 +2205,7 @@ pub fn reconstruct_raw_label_disk(
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<u64> {
-    use crate::fs::{in_place_resize_support, resize_filesystem_for, InPlaceResize};
+    use crate::fs::{in_place_resize_support, resize_filesystem_from, InPlaceResize};
     use crate::partition::{restore_patch, PartitionTable};
 
     reader.seek(SeekFrom::Start(0))?;
@@ -2223,7 +2318,7 @@ pub fn reconstruct_raw_label_disk(
         };
         let off = o.effective_start_lba() * 512;
         if o.export_size != p.size_bytes {
-            resize_filesystem_for(writer, off, o.export_size, log_cb)
+            resize_filesystem_from(writer, off, p.size_bytes, o.export_size, log_cb)
                 .with_context(|| format!("resize partition-{} filesystem", p.index))?;
         }
         patch_hidden_sectors_for(writer, off, o.effective_start_lba(), log_cb)

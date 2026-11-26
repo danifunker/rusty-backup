@@ -123,6 +123,60 @@ pub fn patch_hidden_sectors_for(
     Ok(())
 }
 
+/// Resize like [`resize_filesystem_for`], but refuse to shrink a filesystem it has no resizer for.
+pub fn resize_filesystem_from(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    old_size_bytes: u64,
+    new_size_bytes: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    if new_size_bytes < old_size_bytes {
+        if let InPlaceResize::Unsupported(name) =
+            in_place_resize_support(file, partition_offset, None)
+        {
+            anyhow::bail!(
+                "{name} cannot shrink in place from {} to {}; nothing in it would be kept past the cut",
+                disk_core::display::format_size(old_size_bytes),
+                disk_core::display::format_size(new_size_bytes)
+            );
+        }
+    }
+    resize_filesystem_for(file, partition_offset, new_size_bytes, log_cb)
+}
+
+/// True when `partition_offset` holds an HFS wrapper around HFS+, which is then left as it is.
+fn wrapped_hfsplus_guard(
+    file: &mut (impl Read + Seek),
+    partition_offset: u64,
+    new_size_bytes: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<bool> {
+    let mut mdb = [0u8; 512];
+    file.seek(SeekFrom::Start(partition_offset + 1024))?;
+    if file.read_exact(&mut mdb).is_err() {
+        return Ok(false);
+    }
+    let sig = u16::from_be_bytes([mdb[0], mdb[1]]);
+    let embed = u16::from_be_bytes([mdb[124], mdb[125]]);
+    if sig != 0x4244 || (embed != 0x482B && embed != 0x4858) {
+        return Ok(false);
+    }
+    let blocks = u64::from(u16::from_be_bytes([mdb[18], mdb[19]]));
+    let block_size = u64::from(u32::from_be_bytes([mdb[20], mdb[21], mdb[22], mdb[23]]));
+    let first_alloc = u64::from(u16::from_be_bytes([mdb[28], mdb[29]]));
+    let declared = first_alloc * 512 + blocks * block_size + 1024;
+    if new_size_bytes < declared {
+        anyhow::bail!(
+            "a wrapped HFS+ volume cannot shrink in place from {} to {}",
+            disk_core::display::format_size(declared),
+            disk_core::display::format_size(new_size_bytes)
+        );
+    }
+    log_cb("Wrapped HFS+ volume: left at its size inside the larger partition");
+    Ok(true)
+}
+
 /// Resize whichever filesystem is present at `partition_offset` to
 /// `new_size_bytes`. Each per-FS resize is a no-op when its magic doesn't
 /// match, so this is safe to call without first probing the type. Use this
@@ -160,8 +214,11 @@ pub fn resize_filesystem_for(
     ntfs::resize_ntfs_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
     exfat::resize_exfat_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
     grow_exfat_past_its_fat(file, partition_offset, new_size_bytes, log_cb)?;
-    hfs::resize_hfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
-    hfsplus::resize_hfsplus_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    // The classic resizer would rewrite a wrapper's MDB and leave the HFS+ inside untouched.
+    if !wrapped_hfsplus_guard(file, partition_offset, new_size_bytes, log_cb)? {
+        hfs::resize_hfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+        hfsplus::resize_hfsplus_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    }
     ext::resize_ext_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     btrfs::resize_btrfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     sfs::resize_sfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
@@ -4724,6 +4781,38 @@ mod tests {
         let buf = xfsb_sector();
         let mut cursor = Cursor::new(buf);
         assert_eq!(detect_filesystem_type(&mut cursor, 0), "xfs");
+    }
+
+    #[test]
+    fn shrinking_a_filesystem_without_a_resizer_is_refused() {
+        let mut buf = xfsb_sector();
+        buf.resize(1 << 20, 0);
+        let mut cursor = Cursor::new(buf);
+        let err = resize_filesystem_from(&mut cursor, 0, 1 << 20, 1 << 19, &mut |_| {})
+            .expect_err("an XFS shrink must not pass silently");
+        assert!(err.to_string().contains("cannot shrink"), "{err}");
+        // Growing leaves the old volume intact inside the bigger partition.
+        resize_filesystem_from(&mut cursor, 0, 1 << 19, 1 << 20, &mut |_| {}).unwrap();
+    }
+
+    #[test]
+    fn a_wrapped_hfsplus_volume_is_never_rewritten_as_classic_hfs() {
+        let mut buf = vec![0u8; 4 << 20];
+        let mdb = &mut buf[1024..1536];
+        mdb[0..2].copy_from_slice(&0x4244u16.to_be_bytes());
+        mdb[18..20].copy_from_slice(&1000u16.to_be_bytes());
+        mdb[20..24].copy_from_slice(&4096u32.to_be_bytes());
+        mdb[28..30].copy_from_slice(&16u16.to_be_bytes());
+        mdb[124..126].copy_from_slice(&0x482Bu16.to_be_bytes());
+        let before = buf.clone();
+        let mut cursor = Cursor::new(buf);
+        resize_filesystem_for(&mut cursor, 0, 8 << 20, &mut |_| {}).unwrap();
+        assert_eq!(
+            cursor.get_ref(),
+            &before,
+            "a grow must leave the wrapper alone"
+        );
+        assert!(resize_filesystem_for(&mut cursor, 0, 1 << 20, &mut |_| {}).is_err());
     }
 
     #[test]

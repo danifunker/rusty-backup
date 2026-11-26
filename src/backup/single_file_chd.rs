@@ -2023,7 +2023,7 @@ fn stage_partitions_to_zst(
                 // Resize the FS in place. partition_offset=0 because the
                 // .raw file holds only this one partition's bytes.
                 let mut local_log = |s: &str| log_cb(s);
-                fs::resize_filesystem_for(&mut tf, 0, target_len, &mut local_log)
+                fs::resize_filesystem_from(&mut tf, 0, part.size_bytes, target_len, &mut local_log)
                     .with_context(|| format!("resize filesystem in partition-{}", plan.index))?;
                 // Patch BPB / VBR hidden_sectors for the partition's new
                 // start LBA on the eventual disk. No-op on filesystems

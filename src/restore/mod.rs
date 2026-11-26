@@ -2176,9 +2176,10 @@ fn run_single_file_chd_restore_resize(
             // to what the CHD held.
             if export_size != pm.imaged_size_bytes {
                 let mut local_log = |m: &str| log(&progress, LogLevel::Info, m);
-                crate::fs::resize_filesystem_for(
+                crate::fs::resize_filesystem_from(
                     inner_file,
                     new_offset,
+                    pm.imaged_size_bytes,
                     export_size,
                     &mut local_log,
                 )
@@ -3058,6 +3059,17 @@ fn write_clonezilla_disk(
             patch_hidden_sectors_for(writer, part_offset, effective_lba, &mut |msg| {
                 log(progress, LogLevel::Info, msg)
             })?;
+            // A resizer refuses a cut through used blocks; without one a shrink lost them (RST-002).
+            if export_size != cz_part.size_bytes() {
+                crate::fs::resize_filesystem_from(
+                    writer,
+                    part_offset,
+                    cz_part.size_bytes(),
+                    export_size,
+                    &mut |msg| log(progress, LogLevel::Info, msg),
+                )
+                .with_context(|| format!("resize {} filesystem", cz_part.device_name))?;
+            }
             // The patchers seek to the boot sector; the gap fills after this seek relatively
             writer.seek(SeekFrom::Start(total_written))?;
         }

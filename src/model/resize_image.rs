@@ -481,14 +481,20 @@ fn rehearse<R: Read + Seek>(
             true => "shrink",
             false => "grow",
         };
-        crate::fs::resize_filesystem_for(&mut overlay, offset, p.new_size_bytes, &mut quiet)
-            .with_context(|| {
-                format!(
-                    "partition {} cannot {verb} to {}",
-                    p.index + 1,
-                    format_size(p.new_size_bytes)
-                )
-            })?;
+        crate::fs::resize_filesystem_from(
+            &mut overlay,
+            offset,
+            p.old_size_bytes,
+            p.new_size_bytes,
+            &mut quiet,
+        )
+        .with_context(|| {
+            format!(
+                "partition {} cannot {verb} to {}",
+                p.index + 1,
+                format_size(p.new_size_bytes)
+            )
+        })?;
     }
     Ok(())
 }
