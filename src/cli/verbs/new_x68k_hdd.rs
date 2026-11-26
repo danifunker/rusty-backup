@@ -207,6 +207,9 @@ pub fn run(args: NewX68kHddArgs) -> Result<()> {
         args.system_disk.as_deref(),
         boot_sector_source,
     )?;
+    for w in &summary.warnings {
+        log_stderr(format!("Warning: {w}"));
+    }
 
     log_stderr(format!(
         "wrote {} ({} bytes, {} MiB, {} {}-byte sectors)",

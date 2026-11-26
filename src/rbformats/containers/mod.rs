@@ -219,7 +219,7 @@ pub fn convert_floppy_container(
         std::fs::read(in_path).with_context(|| format!("reading source {}", in_path.display()))?;
     if !is_floppy_container(target) {
         anyhow::bail!(
-            "target {} is not a floppy container — expected one of XDF, HDM, DIM, D88",
+            "target {} is not a floppy container - expected one of XDF, HDM, DIM, D88",
             target.display_name()
         );
     }

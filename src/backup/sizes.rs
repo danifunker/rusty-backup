@@ -258,7 +258,7 @@ pub(super) fn analyze_partitions(
                 set_operation(
                     progress,
                     format!(
-                        "Computing defragmented minimum for partition-{} (this can take a while)…",
+                        "Computing defragmented minimum for partition-{} (this can take a while)...",
                         part.index
                     ),
                 );
@@ -266,7 +266,7 @@ pub(super) fn analyze_partitions(
                     progress,
                     LogLevel::Info,
                     format!(
-                        "Walking partition-{} to compute defragmented minimum…",
+                        "Walking partition-{} to compute defragmented minimum...",
                         part.index
                     ),
                 );

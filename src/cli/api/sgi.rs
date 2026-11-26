@@ -54,6 +54,13 @@ pub(crate) fn cmd_shrink(input: PathBuf, output: PathBuf) -> Result<()> {
         eprintln!("\n  {msg}");
     };
 
+    // A wrong output extension is usage-bad-input, so it carries USAGE_ERROR (R-004).
+    if output.extension().and_then(|s| s.to_str()) != Some("chd") {
+        return Err(crate::cli::exit::usage(format!(
+            "output path must end in .chd (got {})",
+            output.display()
+        )));
+    }
     let report = crate::rbformats::chd::shrink_sgi_disk_to_chd(
         &input,
         &output,

@@ -63,7 +63,7 @@ impl ChdEditSession {
                 e
             )
         })?;
-        Ok(Self::from_hd(hd))
+        Self::from_hd(hd)
     }
 
     /// Open compressed `parent_path` read-only and create `diff_path` as a
@@ -79,7 +79,7 @@ impl ChdEditSession {
                 e
             )
         })?;
-        Ok(Self::from_hd(hd))
+        Self::from_hd(hd)
     }
 
     /// Re-attach to an existing diff that was previously created via
@@ -93,14 +93,18 @@ impl ChdEditSession {
                 e
             )
         })?;
-        Ok(Self::from_hd(hd))
+        Self::from_hd(hd)
     }
 
-    fn from_hd(hd: HdImage) -> Self {
+    fn from_hd(hd: HdImage) -> Result<Self> {
         let sector_size = hd.sector_size() as usize;
+        // Every read divides by the unit size, so a zero from a damaged header is refused (RBF-018).
+        if sector_size == 0 {
+            anyhow::bail!("CHD reports a sector size of 0");
+        }
         let sector_count = hd.sector_count();
         let logical_size = sector_size as u64 * sector_count;
-        Self {
+        Ok(Self {
             hd,
             sector_size,
             sector_count,
@@ -109,7 +113,7 @@ impl ChdEditSession {
             buf: vec![0u8; sector_size],
             cached_lba: None,
             dirty: false,
-        }
+        })
     }
 
     /// Total addressable bytes — `sector_count * sector_size`.

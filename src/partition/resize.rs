@@ -257,7 +257,7 @@ pub fn shift_region(
     file.seek(SeekFrom::Start(gap_start))?;
     let mut remaining = gap_len;
     while remaining > 0 {
-        let n = (remaining as usize).min(CHUNK_SIZE);
+        let n = remaining.min(CHUNK_SIZE as u64) as usize;
         file.write_all(&zeros[..n])?;
         remaining -= n as u64;
     }
@@ -290,19 +290,13 @@ pub fn apply_resize(
     // own size in step with its partition entry.
     preflight_resizable(file, plans, table, log_cb)?;
 
-    // Calculate new disk size: find the furthest end of any partition
-    let new_data_end = plans
-        .iter()
-        .map(|p| p.new_start_lba * 512 + p.new_size_bytes)
-        .max()
-        .unwrap_or(old_disk_size);
-
     // For VHD, the "disk size" is the data portion (excluding 512-byte footer)
     let old_data_size = if is_vhd {
         old_disk_size.saturating_sub(512)
     } else {
         old_disk_size
     };
+    let new_data_end = resized_data_end(plans, table, old_data_size);
 
     let new_data_size = new_data_end.max(old_data_size);
     let new_file_size = if is_vhd {
@@ -310,6 +304,34 @@ pub fn apply_resize(
     } else {
         new_data_size
     };
+
+    // The table edit is rehearsed first: once data has moved, a refused edit strands it (PAR-001).
+    let mut edits = Vec::new();
+    for plan in plans {
+        if plan.new_size_bytes != plan.old_size_bytes {
+            edits.push(PartitionTableEdit::ResizeEntry {
+                index: plan.index,
+                new_size_bytes: plan.new_size_bytes,
+            });
+        }
+        if plan.new_start_lba != plan.old_start_lba {
+            edits.push(PartitionTableEdit::MoveEntry {
+                index: plan.index,
+                new_start_lba: plan.new_start_lba,
+            });
+        }
+    }
+
+    if !edits.is_empty() {
+        let warnings = editor::validate_edits(table, &edits, new_data_size)
+            .context("The partition table can't take this resize; nothing has been written")?;
+        for w in warnings {
+            log_cb(&format!("Warning: {w}"));
+        }
+        let mut rehearsal = super::overlay::Overlay::new(&mut *file);
+        editor::apply_edits(&mut rehearsal, table, &edits, new_data_size, &mut |_| {})
+            .context("The partition table can't take this resize; nothing has been written")?;
+    }
 
     // Calculate total bytes to move for progress reporting
     let total_move_bytes: u64 = plans
@@ -392,22 +414,6 @@ pub fn apply_resize(
 
     // Step 4: Update partition table entries
     log_cb("Updating partition table...");
-    let mut edits = Vec::new();
-    for plan in plans {
-        if plan.new_size_bytes != plan.old_size_bytes {
-            edits.push(PartitionTableEdit::ResizeEntry {
-                index: plan.index,
-                new_size_bytes: plan.new_size_bytes,
-            });
-        }
-        if plan.new_start_lba != plan.old_start_lba {
-            edits.push(PartitionTableEdit::MoveEntry {
-                index: plan.index,
-                new_start_lba: plan.new_start_lba,
-            });
-        }
-    }
-
     if !edits.is_empty() {
         editor::apply_edits(file, table, &edits, new_data_size, log_cb)
             .context("Failed to update partition table")?;
@@ -468,6 +474,23 @@ pub fn apply_resize(
     file.flush()?;
     log_cb("Resize complete.");
     Ok(())
+}
+
+/// Where the disk's data ends after `plans`. GPT keeps its size: its backup table sits at the end (PAR-006).
+pub fn resized_data_end(
+    plans: &[PartitionResizePlan],
+    table: &PartitionTable,
+    old_data_size: u64,
+) -> u64 {
+    let end = plans
+        .iter()
+        .map(|p| p.new_start_lba * 512 + p.new_size_bytes)
+        .max()
+        .unwrap_or(old_data_size);
+    match table {
+        PartitionTable::Gpt { .. } => end.max(old_data_size),
+        _ => end,
+    }
 }
 
 /// Refuse the whole operation when any partition being resized holds a
@@ -689,7 +712,7 @@ mod tests {
                 .fs_size;
         assert!(
             after > before,
-            "the EFS superblock was not patched ({before} -> {after}) — \
+            "the EFS superblock was not patched ({before} -> {after}) - \
              the GUI resize path still skips it"
         );
     }
@@ -970,5 +993,111 @@ mod tests {
         std::fs::write(qcow2.path(), &head).unwrap();
         let err = expand_image_file(qcow2.path(), 4096, &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("QCOW2"), "{err}");
+    }
+
+    /// PAR-001: data used to move before the table editor refused the edit.
+    #[test]
+    fn a_table_the_editor_refuses_leaves_the_data_unmoved() {
+        let disk_size = 8192u64 * 512;
+        let mut disk = vec![0u8; disk_size as usize];
+        disk[2048 * 512..2048 * 512 + 4].copy_from_slice(b"KEEP");
+        let before = disk.clone();
+        let table = PartitionTable::None {
+            size_bytes: 1 << 20,
+            fs_hint: "Unknown".into(),
+        };
+        let plans = [PartitionResizePlan {
+            index: 0,
+            old_start_lba: 2048,
+            old_size_bytes: 1 << 20,
+            new_start_lba: 4096,
+            new_size_bytes: 1 << 20,
+            needs_data_move: true,
+            move_delta_bytes: 1 << 20,
+        }];
+        let mut cursor = std::io::Cursor::new(&mut disk[..]);
+        let err = apply_resize(
+            &mut cursor,
+            &plans,
+            &table,
+            true,
+            false,
+            disk_size,
+            &mut |_, _| {},
+            &mut |_| {},
+        )
+        .expect_err("a superfloppy has no table to edit");
+        assert!(
+            format!("{err:#}").contains("nothing has been written"),
+            "{err:#}"
+        );
+        assert!(disk == before, "no byte moved");
+    }
+
+    /// PAR-006: a shrink cut the image at the last partition, taking the backup GPT with it.
+    #[test]
+    fn a_shrunk_gpt_disk_keeps_its_backup_table() {
+        use part_tables::gpt::{build_minimal_gpt, Gpt, Guid};
+        let disk = 100_000u64 * 512;
+        let guid = Guid::from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7").unwrap();
+        let gpt = build_minimal_gpt(&[(guid, 2048, 99_000, "a".into())], disk);
+        let pmbr = Gpt::build_protective_mbr(disk / 512);
+        let gpt_table = PartitionTable::Gpt {
+            protective_mbr: part_tables::mbr::Mbr::parse(&pmbr).unwrap(),
+            gpt,
+        };
+        let plans = [PartitionResizePlan {
+            index: 0,
+            old_start_lba: 2048,
+            old_size_bytes: (99_001 - 2048) * 512,
+            new_start_lba: 2048,
+            new_size_bytes: 10_000 * 512,
+            needs_data_move: false,
+            move_delta_bytes: 0,
+        }];
+        assert_eq!(resized_data_end(&plans, &gpt_table, disk), disk);
+        let none = PartitionTable::None {
+            size_bytes: disk,
+            fs_hint: "Unknown".into(),
+        };
+        assert_eq!(resized_data_end(&plans, &none, disk), 12_048 * 512);
+    }
+
+    /// Review of PAR-001: the rehearsal left logicals at their old LBAs while their container moved.
+    #[test]
+    fn growing_a_primary_moves_the_extended_container_with_its_logicals() {
+        let sectors = 40_000u64;
+        let mut disk = vec![0u8; (sectors * 512) as usize];
+        let entry = |d: &mut [u8], at: usize, ty: u8, start: u32, len: u32| {
+            d[at + 4] = ty;
+            d[at + 8..at + 12].copy_from_slice(&start.to_le_bytes());
+            d[at + 12..at + 16].copy_from_slice(&len.to_le_bytes());
+        };
+        entry(&mut disk, 446, 0x06, 63, 1985);
+        entry(&mut disk, 462, 0x05, 2048, 8192);
+        disk[510] = 0x55;
+        disk[511] = 0xAA;
+        let ebr = 2048 * 512;
+        entry(&mut disk[ebr..], 446, 0x06, 63, 4000);
+        disk[ebr + 510] = 0x55;
+        disk[ebr + 511] = 0xAA;
+        let table = PartitionTable::detect(&mut Cursor::new(&disk[..])).unwrap();
+        let parts = table.partitions();
+        assert!(parts.iter().any(|p| p.is_logical), "{parts:?}");
+        let plans = compute_resize_plan(&parts, &[(0, 4000 * 512)], 0, sectors * 512).unwrap();
+        let edits: Vec<_> = plans
+            .iter()
+            .filter(|p| p.new_start_lba != p.old_start_lba)
+            .map(|p| PartitionTableEdit::MoveEntry {
+                index: p.index,
+                new_start_lba: p.new_start_lba,
+            })
+            .chain(std::iter::once(PartitionTableEdit::ResizeEntry {
+                index: 0,
+                new_size_bytes: 4000 * 512,
+            }))
+            .collect();
+        editor::validate_edits(&table, &edits, sectors * 512)
+            .expect("the logical moves with its container");
     }
 }

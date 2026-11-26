@@ -90,16 +90,12 @@ pub fn run_resize(
 
     // apply_resize works on any Read + Write + Seek; only a real file can be truncated here.
     if !is_device {
-        let new_data_end = plans
-            .iter()
-            .map(|p| p.new_start_lba * 512 + p.new_size_bytes)
-            .max()
-            .unwrap_or(disk_size);
         let old_data_size = if is_vhd {
             disk_size.saturating_sub(512)
         } else {
             disk_size
         };
+        let new_data_end = crate::partition::resize::resized_data_end(plans, table, old_data_size);
         if new_data_end < old_data_size {
             let target = if is_vhd {
                 new_data_end + 512

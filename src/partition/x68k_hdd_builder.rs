@@ -248,6 +248,8 @@ pub struct BuildSummary {
     /// `true` when the partition was populated from a `--system-disk`
     /// donor rather than the engine-validation seed files.
     pub from_donor: bool,
+    /// Things the user should know about the build, for the caller to show.
+    pub warnings: Vec<String>,
     /// `true` when `--boot-sector-donor` overlaid a real Sharp partition
     /// boot sector onto the output, eliminating the post-build
     /// `SWITCH.X /HD` step.
@@ -310,7 +312,7 @@ pub fn build_x68k_hdd(
     anyhow::ensure!(
         per_partition_bytes >= 64 * 1024,
         "each of the {partitions} partitions would be only {per_partition_bytes} bytes \
-         — bump --size or reduce --partitions",
+         - bump --size or reduce --partitions",
     );
 
     // Pre-read the donor tree (if any) before opening any output
@@ -409,13 +411,26 @@ pub fn build_x68k_hdd(
         // sectors. Without this patch the donor's BPB (configured for its
         // own size, e.g. 100 MB for hd0.hds) would silently steer the boot
         // code at our smaller / different-shaped partition — non-bootable.
+        let mut warnings: Vec<String> = Vec::new();
         let boot_sector_donor_applied = if !matches!(boot_sector_source, BootSectorSource::None) {
             let mut donor_sector: Vec<u8> = match boot_sector_source {
-                BootSectorSource::Donor(p) => extract_partition_boot_sector(p, variant)?,
+                BootSectorSource::Donor(p) => {
+                    let sector = extract_partition_boot_sector(p, variant)?;
+                    // Warnings travel in the summary; stderr never reached the GUI (PAR-012).
+                    if !is_well_known_x68k_oem(&sector[0x02..0x0E]) {
+                        warnings.push(format!(
+                            "the donor boot sector in {} has an unfamiliar OEM marker {:?}; its BPB \
+                             is patched to this partition, so it boots only if its code reads the BPB",
+                            p.display(),
+                            String::from_utf8_lossy(&sector[0x02..0x0E])
+                        ));
+                    }
+                    sector
+                }
                 BootSectorSource::BuiltIn => {
                     anyhow::ensure!(
                         matches!(variant, HddVariant::Scsi),
-                        "built-in boot sector is SCSI only — for SASI output, omit \
+                        "built-in boot sector is SCSI only - for SASI output, omit \
                      --builtin-boot-sector and use the SWITCH.X /HD workflow on \
                      first FDD0 boot, or pass --boot-sector-donor PATH with a \
                      SASI donor file."
@@ -433,7 +448,7 @@ pub fn build_x68k_hdd(
             );
             anyhow::ensure!(
                 per_partition_bytes >= sector_size,
-                "partition 0 is smaller than one sector — can't overlay boot sector",
+                "partition 0 is smaller than one sector - can't overlay boot sector",
             );
             let mut p0 = vec![0u8; sector_size as usize];
             out.seek(SeekFrom::Start(part_start_byte))?;
@@ -456,12 +471,11 @@ pub fn build_x68k_hdd(
                     // (Bomberman-style), the partition body needs to match its
                     // custom format too — which our FAT-formatted partition
                     // doesn't.
-                    eprintln!(
-                        "warning: --boot-sector-donor on SASI variant is experimental and \
-                     unverified. The donor's BPB ships verbatim (no patching), so the \
-                     output partition needs to match the donor's geometry exactly. If \
-                     the output HDD doesn't boot in MAME `x68000 -sasi`, fall back to \
-                     `--system-disk` + the SWITCH.X /HD workflow on first FDD0 boot."
+                    warnings.push(
+                        "--boot-sector-donor on the SASI variant is experimental: the donor's BPB ships \
+                         verbatim, so the partition must match its geometry; if MAME \
+                         `x68000 -sasi` won't boot it, use --system-disk and SWITCH.X /HD instead"
+                        .to_string(),
                     );
                 }
             }
@@ -482,6 +496,13 @@ pub fn build_x68k_hdd(
             let e_off = X68K_TABLE_HEADER_SIZE + idx * X68K_ENTRY_SIZE;
             table[e_off..e_off + 8].copy_from_slice(b"Human   ");
             let entry_start = part_start_sector + (idx as u64) * per_partition_sectors;
+            // The start word's high byte holds the entry's flags (PAR-008).
+            if entry_start + per_partition_sectors > 0x00FF_FFFF {
+                anyhow::bail!(
+                    "partition {} would end past sector 0xFFFFFF, beyond the X68000 table",
+                    idx + 1
+                );
+            }
             BigEndian::write_u32(&mut table[e_off + 8..e_off + 12], entry_start as u32);
             BigEndian::write_u32(
                 &mut table[e_off + 12..e_off + 16],
@@ -535,6 +556,7 @@ pub fn build_x68k_hdd(
             dirs_written: total_dirs_written,
             from_donor,
             boot_sector_donor_applied,
+            warnings,
         })
     })();
     if built.is_err() {
@@ -604,7 +626,7 @@ pub fn extract_partition_boot_sector(
     }
     anyhow::ensure!(
         donor_len >= expected_min_bytes,
-        "donor {} is too small ({} bytes) — expected at least {} to cover \
+        "donor {} is too small ({} bytes) - expected at least {} to cover \
          the signature header, X68K table at byte 0x{:x}, and the first \
          partition sector",
         donor_path.display(),
@@ -620,7 +642,7 @@ pub fn extract_partition_boot_sector(
         HddVariant::Scsi => {
             anyhow::ensure!(
                 &donor_bytes[0..8] == b"X68SCSI1",
-                "donor {} does not start with `X68SCSI1` magic — is it really a \
+                "donor {} does not start with `X68SCSI1` magic - is it really a \
                  Sharp X68000 SCSI HDD? (well-known donor: hd0.hds, ~100 MB)",
                 donor_path.display(),
             );
@@ -662,7 +684,7 @@ pub fn extract_partition_boot_sector(
         .find(|e| e.name_display.starts_with("Human"))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no Human68k partition found in {} — table has {} active entries: {:?}",
+                "no Human68k partition found in {} - table has {} active entries: {:?}",
                 donor_path.display(),
                 table.entries.len(),
                 table
@@ -676,9 +698,10 @@ pub fn extract_partition_boot_sector(
     // Partition's first sector is at start_sector * sector_size within
     // the donor (sector size = 256 for SASI, 1024 for SCSI).
     let sector_size_usize = sector_size as usize;
-    let part_byte_offset = human68k_entry.start_sector as usize * sector_size_usize;
+    // In u64: a start past 4 GiB wrapped a 32-bit usize (PAR-016).
+    let part_byte_offset = u64::from(human68k_entry.start_sector) * sector_size_usize as u64;
     anyhow::ensure!(
-        part_byte_offset + sector_size_usize <= donor_len,
+        part_byte_offset + sector_size_usize as u64 <= donor_len as u64,
         "Human68k partition at sector {} would read past end of donor {} ({} bytes)",
         human68k_entry.start_sector,
         donor_path.display(),
@@ -689,7 +712,7 @@ pub fn extract_partition_boot_sector(
     {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = std::fs::File::open(donor_path)?;
-        f.seek(SeekFrom::Start(part_byte_offset as u64))?;
+        f.seek(SeekFrom::Start(part_byte_offset))?;
         f.read_exact(&mut sector)?;
     }
 
@@ -698,7 +721,7 @@ pub fn extract_partition_boot_sector(
     anyhow::ensure!(
         sector[0] == 0x60,
         "donor partition boot sector at byte 0x{:x} of {} doesn't start \
-         with 0x60 (BRA.S) — expected a Human68k boot sector. Is this \
+         with 0x60 (BRA.S) - expected a Human68k boot sector. Is this \
          partition formatted Human68k?",
         part_byte_offset,
         donor_path.display(),
@@ -720,19 +743,6 @@ pub fn extract_partition_boot_sector(
     // Our BPB patcher rewrites the BPB region with our partition's
     // geometry regardless of OEM, so the donor's boot code reads the
     // right sectors as long as it's BPB-aware.
-    let oem = &sector[0x02..0x0E];
-    if !is_well_known_x68k_oem(oem) {
-        eprintln!(
-            "warning: donor partition boot sector at byte 0x{:x} of {} has \
-             unfamiliar OEM marker {:?} (expected `SHARP/KG    `, ` Hudson...`, \
-             ` Hero...`, or `SxSI...`). Proceeding — the BPB will be patched \
-             with your partition geometry. If the output HDD doesn't boot, \
-             check that the donor's boot code is BPB-aware.",
-            part_byte_offset,
-            donor_path.display(),
-            std::str::from_utf8(oem).unwrap_or("<non-utf8>"),
-        );
-    }
 
     Ok(sector)
 }
@@ -786,16 +796,6 @@ fn validate_and_return_naked_sector(
         donor_path.display(),
         sector.len(),
     );
-    let oem = &sector[0x02..0x0E];
-    if !is_well_known_x68k_oem(oem) {
-        eprintln!(
-            "warning: naked donor sector at {} has unfamiliar OEM marker {:?} \
-             (expected `SHARP/KG    `, ` Hudson...`, ` Hero...`, or `SxSI...`). \
-             Proceeding — the BPB will be patched with your partition geometry.",
-            donor_path.display(),
-            std::str::from_utf8(oem).unwrap_or("<non-utf8>"),
-        );
-    }
     Ok(sector)
 }
 
@@ -871,12 +871,12 @@ fn patch_sharp_kg_bpb_from_pc_bpb(
     anyhow::ensure!(
         sectors_per_fat_16 <= u8::MAX as u16,
         "partition's sectors_per_fat ({sectors_per_fat_16}) exceeds Sharp/KG \
-         BPB's u8 field at offset 0x1D — pick a smaller partition or larger \
+         BPB's u8 field at offset 0x1D - pick a smaller partition or larger \
          sectors_per_cluster",
     );
     anyhow::ensure!(
         sectors_per_fat_16 > 0,
-        "partition has zero sectors_per_fat — refusing to write a degenerate BPB",
+        "partition has zero sectors_per_fat - refusing to write a degenerate BPB",
     );
 
     // ---- Write the Sharp/KG BPB (big-endian) ----
@@ -1204,7 +1204,7 @@ mod tests {
         let sum: u32 = HERO_SOFT_BOOT_SECTOR.iter().map(|&b| b as u32).sum();
         assert!(
             sum > 0,
-            "embedded Hero Soft sector is all-zero — wrong file?"
+            "embedded Hero Soft sector is all-zero - wrong file?"
         );
     }
 

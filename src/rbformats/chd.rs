@@ -543,7 +543,7 @@ pub fn shrink_sgi_disk_to_chd(
     if let Ok(dst_canon) = fs::canonicalize(dst) {
         if dst_canon == src_canon {
             anyhow::bail!(
-                "output path {} resolves to the source file — refusing to overwrite",
+                "output path {} resolves to the source file - refusing to overwrite",
                 dst.display()
             );
         }
@@ -554,13 +554,9 @@ pub fn shrink_sgi_disk_to_chd(
             dst.display()
         );
     }
+    // The CLI checks this first to give it a usage exit code; the model doesn't know the CLI (RBF-020).
     if dst.extension().and_then(|s| s.to_str()) != Some("chd") {
-        // Refusing a wrong output extension is usage-bad-input, so it carries
-        // USAGE_ERROR rather than the catch-all 1 (R-004).
-        return Err(crate::cli::exit::usage(format!(
-            "output path must end in .chd (got {})",
-            dst.display()
-        )));
+        anyhow::bail!("output path must end in .chd (got {})", dst.display());
     }
     if let Some(parent) = dst.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {

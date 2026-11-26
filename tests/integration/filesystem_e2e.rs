@@ -3254,6 +3254,12 @@ fn test_rdb_sfs_export_shrink_round_trip() {
         p.partition_type_string.as_deref(),
     )
     .expect("open SFS after shrink");
+    // The volume itself must shrink with its partition, not only the RDB entry (RBF-004).
+    assert!(
+        fs.total_size() <= new_part_bytes,
+        "SFS still claims {} bytes in a {new_part_bytes}-byte partition",
+        fs.total_size()
+    );
     let root = fs.root().expect("root");
     let kids = fs.list_directory(&root).expect("list");
     assert!(kids.is_empty(), "blank SFS volume should still be empty");

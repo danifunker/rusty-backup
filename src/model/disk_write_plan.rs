@@ -350,18 +350,23 @@ fn wrap_params(
 ) -> Result<WrapParams, String> {
     let alignment = form.alignment();
     let first_byte = alignment.first_partition_lba() * 512;
-    let partition_size = form.partition_size(source.size_bytes, target_size, first_byte);
+    // GPT keeps its backup header and entries in the disk's last 33 sectors.
+    let room = match form.table_kind {
+        TableKind::Gpt => target_size.saturating_sub(33 * 512),
+        TableKind::Mbr => target_size,
+    };
+    let partition_size = form.partition_size(source.size_bytes, room, first_byte);
     if partition_size < source.size_bytes {
         return Err(format!(
             "Partition size ({} bytes) is smaller than source filesystem ({} bytes)",
             partition_size, source.size_bytes,
         ));
     }
-    if first_byte + partition_size > target_size {
+    if first_byte + partition_size > room {
         return Err(format!(
-            "Partition end ({} bytes) exceeds target disk size ({} bytes)",
+            "Partition end ({} bytes) exceeds the room the target disk leaves for it ({} bytes)",
             first_byte + partition_size,
-            target_size,
+            room,
         ));
     }
     let table = match form.table_kind {
@@ -458,6 +463,26 @@ mod tests {
             .wrap
             .unwrap();
         assert_eq!(wrap.partition_size_bytes, (64 << 20) - 2048 * 512);
+    }
+
+    /// RST-004: a GPT fill stops short of the backup GPT in the last 33 sectors.
+    #[test]
+    fn a_gpt_fill_leaves_room_for_the_backup_table() {
+        let s = src(10 << 20, false);
+        let f = WrapForm {
+            synthesize: true,
+            table_kind: TableKind::Gpt,
+            size_mode: SizeMode::FillRemaining,
+            ..WrapForm::default()
+        };
+        let wrap = build_request(&s, &f, &device(64 << 20), None)
+            .unwrap()
+            .wrap
+            .unwrap();
+        assert_eq!(
+            wrap.partition_size_bytes,
+            (64 << 20) - 2048 * 512 - 33 * 512
+        );
     }
 
     #[test]

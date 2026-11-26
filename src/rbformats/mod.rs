@@ -253,7 +253,7 @@ pub fn load_table_sidecars(
                 ));
                 gpt = Some(parsed);
             } else {
-                log_cb("GPT backup has no gpt.json; GPT structures will not be written");
+                bail!("this GPT backup has no gpt.json, so its partition table cannot be written");
             }
         }
         "APM" => {
@@ -269,7 +269,7 @@ pub fn load_table_sidecars(
                 ));
                 apm = Some(parsed);
             } else {
-                log_cb("APM backup has no apm.json; APM structures will not be written");
+                bail!("this APM backup has no apm.json, so its partition map cannot be written");
             }
         }
         _ => {}
@@ -300,6 +300,95 @@ pub fn reconstruct_disk_from_backup(
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
+) -> Result<u64> {
+    reconstruct_disk_inner(
+        backup_folder,
+        metadata,
+        mbr_bytes,
+        partition_sizes,
+        target_size,
+        writer,
+        is_device,
+        fill_unused_with_zeros,
+        gpt,
+        apm,
+        progress_cb,
+        cancel_check,
+        log_cb,
+        &mut Vec::new(),
+    )
+}
+
+/// [`reconstruct_disk_from_backup`] for an export: each resized volume is then fitted to its partition,
+/// the step restore does itself afterwards (RBF-003).
+pub fn reconstruct_disk_for_export(
+    backup_folder: &Path,
+    metadata: &BackupMetadata,
+    mbr_bytes: Option<&[u8; 512]>,
+    partition_sizes: &[PartitionSizeOverride],
+    target_size: u64,
+    writer: &mut (impl Read + Write + Seek),
+    is_device: bool,
+    fill_unused_with_zeros: bool,
+    gpt: Option<&Gpt>,
+    apm: Option<&Apm>,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<u64> {
+    let mut placed = Vec::new();
+    let written = reconstruct_disk_inner(
+        backup_folder,
+        metadata,
+        mbr_bytes,
+        partition_sizes,
+        target_size,
+        writer,
+        is_device,
+        fill_unused_with_zeros,
+        gpt,
+        apm,
+        progress_cb,
+        cancel_check,
+        log_cb,
+        &mut placed,
+    )?;
+    for p in &placed {
+        if p.defragmented_clone || (p.export_size == p.original_size && !p.compacted) {
+            continue;
+        }
+        crate::fs::resize_filesystem_from(writer, p.offset, p.original_size, p.export_size, log_cb)
+            .with_context(|| format!("resize partition-{} filesystem", p.index))?;
+    }
+    writer.seek(SeekFrom::Start(written))?;
+    Ok(written)
+}
+
+/// Where [`reconstruct_disk_inner`] put a partition's volume.
+struct PlacedVolume {
+    index: usize,
+    offset: u64,
+    original_size: u64,
+    export_size: u64,
+    compacted: bool,
+    defragmented_clone: bool,
+}
+
+fn reconstruct_disk_inner(
+    backup_folder: &Path,
+    metadata: &BackupMetadata,
+    mbr_bytes: Option<&[u8; 512]>,
+    partition_sizes: &[PartitionSizeOverride],
+    target_size: u64,
+    writer: &mut (impl Read + Write + Seek),
+    is_device: bool,
+    fill_unused_with_zeros: bool,
+    gpt: Option<&Gpt>,
+    apm: Option<&Apm>,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+    placed: &mut Vec<PlacedVolume>,
 ) -> Result<u64> {
     // EBR chain is built inside the MBR branch (after reading mbr_buf) so we
     // can pass the actual MBR bytes as a fallback for old backup formats that
@@ -341,7 +430,7 @@ pub fn reconstruct_disk_from_backup(
              restored: re-take it with CHD output, which keeps the RDSK/PART/FSHD \
              blocks verbatim. To resize an Amiga disk, export directly from the \
              source image (Inspect tab -> Export to Raw or VHD with size \
-             overrides) — that path is RDB-aware and patches the table for you."
+             overrides) - that path is RDB-aware and patches the table for you."
         );
     } else if is_superfloppy {
         // Superfloppy: no partition table to write — data starts at offset 0
@@ -651,6 +740,14 @@ pub fn reconstruct_disk_from_backup(
         // We always use absolute seeks (SeekFrom::Start) rather than relative
         // seeks because the patch_*_hidden_sectors calls at the end of each
         // iteration may have moved the file cursor away from total_written.
+        // A grown partition reaching past the next start would push it off its LBA (RBF-008).
+        if total_written > part_offset {
+            bail!(
+                "partition {} would start at byte {}, inside data already written (up to byte {total_written})",
+                pm.index,
+                part_offset
+            );
+        }
         if total_written < part_offset {
             let gap = part_offset - total_written;
             // On Windows physical drives, we must write zeros to gaps (seeking
@@ -708,15 +805,13 @@ pub fn reconstruct_disk_from_backup(
             .collect();
         let data_path = members[0].clone();
 
+        // Zeros in its place would be reported as a good restore (RBF-012).
         if let Some(missing) = members.iter().find(|p| !p.exists()) {
-            log_cb(&format!(
-                "partition-{}: data file not found: {}, filling with zeros",
+            bail!(
+                "partition-{}: data file {} is missing from the backup",
                 pm.index,
                 missing.display()
-            ));
-            write_zeros(writer, export_size)?;
-            total_written += export_size;
-            continue;
+            );
         }
 
         log_cb(&format!(
@@ -763,7 +858,7 @@ pub fn reconstruct_disk_from_backup(
             // Progress is reported chunk-by-chunk since the tail can be substantial.
             if pm.compacted || pm.defragmented_clone {
                 log_cb(&format!(
-                    "partition-{}: trimmed backup — zero-filling {} bytes to complete partition \
+                    "partition-{}: trimmed backup - zero-filling {} bytes to complete partition \
                      (filesystem headers finalized in post-processing)",
                     pm.index, pad
                 ));
@@ -793,6 +888,14 @@ pub fn reconstruct_disk_from_backup(
             }
         }
 
+        placed.push(PlacedVolume {
+            index: pm.index,
+            offset: part_offset,
+            original_size: pm.original_size_bytes,
+            export_size,
+            compacted: pm.compacted,
+            defragmented_clone: pm.defragmented_clone,
+        });
         // Update hidden sectors / partition offset to match the new start LBA
         {
             writer.flush()?;
@@ -920,10 +1023,10 @@ pub fn reconstruct_raw_apm_disk(
     struct PartPlan {
         source_lba: u64,
         dest_lba: u64,
+        original_size: u64,
         copy_size: u64,
         export_size: u64,
         name: String,
-        partition_type: String,
     }
     let mut plans: Vec<PartPlan> = Vec::new();
     for entry in &apm.entries {
@@ -942,10 +1045,10 @@ pub fn reconstruct_raw_apm_disk(
         plans.push(PartPlan {
             source_lba: entry_lba,
             dest_lba,
+            original_size,
             copy_size: original_size.min(export_size),
             export_size,
             name: entry.name.clone(),
-            partition_type: entry.partition_type.clone(),
         });
     }
     plans.sort_by_key(|p| p.dest_lba);
@@ -982,7 +1085,7 @@ pub fn reconstruct_raw_apm_disk(
             if cancel_check() {
                 bail!("export cancelled");
             }
-            let to_read = (remaining as usize).min(CHUNK_SIZE);
+            let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
             let n = reader
                 .read(&mut buf[..to_read])
                 .context("failed to read partition data")?;
@@ -1005,26 +1108,18 @@ pub fn reconstruct_raw_apm_disk(
             progress_cb(total_written);
         }
 
-        // For HFS partitions that grew, update the MDB in-place on the dest.
-        if plan.partition_type == "Apple_HFS" && plan.export_size != plan.copy_size {
+        // A resized partition's volume must follow it, grown or shrunk, HFS or HFS+ alike
+        // (RBF-005): this used to resize only a grown classic HFS and log any failure.
+        if plan.export_size != plan.original_size {
             let part_offset = plan.dest_lba * 512;
-            writer.seek(SeekFrom::Start(0))?; // ensure writer is flushed/synced
-            match crate::fs::resize_hfs_in_place(writer, part_offset, plan.export_size, &mut |m| {
-                log_cb(&format!("  [hfs] {m}"))
-            }) {
-                Ok(()) => log_cb(&format!(
-                    "Resized HFS in partition '{}' to {} MB",
-                    plan.name,
-                    plan.export_size / 1024 / 1024
-                )),
-                Err(e) => {
-                    log_cb(&format!(
-                        "HFS resize failed for partition '{}': {e}. Note: HFS+ / wrapped-HFS+ \
-                         volumes can share the Apple_HFS type and aren't resized here.",
-                        plan.name
-                    ));
-                }
-            }
+            crate::fs::resize_filesystem_from(
+                writer,
+                part_offset,
+                plan.original_size,
+                plan.export_size,
+                &mut |m| log_cb(&format!("  [{}] {m}", plan.name)),
+            )
+            .with_context(|| format!("APM export: resizing partition '{}'", plan.name))?;
             writer.seek(SeekFrom::Start(total_written))?;
         }
     }
@@ -1128,7 +1223,7 @@ pub fn reconstruct_raw_rdb_disk(
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut copied: u64 = 0;
     while copied < rdb_bytes {
-        let to_read = ((rdb_bytes - copied) as usize).min(CHUNK_SIZE);
+        let to_read = (rdb_bytes - copied).min(CHUNK_SIZE as u64) as usize;
         let n = reader
             .read(&mut buf[..to_read])
             .context("read RDB region")?;
@@ -1306,7 +1401,7 @@ pub fn reconstruct_raw_rdb_disk(
             if cancel_check() {
                 bail!("export cancelled");
             }
-            let to_read = (remaining as usize).min(CHUNK_SIZE);
+            let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
             let n = reader
                 .read(&mut buf[..to_read])
                 .with_context(|| format!("read partition '{}' data", p.drv_name))?;
@@ -1342,31 +1437,27 @@ pub fn reconstruct_raw_rdb_disk(
         if clone_emitted.contains(&p.dest_lba) {
             continue;
         }
-        if p.export_size == (p.copy_size).max(p.export_size).min(p.export_size)
-            && p.source_lba == p.dest_lba
-            && {
-                // size unchanged AND no offset change → nothing to fix
-                let orig_size = plan
-                    .partition_plans
-                    .iter()
-                    .find(|q| q.source_lba == p.source_lba)
-                    .map(|q| q.copy_size)
-                    .unwrap_or(p.copy_size);
-                orig_size == p.export_size
-            }
-        {
+        // Unchanged size at an unchanged place: nothing to fix. `copy_size` is
+        // min(original, export), so only `original_size` tells a shrink apart (RBF-004).
+        if p.original_size == p.export_size && p.source_lba == p.dest_lba {
             continue;
         }
         let part_offset = p.dest_lba * 512;
         let mut local_log = |m: &str| log_cb(&format!("  [{}] {m}", p.dos_type_string));
-        if let Err(e) =
-            crate::fs::resize_filesystem_for(writer, part_offset, p.export_size, &mut local_log)
-        {
-            log_cb(&format!(
-                "RDB export: resize for partition '{}' ({}) failed: {e}",
+        // A volume left at its old size past a shrunk partition is corrupt: stop, as restore does.
+        crate::fs::resize_filesystem_from(
+            writer,
+            part_offset,
+            p.original_size,
+            p.export_size,
+            &mut local_log,
+        )
+        .with_context(|| {
+            format!(
+                "RDB export: resizing partition '{}' ({})",
                 p.drv_name, p.dos_type_string
-            ));
-        }
+            )
+        })?;
     }
 
     // --- 5. Pad to the declared target size. ---
@@ -1536,6 +1627,22 @@ pub fn detect_image_format(file: File) -> Result<ImageFormat> {
 
 /// Like [`detect_image_format`] but with an optional filesystem path for
 /// extension-based detection of headerless formats.
+/// The most a floppy container decoded in memory may be; a bigger file with the magic is not one (RBF-016).
+const SMALL_CONTAINER_MAX: u64 = 64 << 20;
+
+/// Read a floppy-sized container whole, refusing one past [`SMALL_CONTAINER_MAX`].
+fn read_small_container(r: &mut impl Read, what: &str) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    r.take(SMALL_CONTAINER_MAX + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > SMALL_CONTAINER_MAX {
+        bail!(
+            "{what} image is larger than {} MiB, too big for a floppy container",
+            SMALL_CONTAINER_MAX >> 20
+        );
+    }
+    Ok(raw)
+}
+
 pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<ImageFormat> {
     let file_size = file.metadata()?.len();
     let mut file = file;
@@ -1594,8 +1701,7 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         if file.read_exact(&mut magic).is_ok() && woz::is_woz(&magic) {
             // Read entire file and decode — floppy images are small (< 1MB)
             file.seek(SeekFrom::Start(0))?;
-            let mut raw = Vec::new();
-            file.read_to_end(&mut raw)?;
+            let raw = read_small_container(&mut file, "WOZ")?;
             match woz::WozReader::from_bytes(raw) {
                 Ok(reader) => return Ok(ImageFormat::Woz(reader)),
                 Err(_) => {
@@ -1612,8 +1718,7 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         let mut magic = [0u8; 8];
         if file.read_exact(&mut magic).is_ok() && moof::is_moof(&magic) {
             file.seek(SeekFrom::Start(0))?;
-            let mut raw = Vec::new();
-            file.read_to_end(&mut raw)?;
+            let raw = read_small_container(&mut file, "MOOF")?;
             match moof::MoofReader::from_bytes(raw) {
                 Ok(reader) => return Ok(ImageFormat::Moof(reader)),
                 Err(_) => {
@@ -1940,10 +2045,9 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             Ok((Box::new(reader), size))
         }
         ImageFormat::DosOrder => {
-            let mut raw = Vec::new();
             let mut reader = BufReader::new(file);
             reader.seek(SeekFrom::Start(0))?;
-            reader.read_to_end(&mut raw)?;
+            let raw = read_small_container(&mut reader, "floppy")?;
             let dos_reader = interleave::DosOrderReader::new(raw)
                 .map_err(|e| anyhow::anyhow!("failed to read DOS-order image: {e}"))?;
             let size = dos_reader.len();
@@ -1977,10 +2081,9 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             // Decode the whole DART file into memory (floppies are <= ~1.5 MB):
             // a Lisa disk becomes a DiskCopy 4.2 stream *with* tags, everything
             // else its block data. Either way it's a flat, seekable image.
-            let mut raw = Vec::new();
             let mut reader = BufReader::new(file);
             reader.seek(SeekFrom::Start(0))?;
-            reader.read_to_end(&mut raw)?;
+            let raw = read_small_container(&mut reader, "floppy")?;
             let image = dart::decode_dart_to_image(&raw)
                 .map_err(|e| anyhow::anyhow!("decode DART: {e}"))?;
             let size = image.len() as u64;
@@ -1989,10 +2092,9 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
         ImageFormat::TwiggyDc42(hdr) => {
             // Read the whole Twiggy image (< ~1 MB) and de-interleave its two
             // sides into a flat MFS/HFS volume the superfloppy path can mount.
-            let mut raw = Vec::new();
             let mut reader = BufReader::new(file);
             reader.seek(SeekFrom::Start(0))?;
-            reader.read_to_end(&mut raw)?;
+            let raw = read_small_container(&mut reader, "floppy")?;
             let image = dc42::deinterleave_twiggy(&raw)
                 .ok_or_else(|| anyhow::anyhow!("{}", hdr.twiggy_unsupported_message()))?;
             let size = image.len() as u64;
@@ -2120,7 +2222,7 @@ pub fn reconstruct_raw_label_disk(
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<u64> {
-    use crate::fs::{in_place_resize_support, resize_filesystem_for, InPlaceResize};
+    use crate::fs::{in_place_resize_support, resize_filesystem_from, InPlaceResize};
     use crate::partition::{restore_patch, PartitionTable};
 
     reader.seek(SeekFrom::Start(0))?;
@@ -2192,7 +2294,7 @@ pub fn reconstruct_raw_label_disk(
             if cancel_check() {
                 bail!("export cancelled");
             }
-            let want = (left as usize).min(buf.len());
+            let want = left.min(buf.len() as u64) as usize;
             let n = reader
                 .read(&mut buf[..want])
                 .context("read partition body")?;
@@ -2210,7 +2312,7 @@ pub fn reconstruct_raw_label_disk(
         let mut pad = o.export_size.saturating_sub(to_copy);
         let zeros = vec![0u8; CHUNK_SIZE];
         while pad > 0 {
-            let want = (pad as usize).min(zeros.len());
+            let want = pad.min(zeros.len() as u64) as usize;
             writer
                 .write_all(&zeros[..want])
                 .context("zero-fill grow region")?;
@@ -2222,7 +2324,8 @@ pub fn reconstruct_raw_label_disk(
     writer
         .write_all(&patched.head)
         .context("write the rewritten head")?;
-    if source_data_size > 0 {
+    // Only a short image is extended; a body running to the end keeps its last byte (RBF-011).
+    if source_data_size > 0 && writer.seek(SeekFrom::End(0))? < source_data_size {
         writer.seek(SeekFrom::Start(source_data_size - 1))?;
         writer.write_all(&[0u8]).context("size the image")?;
     }
@@ -2233,7 +2336,7 @@ pub fn reconstruct_raw_label_disk(
         };
         let off = o.effective_start_lba() * 512;
         if o.export_size != p.size_bytes {
-            resize_filesystem_for(writer, off, o.export_size, log_cb)
+            resize_filesystem_from(writer, off, p.size_bytes, o.export_size, log_cb)
                 .with_context(|| format!("resize partition-{} filesystem", p.index))?;
         }
         patch_hidden_sectors_for(writer, off, o.effective_start_lba(), log_cb)
@@ -2417,14 +2520,12 @@ mod table_sidecar_tests {
         assert!(log.iter().all(|l| l.starts_with("Loaded ")), "{log:?}");
     }
 
+    /// RST-010: without its sidecar a GPT backup would be written with no table at all.
     #[test]
-    fn a_gpt_backup_without_its_sidecar_warns_instead_of_failing() {
+    fn a_gpt_backup_without_its_sidecar_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = Vec::new();
-        let (g, a) =
-            load_table_sidecars(dir.path(), "GPT", &mut |m: &str| log.push(m.to_string())).unwrap();
-        assert!(g.is_none() && a.is_none());
-        assert!(log.iter().any(|l| l.contains("no gpt.json")), "{log:?}");
+        let err = load_table_sidecars(dir.path(), "GPT", &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("no gpt.json"), "{err}");
     }
 }
 
@@ -2538,6 +2639,94 @@ mod mbr_gap_restore_tests {
             log.iter()
                 .any(|l| l.contains("between the MBR and the first partition")),
             "{log:?}"
+        );
+    }
+
+    /// RBF-008: a partition grown past the next start used to push that one to the cursor.
+    #[test]
+    fn a_partition_grown_over_its_neighbour_is_refused() {
+        const PART_BYTES: u64 = 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path();
+        let mut mbr = [0u8; 512];
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        let mut parts = Vec::new();
+        for (index, start) in [(0usize, 2048u64), (1, 4096)] {
+            let name = format!("partition-{index}.raw");
+            std::fs::write(folder.join(&name), vec![0u8; PART_BYTES as usize]).unwrap();
+            parts.push(PartitionMetadata {
+                index,
+                type_name: "FAT16".to_string(),
+                partition_type_byte: 0x06,
+                start_lba: start,
+                start_byte: None,
+                original_size_bytes: PART_BYTES,
+                imaged_size_bytes: PART_BYTES,
+                compressed_files: vec![name],
+                checksum: String::new(),
+                resized: false,
+                compacted: false,
+                is_logical: false,
+                partition_type_string: None,
+                minimum_size_bytes: None,
+                defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
+                defragmented_clone: false,
+            });
+        }
+        let total = 8192 * 512;
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-11-25T00:00:00Z".to_string(),
+            source_device: "synthetic".to_string(),
+            source_size_bytes: total,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: crate::backup::CompressionType::None.as_str().to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::PerPartition,
+            container: None,
+            container_logical_size: None,
+            container_sha1: None,
+            size_policy: None,
+            alignment: AlignmentMetadata {
+                detected_type: "Modern1MB".to_string(),
+                first_partition_lba: 2048,
+                alignment_sectors: 2048,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: parts,
+            bad_sectors: vec![],
+            extended_container: None,
+        };
+        let grow = [PartitionSizeOverride::size_only(
+            0,
+            2048,
+            PART_BYTES,
+            2 * PART_BYTES,
+        )];
+        let err = reconstruct_disk_from_backup(
+            folder,
+            &metadata,
+            Some(&mbr),
+            &grow,
+            total,
+            &mut std::io::Cursor::new(Vec::new()),
+            false,
+            false,
+            None,
+            None,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .expect_err("partition 1 would land at the cursor");
+        assert!(
+            format!("{err:#}").contains("inside data already written"),
+            "{err:#}"
         );
     }
 }

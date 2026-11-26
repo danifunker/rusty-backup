@@ -76,10 +76,16 @@ pub fn validate_edits(
                 index,
                 new_start_lba,
             } => {
-                if let Some(p) = partitions.iter_mut().find(|p| p.index == *index) {
-                    p.start_lba = *new_start_lba;
-                } else {
+                let Some(p) = partitions.iter_mut().find(|p| p.index == *index) else {
                     bail!("partition index {} not found", index);
+                };
+                let (old, container) = (p.start_lba, p.is_extended_container);
+                p.start_lba = *new_start_lba;
+                // EBR addresses are container-relative, so the logicals travel with it.
+                if container {
+                    for l in partitions.iter_mut().filter(|l| l.is_logical) {
+                        l.start_lba = (l.start_lba + *new_start_lba).saturating_sub(old);
+                    }
                 }
             }
             PartitionTableEdit::ChangeType { index, .. } => {
@@ -190,6 +196,17 @@ pub fn apply_edits(
     disk_size_bytes: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
+    // Under a sector, a GPT entry ends before it starts (PAR-014).
+    for edit in edits {
+        let size = match edit {
+            PartitionTableEdit::ResizeEntry { new_size_bytes, .. } => *new_size_bytes,
+            PartitionTableEdit::AddEntry { size_bytes, .. } => *size_bytes,
+            _ => continue,
+        };
+        if size < 512 {
+            bail!("a partition must be at least one 512-byte sector, not {size} bytes");
+        }
+    }
     match current_table {
         PartitionTable::Mbr(mbr) => apply_mbr_edits(file, mbr, edits, log_cb),
         PartitionTable::Gpt { gpt, .. } => {
@@ -305,16 +322,13 @@ fn apply_mbr_edits(
                 index,
                 new_size_bytes,
             } => {
+                // A skipped edit used to return Ok, so the caller believed it applied (PAR-013).
                 if *index >= 4 {
-                    log_cb(&format!(
-                        "Skipping resize of logical partition {} (EBR editing not supported)",
-                        index
-                    ));
-                    continue;
+                    bail!("cannot resize logical partition {index}: EBR editing is not supported");
                 }
                 let offset = 446 + index * 16;
                 let start_lba = u32::from_le_bytes(mbr_bytes[offset + 8..offset + 12].try_into()?);
-                let new_sectors = (*new_size_bytes / 512) as u32;
+                let new_sectors = fit32(*new_size_bytes / 512, "partition size")?;
 
                 // Update total sectors
                 mbr_bytes[offset + 12..offset + 16].copy_from_slice(&new_sectors.to_le_bytes());
@@ -335,12 +349,9 @@ fn apply_mbr_edits(
                 index,
                 new_start_lba,
             } => {
+                // A skipped edit used to return Ok, so the caller believed it applied (PAR-013).
                 if *index >= 4 {
-                    log_cb(&format!(
-                        "Skipping move of logical partition {} (EBR editing not supported)",
-                        index
-                    ));
-                    continue;
+                    bail!("cannot move logical partition {index}: EBR editing is not supported");
                 }
                 let offset = 446 + index * 16;
                 let total_sectors =
@@ -348,16 +359,16 @@ fn apply_mbr_edits(
 
                 // Update start LBA
                 mbr_bytes[offset + 8..offset + 12]
-                    .copy_from_slice(&(*new_start_lba as u32).to_le_bytes());
+                    .copy_from_slice(&fit32(*new_start_lba, "start LBA")?.to_le_bytes());
 
                 // Update CHS start
-                let (cyl, head, sec) = lba_to_chs(*new_start_lba as u32, heads, spt);
+                let (cyl, head, sec) = lba_to_chs(fit32(*new_start_lba, "start LBA")?, heads, spt);
                 mbr_bytes[offset + 1] = head as u8;
                 mbr_bytes[offset + 2] = (sec as u8 & 0x3F) | ((cyl >> 2) as u8 & 0xC0);
                 mbr_bytes[offset + 3] = cyl as u8;
 
                 // Update CHS end
-                let end_lba = (*new_start_lba as u32)
+                let end_lba = fit32(*new_start_lba, "start LBA")?
                     .saturating_add(total_sectors)
                     .saturating_sub(1);
                 let (cyl, head, sec) = lba_to_chs(end_lba, heads, spt);
@@ -407,14 +418,11 @@ fn apply_mbr_edits(
                 });
                 let slot = match slot {
                     Some(s) => s,
-                    None => {
-                        log_cb("No empty MBR slot for new partition");
-                        continue;
-                    }
+                    None => bail!("the MBR has no empty slot for a new partition"),
                 };
                 let offset = 446 + slot * 16;
-                let start = *start_lba as u32;
-                let sectors = (*size_bytes / 512) as u32;
+                let start = fit32(*start_lba, "start LBA")?;
+                let sectors = fit32(*size_bytes / 512, "partition size")?;
 
                 mbr_bytes[offset] = if *bootable { 0x80 } else { 0x00 };
                 let (cyl, head, sec) = lba_to_chs(start, heads, spt);
@@ -453,6 +461,12 @@ fn apply_mbr_edits(
     Ok(())
 }
 
+/// A table field that holds 32 bits: past that a cast would wrap onto another place (PAR-004).
+fn fit32(v: u64, what: &str) -> Result<u32> {
+    u32::try_from(v)
+        .map_err(|_| anyhow::anyhow!("{what} {v} does not fit this partition table's 32-bit field"))
+}
+
 fn apply_gpt_edits(
     file: &mut (impl Read + Write + Seek),
     gpt: &Gpt,
@@ -463,6 +477,8 @@ fn apply_gpt_edits(
     let disk_sectors = disk_size_bytes / 512;
     let mut patched = gpt.clone();
 
+    // Deletes wait for the loop's end, so later edits still name the partitions they meant (PAR-002).
+    let mut doomed: Vec<usize> = Vec::new();
     for edit in edits {
         match edit {
             PartitionTableEdit::ResizeEntry {
@@ -507,16 +523,14 @@ fn apply_gpt_edits(
                                     index, guid_str
                                 ));
                             }
-                            Err(err) => {
-                                log_cb(&format!("Invalid GUID {}: {}", guid_str, err));
-                            }
+                            Err(err) => bail!("invalid GPT type GUID {guid_str}: {err}"),
                         }
                     }
                 }
             }
             PartitionTableEdit::DeleteEntry { index } => {
                 if *index < patched.entries.len() {
-                    patched.entries.remove(*index);
+                    doomed.push(*index);
                     log_cb(&format!("Deleted GPT partition {}", index));
                 }
             }
@@ -561,6 +575,23 @@ fn apply_gpt_edits(
             }
         }
     }
+    doomed.sort_unstable();
+    doomed.dedup();
+    for i in doomed.into_iter().rev() {
+        patched.entries.remove(i);
+    }
+    // The backup entries and header take the last sectors; a partition there would lose them (PAR-003).
+    let last_usable = disk_sectors.saturating_sub(1 + patched.array_sectors() + 1);
+    if let Some(e) = patched
+        .entries
+        .iter()
+        .find(|e| !e.is_empty() && e.last_lba > last_usable)
+    {
+        bail!(
+            "GPT partition ending at LBA {} runs into the backup table (last usable LBA {last_usable})",
+            e.last_lba
+        );
+    }
 
     // Write protective MBR
     let pmbr = Gpt::build_protective_mbr(disk_sectors);
@@ -592,9 +623,11 @@ fn apply_apm_edits(
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
     let block_size = apm.ddr.block_size as u64;
-    let total_blocks = (disk_size_bytes / block_size) as u32;
+    let total_blocks = fit32(disk_size_bytes / block_size, "disk size")?;
     let mut patched = apm.clone();
 
+    // Deletes wait for the loop's end, so later edits still name the partitions they meant (PAR-002).
+    let mut doomed: Vec<usize> = Vec::new();
     for edit in edits {
         match edit {
             PartitionTableEdit::ResizeEntry {
@@ -602,7 +635,7 @@ fn apply_apm_edits(
                 new_size_bytes,
             } => {
                 if let Some(e) = patched.entries.get_mut(*index) {
-                    let new_blocks = (*new_size_bytes / block_size) as u32;
+                    let new_blocks = fit32(*new_size_bytes / block_size, "partition size")?;
                     e.block_count = new_blocks;
                     e.data_count = new_blocks;
                     log_cb(&format!(
@@ -617,7 +650,7 @@ fn apply_apm_edits(
             } => {
                 if let Some(e) = patched.entries.get_mut(*index) {
                     // Convert LBA to APM block number
-                    let new_block = (*new_start_lba * 512 / block_size) as u32;
+                    let new_block = fit32(*new_start_lba * 512 / block_size, "start block")?;
                     e.start_block = new_block;
                     log_cb(&format!(
                         "Moved APM partition {} to block {}",
@@ -639,13 +672,7 @@ fn apply_apm_edits(
             }
             PartitionTableEdit::DeleteEntry { index } => {
                 if *index < patched.entries.len() {
-                    patched.entries.remove(*index);
-                    // Update map_entries count on remaining entries
-                    let count = patched.entries.len() as u32;
-                    for e in &mut patched.entries {
-                        e.map_entries = count;
-                    }
-                    patched.map_entry_count = count;
+                    doomed.push(*index);
                     log_cb(&format!("Deleted APM partition {}", index));
                 }
             }
@@ -656,8 +683,8 @@ fn apply_apm_edits(
                 ..
             } => {
                 let ts = type_string.as_deref().unwrap_or("Apple_HFS").to_string();
-                let start_block = (*start_lba * 512 / block_size) as u32;
-                let block_count = (*size_bytes / block_size) as u32;
+                let start_block = fit32(*start_lba * 512 / block_size, "start block")?;
+                let block_count = fit32(*size_bytes / block_size, "partition size")?;
 
                 patched.entries.push(part_tables::apm::ApmPartitionEntry {
                     signature: 0x504D,
@@ -697,6 +724,18 @@ fn apply_apm_edits(
                 log_cb("SetBootable: not yet supported on APM partitions");
             }
         }
+    }
+    doomed.sort_unstable();
+    doomed.dedup();
+    if !doomed.is_empty() {
+        for i in doomed.into_iter().rev() {
+            patched.entries.remove(i);
+        }
+        let count = patched.entries.len() as u32;
+        for e in &mut patched.entries {
+            e.map_entries = count;
+        }
+        patched.map_entry_count = count;
     }
 
     // Serialize and write
@@ -1159,7 +1198,7 @@ fn apply_sgi_dklabel_edits(
         part_tables::sgi_dklabel::SgiDiskMap { base: 0, size: 0 },
     );
     let mut bootfs = sector[OFF_BOOTFS];
-    let total_blocks = (disk_size_bytes / 512) as u32;
+    let total_blocks = fit32(disk_size_bytes / 512, "disk size")?;
     // Only slots the table actually lists may be edited: an empty or
     // whole-disk wrapper slot is not a partition the caller can have meant.
     let resolve = |raw: usize| -> Result<usize> {
@@ -1185,7 +1224,7 @@ fn apply_sgi_dklabel_edits(
             } => {
                 let raw = resolve(*index)?;
                 let slot = slot_mut(&mut map, raw)?;
-                slot.size = (*new_size_bytes / 512) as u32;
+                slot.size = fit32(*new_size_bytes / 512, "partition size")?;
                 log_cb(&format!(
                     "SGI disk label: slot {raw} resized to {} blocks",
                     slot.size
@@ -1197,7 +1236,7 @@ fn apply_sgi_dklabel_edits(
             } => {
                 let raw = resolve(*index)?;
                 let slot = slot_mut(&mut map, raw)?;
-                slot.base = *new_start_lba as u32;
+                slot.base = fit32(*new_start_lba, "start LBA")?;
                 log_cb(&format!(
                     "SGI disk label: slot {raw} moved to block {}",
                     slot.base
@@ -1219,8 +1258,8 @@ fn apply_sgi_dklabel_edits(
                     .iter()
                     .position(|m| m.size == 0)
                     .ok_or_else(|| anyhow::anyhow!("SGI disk label: all 8 slots are in use"))?;
-                map[free].base = *start_lba as u32;
-                map[free].size = (*size_bytes / 512) as u32;
+                map[free].base = fit32(*start_lba, "start LBA")?;
+                map[free].size = fit32(*size_bytes / 512, "partition size")?;
                 log_cb(&format!(
                     "SGI disk label: slot {free} added at block {} for {} blocks",
                     map[free].base, map[free].size
@@ -1239,7 +1278,7 @@ fn apply_sgi_dklabel_edits(
             }
             PartitionTableEdit::ChangeType { .. } => {
                 anyhow::bail!(
-                    "SGI disk label: slots have no type field — a slot's role comes from \
+                    "SGI disk label: slots have no type field - a slot's role comes from \
                      d_bootfs / d_swapfs / d_rootfs, not from a per-slot type"
                 );
             }
@@ -1353,7 +1392,7 @@ fn apply_sgi_edits(
                 let entry = patched.partitions.get_mut(*index).ok_or_else(|| {
                     anyhow::anyhow!("SGI partition slot {} out of range (max 15)", index)
                 })?;
-                let new_blocks = (*new_size_bytes / 512) as u32;
+                let new_blocks = fit32(*new_size_bytes / 512, "partition size")?;
                 entry.blocks = new_blocks;
                 log_cb(&format!(
                     "Resized SGI partition slot {} to {} sectors",
@@ -1367,7 +1406,7 @@ fn apply_sgi_edits(
                 let entry = patched.partitions.get_mut(*index).ok_or_else(|| {
                     anyhow::anyhow!("SGI partition slot {} out of range (max 15)", index)
                 })?;
-                entry.first = (*new_start_lba) as u32;
+                entry.first = fit32(*new_start_lba, "start LBA")?;
                 log_cb(&format!(
                     "Moved SGI partition slot {} to LBA {}",
                     index, new_start_lba
@@ -1408,7 +1447,7 @@ fn apply_sgi_edits(
                 ..
             } => {
                 // SGI has 16 fixed slots. Find the first empty one — but
-                // refuse to touch slots 8 (VOLUME) and 10 (VOLHDR) since
+                // refuse to touch slots 8 (VOLHDR) and 10 (VOLUME) since
                 // those are reserved disk-wide wrappers. (They're filtered
                 // out of the editor's view by .partitions(), so the user
                 // won't see them, but defensive check anyway.)
@@ -1423,8 +1462,8 @@ fn apply_sgi_edits(
                         anyhow::anyhow!("no empty SGI partition slot available (all 16 used)")
                     })?;
                 patched.partitions[slot] = SgiPartitionEntry {
-                    blocks: (*size_bytes / 512) as u32,
-                    first: (*start_lba) as u32,
+                    blocks: fit32(*size_bytes / 512, "partition size")?,
+                    first: fit32(*start_lba, "start LBA")?,
                     partition_type_raw: new_type.as_u32(),
                 };
                 log_cb(&format!(
@@ -1560,6 +1599,97 @@ mod tests {
         let non_empty: Vec<_> = updated.entries.iter().filter(|e| !e.is_empty()).collect();
         assert_eq!(non_empty.len(), 1);
         assert_eq!(non_empty[0].partition_type, 0x83);
+    }
+
+    /// PAR-002: a delete used to shift the indices the edits after it name.
+    #[test]
+    fn a_gpt_delete_leaves_later_edits_on_their_own_partitions() {
+        use part_tables::gpt::{build_minimal_gpt, Guid};
+        let disk_size = 100_000u64 * 512;
+        let guid = Guid::from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7").unwrap();
+        let gpt = build_minimal_gpt(
+            &[
+                (guid, 2048, 4095, "a".into()),
+                (guid, 4096, 6143, "b".into()),
+                (guid, 8192, 10239, "c".into()),
+            ],
+            disk_size,
+        );
+        let pmbr = Gpt::build_protective_mbr(disk_size / 512);
+        let table = PartitionTable::Gpt {
+            protective_mbr: Mbr::parse(&pmbr).unwrap(),
+            gpt,
+        };
+        let mut disk = vec![0u8; disk_size as usize];
+        let edits = vec![
+            PartitionTableEdit::DeleteEntry { index: 0 },
+            PartitionTableEdit::ResizeEntry {
+                index: 2,
+                new_size_bytes: 4096 * 512,
+            },
+        ];
+        let mut cursor = Cursor::new(&mut disk[..]);
+        apply_edits(&mut cursor, &table, &edits, disk_size, &mut |_| {}).unwrap();
+        let updated = Gpt::parse(&mut Cursor::new(&disk[..])).unwrap();
+        let spans: Vec<(u64, u64)> = updated
+            .entries
+            .iter()
+            .map(|e| (e.first_lba, e.last_lba))
+            .collect();
+        assert_eq!(spans, vec![(4096, 6143), (8192, 12287)]);
+    }
+
+    /// PAR-003: growing the last GPT partition to the disk's end put the backup table inside it.
+    #[test]
+    fn a_gpt_partition_cannot_grow_into_the_backup_table() {
+        use part_tables::gpt::{build_minimal_gpt, Guid};
+        let disk_size = 100_000u64 * 512;
+        let guid = Guid::from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7").unwrap();
+        let gpt = build_minimal_gpt(&[(guid, 2048, 4095, "a".into())], disk_size);
+        let pmbr = Gpt::build_protective_mbr(disk_size / 512);
+        let table = PartitionTable::Gpt {
+            protective_mbr: Mbr::parse(&pmbr).unwrap(),
+            gpt,
+        };
+        let mut disk = vec![0u8; disk_size as usize];
+        let mut grow = |sectors: u64| {
+            let edits = [PartitionTableEdit::ResizeEntry {
+                index: 0,
+                new_size_bytes: sectors * 512,
+            }];
+            apply_edits(
+                &mut Cursor::new(&mut disk[..]),
+                &table,
+                &edits,
+                disk_size,
+                &mut |_| {},
+            )
+        };
+        assert!(grow(100_000 - 2048).is_err(), "to the very last sector");
+        grow(100_000 - 34 - 2048 + 1).expect("up to the last usable LBA");
+    }
+
+    /// PAR-004: a size past 2 TiB used to wrap in the MBR's 32-bit field and land as a tiny partition.
+    #[test]
+    fn an_mbr_size_past_32_bits_is_refused() {
+        let mbr_bytes = build_minimal_mbr(0x1234, &[(0x0C, 2048, 1000, false)], 255, 63);
+        let mut disk = vec![0u8; 4096 * 512];
+        disk[..512].copy_from_slice(&mbr_bytes);
+        let table = PartitionTable::Mbr(Mbr::parse(&mbr_bytes).unwrap());
+        let edits = [PartitionTableEdit::ResizeEntry {
+            index: 0,
+            new_size_bytes: (1u64 << 32) * 512 + 512,
+        }];
+        let err = apply_edits(
+            &mut Cursor::new(&mut disk[..]),
+            &table,
+            &edits,
+            u64::MAX,
+            &mut |_| {},
+        )
+        .expect_err("wraps to one sector");
+        assert!(err.to_string().contains("32-bit"), "{err}");
+        assert_eq!(&disk[..512], &mbr_bytes[..], "the table is untouched");
     }
 
     // --- SGI disklabel writer tests (Phase 3 of disk_expansion.md) ---

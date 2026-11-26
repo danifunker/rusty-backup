@@ -61,7 +61,11 @@ pub fn layout_limits(table_type: &str, head: &[u8]) -> (u64, u64) {
         "Sun" => head
             .get(..512)
             .and_then(|h| part_tables::sun::SunDiskLabel::parse(h).ok())
-            .map(|l| (l.sectors_per_cylinder * 512, 0)),
+            // The patcher keeps the alternate cylinders free at the end (PAR-005).
+            .map(|l| {
+                let unit = l.sectors_per_cylinder * 512;
+                (unit, BigEndian::read_u16(&head[434..436]) as u64 * unit)
+            }),
         "NeXT" => head
             .get(..part_tables::next::LABEL_SPAN)
             .and_then(|h| part_tables::next::NextDiskLabel::parse(h, 0).ok())
@@ -121,6 +125,12 @@ fn last_end(overrides: &[PartitionSizeOverride]) -> u64 {
         .map(|o| o.effective_start_lba() * 512 + o.export_size)
         .max()
         .unwrap_or(0)
+}
+
+/// A label field that holds 32 bits; past that a cast would wrap onto another place (PAR-007).
+fn fit32(v: u64, what: &str) -> Result<u32> {
+    u32::try_from(v)
+        .map_err(|_| anyhow::anyhow!("{what} {v} does not fit this label's 32-bit field"))
 }
 
 fn check_fits(overrides: &[PartitionSizeOverride], limit: u64, what: &str) -> Result<()> {
@@ -183,7 +193,10 @@ fn patch_sun(
         if label.is_whole_disk_slice(i) && !adjusted.iter().any(|o| o.index == i) {
             let base = 444 + i * 8;
             BigEndian::write_u32(&mut out[base..base + 4], 0);
-            BigEndian::write_u32(&mut out[base + 4..base + 8], (ncyl * spc) as u32);
+            BigEndian::write_u32(
+                &mut out[base + 4..base + 8],
+                fit32(ncyl * spc, "label size")?,
+            );
         }
     }
     for o in &adjusted {
@@ -200,8 +213,8 @@ fn patch_sun(
             );
         }
         let base = 444 + o.index * 8;
-        let start_cyl = (o.effective_start_lba() * 512 / unit) as u32;
-        let nblocks = (o.export_size / 512) as u32;
+        let start_cyl = fit32(o.effective_start_lba() * 512 / unit, "start cylinder")?;
+        let nblocks = fit32(o.export_size / 512, "partition size")?;
         BigEndian::write_u32(&mut out[base..base + 4], start_cyl);
         BigEndian::write_u32(&mut out[base + 4..base + 8], nblocks);
     }
@@ -312,8 +325,8 @@ fn patch_sgi(
                 o.start_lba
             );
         }
-        e.first = o.effective_start_lba() as u32;
-        e.blocks = (o.export_size / 512) as u32;
+        e.first = fit32(o.effective_start_lba(), "start LBA")?;
+        e.blocks = fit32(o.export_size / 512, "partition size")?;
     }
     // The VOLUME slot and the cylinder count describe the target disk, in whole cylinders.
     let dp = &mut vh.device_parameters;
@@ -332,7 +345,7 @@ fn patch_sgi(
             && !adjusted.iter().any(|o| o.index == i)
         {
             e.first = 0;
-            e.blocks = blocks as u32;
+            e.blocks = fit32(blocks, "partition size")?;
         }
     }
     let mut out = head.to_vec();
@@ -377,8 +390,14 @@ fn patch_sgi_dklabel(
             );
         }
         let off = OFF_MAP + o.index * 8;
-        BigEndian::write_u32(&mut out[off..off + 4], o.effective_start_lba() as u32);
-        BigEndian::write_u32(&mut out[off + 4..off + 8], (o.export_size / 512) as u32);
+        BigEndian::write_u32(
+            &mut out[off..off + 4],
+            fit32(o.effective_start_lba(), "start LBA")?,
+        );
+        BigEndian::write_u32(
+            &mut out[off + 4..off + 8],
+            fit32(o.export_size / 512, "partition size")?,
+        );
         // The label's own word order: a swabbed image wants these words swapped too.
         apply_byte_order(label.byte_order, &mut out[off..off + 8]);
     }
@@ -511,11 +530,20 @@ fn patch_ahdi(
             );
         }
         let off = 0x1C6 + o.index * 12;
-        BigEndian::write_u32(&mut out[off + 4..off + 8], o.effective_start_lba() as u32);
-        BigEndian::write_u32(&mut out[off + 8..off + 12], (o.export_size / 512) as u32);
+        BigEndian::write_u32(
+            &mut out[off + 4..off + 8],
+            fit32(o.effective_start_lba(), "start LBA")?,
+        );
+        BigEndian::write_u32(
+            &mut out[off + 8..off + 12],
+            fit32(o.export_size / 512, "partition size")?,
+        );
     }
     if table.disk_size_sectors != 0 {
-        BigEndian::write_u32(&mut out[0x1F6..0x1FA], (target_size / 512) as u32);
+        BigEndian::write_u32(
+            &mut out[0x1F6..0x1FA],
+            fit32(target_size / 512, "disk size")?,
+        );
     }
     // Only a bootable root sector carries the 0x1234 word-sum; keep a plain one plain.
     if table.checksum_valid {
@@ -561,12 +589,21 @@ fn patch_apm_ts(
             );
         };
         let off = TsMap::entry_byte_offset(slot);
-        BigEndian::write_u32(&mut out[off..off + 4], o.effective_start_lba() as u32);
-        BigEndian::write_u32(&mut out[off + 4..off + 8], (o.export_size / 512) as u32);
+        BigEndian::write_u32(
+            &mut out[off..off + 4],
+            fit32(o.effective_start_lba(), "start LBA")?,
+        );
+        BigEndian::write_u32(
+            &mut out[off + 4..off + 8],
+            fit32(o.export_size / 512, "partition size")?,
+        );
     }
     // sbBlkCount, in the DDR's own block size.
     let block_size = (map.ddr.block_size as u64).max(512);
-    BigEndian::write_u32(&mut out[4..8], (target_size / block_size) as u32);
+    BigEndian::write_u32(
+        &mut out[4..8],
+        fit32(target_size / block_size, "disk size")?,
+    );
     log_cb("  table: DDR and TS partition map rewritten");
     Ok(PatchedHead {
         head: out,
@@ -633,7 +670,7 @@ fn patch_x68k(
     part_tables::x68k::patch_x68k_entries(block, &by_slot, ss)
         .context("patching the X68k table")?;
     if BigEndian::read_u32(&block[4..8]) != 0 {
-        let sectors = (target_size / ss) as u32;
+        let sectors = fit32(target_size / ss, "disk size")?;
         BigEndian::write_u32(&mut block[4..8], sectors);
         BigEndian::write_u32(&mut block[8..12], sectors);
     }

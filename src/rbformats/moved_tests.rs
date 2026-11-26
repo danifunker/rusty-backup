@@ -112,7 +112,7 @@ mod qcow2 {
         //    other qemu-img tests — skip cleanly when qemu-img isn't present.
         match crate::rbformats::qemu_img_test::qemu_img_check(tmp.path()) {
             Ok(true) => {}
-            Ok(false) => eprintln!("skipping qemu-img check — `qemu-img` not on PATH"),
+            Ok(false) => eprintln!("skipping qemu-img check - `qemu-img` not on PATH"),
             Err(e) => panic!("qemu-img check failed on edited APM+HFS image: {e}"),
         }
 

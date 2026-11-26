@@ -72,7 +72,8 @@ pub fn decode_gz_index(b: &[u8]) -> Result<Vec<GzSpan>> {
         bail!("unsupported gz index version {ver}");
     }
     let count = u32::from_le_bytes(b[6..10].try_into().unwrap()) as usize;
-    let mut spans = Vec::with_capacity(count);
+    // The count is the sidecar's word, so capacity follows the bytes actually there (RBF-017).
+    let mut spans = Vec::with_capacity(count.min((b.len() - 10) / 16));
     let mut p = 10usize;
     for _ in 0..count {
         if p + 16 > b.len() {
@@ -122,5 +123,17 @@ mod tests {
         let bytes = encode_gz_index(&spans);
         assert_eq!(decode_gz_index(&bytes).unwrap(), spans);
         assert!(decode_gz_index(b"nope").is_err());
+    }
+
+    /// RBF-017: a huge count used to reserve memory before the truncation check.
+    #[test]
+    fn a_count_past_the_data_is_truncation_not_an_allocation() {
+        let mut b = GZ_IDX_MAGIC.to_le_bytes().to_vec();
+        b.extend_from_slice(&GZ_IDX_VERSION.to_le_bytes());
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_gz_index(&b)
+            .unwrap_err()
+            .to_string()
+            .contains("truncated"));
     }
 }

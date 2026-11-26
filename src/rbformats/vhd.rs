@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use super::{decompress_members_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
+use super::{decompress_members_to_writer, reconstruct_disk_for_export, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
-use crate::fs::{patch_hidden_sectors_for, resize_filesystem_for};
+use crate::fs::{patch_hidden_sectors_for, resize_filesystem_from};
 use part_tables::mbr::{build_ebr_chain, parse_ebr_chain, patch_mbr_entries, Mbr};
 use part_tables::PartitionSizeOverride;
 
@@ -229,7 +229,7 @@ fn rebuild_vhd_ebr_chain(
     // (positions and partition types).
     let source_logicals = match parse_ebr_chain(source, extended_start_lba) {
         Ok(v) if !v.is_empty() => v,
-        Ok(_) => return Ok(None), // empty chain — nothing to update
+        Ok(_) => return Ok(None), // empty chain - nothing to update
         Err(e) => {
             log_cb(&format!("Warning: could not parse source EBR chain: {e}"));
             return Ok(None);
@@ -281,6 +281,16 @@ fn rebuild_vhd_ebr_chain(
     }))
 }
 
+/// Write the fixed-VHD footer at `data_len`, wherever the cursor was left: reconstruction ends
+/// on a seek-back write (the hidden-sector patch), so the cursor is not the data's end (RBF-001).
+fn append_vhd_footer(file: &mut File, data_len: u64) -> Result<()> {
+    file.seek(SeekFrom::Start(data_len))?;
+    file.write_all(&build_vhd_footer(data_len))
+        .context("failed to write VHD footer")?;
+    file.set_len(data_len + 512)?;
+    Ok(())
+}
+
 /// Export a whole disk image as a Fixed VHD file.
 ///
 /// For raw image files or devices: reconstructs the disk with partition size overrides.
@@ -316,7 +326,7 @@ pub fn export_whole_disk_vhd(
 
         let (gpt_sidecar, apm_sidecar) =
             super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
-        total_written = reconstruct_disk_from_backup(
+        total_written = reconstruct_disk_for_export(
             source_path,
             meta,
             mbr_bytes,
@@ -333,9 +343,7 @@ pub fn export_whole_disk_vhd(
         )?;
 
         // Append VHD footer
-        let footer = build_vhd_footer(total_written);
-        file.write_all(&footer)
-            .context("failed to write VHD footer")?;
+        append_vhd_footer(&mut file, total_written)?;
         file.flush()?;
 
         log_cb(&format!(
@@ -506,9 +514,7 @@ pub fn export_whole_disk_vhd(
                 )?
             };
 
-            let footer = build_vhd_footer(total_written);
-            file.write_all(&footer)
-                .context("failed to write VHD footer")?;
+            append_vhd_footer(&mut file, total_written)?;
             file.flush()?;
 
             let table_kind = if is_apm {
@@ -682,6 +688,14 @@ pub fn export_whole_disk_vhd(
                 let source_offset = pw.source_lba * 512;
 
                 // Fill gap between current position and this partition's dest
+                // A grown partition reaching past the next start would push it off its LBA (RBF-008).
+                if total_written > dest_offset {
+                    bail!(
+                        "partition {} would start at byte {}, inside data already written (up to byte {total_written})",
+                        pw.index,
+                        dest_offset
+                    );
+                }
                 if total_written < dest_offset {
                     let gap = dest_offset - total_written;
                     if pw.source_lba == pw.dest_lba {
@@ -690,7 +704,7 @@ pub fn export_whole_disk_vhd(
                         let mut gap_reader = (&mut reader).take(gap);
                         let mut gap_remaining = gap;
                         while gap_remaining > 0 {
-                            let to_read = (gap_remaining as usize).min(CHUNK_SIZE);
+                            let to_read = gap_remaining.min(CHUNK_SIZE as u64) as usize;
                             let n = gap_reader.read(&mut buf[..to_read])?;
                             if n == 0 {
                                 write_zeros(&mut writer, gap_remaining)?;
@@ -718,7 +732,7 @@ pub fn export_whole_disk_vhd(
                     if cancel_check() {
                         bail!("export cancelled");
                     }
-                    let to_read = (part_remaining as usize).min(CHUNK_SIZE);
+                    let to_read = part_remaining.min(CHUNK_SIZE as u64) as usize;
                     let n = part_reader.read(&mut buf[..to_read])?;
                     if n == 0 {
                         break;
@@ -753,9 +767,10 @@ pub fn export_whole_disk_vhd(
                 if pw.export_size != pw.original_size {
                     writer.flush()?;
                     let end_pos = total_written;
-                    resize_filesystem_for(
+                    resize_filesystem_from(
                         writer.get_mut(),
                         dest_offset,
+                        pw.original_size,
                         pw.export_size,
                         &mut log_cb,
                     )?;
@@ -917,6 +932,11 @@ pub fn export_clonezilla_disk_vhd(
         patch_mbr_entries(&mut mbr_buf, partition_sizes).context("patching the MBR")?;
         log_cb("Patched MBR partition table with export sizes");
     }
+    // Clonezilla keeps only the first EBR, so the chain is rebuilt as restore does (RBF-009).
+    let ebr_layout = crate::restore::clonezilla_ebr_layout(cz_image, partition_sizes)?;
+    if let Some(ref layout) = ebr_layout {
+        crate::restore::patch_clonezilla_extended_entry(&mut mbr_buf, cz_image, layout);
+    }
     file.write_all(&mbr_buf).context("failed to write MBR")?;
     total_written += 512;
 
@@ -941,33 +961,26 @@ pub fn export_clonezilla_disk_vhd(
             bail!("export cancelled");
         }
 
-        let part_offset = cz_part.start_lba * 512;
-        let export_size = get_export_size(cz_part.index, cz_part.size_bytes());
-
-        // Fill gap to partition start
-        if total_written < part_offset {
-            let gap = part_offset - total_written;
-
-            // Write EBR if this is an extended partition and we have EBR data
-            if let Some(ebr_data) = cz_image.ebr_data.get(&cz_part.device_name) {
-                // EBR sits at the partition's start LBA
-                let ebr_gap = part_offset - total_written - ebr_data.len().min(512) as u64;
-                if ebr_gap > 0 {
-                    super::write_zeros(&mut file, ebr_gap)?;
-                    total_written += ebr_gap;
-                }
-                let write_len = ebr_data.len().min(512);
-                file.write_all(&ebr_data[..write_len])?;
-                total_written += write_len as u64;
-            } else {
-                super::write_zeros(&mut file, gap)?;
-                total_written += gap;
-            }
-        }
-
-        // Handle extended container partitions (no data to write)
+        // The container has no data of its own; its EBRs are written after the partitions.
         if cz_part.is_extended {
             continue;
+        }
+        let effective_lba = partition_sizes
+            .iter()
+            .find(|ps| ps.index == cz_part.index)
+            .map(|ps| ps.effective_start_lba())
+            .unwrap_or(cz_part.start_lba);
+        let part_offset = effective_lba * 512;
+        let export_size = get_export_size(cz_part.index, cz_part.size_bytes());
+        if part_offset < total_written {
+            bail!(
+                "partition {} would start at byte {part_offset}, inside data already written",
+                cz_part.device_name
+            );
+        }
+        if total_written < part_offset {
+            super::write_zeros(&mut file, part_offset - total_written)?;
+            total_written = part_offset;
         }
 
         // Write partition data from partclone
@@ -1016,16 +1029,16 @@ pub fn export_clonezilla_disk_vhd(
 
         // Patch hidden sectors and resize filesystem
         {
-            let effective_lba = partition_sizes
-                .iter()
-                .find(|ps| ps.index == cz_part.index)
-                .map(|ps| ps.effective_start_lba())
-                .unwrap_or(cz_part.start_lba);
-
             patch_hidden_sectors_for(&mut file, part_offset, effective_lba, &mut log_cb)?;
 
             if export_size != cz_part.size_bytes() {
-                resize_filesystem_for(&mut file, part_offset, export_size, &mut log_cb)?;
+                resize_filesystem_from(
+                    &mut file,
+                    part_offset,
+                    cz_part.size_bytes(),
+                    export_size,
+                    &mut log_cb,
+                )?;
             }
 
             // Seek back to end for next partition
@@ -1038,10 +1051,19 @@ pub fn export_clonezilla_disk_vhd(
         ));
     }
 
+    if let Some(ref layout) = ebr_layout {
+        for (offset, sector) in &layout.ebr_sectors {
+            file.seek(SeekFrom::Start(*offset))?;
+            file.write_all(sector).context("failed to write EBR")?;
+        }
+        log_cb(&format!(
+            "Wrote {} EBR(s) for logical partitions",
+            layout.ebr_sectors.len()
+        ));
+    }
+
     // Append VHD footer
-    let footer = build_vhd_footer(total_written);
-    file.write_all(&footer)
-        .context("failed to write VHD footer")?;
+    append_vhd_footer(&mut file, total_written)?;
     file.flush()?;
 
     log_cb(&format!(

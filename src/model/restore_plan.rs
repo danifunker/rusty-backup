@@ -706,13 +706,17 @@ pub fn new_disk_config(
     device_size: Option<u64>,
     choice: &NewDiskChoice,
 ) -> SinglePartitionRestoreConfig {
-    // An image target is sized from the source plus room for the alignment.
-    let disk_size_bytes = match (target_is_device, device_size) {
-        (true, Some(n)) => n,
-        _ => source.data_size().unwrap_or(0) + 2048 * 512,
-    };
     let alignment_sectors = new_disk_alignment_sectors(choice.alignment, choice.custom_alignment);
     let start_lba = new_disk_start_lba(choice.table, alignment_sectors);
+    // An image is the start, the data, and for GPT the backup table after it (RST-005).
+    let tail = match choice.table {
+        NewTableType::Gpt => 33 * 512,
+        _ => 0,
+    };
+    let disk_size_bytes = match (target_is_device, device_size) {
+        (true, Some(n)) => n,
+        _ => start_lba * 512 + source.data_size().unwrap_or(0) + tail,
+    };
     let part = source.partition();
     SinglePartitionRestoreConfig {
         source: source.engine(),

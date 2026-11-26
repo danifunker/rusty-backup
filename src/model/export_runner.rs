@@ -902,7 +902,7 @@ fn run_per_partition(
                 let zeros = vec![0u8; 256 * 1024];
                 let mut remaining = pad;
                 while remaining > 0 {
-                    let n = (remaining as usize).min(zeros.len());
+                    let n = remaining.min(zeros.len() as u64) as usize;
                     writer.write_all(&zeros[..n])?;
                     remaining -= n as u64;
                 }
