@@ -248,18 +248,15 @@ impl Write for RemoteBlockReader {
 
 impl Seek for RemoteBlockReader {
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        // Unsigned with checked offsets: the i64 casts wrapped or panicked (RMT-015).
         let new = match from {
-            SeekFrom::Start(o) => o as i64,
-            SeekFrom::Current(d) => self.pos as i64 + d,
-            SeekFrom::End(d) => self.len as i64 + d,
+            SeekFrom::Start(o) => Some(o),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
         };
-        if new < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek before start of image",
-            ));
-        }
-        self.pos = new as u64;
+        self.pos = new.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "seek before start of image")
+        })?;
         Ok(self.pos)
     }
 }

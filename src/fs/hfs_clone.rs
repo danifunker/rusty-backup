@@ -272,6 +272,13 @@ where
     for d in &drivers {
         let src_off = d.start_block as u64 * 512;
         let len = d.block_count as u64 * 512;
+        // A driver partition is held in RAM, so a map claiming a huge one is refused (FSX-008).
+        if len > 64 << 20 {
+            return Err(FilesystemError::InvalidData(format!(
+                "the source's driver partition at block {} claims {len} bytes",
+                d.start_block
+            )));
+        }
         let copy_bound = len.min(source_data_size.saturating_sub(src_off));
         let mut data = vec![0u8; len as usize];
         if copy_bound > 0 {

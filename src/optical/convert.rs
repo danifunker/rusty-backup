@@ -71,7 +71,20 @@ pub fn iso_to_bincue(
     let iso_file = File::open(iso_path)
         .with_context(|| format!("Failed to open ISO: {}", iso_path.display()))?;
     let iso_size = iso_file.metadata()?.len();
+    // A CD's MSF header counts to 99:59:74, and a partial last sector would be dropped (OPT-013).
+    if iso_size % 2048 != 0 {
+        bail!(
+            "{} is not a whole number of 2048-byte sectors",
+            iso_path.display()
+        );
+    }
     let sector_count = iso_size / 2048;
+    if sector_count + 150 > 100 * 60 * 75 {
+        bail!(
+            "{} is longer than a CD can address (99:59:74)",
+            iso_path.display()
+        );
+    }
 
     if let Ok(mut p) = progress.lock() {
         p.total_bytes = sector_count * 2352;
@@ -194,7 +207,11 @@ pub fn bincue_to_iso(
     } else {
         let bin_size = data_track.bin_path.metadata()?.len();
         let sector_size = data_track.sector_size();
-        (bin_size - data_track.file_byte_offset) / sector_size
+        // A cue pointing past the BIN's end wrapped this into a huge count (OPT-007).
+        bin_size
+            .checked_sub(data_track.file_byte_offset)
+            .context("the CUE's data track starts past the end of its BIN")?
+            / sector_size
     };
 
     let total_bytes = sector_count * 2048;
@@ -481,7 +498,7 @@ pub fn chd_to_bincue_multi(
             LogLevel::Warning,
             format!(
                 "multi-bin: track sizes (sum {}) don't match bin size ({}); the CHD likely has \
-                 padframes/splitframes that aren't exposed publicly — falling back to single-bin output",
+                 padframes/splitframes that aren't exposed publicly - falling back to single-bin output",
                 claimed, bin_size,
             ),
         );
@@ -536,7 +553,10 @@ pub fn chd_to_bincue_multi(
                 .with_context(|| format!("write {}", track_bin.display()))?;
             remaining -= n as u64;
         }
-        writer.flush().ok();
+        // A short track on a full disk was dropped here, then the only full copy deleted (OPT-001).
+        writer
+            .flush()
+            .with_context(|| format!("write {}", track_bin.display()))?;
         per_track_bins.push(track_bin);
     }
 

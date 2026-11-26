@@ -158,6 +158,12 @@ impl MacScsiDriver {
 
         // Read the driver extent, tolerating a donor file shorter than the
         // declared partition (zero-fill the remainder).
+        // The donor's map sizes this; a real SCSI driver is well under a megabyte (FSX-009).
+        if u64::from(read_blocks) * APM_BLOCK_SIZE > 64 << 20 {
+            return Err(FilesystemError::InvalidData(format!(
+                "the donor's driver partition claims {read_blocks} blocks"
+            )));
+        }
         let mut code = vec![0u8; read_blocks as usize * APM_BLOCK_SIZE as usize];
         donor.seek(SeekFrom::Start(entry.start_block as u64 * APM_BLOCK_SIZE))?;
         let mut filled = 0usize;

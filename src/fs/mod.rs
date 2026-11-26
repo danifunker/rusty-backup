@@ -123,6 +123,44 @@ pub fn patch_hidden_sectors_for(
     Ok(())
 }
 
+/// `bytes` as the FAT (saturated to 32 bits), NTFS and exFAT sector counts the resizers take.
+pub fn native_sectors(
+    file: &mut (impl Read + Seek),
+    partition_offset: u64,
+    bytes: u64,
+) -> anyhow::Result<(u32, u64, u64)> {
+    let (bps, exfat_bps) = native_sector_sizes(file, partition_offset)?;
+    Ok((
+        u32::try_from(bytes / bps).unwrap_or(u32::MAX),
+        bytes / bps,
+        bytes / exfat_bps,
+    ))
+}
+
+/// The sector sizes a FAT/NTFS BPB and an exFAT VBR count in; 512 where neither is present.
+fn native_sector_sizes(
+    file: &mut (impl Read + Seek),
+    partition_offset: u64,
+) -> anyhow::Result<(u64, u64)> {
+    let mut vbr = [0u8; 512];
+    file.seek(SeekFrom::Start(partition_offset))?;
+    if file.read_exact(&mut vbr).is_err() {
+        return Ok((512, 512));
+    }
+    let bps = u64::from(u16::from_le_bytes([vbr[11], vbr[12]]));
+    let bps = if matches!(bps, 512 | 1024 | 2048 | 4096) {
+        bps
+    } else {
+        512
+    };
+    let exfat = if &vbr[3..11] == b"EXFAT   " && (9..=12).contains(&vbr[0x6C]) {
+        1u64 << vbr[0x6C]
+    } else {
+        512
+    };
+    Ok((bps, exfat))
+}
+
 /// Resize like [`resize_filesystem_for`], but refuse to shrink a filesystem it has no resizer for.
 pub fn resize_filesystem_from(
     file: &mut (impl Read + Write + Seek),
@@ -189,14 +227,20 @@ pub fn resize_filesystem_for(
     new_size_bytes: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> anyhow::Result<()> {
-    let new_sectors_u32 = (new_size_bytes / 512) as u32;
-    let new_sectors_u64 = new_size_bytes / 512;
+    // Counts go in the volume's own sector size; 512 grew a 2048-bps or 4Kn volume 4-8x (FSG-001).
+    let (bps, exfat_bps) = native_sector_sizes(file, partition_offset)?;
+    let new_sectors_u32 = u32::try_from(new_size_bytes / bps).unwrap_or(u32::MAX);
+    let new_sectors_u64 = new_size_bytes / bps;
+    let exfat_sectors = new_size_bytes / exfat_bps;
+    // Read before any resizer writes: HFS and ext check only a 2-byte magic at +1024, which a
+    // FAT's own table can hold, so they run only on the volume detection names (FSG-002).
+    let detected = detect_filesystem_type(file, partition_offset);
     // FAT says it declined only through its bool, so a shrink it refused is caught here.
     let fat_resized = fat::resize_fat_in_place(file, partition_offset, new_sectors_u32, log_cb)?;
     if fat_resized {
         recount_fat32_free(file, partition_offset, log_cb)?;
     }
-    if !fat_resized && detect_filesystem_type(file, partition_offset) == "fat" {
+    if !fat_resized && detected == "fat" {
         let declared = fat_declared_bytes(file, partition_offset)?;
         if declared > new_size_bytes {
             anyhow::bail!(
@@ -212,14 +256,17 @@ pub fn resize_filesystem_for(
     // not the 512-byte unit the FAT path assumes. No-op for non-SHARP/KG BPBs.
     human68k::resize_human68k_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     ntfs::resize_ntfs_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
-    exfat::resize_exfat_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
+    exfat::resize_exfat_in_place(file, partition_offset, exfat_sectors, log_cb)?;
     grow_exfat_past_its_fat(file, partition_offset, new_size_bytes, log_cb)?;
     // The classic resizer would rewrite a wrapper's MDB and leave the HFS+ inside untouched.
-    if !wrapped_hfsplus_guard(file, partition_offset, new_size_bytes, log_cb)? {
+    let mac = matches!(detected, "hfs" | "hfsplus");
+    if mac && !wrapped_hfsplus_guard(file, partition_offset, new_size_bytes, log_cb)? {
         hfs::resize_hfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
         hfsplus::resize_hfsplus_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     }
-    ext::resize_ext_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    if detected == "ext" {
+        ext::resize_ext_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    }
     btrfs::resize_btrfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     sfs::resize_sfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     pfs3::resize_pfs3_in_place(file, partition_offset, new_size_bytes, log_cb)?;
@@ -688,7 +735,8 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                 // HFS MDB; drEmbedSigWord at 124 marks a wrapped HFS+ volume.
                 0x4244 if hfs_mdb_plausible(&sb_buf) => {
                     let embed_sig = u16::from_be_bytes([sb_buf[124], sb_buf[125]]);
-                    if embed_sig == 0x482B {
+                    // HFSX can be embedded as well, which the resize guard already knew (FSG-019).
+                    if embed_sig == 0x482B || embed_sig == 0x4858 {
                         return "hfsplus";
                     }
                     return "hfs";
@@ -730,10 +778,7 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     if qnx2::looks_like_qnx2(reader, partition_offset) {
         return "qnx2";
     }
-    // QNX 4: a `/` root entry at block 1; QNX 6: its superblock magic after the 8 KiB boot area.
-    if qnx4::looks_like_qnx4(reader, partition_offset) {
-        return "qnx4";
-    }
+    // QNX 4 was probed ahead of FAT (FSG-021); QNX 6: its superblock magic after the 8 KiB boot area.
     if qnx6::looks_like_qnx6(reader, partition_offset) {
         return "qnx6";
     }
@@ -1417,9 +1462,12 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
                     )?,
                 }
             }
-            (None, 0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C) => {
-                fat_compact_reader(reader, partition_offset, keep_swap)?
-            }
+            // Hidden FAT12 (0x11) and the EFI partition (0xEF) are FAT too (FSG-012).
+            (
+                None,
+                0x01 | 0x04 | 0x06 | 0x0E | 0x11 | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C
+                | 0xEF,
+            ) => fat_compact_reader(reader, partition_offset, keep_swap)?,
             (None, 0x07) => {
                 let fs_type = detect_0x07_type(&mut reader, partition_offset);
                 match fs_type {
@@ -3224,7 +3272,7 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             let preset_name = &s[4..];
             let dpb = cpm_diskdefs::preset_by_name(preset_name).ok_or_else(|| {
                 FilesystemError::Unsupported(format!(
-                    "unknown CP/M DPB preset '{preset_name}' — \
+                    "unknown CP/M DPB preset '{preset_name}' - \
                      valid names: {}",
                     cpm_diskdefs::ALL_PRESETS
                         .iter()
@@ -3362,7 +3410,15 @@ fn wrapped_hfsplus_compact_reader<R: Read + Seek + Send + 'static>(
     let Some(partition_size) = partition_size else {
         return Ok(None);
     };
-    let mut head = vec![0u8; (inner_offset - partition_offset) as usize];
+    // Both ends are held in RAM; their sizes come from the MDB, so they are capped (FSG-006, FSG-007).
+    const WRAPPER_END_MAX: u64 = 256 << 20;
+    let head_len = inner_offset.saturating_sub(partition_offset);
+    if head_len > WRAPPER_END_MAX {
+        return Err(format!(
+            "the HFS wrapper claims a {head_len}-byte head ahead of its HFS+ volume"
+        ));
+    }
+    let mut head = vec![0u8; head_len as usize];
     reader
         .seek(SeekFrom::Start(partition_offset))
         .and_then(|_| reader.read_exact(&mut head))
@@ -3379,6 +3435,12 @@ fn wrapped_hfsplus_compact_reader<R: Read + Seek + Send + 'static>(
         return Err(format!(
             "wrapped HFS+ volume ends at {inner_end}, past its partition's end {partition_end}"
         ));
+    }
+    if partition_end - inner_end > WRAPPER_END_MAX {
+        return Err(
+            "the HFS wrapper is far larger than its HFS+ volume; back it up sector by sector"
+                .to_string(),
+        );
     }
     let mut tail = vec![0u8; (partition_end - inner_end) as usize];
     reader
@@ -3902,7 +3964,7 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
     // FAT12/16/32 partition types (same set as `fs_name_for`'s FAT arm).
     if matches!(
         ptype,
-        0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E
+        0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E | 0x11 | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E | 0xEF
     ) {
         return true;
     }
@@ -4011,10 +4073,11 @@ pub fn fit_apple_volume_to_partition(
     if partition_len < 2048 {
         return Ok(());
     }
+    // A whole sector: a 2-byte read at +1024 fails on a raw device (FSG-009).
     device.seek(SeekFrom::Start(partition_offset + 1024))?;
-    let mut sig = [0u8; 2];
-    device.read_exact(&mut sig)?;
-    match u16::from_be_bytes(sig) {
+    let mut sector = [0u8; 512];
+    device.read_exact(&mut sector)?;
+    match u16::from_be_bytes([sector[0], sector[1]]) {
         0x482B | 0x4858 => {
             hfsplus::mirror_alternate_volume_header(device, partition_offset, partition_len, log)?;
         }
@@ -4198,7 +4261,7 @@ pub fn defrag_clone_shape<R: Read + Seek>(
     let unmounted_clean = attributes & 0x100 != 0;
     if journaled && !unmounted_clean {
         return Err(
-            "journaled HFS+ volume is dirty (kHFSVolumeUnmountedBit clear) — the \
+            "journaled HFS+ volume is dirty (kHFSVolumeUnmountedBit clear) - the \
              on-disk journal carries pending metadata changes that haven't been \
              applied to the catalog. Mount + cleanly unmount the volume first \
              (or run `fsck_hfs -f` against it), then re-run the backup."
@@ -4781,6 +4844,24 @@ mod tests {
         let buf = xfsb_sector();
         let mut cursor = Cursor::new(buf);
         assert_eq!(detect_filesystem_type(&mut cursor, 0), "xfs");
+    }
+
+    /// FSG-001: resizers count in the volume's sectors, so 512-byte counts grew a 2048-bps FAT 4x.
+    #[test]
+    fn resize_counts_are_in_the_volumes_own_sectors() {
+        let mut vbr = vec![0u8; 4096];
+        vbr[11..13].copy_from_slice(&2048u16.to_le_bytes());
+        let (fat, ntfs, exfat) = native_sectors(&mut Cursor::new(vbr), 0, 8 << 20).unwrap();
+        assert_eq!((fat, ntfs, exfat), (4096, 4096, 16384));
+        let mut ex = vec![0u8; 4096];
+        ex[3..11].copy_from_slice(b"EXFAT   ");
+        ex[0x6C] = 12;
+        assert_eq!(
+            native_sectors(&mut Cursor::new(ex), 0, 8 << 20).unwrap().2,
+            2048
+        );
+        let huge = native_sectors(&mut Cursor::new(vec![0u8; 512]), 0, 3 << 40).unwrap();
+        assert_eq!(huge.0, u32::MAX, "saturates, never wraps (FSG-004)");
     }
 
     #[test]

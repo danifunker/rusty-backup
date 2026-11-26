@@ -62,18 +62,11 @@ pub fn format_tree_with_ids(fs: &mut dyn Filesystem) -> Result<String, Filesyste
     Ok(out)
 }
 
-/// Replace ASCII control characters with Unicode Control Pictures (U+2400–U+241F)
-/// so they render as visible glyphs instead of disrupting the tree layout.
+/// Show an ASCII control character as `?` so it can't break the tree layout; the
+/// Control Pictures glyphs used before render as boxes in the egui font (FSX-016).
 fn display_name(name: &str) -> String {
     name.chars()
-        .map(|c| {
-            if c.is_ascii_control() {
-                // Unicode Control Pictures block: U+2400 + codepoint
-                char::from_u32(0x2400 + c as u32).unwrap_or('\u{FFFD}')
-            } else {
-                c
-            }
-        })
+        .map(|c| if c.is_ascii_control() { '?' } else { c })
         .collect()
 }
 
@@ -86,6 +79,13 @@ fn walk_tree(
     dir_count: &mut u64,
     file_count: &mut u64,
 ) -> Result<(), FilesystemError> {
+    // The prefix grows 4 chars a level; a folder listing its ancestor recursed forever (FSX-012).
+    if prefix.len() > 4 * 512 {
+        return Err(FilesystemError::InvalidData(format!(
+            "{} is nested more than 512 folders deep; the volume may be damaged",
+            dir.path
+        )));
+    }
     let children = fs.list_directory(dir)?;
     let count = children.len();
 
@@ -103,7 +103,9 @@ fn walk_tree(
         out.push_str(&display_name(&child.name));
 
         if child.is_file() || child.is_symlink() {
-            let total_size = child.size + child.resource_fork_size.unwrap_or(0);
+            let total_size = child
+                .size
+                .saturating_add(child.resource_fork_size.unwrap_or(0));
             out.push_str(&format!("  [{}]", format_size(total_size)));
         }
 

@@ -37,6 +37,30 @@ pub struct RemoteSession {
     capabilities: u16,
 }
 
+/// A reply buffer that refuses past what was asked for: a daemon streaming more would fill
+/// RAM before the length check at the end (RMT-008).
+struct CappedSink<'a> {
+    buf: &'a mut Vec<u8>,
+    max: usize,
+}
+
+impl Write for CappedSink<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() + data.len() > self.max {
+            return Err(crate::compat::io_other(format!(
+                "the daemon sent more than the {} byte(s) asked for",
+                self.max
+            )));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl RemoteSession {
     /// Connect to `addr` (`host:port`) and complete the handshake, verifying
     /// the daemon offers Family F.
@@ -664,7 +688,15 @@ impl RemoteSession {
         match self.read_response()? {
             Response::FileBegin { size } => {
                 let mut buf = Vec::new();
-                self.read_declared(size, &mut buf, &format!("reading block of handle {handle}"))?;
+                let mut sink = CappedSink {
+                    buf: &mut buf,
+                    max: len as usize,
+                };
+                self.read_declared(
+                    size,
+                    &mut sink,
+                    &format!("reading block of handle {handle}"),
+                )?;
                 Ok(buf)
             }
             Response::Error { message } => bail!("read block {handle}: {message}"),
@@ -754,7 +786,10 @@ impl RemoteSession {
         match self.read_response()? {
             Response::FileBegin { size } => {
                 let mut buf = Vec::new();
-                self.read_declared(size, &mut buf, &format!("reading sectors at LBA {lba}"))?;
+                // 2448 bytes covers a raw sector with subchannel, the largest mode asked for.
+                let max = (count as usize).saturating_mul(2448);
+                let mut sink = CappedSink { buf: &mut buf, max };
+                self.read_declared(size, &mut sink, &format!("reading sectors at LBA {lba}"))?;
                 Ok(buf)
             }
             Response::Error { message } => bail!("read sectors at LBA {lba}: {message}"),

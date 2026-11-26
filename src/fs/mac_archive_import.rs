@@ -41,6 +41,10 @@ pub fn looks_like_mac_archive(path: &Path) -> bool {
     if !MAC_ARCHIVE_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
         return false;
     }
+    // BinHex detection decodes the whole file, so a huge one is not read to sniff it (FSX-014).
+    if std::fs::metadata(path).map_or(true, |m| m.len() > 256 << 20) {
+        return false;
+    }
     match std::fs::read(path) {
         Ok(bytes) => detect_mac_archive(&bytes).is_some(),
         Err(_) => false,
