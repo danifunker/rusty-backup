@@ -21,7 +21,7 @@ use anyhow::{bail, Context, Result};
 use crate::fs::replace::OnConflict;
 use crate::model::browse_session::BrowseSession;
 use crate::model::commander_descend::DescendKind;
-use crate::model::edit_queue::{apply_edit, EditQueue, QueueScan, StagedEdit};
+use crate::model::edit_queue::{apply_edit, QueueScan, StagedEdit};
 use crate::model::wrapper_tree::{PreparedMount, WrapperSource, WrapperTree};
 #[cfg(feature = "remote")]
 use crate::remote::RemoteConnection;
@@ -286,16 +286,13 @@ pub fn preflight_remote_apply(
 }
 
 fn preflight_fs(fs: &mut dyn Filesystem, edits: &[StagedEdit]) -> ApplyPreflight {
-    let mut queue = EditQueue::new();
-    for e in edits {
-        queue.push(e.clone());
-    }
-    let scan = queue.scan_against(fs);
+    // Read in place: a staged MacBinary import holds its data fork, so a copy doubles it (MCM-023).
+    let scan = crate::model::edit_queue::scan_edits(edits, fs);
     let unit = fs.allocation_unit().unwrap_or(512);
     ApplyPreflight {
         fs_type: fs.fs_type().to_string(),
         scan,
-        bytes_needed: queue.bytes_needed_on(fs, unit),
+        bytes_needed: crate::model::edit_queue::bytes_needed_on(edits, fs, unit),
         bytes_free: fs.total_size().saturating_sub(fs.used_size()),
     }
 }
@@ -2247,7 +2244,7 @@ mod tests {
         assert_eq!(outcome.applied_indices, [0, 1]);
         assert_eq!(outcome.stopped_at, Some(3));
 
-        let mut queue = EditQueue::new();
+        let mut queue = crate::model::edit_queue::EditQueue::new();
         for e in edits {
             queue.push(e);
         }

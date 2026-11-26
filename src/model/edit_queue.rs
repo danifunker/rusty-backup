@@ -287,7 +287,7 @@ pub fn apply_edit(
                     let mut cursor = Cursor::new(data_fork);
                     let df_size = data_fork.len() as u64;
                     let resolved_parent = resolve_dir_by_path(efs, &parent.path)?;
-                    crate::fs::replace::create_or_replace(
+                    let outcome = crate::fs::replace::create_or_replace(
                         efs,
                         &resolved_parent,
                         name,
@@ -299,6 +299,12 @@ pub fn apply_edit(
                             ..Default::default()
                         },
                     )?;
+                    // The same dates the plain-file path below applies (MCM-016).
+                    if let (Some(created), Some((c, m, b))) =
+                        (outcome.created, dates.as_ref().and_then(|d| d.mac))
+                    {
+                        let _ = efs.set_dates(&created, c, m, b);
+                    }
                     return Ok(());
                 }
             }
@@ -583,139 +589,18 @@ impl EditQueue {
     /// name the way the apply will see it; names compare the way the
     /// destination folds case.
     pub fn scan_against(&self, fs: &mut dyn Filesystem) -> QueueScan {
-        // Folder path -> its children as (name, is_dir); None when the folder is not on disk.
-        type Occupied = std::collections::HashMap<String, Option<Vec<(String, bool)>>>;
-        fn names_in<'a>(
-            occupied: &'a mut Occupied,
-            parent: &str,
-            fs: &mut dyn Filesystem,
-        ) -> Option<&'a mut Vec<(String, bool)>> {
-            occupied
-                .entry(parent.to_string())
-                .or_insert_with(|| {
-                    let dir = resolve_dir_in(fs, parent).ok()?;
-                    let children = fs.list_directory(&dir).ok()?;
-                    Some(
-                        children
-                            .into_iter()
-                            .map(|e| {
-                                let d = e.is_directory();
-                                (e.name, d)
-                            })
-                            .collect(),
-                    )
-                })
-                .as_mut()
-        }
-        let fold = fs.case_insensitive_lookup();
-        let same = |a: &str, b: &str| a == b || (fold && a.eq_ignore_ascii_case(b));
-        let mut occupied = Occupied::new();
-        let mut created: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut scan = QueueScan::default();
-        for edit in &self.edits {
-            match edit {
-                StagedEdit::AddFile { parent, name, .. }
-                | StagedEdit::CreateDirectory { parent, name, .. } => {
-                    let is_dir = matches!(edit, StagedEdit::CreateDirectory { .. });
-                    let full = Self::pending_path(&parent.path, name);
-                    let names = names_in(&mut occupied, &parent.path, fs);
-                    if names.is_none() && !created.contains(&parent.path) {
-                        missing.insert(parent.path.clone());
-                    }
-                    if is_dir {
-                        created.insert(full.clone());
-                    }
-                    let Some(names) = names else {
-                        continue;
-                    };
-                    match names.iter().find(|(n, _)| same(n, name)) {
-                        Some((_, true)) if is_dir => {}
-                        Some((_, false)) if is_dir => scan.blocked_folders.push(full),
-                        Some(_) => scan.conflicts.push((full, name.clone())),
-                        None => names.push((name.clone(), is_dir)),
-                    }
-                }
-                StagedEdit::DeleteEntry { parent, entry }
-                | StagedEdit::DeleteRecursive { parent, entry } => {
-                    if let Some(names) = names_in(&mut occupied, &parent.path, fs) {
-                        names.retain(|(n, _)| n != &entry.name);
-                    }
-                }
-                StagedEdit::Rename {
-                    parent,
-                    entry,
-                    new_name,
-                } => {
-                    if let Some(names) = names_in(&mut occupied, &parent.path, fs) {
-                        names.retain(|(n, _)| n != &entry.name);
-                        names.push((new_name.clone(), entry.is_directory()));
-                    }
-                }
-                _ => {}
-            }
-        }
-        scan.missing_folders = missing.into_iter().collect();
-        scan
+        scan_edits(&self.edits, fs)
     }
 
     /// Bytes the staged batch will allocate on a volume with `unit`-byte blocks,
     /// net of staged file deletes; each fork rounds up, each new folder costs a block.
     pub fn bytes_needed(&self, unit: u64) -> u64 {
-        self.bytes_needed_crediting(unit, &mut |_| 0)
+        bytes_needed_crediting(&self.edits, unit, &mut |_| 0)
     }
 
     /// [`Self::bytes_needed`] that also credits what a staged recursive folder delete frees on `fs` (MCM-021).
     pub fn bytes_needed_on(&self, fs: &mut dyn Filesystem, unit: u64) -> u64 {
-        let unit = unit.max(1);
-        self.bytes_needed_crediting(unit, &mut |dir| tree_bytes(fs, dir, unit, 0))
-    }
-
-    fn bytes_needed_crediting(&self, unit: u64, folder: &mut dyn FnMut(&FileEntry) -> u64) -> u64 {
-        let unit = unit.max(1);
-        let round = |n: u64| n.div_ceil(unit) * unit;
-        let mut need = 0u64;
-        let mut freed = 0u64;
-        // A folder deleted whole already counts what is inside it.
-        let gone: Vec<String> = self
-            .edits
-            .iter()
-            .filter_map(|e| match e {
-                StagedEdit::DeleteRecursive { entry, .. } if entry.is_directory() => {
-                    Some(format!("{}/", entry.path.trim_end_matches('/')))
-                }
-                _ => None,
-            })
-            .collect();
-        let in_deleted = |path: &str| gone.iter().any(|g| path.starts_with(g.as_str()));
-        for edit in &self.edits {
-            match edit {
-                StagedEdit::AddFile {
-                    size,
-                    resource_fork,
-                    ..
-                } => {
-                    let rsrc = resource_fork.as_ref().map_or(0, |r| r.data.len() as u64);
-                    need = need
-                        .saturating_add(round(*size))
-                        .saturating_add(round(rsrc));
-                }
-                StagedEdit::CreateDirectory { .. } => need = need.saturating_add(unit),
-                StagedEdit::DeleteEntry { entry, .. }
-                | StagedEdit::DeleteRecursive { entry, .. }
-                    if !entry.is_directory() && !in_deleted(&entry.path) =>
-                {
-                    freed = freed.saturating_add(round(entry.size));
-                }
-                StagedEdit::DeleteRecursive { entry, .. }
-                    if entry.is_directory() && !in_deleted(entry.path.trim_end_matches('/')) =>
-                {
-                    freed = freed.saturating_add(folder(entry));
-                }
-                _ => {}
-            }
-        }
-        need.saturating_sub(freed)
+        bytes_needed_on(&self.edits, fs, unit)
     }
 
     /// Apply a conflict decision to one staged addition, keyed by the full path
@@ -1252,6 +1137,139 @@ impl EditQueue {
             _ => None,
         })
     }
+}
+
+/// [`EditQueue::scan_against`] over borrowed edits, so a preflight needs no copy of them (MCM-023).
+pub fn scan_edits(edits: &[StagedEdit], fs: &mut dyn Filesystem) -> QueueScan {
+    // Folder path -> its children as (name, is_dir); None when the folder is not on disk.
+    type Occupied = std::collections::HashMap<String, Option<Vec<(String, bool)>>>;
+    fn names_in<'a>(
+        occupied: &'a mut Occupied,
+        parent: &str,
+        fs: &mut dyn Filesystem,
+    ) -> Option<&'a mut Vec<(String, bool)>> {
+        occupied
+            .entry(parent.to_string())
+            .or_insert_with(|| {
+                let dir = resolve_dir_in(fs, parent).ok()?;
+                let children = fs.list_directory(&dir).ok()?;
+                Some(
+                    children
+                        .into_iter()
+                        .map(|e| {
+                            let d = e.is_directory();
+                            (e.name, d)
+                        })
+                        .collect(),
+                )
+            })
+            .as_mut()
+    }
+    let fold = fs.case_insensitive_lookup();
+    let same = |a: &str, b: &str| a == b || (fold && a.eq_ignore_ascii_case(b));
+    let mut occupied = Occupied::new();
+    let mut created: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut scan = QueueScan::default();
+    for edit in edits {
+        match edit {
+            StagedEdit::AddFile { parent, name, .. }
+            | StagedEdit::CreateDirectory { parent, name, .. } => {
+                let is_dir = matches!(edit, StagedEdit::CreateDirectory { .. });
+                let full = EditQueue::pending_path(&parent.path, name);
+                let names = names_in(&mut occupied, &parent.path, fs);
+                if names.is_none() && !created.contains(&parent.path) {
+                    missing.insert(parent.path.clone());
+                }
+                if is_dir {
+                    created.insert(full.clone());
+                }
+                let Some(names) = names else {
+                    continue;
+                };
+                match names.iter().find(|(n, _)| same(n, name)) {
+                    Some((_, true)) if is_dir => {}
+                    Some((_, false)) if is_dir => scan.blocked_folders.push(full),
+                    Some(_) => scan.conflicts.push((full, name.clone())),
+                    None => names.push((name.clone(), is_dir)),
+                }
+            }
+            StagedEdit::DeleteEntry { parent, entry }
+            | StagedEdit::DeleteRecursive { parent, entry } => {
+                if let Some(names) = names_in(&mut occupied, &parent.path, fs) {
+                    names.retain(|(n, _)| n != &entry.name);
+                }
+            }
+            StagedEdit::Rename {
+                parent,
+                entry,
+                new_name,
+            } => {
+                if let Some(names) = names_in(&mut occupied, &parent.path, fs) {
+                    names.retain(|(n, _)| n != &entry.name);
+                    names.push((new_name.clone(), entry.is_directory()));
+                }
+            }
+            _ => {}
+        }
+    }
+    scan.missing_folders = missing.into_iter().collect();
+    scan
+}
+
+fn bytes_needed_crediting(
+    edits: &[StagedEdit],
+    unit: u64,
+    folder: &mut dyn FnMut(&FileEntry) -> u64,
+) -> u64 {
+    let unit = unit.max(1);
+    let round = |n: u64| n.div_ceil(unit) * unit;
+    let mut need = 0u64;
+    let mut freed = 0u64;
+    // A folder deleted whole already counts what is inside it.
+    let gone: Vec<String> = edits
+        .iter()
+        .filter_map(|e| match e {
+            StagedEdit::DeleteRecursive { entry, .. } if entry.is_directory() => {
+                Some(format!("{}/", entry.path.trim_end_matches('/')))
+            }
+            _ => None,
+        })
+        .collect();
+    let in_deleted = |path: &str| gone.iter().any(|g| path.starts_with(g.as_str()));
+    for edit in edits {
+        match edit {
+            StagedEdit::AddFile {
+                size,
+                resource_fork,
+                ..
+            } => {
+                let rsrc = resource_fork.as_ref().map_or(0, |r| r.data.len() as u64);
+                need = need
+                    .saturating_add(round(*size))
+                    .saturating_add(round(rsrc));
+            }
+            StagedEdit::CreateDirectory { .. } => need = need.saturating_add(unit),
+            StagedEdit::DeleteEntry { entry, .. } | StagedEdit::DeleteRecursive { entry, .. }
+                if !entry.is_directory() && !in_deleted(&entry.path) =>
+            {
+                freed = freed.saturating_add(round(entry.size));
+            }
+            StagedEdit::DeleteRecursive { entry, .. }
+                if entry.is_directory() && !in_deleted(entry.path.trim_end_matches('/')) =>
+            {
+                freed = freed.saturating_add(folder(entry));
+            }
+            _ => {}
+        }
+    }
+    need.saturating_sub(freed)
+}
+
+/// [`EditQueue::bytes_needed_on`] over borrowed edits.
+pub fn bytes_needed_on(edits: &[StagedEdit], fs: &mut dyn Filesystem, unit: u64) -> u64 {
+    let unit = unit.max(1);
+    bytes_needed_crediting(edits, unit, &mut |dir| tree_bytes(fs, dir, unit, 0))
 }
 
 /// Blocks a folder's tree holds on `fs`: each file rounded up, each folder one block.

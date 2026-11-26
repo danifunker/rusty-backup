@@ -69,6 +69,30 @@ impl RateTracker {
         Some(db / dt)
     }
 
+    /// The rate over the window ending at `now`: with no new samples during a stall it falls to zero.
+    pub fn rate_as_of(&self, now: Instant) -> Option<f64> {
+        const WINDOW: Duration = Duration::from_secs(10);
+        let &(t_last, b_last) = self.samples.back()?;
+        let inside = |t: Instant| now.saturating_duration_since(t) <= WINDOW;
+        if !inside(t_last) {
+            return Some(0.0);
+        }
+        // The last sample before the window is the baseline, so sparse ticks keep their bytes.
+        let first_in = self
+            .samples
+            .iter()
+            .position(|(t, _)| inside(*t))
+            .unwrap_or(0);
+        let (t_first, b_first) = self.samples[first_in.saturating_sub(1)];
+        let dt = now.saturating_duration_since(t_first).as_secs_f64();
+        if dt < 0.25
+            || (self.samples.len() < 2 && now.saturating_duration_since(t_last).as_secs_f64() < 1.0)
+        {
+            return None;
+        }
+        Some(b_last.saturating_sub(b_first) as f64 / dt)
+    }
+
     /// Estimated seconds remaining at the current rate. Returns `None` when the
     /// rate is unknown, zero, or `total_bytes` is missing.
     pub fn eta_secs(&self, current_bytes: u64, total_bytes: u64) -> Option<u64> {
@@ -183,5 +207,17 @@ mod tests {
         assert!(t.rate_bytes_per_sec().is_some());
         t.record(0, "stage");
         assert!(t.rate_bytes_per_sec().is_none());
+    }
+
+    #[test]
+    fn a_stall_decays_the_rate_as_of_now() {
+        let mut t = RateTracker::default();
+        let start = Instant::now();
+        t.samples.push_back((start, 0));
+        t.samples.push_back((start + Duration::from_secs(1), 1000));
+        let busy = t.rate_as_of(start + Duration::from_secs(1)).unwrap();
+        let stalled = t.rate_as_of(start + Duration::from_secs(5)).unwrap();
+        assert!(stalled < busy / 4.0, "{busy} -> {stalled}");
+        assert_eq!(t.rate_as_of(start + Duration::from_secs(60)), Some(0.0));
     }
 }

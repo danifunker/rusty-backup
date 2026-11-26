@@ -34,14 +34,22 @@ pub fn spawn_partclone_scan(
         partition_index,
         partition_type,
         cache: Arc::clone(&cache),
+        cancel: Arc::default(),
     }));
+    let cancel = Arc::clone(&crate::model::worker::lock_status(&status).cancel);
     let status_thread = Arc::clone(&status);
     crate::model::worker::spawn_guarded(
         Arc::clone(&status),
         "Clonezilla metadata scan",
         move || {
             let _wake = crate::os::wakelock::acquire("Rusty Backup: Clonezilla metadata scan");
-            let result = metadata_scan::scan_metadata(&cache, partition_type, Some(&cache_path));
+            let stop = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+            let result = metadata_scan::scan_metadata_cancellable(
+                &cache,
+                partition_type,
+                Some(&cache_path),
+                &stop,
+            );
             if let Ok(mut s) = status_thread.lock() {
                 s.finished = true;
                 if let Err(e) = result {
@@ -67,13 +75,17 @@ pub fn scan_in_job(
         {
             let mut g = crate::model::worker::lock_status(&status);
             if g.finished {
+                ctx.check_cancel()?;
                 return match g.error.take() {
                     Some(e) => Err(anyhow::anyhow!("Clonezilla metadata scan failed: {e}")),
                     None => Ok(()),
                 };
             }
+            // Stop the scan and wait for it, so a reopen never runs a second one beside it.
+            if ctx.is_cancelled() {
+                g.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
-        ctx.check_cancel()?;
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }

@@ -1240,7 +1240,7 @@ fn open_read_dispatch(
             }
         }
         // A device cannot answer seek(End); carry the length the OS reports instead.
-        if crate::cli::device_safety::looks_like_device_path(path) {
+        if crate::os::looks_like_device_path(path) {
             return open_device_read(path);
         }
         open_plain_raw(path)
@@ -1388,7 +1388,7 @@ pub fn open_peeled_read_with_entry(
     }
     // Checked before the content probes below: their plain opens would fail a
     // root-owned device node with a bare EACCES, denying elevation (R19, R-068).
-    if crate::cli::device_safety::looks_like_device_path(path) {
+    if crate::os::looks_like_device_path(path) {
         return open_device_read(path);
     }
     // Encrypted DMG (encrcdsa v2): the `koly`/partition table only appears after

@@ -9,6 +9,9 @@ use disk_core::filesystem::Filesystem;
 /// How much of a file the sniff reads: every magic sits at or near the start.
 pub const SNIFF_LIMIT: usize = 16 * 1024 * 1024;
 
+/// The largest Mac archive decoded: the decoder holds the archive and its output in memory.
+pub const DECODE_MAX: u64 = 512 * 1024 * 1024;
+
 /// What a decoded archive is for, which decides what is kept and how a failure reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveUse {
@@ -80,6 +83,13 @@ pub fn read(
     entry: &FileEntry,
     purpose: ArchiveUse,
 ) -> Result<ArchiveRead, String> {
+    if entry.size > DECODE_MAX {
+        return Err(format!(
+            "{} is larger than the {} MiB a Mac archive is decoded in.",
+            entry.name,
+            DECODE_MAX >> 20
+        ));
+    }
     let raw = fs
         .read_file(entry, usize::MAX)
         .map_err(|e| format!("Read failed: {e}"))?;

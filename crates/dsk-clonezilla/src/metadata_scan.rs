@@ -35,6 +35,16 @@ pub fn scan_metadata(
     partition_type: u8,
     cache_path: Option<&Path>,
 ) -> Result<()> {
+    scan_metadata_cancellable(cache, partition_type, cache_path, &|| false)
+}
+
+/// [`scan_metadata`] that stops with an error, saving nothing, once `cancel` says so.
+pub fn scan_metadata_cancellable(
+    cache: &Arc<Mutex<PartcloneBlockCache>>,
+    partition_type: u8,
+    cache_path: Option<&Path>,
+    cancel: &dyn Fn() -> bool,
+) -> Result<()> {
     // Step 1: Open partclone and parse header + bitmap
     let files = cache.lock().unwrap().partclone_files.clone();
     let (header, bitmap, decoder) = partclone::open_partclone_raw(&files)?;
@@ -94,6 +104,9 @@ pub fn scan_metadata(
     };
 
     while current_block < total_blocks {
+        if current_block.is_multiple_of(65536) && cancel() {
+            anyhow::bail!("cancelled");
+        }
         // Check if we've cached everything we need
         if metadata_identified && directory_scan_done && current_block > max_needed_block {
             break;

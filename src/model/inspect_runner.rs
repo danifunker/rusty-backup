@@ -245,12 +245,20 @@ pub fn inspect_source(
     let alignment = detect_alignment(&table);
     let mut partitions = table.partitions();
     let is_chd = !remote && crate::model::source_reader::is_chd_path(path);
-    // A raw .chd is compressed at partition offsets, so probes read through a fresh decoder.
+    // A raw .chd is compressed at partition offsets, so probes share one decoder, opened once (MSR-007).
+    let decoded: std::cell::OnceCell<Option<SharedReader>> = std::cell::OnceCell::new();
     let probe = || -> Option<Box<dyn ReadSeek>> {
         if let Some(r) = req.remote_reader() {
             r.ok()
         } else if uses_streaming_reader || is_chd {
-            crate::model::source_reader::open_read(path).ok()
+            let shared = decoded.get_or_init(|| {
+                crate::model::source_reader::open_read(path)
+                    .ok()
+                    .map(SharedReader::new)
+            });
+            shared
+                .as_ref()
+                .map(|s| Box::new(s.handle()) as Box<dyn ReadSeek>)
         } else {
             let f = device_file.as_ref()?.try_clone().ok()?;
             // A raw device needs aligned reads and a known length, as the minimum loop has (MSR-006).
@@ -693,6 +701,71 @@ pub fn read_table_unelevated(path: &Path) -> std::io::Result<Option<PlainTable>>
         }))
 }
 
+/// One reader shared by several handles, each seeking to its own position before every read.
+/// The reader and where it last stopped.
+type SharedInner = std::sync::Arc<std::sync::Mutex<(Box<dyn ReadSeek>, Option<u64>)>>;
+
+struct SharedReader(SharedInner);
+
+impl SharedReader {
+    fn new(inner: Box<dyn ReadSeek>) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new((inner, None))))
+    }
+
+    fn handle(&self) -> SharedHandle {
+        SharedHandle {
+            inner: std::sync::Arc::clone(&self.0),
+            pos: 0,
+        }
+    }
+}
+
+struct SharedHandle {
+    // The reader and where it last stopped, so a handle reading on in order skips the seek.
+    inner: SharedInner,
+    pos: u64,
+}
+
+impl SharedHandle {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (Box<dyn ReadSeek>, Option<u64>)> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl std::io::Read for SharedHandle {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut g = self.lock();
+        let (r, at) = &mut *g;
+        if *at != Some(self.pos) {
+            *at = None;
+            r.seek(std::io::SeekFrom::Start(self.pos))?;
+        }
+        let n = r.read(buf)?;
+        *at = Some(self.pos + n as u64);
+        drop(g);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for SharedHandle {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let next = match to {
+            std::io::SeekFrom::Start(n) => n,
+            std::io::SeekFrom::Current(d) => self.pos.checked_add_signed(d).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek out of range")
+            })?,
+            end => {
+                let mut g = self.lock();
+                g.1 = None;
+                g.0.seek(end)?
+            }
+        };
+        self.pos = next;
+        Ok(next)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,5 +834,21 @@ mod tests {
         assert!(flat.len() as u64 <= MAX_FLOPPY_CONTAINER_BYTES);
         std::fs::write(&path, &flat).unwrap();
         assert!(is_floppy_container_file(&path));
+    }
+
+    #[test]
+    fn shared_handles_keep_their_own_positions() {
+        use std::io::{Read, Seek, SeekFrom};
+        let data: Vec<u8> = (0..=255u8).collect();
+        let shared = SharedReader::new(Box::new(std::io::Cursor::new(data)));
+        let (mut a, mut b) = (shared.handle(), shared.handle());
+        a.seek(SeekFrom::Start(10)).unwrap();
+        b.seek(SeekFrom::Start(200)).unwrap();
+        let (mut x, mut y) = ([0u8; 2], [0u8; 2]);
+        a.read_exact(&mut x).unwrap();
+        b.read_exact(&mut y).unwrap();
+        a.read_exact(&mut x).unwrap();
+        assert_eq!((x, y), ([12, 13], [200, 201]));
+        assert_eq!(a.seek(SeekFrom::End(0)).unwrap(), 256);
     }
 }

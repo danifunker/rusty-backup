@@ -247,9 +247,14 @@ fn exfat_in_place_max(head: &[u8]) -> Option<u64> {
     } else {
         fat_length
     };
-    let clusters = (usable * bps / 4).saturating_sub(2);
+    // A corrupt boot sector must not overflow into a bogus limit (MJB-005).
+    let clusters = (usable.checked_mul(bps)? / 4).saturating_sub(2);
     let volume_sectors = u64::from_le_bytes(head[0x48..0x50].try_into().ok()?);
-    Some((heap + (clusters + 1) * spc).max(volume_sectors) * bps)
+    let end = clusters
+        .checked_add(1)?
+        .checked_mul(spc)?
+        .checked_add(heap)?;
+    end.max(volume_sectors).checked_mul(bps)
 }
 
 fn family_name(family: FsFamily) -> &'static str {
@@ -439,5 +444,15 @@ mod tests {
             in_place_max: Some(PRODOS_MAX_BYTES),
         };
         assert!(caveats(&f, 64 * MIB)[0].text.contains("ProDOS stops"));
+    }
+
+    #[test]
+    fn a_corrupt_exfat_head_does_not_overflow() {
+        let mut head = vec![0u8; 512];
+        head[0x6C] = 12;
+        head[0x6D] = 25;
+        head[0x54..0x58].copy_from_slice(&u32::MAX.to_le_bytes());
+        head[0x58..0x5C].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(exfat_in_place_max(&head), None);
     }
 }

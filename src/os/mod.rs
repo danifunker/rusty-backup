@@ -1032,6 +1032,15 @@ pub fn open_target_preserving(path: &Path) -> Result<DeviceWriteHandle> {
     open_target_for_writing_inner(path, false)
 }
 
+/// `/dev/...` or a `\\.\PhysicalDriveN` / `\\?\PhysicalDriveN` path; not mount points or files.
+pub fn looks_like_device_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let lower = s.to_ascii_lowercase();
+    s.starts_with("/dev/")
+        || lower.starts_with(r"\\.\physicaldrive")
+        || lower.starts_with(r"\\?\physicaldrive")
+}
+
 /// Whether a target path names a raw device rather than a regular file.
 /// Matches what [`open_target_for_writing`] keys off internally.
 pub fn is_device_path(path: &Path) -> bool {

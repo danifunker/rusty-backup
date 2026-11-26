@@ -405,12 +405,12 @@ impl RestoreController {
             .unwrap_or_default();
         let worker_path = path.clone();
         let job = self.spawn("Decompress image", move |ctx| {
-            ctx.set_can_cancel(false);
             ctx.set_phase(format!("Decompressing {name}..."));
             Ok(crate::model::image_prep::prepare_disk_image_path_reporting(
                 worker_path.as_path(),
                 true,
                 &|done, total| ctx.set_bytes(done, total),
+                &|| ctx.is_cancelled(),
             )?)
         });
         self.src.decode = Some((path, job));

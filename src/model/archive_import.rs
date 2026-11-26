@@ -50,7 +50,10 @@ pub fn classify(path: &Path, mac_volume: bool) -> HostPick {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| MAC_ARCHIVE_EXTS.iter().any(|a| a.eq_ignore_ascii_case(e)));
-    if size > fs_tar::mem_archive::INLINE_MAX && !named {
+    // Even a named archive is decoded in RAM, so it has a ceiling too (MCM-013).
+    if (size > fs_tar::mem_archive::INLINE_MAX && !named)
+        || size > crate::model::mac_archive_read::DECODE_MAX
+    {
         return plain();
     }
     let Ok(raw) = std::fs::read(path) else {
