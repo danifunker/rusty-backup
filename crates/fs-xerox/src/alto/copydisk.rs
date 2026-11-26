@@ -196,7 +196,7 @@ pub fn read(bytes: &[u8]) -> Result<Disk, FilesystemError> {
         geometry.disk_model
     );
 
-    Ok(Disk { geometry, sectors })
+    Ok(Disk::new(geometry, sectors))
 }
 
 #[cfg(test)]

@@ -66,6 +66,43 @@ pub enum PackFormat {
     ReadOnly,
 }
 
+/// [`open_pack`] for a file: a Trident pack (76 or 289 MB) is read from the file on demand,
+/// every other container (a few MB at most) is read whole as before (MCM-024).
+pub fn open_pack_file(path: &std::path::Path) -> Result<Disk, FilesystemError> {
+    let file = std::fs::File::open(path).map_err(FilesystemError::Io)?;
+    let len = file.metadata().map_err(FilesystemError::Io)?.len() as usize;
+    let mut magic = [0u8; 16];
+    let got = std::io::Read::read(&mut &file, &mut magic).map_err(FilesystemError::Io)?;
+    let head = &magic[..got];
+    let other_magic = head.starts_with(pdi::MAGIC) || zdisk::is_zdisk(head);
+    if (len == trident::T80_BYTES || len == trident::T300_BYTES) && !other_magic {
+        return trident::open_file(file);
+    }
+    drop(file);
+    open_pack(&std::fs::read(path).map_err(FilesystemError::Io)?)
+}
+
+/// The [`PackFormat`] of the pack file at `path`, reading only what the choice needs.
+pub fn pack_format_of_file(path: &std::path::Path) -> PackFormat {
+    let len = std::fs::metadata(path)
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
+    let head = std::fs::File::open(path)
+        .and_then(|f| {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(f, 16), &mut buf)?;
+            Ok(buf)
+        })
+        .unwrap_or_default();
+    let other_magic = head.starts_with(pdi::MAGIC) || zdisk::is_zdisk(&head);
+    match (len == trident::T80_BYTES || len == trident::T300_BYTES) && !other_magic {
+        true => PackFormat::Trident,
+        false => std::fs::read(path)
+            .map(|b| pack_format(&b))
+            .unwrap_or(PackFormat::ReadOnly),
+    }
+}
+
 /// The [`PackFormat`] [`open_pack`] would read `bytes` as.
 pub fn pack_format(bytes: &[u8]) -> PackFormat {
     if bytes.len() >= pdi::MAGIC.len() && &bytes[..pdi::MAGIC.len()] == pdi::MAGIC {
@@ -461,16 +498,113 @@ impl Sector {
     }
 }
 
-/// A whole disk pack held in memory, sectors indexed by virtual disk address.
+/// A disk pack, sectors indexed by virtual disk address: held in memory, or (a big Trident
+/// pack opened from a file) read from the file on demand so it never sits in RAM whole.
 #[derive(Debug, Clone)]
 pub struct Disk {
     pub geometry: Geometry,
+    /// The sectors of an in-memory pack; empty while the pack is file-backed.
     pub sectors: Vec<Sector>,
+    backing: Option<Backing>,
+}
+
+/// Where a file-backed pack's sectors come from.
+#[derive(Clone)]
+struct Backing {
+    file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+    /// Record index of each VDA in the file; `u32::MAX` for a page no record claims.
+    records: std::sync::Arc<Vec<u32>>,
+    read: fn(&mut std::fs::File, u32) -> std::io::Result<Sector>,
+}
+
+impl std::fmt::Debug for Backing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Backing({} sectors)", self.records.len())
+    }
 }
 
 impl Disk {
-    /// Borrow the sector at virtual disk address `vda`, if in range.
-    pub fn sector(&self, vda: usize) -> Option<&Sector> {
-        self.sectors.get(vda)
+    /// An in-memory pack.
+    pub fn new(geometry: Geometry, sectors: Vec<Sector>) -> Self {
+        Disk {
+            geometry,
+            sectors,
+            backing: None,
+        }
+    }
+
+    pub(crate) fn file_backed(
+        geometry: Geometry,
+        file: std::fs::File,
+        records: Vec<u32>,
+        read: fn(&mut std::fs::File, u32) -> std::io::Result<Sector>,
+    ) -> Self {
+        Disk {
+            geometry,
+            sectors: Vec::new(),
+            backing: Some(Backing {
+                file: std::sync::Arc::new(std::sync::Mutex::new(file)),
+                records: std::sync::Arc::new(records),
+                read,
+            }),
+        }
+    }
+
+    /// How many sectors the pack has.
+    pub fn sector_count(&self) -> usize {
+        match &self.backing {
+            Some(b) => b.records.len(),
+            None => self.sectors.len(),
+        }
+    }
+
+    /// The sector at virtual disk address `vda`, if in range: borrowed in memory, read from the file
+    /// otherwise (a read error reads as a zeroed page, which every caller already treats as unwritten).
+    pub fn sector(&self, vda: usize) -> Option<std::borrow::Cow<'_, Sector>> {
+        let Some(b) = &self.backing else {
+            return self.sectors.get(vda).map(std::borrow::Cow::Borrowed);
+        };
+        let rec = *b.records.get(vda)?;
+        let zeroed = || {
+            Sector::zeroed(
+                self.geometry.label_bytes as usize,
+                self.geometry.data_bytes as usize,
+            )
+        };
+        if rec == u32::MAX {
+            return Some(std::borrow::Cow::Owned(zeroed()));
+        }
+        let mut file = b.file.lock().unwrap_or_else(|p| p.into_inner());
+        Some(std::borrow::Cow::Owned(
+            (b.read)(&mut file, rec).unwrap_or_else(|_| zeroed()),
+        ))
+    }
+
+    /// Every sector in VDA order, read one at a time from a file-backed pack.
+    pub fn iter_sectors(&self) -> impl Iterator<Item = std::borrow::Cow<'_, Sector>> + '_ {
+        (0..self.sector_count()).filter_map(move |v| self.sector(v))
+    }
+
+    /// Whether the pack is read from its file rather than held in memory.
+    pub fn is_file_backed(&self) -> bool {
+        self.backing.is_some()
+    }
+
+    /// Load a file-backed pack into memory, for the edits that rebuild or patch the volume.
+    pub fn make_resident(&mut self) {
+        if self.backing.is_some() {
+            self.sectors = self
+                .iter_sectors()
+                .map(std::borrow::Cow::into_owned)
+                .collect();
+            self.backing = None;
+        }
+    }
+
+    /// An in-memory copy, for the edits that return a new pack.
+    pub fn to_resident(&self) -> Disk {
+        let mut copy = self.clone();
+        copy.make_resident();
+        copy
     }
 }

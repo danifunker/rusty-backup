@@ -125,10 +125,7 @@ pub fn read(bytes: &[u8]) -> Result<Disk, FilesystemError> {
         sectors.push(Sector { label, data });
     }
 
-    Ok(Disk {
-        geometry: diablo31_geometry(),
-        sectors,
-    })
+    Ok(Disk::new(diablo31_geometry(), sectors))
 }
 
 /// Serialize a [`Disk`] to a Salto cooked `.dsk` image. The disk must be a
@@ -149,7 +146,7 @@ pub fn write(disk: &Disk) -> Result<Vec<u8>, FilesystemError> {
     }
 
     let mut out = vec![0u8; IMAGE_BYTES];
-    for (vda, sector) in disk.sectors.iter().enumerate() {
+    for (vda, sector) in disk.iter_sectors().enumerate() {
         let rec = vda * RECORD_BYTES;
         put_be16(&mut out, rec, vda as u16); // pageno
                                              // sector header: word 0 = 0, word 1 = packed disk address
@@ -180,7 +177,7 @@ mod tests {
                 s
             })
             .collect();
-        Disk { geometry, sectors }
+        Disk::new(geometry, sectors)
     }
 
     #[test]

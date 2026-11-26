@@ -503,7 +503,7 @@ pub fn build_disk(geometry: Geometry, files: &[FileImage]) -> Result<Disk, Files
         DD_SN,
     );
 
-    Ok(Disk { geometry, sectors })
+    Ok(Disk::new(geometry, sectors))
 }
 
 struct FileLayout {

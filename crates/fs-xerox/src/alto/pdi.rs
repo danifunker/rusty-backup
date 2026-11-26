@@ -73,7 +73,7 @@ pub fn write_with_flags(disk: &Disk, extra_flags: u16) -> Vec<u8> {
     put_be16(&mut out, 30, 0); // fsNumber
                                // bytes 32.. (volumeLabel, reserved) left zero
 
-    for (vda, sector) in disk.sectors.iter().enumerate() {
+    for (vda, sector) in disk.iter_sectors().enumerate() {
         let off = HEADER_SIZE + vda * record;
         out[off..off + label_bytes].copy_from_slice(&sector.label);
         out[off + label_bytes..off + record].copy_from_slice(&sector.data);
@@ -180,10 +180,7 @@ pub fn read(bytes: &[u8]) -> Result<Disk, FilesystemError> {
         sectors.push(Sector { label, data });
     }
 
-    Ok(Disk {
-        geometry: g,
-        sectors,
-    })
+    Ok(Disk::new(g, sectors))
 }
 
 #[cfg(test)]
@@ -210,7 +207,7 @@ mod tests {
                 s
             })
             .collect();
-        Disk { geometry, sectors }
+        Disk::new(geometry, sectors)
     }
 
     #[test]

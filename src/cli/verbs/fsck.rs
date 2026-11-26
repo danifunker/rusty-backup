@@ -373,13 +373,8 @@ fn read_alto_disk(path: &std::path::Path) -> Result<Option<(alto::Disk, bool)>> 
     if !alto::looks_like_pack(&magic[..n], len) {
         return Ok(None);
     }
-    let bytes = std::fs::read(path)?;
-    match alto::open_pack(&bytes) {
-        Ok(disk) => {
-            let is_pdi = bytes.len() >= alto::pdi::MAGIC.len()
-                && &bytes[..alto::pdi::MAGIC.len()] == alto::pdi::MAGIC;
-            Ok(Some((disk, is_pdi)))
-        }
+    match alto::open_pack_file(path) {
+        Ok(disk) => Ok(Some((disk, magic[..n].starts_with(alto::pdi::MAGIC)))),
         // Gate passed but it isn't actually a pack (e.g. an unrelated image of
         // exactly the Salto/Trident size) — fall through to the normal path.
         Err(_) => Ok(None),

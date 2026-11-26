@@ -186,10 +186,7 @@ pub fn read(bytes: &[u8]) -> Result<Disk, FilesystemError> {
     let (heads, cyls, sects) = read_header(&d)?;
     let mut sectors = vec![Sector::zeroed(LABEL_BYTES, DATA_BYTES); sects];
     apply_records(&d, &mut sectors)?;
-    Ok(Disk {
-        geometry: geometry(heads, cyls),
-        sectors,
-    })
+    Ok(Disk::new(geometry(heads, cyls), sectors))
 }
 
 /// Overlay a `.zdelta` (sibling delta file) onto an already-read disk. The delta
@@ -197,6 +194,7 @@ pub fn read(bytes: &[u8]) -> Result<Disk, FilesystemError> {
 pub fn apply_delta(disk: &mut Disk, delta_bytes: &[u8]) -> Result<usize, FilesystemError> {
     let d = inflate(delta_bytes)?;
     let (heads, cyls, sects) = read_header(&d)?;
+    disk.make_resident();
     if cyls != disk.geometry.n_cylinders
         || heads != disk.geometry.n_heads
         || sects != disk.sectors.len()
@@ -222,15 +220,16 @@ pub fn write(disk: &Disk) -> Result<Vec<u8>, FilesystemError> {
             "zdisk export requires a single-drive 6085 Pilot pack (16 sectors/track, 20-byte labels, 512-byte data)".into(),
         ));
     }
-    let mut raw = vec![0u8; HEADER_BYTES + disk.sectors.len() * RECORD_BYTES];
+    let count = disk.sector_count();
+    let mut raw = vec![0u8; HEADER_BYTES + count * RECORD_BYTES];
     put_be16(&mut raw, 0, SIG1);
     put_be16(&mut raw, 2, g.n_heads);
     put_be16(&mut raw, 4, g.n_cylinders);
-    put_be16(&mut raw, 6, (disk.sectors.len() >> 16) as u16);
-    put_be16(&mut raw, 8, (disk.sectors.len() & 0xffff) as u16);
+    put_be16(&mut raw, 6, (count >> 16) as u16);
+    put_be16(&mut raw, 8, (count & 0xffff) as u16);
     put_be16(&mut raw, 10, SIG2);
     let mut off = HEADER_BYTES;
-    for (idx, s) in disk.sectors.iter().enumerate() {
+    for (idx, s) in disk.iter_sectors().enumerate() {
         put_be16(&mut raw, off, (idx >> 16) as u16);
         put_be16(&mut raw, off + 2, (idx & 0xffff) as u16);
         off += 4;
@@ -263,7 +262,7 @@ mod tests {
                 s
             })
             .collect();
-        Disk { geometry, sectors }
+        Disk::new(geometry, sectors)
     }
 
     #[test]
