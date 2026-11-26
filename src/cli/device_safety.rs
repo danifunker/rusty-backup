@@ -32,17 +32,7 @@ use disk_core::display::format_size;
 /// conventions documented in `docs/cli-todo.md` §"Device-write safety").
 /// False for mount points and ordinary files.
 pub fn looks_like_device_path(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    // Unix device files: /dev/...
-    if s.starts_with("/dev/") {
-        return true;
-    }
-    // Windows physical drive: \\.\PhysicalDriveN  (also \\?\PhysicalDriveN)
-    let lower = s.to_ascii_lowercase();
-    if lower.starts_with(r"\\.\physicaldrive") || lower.starts_with(r"\\?\physicaldrive") {
-        return true;
-    }
-    false
+    crate::os::looks_like_device_path(path)
 }
 
 /// The whole-disk path behind a partition/slice node, or `None` if `path` is

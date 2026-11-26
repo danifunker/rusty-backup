@@ -9,7 +9,6 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use crate::fs::{self, MinimumResult};
 use crate::os::SectorAlignedReader;
@@ -101,113 +100,86 @@ pub struct MinSizeRequest {
 pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
     let status = Arc::new(Mutex::new(MinSizeStatus::new(req.partition_index)));
     let status_thread = Arc::clone(&status);
-    thread::spawn(move || {
-        let panic_status = Arc::clone(&status_thread);
-        crate::model::worker::run_guarded(&panic_status, "minimum-size", move || {
-            let progress_status = Arc::clone(&status_thread);
-            let progress = move |phase: &str| {
-                if let Ok(mut s) = progress_status.lock() {
-                    s.phase = phase.to_string();
-                    s.phase_log.push(phase.to_string());
-                }
-            };
-            let cancel_status = Arc::clone(&status_thread);
-            let cancel = move || {
-                cancel_status
-                    .lock()
-                    .map(|s| s.cancel_requested)
-                    .unwrap_or(false)
-            };
+    // Through the guarded spawner, and every lock survives poison, so the job always finishes (MJB-014).
+    crate::model::worker::spawn_guarded(Arc::clone(&status_thread), "minimum-size", move || {
+        let progress_status = Arc::clone(&status_thread);
+        let progress = move |phase: &str| {
+            let mut s = crate::model::worker::lock_status(&progress_status);
+            s.phase = phase.to_string();
+            s.phase_log.push(phase.to_string());
+        };
+        let cancel_status = Arc::clone(&status_thread);
+        let cancel = move || crate::model::worker::lock_status(&cancel_status).cancel_requested;
 
-            let result = match req.source {
-                MinSizeSource::File {
-                    file,
-                    use_sector_aligned,
-                } => {
-                    // Race-safe wrapper probe: `try_clone` on Unix is `dup()`,
-                    // which shares the kernel seek offset across workers, so a
-                    // concurrent `seek + read` from another partition's worker
-                    // can clobber a plain `detect_wrapped_hfsplus` probe and
-                    // leak the wrong partition's wrapper params. Read the MDB
-                    // here via positioned I/O on the original handle (which
-                    // doesn't touch the shared cursor) and pass the parsed
-                    // info into `partition_minimum_size` as a hint so it skips
-                    // its own probe.
-                    progress("Probing for HFS wrapper...");
-                    let wrapper_hint = fs_mac::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
-                        &file,
+        let result = match req.source {
+            MinSizeSource::File {
+                file,
+                use_sector_aligned,
+            } => {
+                // Race-safe wrapper probe: `try_clone` on Unix is `dup()`,
+                // which shares the kernel seek offset across workers, so a
+                // concurrent `seek + read` from another partition's worker
+                // can clobber a plain `detect_wrapped_hfsplus` probe and
+                // leak the wrong partition's wrapper params. Read the MDB
+                // here via positioned I/O on the original handle (which
+                // doesn't touch the shared cursor) and pass the parsed
+                // info into `partition_minimum_size` as a hint so it skips
+                // its own probe.
+                progress("Probing for HFS wrapper...");
+                let wrapper_hint = fs_mac::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
+                    &file,
+                    req.partition_offset,
+                    u64::MAX,
+                );
+                let clone = match file.try_clone() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        {
+                            let mut s = crate::model::worker::lock_status(&status_thread);
+                            s.error = Some(format!("clone failed: {e}"));
+                            s.finished = true;
+                        }
+                        return Ok(());
+                    }
+                };
+                if use_sector_aligned {
+                    fs::partition_minimum_size_cancellable(
+                        SectorAlignedReader::new(crate::os::PositionalFile::new(clone)),
                         req.partition_offset,
-                        u64::MAX,
-                    );
-                    let clone = match file.try_clone() {
-                        Ok(f) => f,
-                        Err(e) => {
-                            if let Ok(mut s) = status_thread.lock() {
-                                s.error = Some(format!("clone failed: {e}"));
-                                s.finished = true;
-                            }
-                            return Ok(());
-                        }
-                    };
-                    if use_sector_aligned {
-                        fs::partition_minimum_size_cancellable(
-                            SectorAlignedReader::new(crate::os::PositionalFile::new(clone)),
-                            req.partition_offset,
-                            req.partition_type,
-                            req.partition_type_string.as_deref(),
-                            req.partition_size,
-                            true,
-                            wrapper_hint,
-                            &progress,
-                            &cancel,
-                        )
-                    } else {
-                        fs::partition_minimum_size_cancellable(
-                            BufReader::new(crate::os::PositionalFile::new(clone)),
-                            req.partition_offset,
-                            req.partition_type,
-                            req.partition_type_string.as_deref(),
-                            req.partition_size,
-                            true,
-                            wrapper_hint,
-                            &progress,
-                            &cancel,
-                        )
-                    }
+                        req.partition_type,
+                        req.partition_type_string.as_deref(),
+                        req.partition_size,
+                        true,
+                        wrapper_hint,
+                        &progress,
+                        &cancel,
+                    )
+                } else {
+                    fs::partition_minimum_size_cancellable(
+                        BufReader::new(crate::os::PositionalFile::new(clone)),
+                        req.partition_offset,
+                        req.partition_type,
+                        req.partition_type_string.as_deref(),
+                        req.partition_size,
+                        true,
+                        wrapper_hint,
+                        &progress,
+                        &cancel,
+                    )
                 }
-                #[cfg(feature = "remote")]
-                MinSizeSource::Remote {
-                    conn,
-                    path,
-                    is_device,
-                } => {
-                    let opened = if is_device {
-                        crate::remote::RemoteBlockReader::open_device(conn, &path)
-                    } else {
-                        crate::remote::RemoteBlockReader::open(conn, &path)
-                    };
-                    match opened {
-                        Ok(reader) => fs::partition_minimum_size_cancellable(
-                            reader,
-                            req.partition_offset,
-                            req.partition_type,
-                            req.partition_type_string.as_deref(),
-                            req.partition_size,
-                            true,
-                            None,
-                            &progress,
-                            &cancel,
-                        ),
-                        Err(e) => {
-                            if let Ok(mut s) = status_thread.lock() {
-                                s.error = Some(format!("{e:#}"));
-                                s.finished = true;
-                            }
-                            return Ok(());
-                        }
-                    }
-                }
-                MinSizeSource::Chd(path) => match ChdReader::open(&path) {
+            }
+            #[cfg(feature = "remote")]
+            MinSizeSource::Remote {
+                conn,
+                path,
+                is_device,
+            } => {
+                let opened = if is_device {
+                    crate::remote::RemoteBlockReader::open_device(conn, &path)
+                } else {
+                    crate::remote::RemoteBlockReader::open(conn, &path)
+                };
+                match opened {
                     Ok(reader) => fs::partition_minimum_size_cancellable(
                         reader,
                         req.partition_offset,
@@ -220,61 +192,85 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                         &cancel,
                     ),
                     Err(e) => {
-                        if let Ok(mut s) = status_thread.lock() {
-                            s.error = Some(format!("open CHD failed: {e}"));
+                        {
+                            let mut s = crate::model::worker::lock_status(&status_thread);
+                            s.error = Some(format!("{e:#}"));
                             s.finished = true;
                         }
                         return Ok(());
                     }
-                },
-                MinSizeSource::Gho(path) => match GhoReader::open(&path) {
-                    Ok(reader) => fs::partition_minimum_size_cancellable(
-                        reader,
-                        req.partition_offset,
-                        req.partition_type,
-                        req.partition_type_string.as_deref(),
-                        req.partition_size,
-                        true,
-                        None,
-                        &progress,
-                        &cancel,
-                    ),
-                    Err(e) => {
-                        if let Ok(mut s) = status_thread.lock() {
-                            s.error = Some(format!("open GHO failed: {e:#}"));
-                            s.finished = true;
-                        }
-                        return Ok(());
+                }
+            }
+            MinSizeSource::Chd(path) => match ChdReader::open(&path) {
+                Ok(reader) => fs::partition_minimum_size_cancellable(
+                    reader,
+                    req.partition_offset,
+                    req.partition_type,
+                    req.partition_type_string.as_deref(),
+                    req.partition_size,
+                    true,
+                    None,
+                    &progress,
+                    &cancel,
+                ),
+                Err(e) => {
+                    {
+                        let mut s = crate::model::worker::lock_status(&status_thread);
+                        s.error = Some(format!("open CHD failed: {e}"));
+                        s.finished = true;
                     }
-                },
-            };
-
-            if let Ok(mut s) = status_thread.lock() {
-                if s.cancel_requested {
-                    s.error = Some("cancelled: source closed".to_string());
-                    s.finished = true;
                     return Ok(());
                 }
-                match result {
-                    MinimumResult::Computed {
-                        in_place,
-                        defragmented,
-                        fragmentation_percent,
-                    } => {
-                        s.result = in_place;
-                        s.defragmented_min = defragmented;
-                        s.fragmentation_percent = fragmentation_percent;
+            },
+            MinSizeSource::Gho(path) => match GhoReader::open(&path) {
+                Ok(reader) => fs::partition_minimum_size_cancellable(
+                    reader,
+                    req.partition_offset,
+                    req.partition_type,
+                    req.partition_type_string.as_deref(),
+                    req.partition_size,
+                    true,
+                    None,
+                    &progress,
+                    &cancel,
+                ),
+                Err(e) => {
+                    {
+                        let mut s = crate::model::worker::lock_status(&status_thread);
+                        s.error = Some(format!("open GHO failed: {e:#}"));
+                        s.finished = true;
                     }
-                    MinimumResult::Deferred { fs_name } => {
-                        s.error = Some(format!(
-                            "internal: partition_minimum_size deferred unexpectedly ({fs_name})"
-                        ));
-                    }
+                    return Ok(());
                 }
+            },
+        };
+
+        {
+            let mut s = crate::model::worker::lock_status(&status_thread);
+            if s.cancel_requested {
+                s.error = Some("cancelled: source closed".to_string());
                 s.finished = true;
+                return Ok(());
             }
-            Ok(())
-        });
+            match result {
+                MinimumResult::Computed {
+                    in_place,
+                    defragmented,
+                    fragmentation_percent,
+                } => {
+                    s.result = in_place;
+                    s.defragmented_min = defragmented;
+                    s.fragmentation_percent = fragmentation_percent;
+                }
+                MinimumResult::Deferred { fs_name } => {
+                    s.error = Some(format!(
+                        "internal: partition_minimum_size deferred unexpectedly ({fs_name})"
+                    ));
+                }
+            }
+            s.finished = true;
+        }
+        Ok(())
     });
     status
 }

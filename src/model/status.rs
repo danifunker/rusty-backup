@@ -74,6 +74,8 @@ pub struct BlockCacheScan {
     pub partition_index: usize,
     pub partition_type: u8,
     pub cache: Arc<Mutex<PartcloneBlockCache>>,
+    /// Set to stop the scan; it ends with an error and saves nothing (MSR-009).
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Status of a background file/folder extraction from `BrowseView`.

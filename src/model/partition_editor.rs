@@ -408,9 +408,19 @@ impl PartitionEditor {
                     _ => {}
                 }
             } else {
-                let type_byte =
-                    u8::from_str_radix(entry.type_text.trim().trim_start_matches("0x"), 16)
-                        .unwrap_or(0x83);
+                let parsed =
+                    u8::from_str_radix(entry.type_text.trim().trim_start_matches("0x"), 16);
+                let type_byte = match (&parsed, matches!(table, PartitionTable::Mbr(_))) {
+                    (Ok(b), _) => *b,
+                    (Err(_), true) => {
+                        self.errors.push(format!(
+                            "Invalid hex type for the new partition at LBA {}: '{}'",
+                            entry.start_lba, entry.type_text
+                        ));
+                        continue;
+                    }
+                    (Err(_), false) => 0x83,
+                };
                 let type_string = if entry.partition_type_string.is_some() {
                     Some(entry.type_text.trim().to_string())
                 } else {
@@ -690,6 +700,20 @@ mod tests {
         editor.build_and_validate(&table);
         assert!(editor.errors.is_empty(), "errors: {:?}", editor.errors);
         assert_eq!(editor.edits.len(), 1);
+    }
+
+    #[test]
+    fn a_new_mbr_rows_bad_type_is_an_error_not_linux() {
+        let (mut editor, parts) = seeded_editor();
+        let table = mbr_table(&parts);
+        editor.add_start_lba = format!("{}", 2048 + (50 * MIB / 512));
+        editor.add_size_mb = "40".to_string();
+        editor.add_type = "AF".to_string();
+        assert!(editor.add_entry_from_inputs(TableKind::Mbr));
+        editor.entries.last_mut().unwrap().type_text = "ZZ".to_string();
+        editor.build_and_validate(&table);
+        assert_eq!(editor.errors.len(), 1, "{:?}", editor.errors);
+        assert!(editor.edits.is_empty());
     }
 
     #[test]

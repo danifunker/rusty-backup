@@ -378,10 +378,12 @@ fn scan_in_job(
     cache_path: PathBuf,
     job: &JobCtx,
 ) -> anyhow::Result<()> {
-    job.set_can_cancel(false);
     let status = crate::model::cache_runner::spawn_partclone_scan(cache, index, ptype, cache_path);
     let mut err = None;
     crate::model::worker::wait_spawned(job, &status, |s, ctx| {
+        if ctx.is_cancelled() {
+            s.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Ok(c) = s.cache.lock() {
             if c.total_used_blocks > 0 {
                 ctx.set_progress(Progress::Determinate {
@@ -396,6 +398,7 @@ fn scan_in_job(
         }
         s.finished
     });
+    job.check_cancel()?;
     match err {
         Some(e) => Err(anyhow::anyhow!(e)),
         None => Ok(()),

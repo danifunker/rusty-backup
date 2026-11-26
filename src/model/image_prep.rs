@@ -42,14 +42,16 @@ pub fn prepare_disk_image_path(
     path: &std::path::Path,
     decode_floppy_containers: bool,
 ) -> std::io::Result<(std::path::PathBuf, Option<tempfile::TempDir>)> {
-    prepare_disk_image_path_reporting(path, decode_floppy_containers, &|_, _| {})
+    prepare_disk_image_path_reporting(path, decode_floppy_containers, &|_, _| {}, &|| false)
 }
 
-/// [`prepare_disk_image_path`], reporting `(compressed bytes read, compressed total)` while it gunzips.
+/// [`prepare_disk_image_path`], reporting `(compressed bytes read, compressed total)` while it
+/// gunzips, and stopping with `Interrupted` once `cancel` says so.
 pub fn prepare_disk_image_path_reporting(
     path: &std::path::Path,
     decode_floppy_containers: bool,
     progress: &dyn Fn(u64, u64),
+    cancel: &dyn Fn() -> bool,
 ) -> std::io::Result<(std::path::PathBuf, Option<tempfile::TempDir>)> {
     let ext = path
         .extension()
@@ -177,6 +179,7 @@ pub fn prepare_disk_image_path_reporting(
         read: 0,
         total,
         progress,
+        cancel,
     };
     let mut decoder = flate2::read::GzDecoder::new(counted);
     let mut out = std::fs::File::create(&out_path)?;
@@ -197,10 +200,15 @@ struct CountingReader<'a, R> {
     read: u64,
     total: u64,
     progress: &'a dyn Fn(u64, u64),
+    cancel: &'a dyn Fn() -> bool,
 }
 
 impl<R: std::io::Read> std::io::Read for CountingReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if (self.cancel)() {
+            // Not `Interrupted`: `io::copy` and flate2 retry that forever.
+            return Err(crate::compat::io_other("cancelled"));
+        }
         let n = self.inner.read(buf)?;
         self.read += n as u64;
         (self.progress)(self.read, self.total);
@@ -212,6 +220,16 @@ impl<R: std::io::Read> std::io::Read for CountingReader<'_, R> {
 mod materialize_tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn a_cancelled_gunzip_ends_instead_of_retrying() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hdz = tmp.path().join("disk.hdz");
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&vec![0u8; 1 << 20]).unwrap();
+        std::fs::write(&hdz, gz.finish().unwrap()).unwrap();
+        assert!(prepare_disk_image_path_reporting(&hdz, true, &|_, _| {}, &|| true).is_err());
+    }
 
     #[test]
     fn materialize_passes_raw_adf_through() {

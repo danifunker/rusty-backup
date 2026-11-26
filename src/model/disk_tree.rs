@@ -127,7 +127,7 @@ fn disc_trees(path: &Path, selector: Option<PartSelector>, ids: bool) -> Result<
         }
     };
     if ids {
-        crate::cli::logging::log_stderr("rb-cli tree: --ids does not apply to disc images");
+        log::warn!("--ids does not apply to disc images");
     }
     Ok(sides
         .into_iter()

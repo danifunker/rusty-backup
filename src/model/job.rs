@@ -463,6 +463,18 @@ impl<R> Job<R> {
         let mut snap = st.snapshot.clone();
         if snap.status == Status::Running {
             snap.elapsed = st.started.elapsed();
+            // A stalled body sends no progress, so the rate is re-read as of now (MJB-010).
+            if !matches!(snap.progress, Progress::Indeterminate) {
+                snap.rate = st.rate.rate_as_of(Instant::now());
+                snap.eta_secs = match (snap.progress, snap.rate) {
+                    (Progress::Determinate { done, total, .. }, Some(r))
+                        if r > 0.0 && total > 0 =>
+                    {
+                        Some((total.saturating_sub(done) as f64 / r) as u64)
+                    }
+                    _ => None,
+                };
+            }
         }
         snap
     }

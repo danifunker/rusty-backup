@@ -226,6 +226,14 @@ impl ContainerEditSession {
         tmp.write_all(&encoded)
             .context("write re-encoded container")?;
         tmp.flush()?;
+        tmp.as_file()
+            .sync_all()
+            .context("sync re-encoded container")?;
+        // Unix only: a read-only Windows temp could not be removed if the persist fails.
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(&self.original_path) {
+            let _ = std::fs::set_permissions(tmp.path(), meta.permissions());
+        }
         tmp.persist(&self.original_path).map_err(|e| {
             anyhow::anyhow!(
                 "persist re-encoded container to {}: {e}",
