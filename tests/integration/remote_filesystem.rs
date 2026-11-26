@@ -2554,9 +2554,10 @@ fn upload_host_tree_to_remote_host_over_the_wire() {
         ),
     ];
     let status = commander_ops::spawn_host_copy(HostCopyJob::HostToRemoteHost {
-        entries,
-        dest_addr: addr,
+        entries: entries.clone(),
+        dest_addr: addr.clone(),
         dest_parent: "/dest".into(),
+        on_conflict: rusty_backup::fs::replace::OnConflict::Replace,
     });
     wait_host_copy(&status);
 
@@ -2564,6 +2565,23 @@ fn upload_host_tree_to_remote_host_over_the_wire() {
         std::fs::read(root.join("dest/top.txt")).unwrap(),
         b"top-data"
     );
+
+    // MCM-002: a second upload under Skip leaves the daemon's newer file alone and says so.
+    std::fs::write(root.join("dest/top.txt"), b"theirs").unwrap();
+    let status = commander_ops::spawn_host_copy(HostCopyJob::HostToRemoteHost {
+        entries,
+        dest_addr: addr,
+        dest_parent: "/dest".into(),
+        on_conflict: rusty_backup::fs::replace::OnConflict::Skip,
+    });
+    wait_host_copy(&status);
+    assert_eq!(std::fs::read(root.join("dest/top.txt")).unwrap(), b"theirs");
+    assert!(status
+        .lock()
+        .unwrap()
+        .skipped
+        .iter()
+        .any(|s| s.contains("top.txt")));
     assert_eq!(
         std::fs::read(root.join("dest/sub/inner.txt")).unwrap(),
         b"inner-data"
@@ -2613,6 +2631,7 @@ fn upload_image_subtree_to_remote_host_over_the_wire() {
         dest_addr: addr,
         dest_parent: "/".into(),
         fork_mode: ResourceForkMode::DataForkOnly,
+        on_conflict: rusty_backup::fs::replace::OnConflict::Replace,
     });
     wait_host_copy(&status);
 

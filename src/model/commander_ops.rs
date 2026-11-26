@@ -915,6 +915,7 @@ pub enum HostCopyJob {
         dest_addr: String,
         dest_parent: String,
         fork_mode: ResourceForkMode,
+        on_conflict: OnConflict,
     },
     /// Upload host `entries` (local paths) onto a remote daemon's host
     /// filesystem under `dest_parent`. The remote analog of `HostToHost`.
@@ -923,6 +924,7 @@ pub enum HostCopyJob {
         entries: Vec<FileEntry>,
         dest_addr: String,
         dest_parent: String,
+        on_conflict: OnConflict,
     },
     /// Export image-volume `entries` to the host in `format` — loose files / a
     /// per-file-compressed tree into a folder, or one tar/zip/sit archive file.
@@ -987,6 +989,9 @@ impl HostCopyJob {
         match &mut self {
             HostCopyJob::ImageToHost { on_conflict, .. }
             | HostCopyJob::HostToHost { on_conflict, .. } => *on_conflict = on,
+            #[cfg(feature = "remote")]
+            HostCopyJob::ImageToRemoteHost { on_conflict, .. }
+            | HostCopyJob::HostToRemoteHost { on_conflict, .. } => *on_conflict = on,
             HostCopyJob::Extract(job) => job.on_conflict = on,
             _ => {}
         }
@@ -1139,6 +1144,7 @@ fn run_host_copy(
             dest_addr,
             dest_parent,
             fork_mode,
+            on_conflict,
         } => {
             let mut fs = source.open()?;
             let (files_total, bytes_total) = scan_image_entries(fs.as_mut(), &entries)?;
@@ -1154,6 +1160,7 @@ fn run_host_copy(
                 &mut conn,
                 &dest_parent,
                 fork_mode,
+                on_conflict,
                 status,
             )
         }
@@ -1162,6 +1169,7 @@ fn run_host_copy(
             entries,
             dest_addr,
             dest_parent,
+            on_conflict,
         } => {
             let (files_total, bytes_total) = scan_host_entries(&entries);
             if let Ok(mut g) = status.lock() {
@@ -1170,7 +1178,13 @@ fn run_host_copy(
             }
             let mut conn = RemoteConnection::connect(&dest_addr)
                 .context("connecting to the destination daemon")?;
-            upload_host_entries_to_remote_host(&entries, &mut conn, &dest_parent, status)
+            upload_host_entries_to_remote_host(
+                &entries,
+                &mut conn,
+                &dest_parent,
+                on_conflict,
+                status,
+            )
         }
         HostCopyJob::ExportSelection(job) => run_export(*job, status),
         HostCopyJob::Extract(job) => crate::model::extract::run(*job, status, ask),
@@ -1592,6 +1606,7 @@ fn upload_image_entries_to_remote_host(
     conn: &mut RemoteConnection,
     dest_parent: &str,
     fork_mode: ResourceForkMode,
+    on: OnConflict,
     status: &Arc<Mutex<HostCopyStatus>>,
 ) -> Result<usize> {
     let mut count = 0;
@@ -1606,8 +1621,9 @@ fn upload_image_entries_to_remote_host(
             let children = fs
                 .list_directory(entry)
                 .with_context(|| format!("listing '{}'", entry.name))?;
-            count +=
-                upload_image_entries_to_remote_host(fs, &children, conn, &sub, fork_mode, status)?;
+            count += upload_image_entries_to_remote_host(
+                fs, &children, conn, &sub, fork_mode, on, status,
+            )?;
         } else if entry.is_file() {
             if let Ok(mut g) = status.lock() {
                 g.current_file = entry.path.clone();
@@ -1623,8 +1639,9 @@ fn upload_image_entries_to_remote_host(
                 fork_mode,
             )
             .with_context(|| format!("encoding '{}'", entry.name))?;
-            upload_dir_files_to_remote(conn, temp.path(), dest_parent)?;
-            count += 1;
+            if upload_dir_files_to_remote(conn, temp.path(), dest_parent, on, status)? {
+                count += 1;
+            }
             if let Ok(mut g) = status.lock() {
                 g.copied = count;
                 g.bytes_done = g.bytes_done.saturating_add(entry.size);
@@ -1642,16 +1659,39 @@ fn upload_dir_files_to_remote(
     conn: &mut RemoteConnection,
     dir: &Path,
     dest_parent: &str,
-) -> Result<()> {
+    on: OnConflict,
+    status: &Arc<Mutex<HostCopyStatus>>,
+) -> Result<bool> {
+    let mut wrote = false;
     for dent in std::fs::read_dir(dir)?.flatten() {
         if dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
             let name = dent.file_name().to_string_lossy().into_owned();
             let dest = join_remote(dest_parent, &name);
-            conn.write_host_file(&dest, &dent.path(), true)
+            wrote |= put_remote(conn, &dest, &dent.path(), on, status)
                 .with_context(|| format!("uploading '{name}'"))?;
         }
     }
-    Ok(())
+    Ok(wrote)
+}
+
+/// Write one file to the daemon under the conflict policy: uploads always forced before, so the
+/// daemon's existing files were replaced without the review local copies get (MCM-002).
+fn put_remote(
+    conn: &mut RemoteConnection,
+    dest: &str,
+    src: &Path,
+    on: OnConflict,
+    status: &Arc<Mutex<HostCopyStatus>>,
+) -> Result<bool> {
+    if on != OnConflict::Replace && matches!(conn.host_stat(dest), Ok((true, _))) {
+        if on == OnConflict::Fail {
+            bail!("{dest} already exists on the daemon");
+        }
+        note_skipped(status, Path::new(dest), "already exists");
+        return Ok(false);
+    }
+    conn.write_host_file(dest, src, true)?;
+    Ok(true)
 }
 
 /// Upload host `entries` (local paths) onto the daemon's host FS under
@@ -1663,6 +1703,7 @@ fn upload_host_entries_to_remote_host(
     entries: &[FileEntry],
     conn: &mut RemoteConnection,
     dest_parent: &str,
+    on: OnConflict,
     status: &Arc<Mutex<HostCopyStatus>>,
 ) -> Result<usize> {
     let mut count = 0;
@@ -1675,13 +1716,16 @@ fn upload_host_entries_to_remote_host(
         if entry.is_directory() {
             conn.mkdir_host(&dest)
                 .with_context(|| format!("creating remote directory '{}'", entry.name))?;
-            upload_host_dir_to_remote(&src, &dest, conn, &mut count, status)?;
+            upload_host_dir_to_remote(&src, &dest, conn, &mut count, on, status)?;
         } else if entry.is_file() {
             if let Ok(mut g) = status.lock() {
                 g.current_file = entry.path.clone();
             }
-            conn.write_host_file(&dest, &src, true)
-                .with_context(|| format!("uploading '{}'", entry.name))?;
+            if !put_remote(conn, &dest, &src, on, status)
+                .with_context(|| format!("uploading '{}'", entry.name))?
+            {
+                continue;
+            }
             count += 1;
             if let Ok(mut g) = status.lock() {
                 g.copied = count;
@@ -1701,6 +1745,7 @@ fn upload_host_dir_to_remote(
     dest: &str,
     conn: &mut RemoteConnection,
     count: &mut usize,
+    on: OnConflict,
     status: &Arc<Mutex<HostCopyStatus>>,
 ) -> Result<()> {
     for dent in std::fs::read_dir(src)
@@ -1724,13 +1769,16 @@ fn upload_host_dir_to_remote(
         } else if ft.is_dir() {
             conn.mkdir_host(&child_dest)
                 .with_context(|| format!("creating remote directory '{name}'"))?;
-            upload_host_dir_to_remote(&dent.path(), &child_dest, conn, count, status)?;
+            upload_host_dir_to_remote(&dent.path(), &child_dest, conn, count, on, status)?;
         } else if ft.is_file() {
             if let Ok(mut g) = status.lock() {
                 g.current_file = dent.path().display().to_string();
             }
-            conn.write_host_file(&child_dest, &dent.path(), true)
-                .with_context(|| format!("uploading {}", dent.path().display()))?;
+            if !put_remote(conn, &child_dest, &dent.path(), on, status)
+                .with_context(|| format!("uploading {}", dent.path().display()))?
+            {
+                continue;
+            }
             *count += 1;
             if let Ok(mut g) = status.lock() {
                 g.copied = *count;
@@ -1753,7 +1801,13 @@ pub fn upload_host_entries_to_remote(
     let mut conn =
         RemoteConnection::connect(addr).context("connecting to the destination daemon")?;
     let status = Arc::new(Mutex::new(HostCopyStatus::default()));
-    upload_host_entries_to_remote_host(entries, &mut conn, dest_parent, &status)
+    upload_host_entries_to_remote_host(
+        entries,
+        &mut conn,
+        dest_parent,
+        OnConflict::Replace,
+        &status,
+    )
 }
 
 /// Synchronously upload image-volume `entries` (read through `fs`) onto the
@@ -1771,7 +1825,15 @@ pub fn upload_fs_entries_to_remote(
     let mut conn =
         RemoteConnection::connect(addr).context("connecting to the destination daemon")?;
     let status = Arc::new(Mutex::new(HostCopyStatus::default()));
-    upload_image_entries_to_remote_host(fs, entries, &mut conn, dest_parent, fork_mode, &status)
+    upload_image_entries_to_remote_host(
+        fs,
+        entries,
+        &mut conn,
+        dest_parent,
+        fork_mode,
+        OnConflict::Replace,
+        &status,
+    )
 }
 
 /// Write the queue as a job, continuing past failed items; progress counts bytes (or edits when none).
