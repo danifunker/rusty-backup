@@ -467,13 +467,13 @@ pub fn read_volume(disk: &Disk, generation: Generation) -> Result<PilotVolume, F
             "not a Pilot/Cedar disk (fsFamily != 2)".into(),
         ));
     }
-    let page = |vda: usize| -> Result<&[u8], FilesystemError> {
+    let page = |vda: usize| -> Result<Vec<u8>, FilesystemError> {
         disk.sector(vda)
-            .map(|s| s.data.as_slice())
+            .map(|s| s.into_owned().data)
             .ok_or_else(|| FilesystemError::Parse(format!("Pilot: page {vda} out of range")))
     };
 
-    let physical_root = PhysicalRoot::parse(page(0)?)?;
+    let physical_root = PhysicalRoot::parse(&page(0)?)?;
     // Every loop and page index below is driven by these counts: they must fit the pack.
     let total = disk.geometry.total_sectors() as u64;
     for sv in &physical_root.sub_volumes {
@@ -499,7 +499,7 @@ pub fn read_volume(disk: &Disk, generation: Generation) -> Result<PilotVolume, F
         })?;
 
     let lv_root_vda = root_sv.pv_page as usize; // logical page 0 -> physical pv_page
-    let logical_root = LogicalRoot::parse(page(lv_root_vda)?)?;
+    let logical_root = LogicalRoot::parse(&page(lv_root_vda)?)?;
 
     // Free space: scan the subvolume's logical pages and count freePage labels
     // (the page label is authoritative; the VAM is only a hint).
@@ -642,7 +642,7 @@ pub fn create_blank(
         set_page_checksum(d);
     }
 
-    let mut disk = Disk { geometry, sectors };
+    let mut disk = Disk::new(geometry, sectors);
     // Install the VAM file (root-file slot 7) and fill its bitmap from labels.
     install_vam(&mut disk, &sub, generation);
     Ok(disk)
@@ -653,6 +653,7 @@ pub fn create_blank(
 /// holding the `VAMObject` bitmap, with `rootFile[VAM]` and `lastFileID` set in
 /// the LV root. The bitmap is then filled from the page labels.
 fn install_vam(disk: &mut Disk, sv: &SubVolumeDesc, generation: Generation) {
+    disk.make_resident();
     let pv = sv.pv_page as usize;
     let n_data = vam_data_pages(sv.lv_size);
     let header_lp = 1usize;
@@ -726,6 +727,7 @@ fn install_vam(disk: &mut Disk, sv: &SubVolumeDesc, generation: Generation) {
 /// style): bit set = page in use (`attributes != freePage`), LSB-first within
 /// each 16-bit word. A no-op if the VAM file isn't present.
 fn rebuild_vam(disk: &mut Disk, sv: &SubVolumeDesc) {
+    disk.make_resident();
     let pv = sv.pv_page as usize;
     let vsize = sv.lv_size as usize;
     // The bitmap covers the whole logical volume, which is indexed here as this one subvolume.
@@ -1317,7 +1319,7 @@ pub fn add_file(
         ));
     }
 
-    let mut disk = disk.clone();
+    let mut disk = disk.to_resident();
 
     // Allocate a FileID (advance the LV-root counter at word 253).
     let lv_root_vda = pv_page; // logical page 0
@@ -1410,7 +1412,7 @@ pub fn delete_file(disk: &Disk, fid: u32) -> Result<Disk, FilesystemError> {
 
     let target = [(fid & 0xffff) as u16, (fid >> 16) as u16];
     let pv_page = sv.pv_page as usize;
-    let mut disk = disk.clone();
+    let mut disk = disk.to_resident();
     let mut freed = 0u32;
     for lp in 1..sv.n_pages as usize {
         let vda = pv_page + lp;
@@ -1775,6 +1777,7 @@ fn build_client_directory(entries: &[ClientDirEntry]) -> Result<Vec<u8>, Filesys
 /// `data` flag and its three continuation labels have `freePage` flags.  The
 /// non-volume RelID still makes those continuation pages allocated.
 fn set_cedar_btree_label_flags(disk: &mut Disk, file_id: [u16; 5]) {
+    disk.make_resident();
     for sector in &mut disk.sectors {
         let mut label = Label::parse(&sector.label);
         if label.file_id != file_id || label.attributes == attr::HEADER {
@@ -2052,11 +2055,10 @@ impl BootFileEntry {
 
 /// Read a PV-root `bootingInfo` slot's `DiskFileID`.
 pub fn boot_file_entry(disk: &Disk, slot: PvBootFile) -> Result<BootFileEntry, FilesystemError> {
-    let d = disk
+    let root = disk
         .sector(0)
-        .ok_or_else(|| FilesystemError::Parse("Pilot: no physical-volume root page".into()))?
-        .data
-        .as_slice();
+        .ok_or_else(|| FilesystemError::Parse("Pilot: no physical-volume root page".into()))?;
+    let d = root.data.as_slice();
     if rdw(d, 0) != PR_SEAL {
         return Err(FilesystemError::Parse(
             "Pilot: bad physical-root seal".into(),
@@ -2134,7 +2136,7 @@ pub fn install_boot_file(
     let pages = free[..n].to_vec();
     let vdas: Vec<u32> = pages.iter().map(|&lp| pv_page as u32 + lp).collect();
 
-    let mut disk = disk.clone();
+    let mut disk = disk.to_resident();
 
     // Allocate a FileID for the boot file (advance the LV-root counter).
     let lv_root_vda = pv_page;
@@ -2568,9 +2570,11 @@ mod tests {
             .unwrap()
             .physical_root
             .sub_volumes[0];
-        let lv = back.sector(sv.pv_page as usize).unwrap().data.as_slice();
+        let lv_page = back.sector(sv.pv_page as usize).unwrap();
+        let lv = lv_page.data.as_slice();
         for slot in [PvBootFile::Germ, PvBootFile::BootFile] {
-            let pv = back.sector(0).unwrap().data.as_slice();
+            let pv_page = back.sector(0).unwrap();
+            let pv = pv_page.data.as_slice();
             let pw = slot.root_word();
             let bw = LV_BOOTING_INFO_BASE + slot.ordinal() * DISK_FILE_ID_WORDS;
             for k in 0..DISK_FILE_ID_WORDS {

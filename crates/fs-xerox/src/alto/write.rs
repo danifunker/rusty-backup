@@ -130,6 +130,8 @@ pub fn extract_files(disk: &Disk) -> Result<Vec<FileImage>, FilesystemError> {
             pages,
         });
     }
+    // A page that failed to read stood in as zeros; a copy built on it would lose data quietly.
+    disk.check_reads()?;
     Ok(out)
 }
 
@@ -503,7 +505,7 @@ pub fn build_disk(geometry: Geometry, files: &[FileImage]) -> Result<Disk, Files
         DD_SN,
     );
 
-    Ok(Disk { geometry, sectors })
+    Ok(Disk::new(geometry, sectors))
 }
 
 struct FileLayout {

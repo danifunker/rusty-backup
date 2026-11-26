@@ -291,14 +291,19 @@ impl BrowseSession {
             || is_trident
             || zdisk_bytes.is_some()
         {
-            let bytes = match zdisk_bytes {
-                Some(b) => b,
+            // A plain pack file opens from the file, a Trident read on demand (MCM-024).
+            let (disk, head) = match zdisk_bytes {
+                Some(b) => (fs_xerox::alto::open_pack(&b)?, b),
                 None if is_gzip => {
-                    crate::model::source_reader::gunzip_to_vec(path).map_err(FilesystemError::Io)?
+                    let b = crate::model::source_reader::gunzip_to_vec(path)
+                        .map_err(FilesystemError::Io)?;
+                    (fs_xerox::alto::open_pack(&b)?, b)
                 }
-                None => std::fs::read(path).map_err(FilesystemError::Io)?,
+                None => (
+                    fs_xerox::alto::open_pack_file(path)?,
+                    crate::compat::read_head(path, 512).map_err(FilesystemError::Io)?,
+                ),
             };
-            let disk = fs_xerox::alto::open_pack(&bytes)?;
             // A PDI with fsFamily=2 (or any .zdisk) is a Pilot/Cedar volume
             // (structurally unrelated to BFS); everything else is an Alto BFS pack.
             if disk.geometry.family == fs_xerox::alto::FsFamily::Pilot {
@@ -307,7 +312,7 @@ impl BrowseSession {
                 // carries no flags, so default to the original-Pilot generation
                 // (these are classic Pilot 12.3 volumes). Generation does not
                 // affect the read path, only how a written ID is interpreted.
-                let generation = fs_xerox::alto::pdi::read_header(&bytes)
+                let generation = fs_xerox::alto::pdi::read_header(&head)
                     .map(|h| Generation::from_pdi_flag_bit2(h.flags & 0x0004 != 0))
                     .unwrap_or(Generation::OriginalPilot);
                 return Ok(Box::new(PilotFilesystem::open(disk, generation)?));
@@ -774,8 +779,7 @@ impl BrowseSession {
                 || is_salto_dsk
                 || is_zdisk
             {
-                let bytes = std::fs::read(path).map_err(FilesystemError::Io)?;
-                let disk = fs_xerox::alto::open_pack(&bytes)?;
+                let disk = fs_xerox::alto::open_pack_file(path)?;
                 // Pilot/Cedar volumes (fsFamily=2, and every .zdisk) are
                 // read-only for now.
                 if disk.geometry.family == fs_xerox::alto::FsFamily::Pilot {
@@ -1093,7 +1097,7 @@ mod tests {
         };
         let total = geometry.total_sectors();
         let sectors = (0..total).map(|_| Sector::zeroed(16, 512)).collect();
-        let pdi = fs_xerox::alto::pdi::write(&Disk { geometry, sectors });
+        let pdi = fs_xerox::alto::pdi::write(&Disk::new(geometry, sectors));
 
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&pdi).unwrap();
@@ -1124,7 +1128,7 @@ mod tests {
         };
         let total = geometry.total_sectors();
         let sectors = (0..total).map(|_| Sector::zeroed(16, 512)).collect();
-        let dsk = salto::write(&Disk { geometry, sectors }).expect("salto write");
+        let dsk = salto::write(&Disk::new(geometry, sectors)).expect("salto write");
         assert_eq!(dsk.len(), salto::IMAGE_BYTES);
 
         let mut tmp = tempfile::Builder::new().suffix(".dsk").tempfile().unwrap();

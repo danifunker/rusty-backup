@@ -377,6 +377,8 @@ impl<'a> Bfs<'a> {
         }
 
         let repairable = errors.iter().any(|e| e.repairable);
+        // An I/O failure is reported as one, not as the broken chains its zeroed pages look like.
+        self.disk.check_reads()?;
         Ok(FsckResult {
             errors,
             warnings: Vec::new(),
@@ -450,9 +452,7 @@ impl BfsFilesystem {
     /// both still open by magic).
     pub fn open_editable(disk: Disk, save_path: PathBuf) -> Self {
         // Keep the file's own container: a Salto .dsk saved as PDI is no longer a Salto .dsk.
-        let format = std::fs::read(&save_path)
-            .map(|b| super::pack_format(&b))
-            .unwrap_or(super::PackFormat::ReadOnly);
+        let format = super::pack_format_of_file(&save_path);
         let mut fs = Self::open(disk);
         fs.save_path = Some(save_path);
         fs.save_format = format;
@@ -875,7 +875,7 @@ mod tests {
         put(&mut sectors[5], 6, 5); // numChars
         sectors[5].data[..5].copy_from_slice(b"hello");
 
-        let disk = Disk { geometry, sectors };
+        let disk = Disk::new(geometry, sectors);
         let mut fs = BfsFilesystem::open(disk);
         let root = fs.root().unwrap();
         let entries = fs.list_directory(&root).unwrap();

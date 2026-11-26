@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use fs_xerox::alto::bfs::Bfs;
-use fs_xerox::alto::{open_pack, pdi, write, FsFamily, Geometry};
+use fs_xerox::alto::{pdi, write, FsFamily, Geometry};
 
 /// The geometries an Alto volume can be re-laid onto.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +53,7 @@ impl AltoTarget {
 /// A Trident T-300 pack is about 289 MB; anything past this is no pack, refused before the read (MWR-019).
 const MAX_PACK_BYTES: u64 = 512 * 1024 * 1024;
 
-fn read_pack(path: &Path) -> Result<Vec<u8>, String> {
+fn read_pack(path: &Path) -> Result<fs_xerox::alto::Disk, String> {
     let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
     if len > MAX_PACK_BYTES {
         return Err(format!(
@@ -63,7 +63,7 @@ fn read_pack(path: &Path) -> Result<Vec<u8>, String> {
             MAX_PACK_BYTES >> 20
         ));
     }
-    std::fs::read(path).map_err(|e| e.to_string())
+    fs_xerox::alto::open_pack_file(path).map_err(|e| format!("{e}"))
 }
 
 /// What the dialog shows about the source pack.
@@ -78,8 +78,7 @@ pub struct AltoSummary {
 
 /// Read the pack's geometry and used-page count.
 pub fn summarize(path: &Path) -> Result<AltoSummary, String> {
-    let bytes = read_pack(path)?;
-    let disk = open_pack(bytes.as_slice()).map_err(|e| format!("{e}"))?;
+    let disk = read_pack(path)?;
     let g = &disk.geometry;
     let total = g.total_sectors();
     let free = Bfs::new(&disk)
@@ -103,8 +102,7 @@ pub fn summarize(path: &Path) -> Result<AltoSummary, String> {
 
 /// Clone the pack at `source` onto `target` and write it to `out` as a PDI; "Saved ... (N pages).".
 pub fn resize_to(source: &Path, target: AltoTarget, out: &Path) -> Result<String, String> {
-    let bytes = read_pack(source)?;
-    let src = open_pack(bytes.as_slice()).map_err(|e| format!("{e}"))?;
+    let src = read_pack(source)?;
     let resized = write::clone_to(&src, target.geometry()).map_err(|e| format!("{e}"))?;
     std::fs::write(out, pdi::write(&resized)).map_err(|e| e.to_string())?;
     Ok(format!(

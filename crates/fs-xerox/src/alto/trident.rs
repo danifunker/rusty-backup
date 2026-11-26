@@ -153,10 +153,55 @@ pub fn read(bytes: &[u8]) -> Result<Disk, FilesystemError> {
         swap_words(&mut data);
         sectors[vda] = Sector { label, data };
     }
-    Ok(Disk {
-        geometry: geom,
-        sectors,
-    })
+    Ok(Disk::new(geom, sectors))
+}
+
+/// Open a Trident pack file without reading it into memory: one pass maps each VDA to its record
+/// (the same placement [`read`] makes, last record wins), then sectors are read on demand.
+pub fn open_file(mut file: std::fs::File) -> Result<Disk, FilesystemError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file.metadata().map_err(FilesystemError::Io)?.len();
+    let (model, sectors_n) = match len {
+        n if n == T80_BYTES as u64 => (80u16, T80_SECTORS),
+        n if n == T300_BYTES as u64 => (300u16, T300_SECTORS),
+        n => {
+            return Err(FilesystemError::Parse(format!(
+            "Trident pack: file is {n} bytes, expected {T80_BYTES} (T-80) or {T300_BYTES} (T-300)"
+        )))
+        }
+    };
+    let geom = geometry(model);
+    let header_off = DUMMY_WORDS * 2;
+    let mut records = vec![u32::MAX; sectors_n];
+    file.seek(SeekFrom::Start(0)).map_err(FilesystemError::Io)?;
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, &mut file);
+    let mut rec = vec![0u8; SECTOR_BYTES];
+    for i in 0..sectors_n {
+        reader.read_exact(&mut rec).map_err(FilesystemError::Io)?;
+        let h0 = (rec[header_off] as u16) | ((rec[header_off + 1] as u16) << 8);
+        let h1 = (rec[header_off + 2] as u16) | ((rec[header_off + 3] as u16) << 8);
+        let vda = geom.trident_vda_from_dh(h0, h1);
+        if vda < sectors_n {
+            records[vda] = i as u32;
+        }
+    }
+    drop(reader);
+    Ok(Disk::file_backed(geom, file, records, read_record))
+}
+
+/// One record of a Trident pack file, words normalized to big-endian.
+fn read_record(file: &mut std::fs::File, rec: u32) -> std::io::Result<Sector> {
+    use std::io::{Read, Seek, SeekFrom};
+    let label_off = (DUMMY_WORDS + HEADER_WORDS) * 2;
+    let data_off = label_off + LABEL_BYTES;
+    let mut buf = vec![0u8; SECTOR_BYTES];
+    file.seek(SeekFrom::Start(rec as u64 * SECTOR_BYTES as u64))?;
+    file.read_exact(&mut buf)?;
+    let mut label = buf[label_off..label_off + LABEL_BYTES].to_vec();
+    let mut data = buf[data_off..data_off + DATA_BYTES].to_vec();
+    swap_words(&mut label);
+    swap_words(&mut data);
+    Ok(Sector { label, data })
 }
 
 /// Serialize a [`Disk`] (single-drive Trident pack) to a pack image. The 2-word
@@ -175,8 +220,8 @@ pub fn write(disk: &Disk) -> Result<Vec<u8>, FilesystemError> {
     }
     let label_off = (DUMMY_WORDS + HEADER_WORDS) * 2;
     let data_off = label_off + LABEL_BYTES;
-    let mut out = vec![0u8; disk.sectors.len() * SECTOR_BYTES];
-    for (vda, s) in disk.sectors.iter().enumerate() {
+    let mut out = vec![0u8; disk.sector_count() * SECTOR_BYTES];
+    for (vda, s) in disk.iter_sectors().enumerate() {
         let rec = vda * SECTOR_BYTES;
         // header (words 1-2 after the dummy) = the 2-word disk header (DH).
         let [hw0, hw1] = g.trident_dh_from_vda(vda);
@@ -239,10 +284,7 @@ pub fn read_diablo(bytes: &[u8]) -> Result<Disk, FilesystemError> {
         swap_words(&mut data);
         sectors[vda] = Sector { label, data };
     }
-    Ok(Disk {
-        geometry: geom,
-        sectors,
-    })
+    Ok(Disk::new(geom, sectors))
 }
 
 #[cfg(test)]
@@ -313,10 +355,7 @@ mod tests {
                 s
             })
             .collect();
-        Disk {
-            geometry: g,
-            sectors,
-        }
+        Disk::new(g, sectors)
     }
 
     #[test]
@@ -337,6 +376,35 @@ mod tests {
             );
             assert_eq!(back.sectors[vda].data, disk.sectors[vda].data, "data {vda}");
         }
+    }
+
+    #[test]
+    fn a_pack_opened_from_its_file_reads_as_the_parsed_pack() {
+        let disk = sample_pack(80);
+        let bytes = write(&disk).expect("write");
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, &bytes).unwrap();
+        let path = tmp.path().to_path_buf();
+        let backed = crate::alto::open_pack_file(&path).expect("open");
+        assert!(backed.is_file_backed());
+        assert!(backed.sectors.is_empty(), "nothing loaded up front");
+        assert_eq!(backed.sector_count(), T80_SECTORS);
+        let parsed = read(&bytes).expect("read");
+        for vda in [0usize, 1, 9, 1000, T80_SECTORS - 1] {
+            let (a, b) = (backed.sector(vda).unwrap(), parsed.sector(vda).unwrap());
+            assert_eq!((&a.label, &a.data), (&b.label, &b.data), "vda {vda}");
+        }
+        // Writing it back streams every sector; loading it for an edit gives the same pack.
+        assert_eq!(write(&backed).unwrap(), bytes);
+        let resident = backed.to_resident();
+        assert!(!resident.is_file_backed());
+        assert_eq!(resident.sectors.len(), T80_SECTORS);
+        // A pack whose file stops reading reports the failure instead of exporting zeros.
+        assert!(backed.check_reads().is_ok());
+        tmp.as_file().set_len(1024).unwrap();
+        let _ = backed.sector(T80_SECTORS - 1);
+        assert!(backed.check_reads().is_err());
+        assert!(crate::alto::write_pack(&backed, crate::alto::PackFormat::Trident).is_err());
     }
 
     #[test]
