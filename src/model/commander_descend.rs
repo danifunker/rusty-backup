@@ -254,7 +254,7 @@ pub fn open_optical(path: &Path, label: Option<String>) -> Result<Box<dyn Filesy
     let fs = crate::fs::optical_fs::OpticalFilesystem::open(path, label).map_err(|e| {
         // NKit-scrubbed GC/Wii images identify as a normal disc but can't be
         // reconstructed by `nod`; give the user an actionable message.
-        crate::cli::optical_hint::with_nkit_hint(
+        crate::model::optical_hint::with_nkit_hint(
             anyhow::anyhow!("open optical image {}: {e}", path.display()),
             path,
         )

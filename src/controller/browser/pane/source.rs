@@ -51,6 +51,7 @@ pub mod purpose {
     pub const OPEN_BACKUP_FOLDER: &str = "commander.open_backup_folder";
     pub const DISCARD_EDITS: &str = "commander.discard_edits";
     pub const DISCARD_STAGED: &str = "commander.discard_staged";
+    pub const LOSSY_SAVE: &str = "browser.lossy_save";
     pub const HOST_DELETE: &str = "commander.host_delete";
     pub const RENAME: &str = "commander.rename";
     pub const NEW_FOLDER: &str = "commander.new_folder";

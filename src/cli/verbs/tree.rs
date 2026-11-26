@@ -33,10 +33,11 @@ pub struct TreeArgs {
 }
 
 pub fn run(args: TreeArgs) -> Result<()> {
+    crate::fs::carve::set_full_scan(args.fs_override.carve_full);
     let opts = TreeOptions {
         ids: args.ids,
         password: args.password.as_deref(),
-        fs_override: Some(&args.fs_override),
+        fs_type: args.fs_override.fs_type.as_deref(),
         inside: args.inside.as_deref(),
     };
     let found = trees(&args.image.path, args.image.partition.clone(), &opts)?;

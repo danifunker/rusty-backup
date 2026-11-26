@@ -26,6 +26,27 @@ use crate::rbformats::containers::{
     decode_floppy_container_file, encode_floppy_container, ContainerKind,
 };
 
+/// What saving an edit drops from a container rebuilt from its sectors, or `None` when nothing
+/// is lost; shells show it before the first save (MCM-003).
+pub fn reencode_loss(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "woz" => {
+            "Saving rewrites this WOZ from its sectors: copy protection, track timing, the META \
+             information and the write-protect flag are lost. Keep a copy if you need them."
+        }
+        "d88" | "d77" | "88d" => {
+            "Saving rewrites this D88 from its sectors: the disk name, the write-protect flag and \
+             any non-standard sector layout or copy protection are lost."
+        }
+        "dim" => {
+            "Saving rewrites this DIM from its sectors with a fresh header: anything else the \
+             original header held, and any copy protection, is lost."
+        }
+        _ => return None,
+    })
+}
+
 /// What kind of wrapper a [`ContainerEditSession`] is re-encoding on commit.
 enum EditFormat {
     /// A fixed-geometry floppy container (XDF / HDM / DIM / D88 / ATR). The
@@ -247,6 +268,16 @@ impl ContainerEditSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_lossy_re_encodes_carry_a_warning() {
+        for lossy in ["a.woz", "b.D88", "c.dim"] {
+            assert!(reencode_loss(Path::new(lossy)).is_some(), "{lossy}");
+        }
+        for kept in ["d.adz", "e.dsd", "f.img"] {
+            assert!(reencode_loss(Path::new(kept)).is_none(), "{kept}");
+        }
+    }
     use crate::rbformats::containers::convert_floppy_container;
     use dsk_floppy::floppy_geom::FloppyMedia;
 

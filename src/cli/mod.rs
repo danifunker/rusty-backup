@@ -20,17 +20,17 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub mod api;
-pub mod backup_edit;
+pub use crate::model::backup_edit;
 pub mod config;
 pub mod copy_paths;
 pub mod device_safety;
 pub mod dir_picker;
 pub mod exit;
 pub mod glob;
-pub mod img_at;
-pub mod io;
+pub use crate::model::image_io as io;
+pub use crate::model::img_at;
 pub mod logging;
-pub mod optical_hint;
+pub use crate::model::optical_hint;
 pub mod output;
 pub mod parse;
 pub mod resolve;
@@ -400,6 +400,8 @@ pub enum Command {
 /// [`crate::cli::exit`].
 pub fn run(cli: Cli) -> Result<()> {
     logging::install(&cli.globals)?;
+    // Model progress notes reach the terminal the way the CLI's own do (`--quiet` included).
+    crate::model::notice::set_sink(|m: &str| logging::log_stderr(m));
     match cli.command {
         Some(command) => dispatch(command),
         None => no_command(),

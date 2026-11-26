@@ -151,6 +151,8 @@ pub(super) struct EditState {
     host_job: Option<HostJob>,
     wrapper: Option<WrapperOpening>,
     log: Vec<String>,
+    /// The user saw what saving drops from this container (MCM-003); asked once per source.
+    loss_accepted: bool,
 }
 
 impl EditState {
@@ -165,6 +167,7 @@ impl EditState {
             host_job: None,
             wrapper: None,
             log: Vec::new(),
+            loss_accepted: false,
         }
     }
 
@@ -633,7 +636,26 @@ impl BrowserPaneController {
                 self.ed.show_edits = on;
                 Vec::new()
             }
-            A::Apply => self.start_check(),
+            A::Apply => match self.loss_note() {
+                // Saving is allowed, but the user hears first what a flat re-encode drops (MCM-003).
+                Some(note) if !self.ed.loss_accepted && self.can_apply() => {
+                    vec![Effect::Confirm(ConfirmSpec {
+                        purpose: purpose::LOSSY_SAVE,
+                        title: "Save edits".to_string(),
+                        message: note.to_string(),
+                        confirm_label: "Save Anyway".to_string(),
+                        destructive: true,
+                    })]
+                }
+                _ => self.start_check(),
+            },
+            A::Confirmed { purpose, yes } if purpose == purpose::LOSSY_SAVE => {
+                if !yes {
+                    return Ok(msg("nothing was written; the edits stay staged."));
+                }
+                self.ed.loss_accepted = true;
+                self.start_check()
+            }
             A::ApplyReviewed(on) => self.reviewed(on),
             A::DismissReview => {
                 if !matches!(self.ed.apply, ApplyPhase::Review(_)) {
@@ -1115,6 +1137,11 @@ impl BrowserPaneController {
             return Some(ApplyTarget::Remote(image));
         }
         self.session().cloned().map(ApplyTarget::Session)
+    }
+
+    /// What saving would drop from this source's container, if anything.
+    fn loss_note(&self) -> Option<&'static str> {
+        crate::model::container_edit::reencode_loss(self.source_path()?)
     }
 
     pub(super) fn start_check(&mut self) -> Vec<Effect> {

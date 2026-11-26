@@ -6,8 +6,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, Result};
 
-use crate::cli::img_at::PartSelector;
-use crate::cli::resolve::FsDispatchOverride;
+use crate::model::img_at::PartSelector;
 
 /// One volume's listing, or why it could not be listed.
 #[derive(Debug)]
@@ -24,7 +23,7 @@ pub struct TreeOptions<'a> {
     pub ids: bool,
     pub password: Option<&'a str>,
     /// `--fs-type`: read every listed volume as this filesystem.
-    pub fs_override: Option<&'a FsDispatchOverride>,
+    pub fs_type: Option<&'a str>,
     /// The disk image to open inside a `.zip` holding several.
     pub inside: Option<&'a str>,
 }
@@ -40,7 +39,7 @@ pub fn trees(
         return remote_trees(&r, selector, opts.ids);
     }
     #[cfg(feature = "optical")]
-    if crate::cli::optical_hint::is_browsable_optical(path) {
+    if crate::model::optical_hint::is_browsable_optical(path) {
         return disc_trees(path, selector, opts.ids);
     }
     let count = match &selector {
@@ -63,8 +62,8 @@ pub fn trees(
 
 /// How many partitions `@N` numbers on this disk; 0 for a bare volume.
 fn partition_count(path: &Path, opts: &TreeOptions) -> Result<usize> {
-    if crate::cli::backup_edit::is_backup_folder(path) {
-        return crate::cli::backup_edit::partition_count(path);
+    if crate::model::backup_edit::is_backup_folder(path) {
+        return crate::model::backup_edit::partition_count(path);
     }
     let pw = opts.password.map(str::as_bytes);
     let mut reader =
@@ -73,7 +72,7 @@ fn partition_count(path: &Path, opts: &TreeOptions) -> Result<usize> {
         match crate::partition::PartitionTable::detect(&mut reader) {
             Ok(table) => crate::partition::partitions_with_volumes(&mut reader, &table).len(),
             // `--fs-type` on a disk with no table: the whole image is the volume.
-            Err(_) if opts.fs_override.is_some_and(|o| o.fs_type.is_some()) => 0,
+            Err(_) if opts.fs_type.is_some() => 0,
             Err(e) => return Err(anyhow!(e)),
         },
     )
@@ -82,16 +81,16 @@ fn partition_count(path: &Path, opts: &TreeOptions) -> Result<usize> {
 /// One volume of a local disk; a volume that does not open is reported, not fatal.
 fn one(path: &Path, selector: Option<PartSelector>, opts: &TreeOptions) -> Result<VolumeTree> {
     let pw = opts.password.map(str::as_bytes);
-    let fs_type = opts.fs_override.and_then(|o| o.fs_type.as_deref());
-    let (reader, mut ctx) = crate::cli::resolve::resolve_partition_streaming_forced_inside(
+    let fs_type = opts.fs_type;
+    let (reader, mut ctx) = crate::model::resolve::resolve_partition_streaming_forced_inside(
         path,
         selector,
         pw,
         fs_type,
         opts.inside,
     )?;
-    if let Some(o) = opts.fs_override {
-        o.apply(&mut ctx);
+    if let Some(t) = opts.fs_type {
+        crate::model::resolve::apply_fs_type(&mut ctx, t);
     }
     let tree = match ctx.open_ro(reader, opts.password) {
         Ok(mut fs) => listing(fs.as_mut(), opts.ids),

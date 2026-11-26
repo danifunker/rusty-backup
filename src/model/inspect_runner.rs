@@ -223,7 +223,7 @@ pub fn inspect_source(
     let mut table = match detect_result {
         Ok(t) => t,
         Err(e) => {
-            if !remote && crate::cli::optical_hint::is_browsable_optical(path) {
+            if !remote && crate::model::optical_hint::is_browsable_optical(path) {
                 return Ok(Inspected::Optical(path.to_path_buf()));
             }
             if !remote && !is_device && crate::model::mac_archive_read::is_archive_file(path) {
@@ -425,10 +425,10 @@ fn no_table(req: &InspectRequest, e: impl std::fmt::Display) -> String {
         return format!("{base:#}");
     }
     let path = req.path.as_path();
-    let hinted = if crate::cli::optical_hint::is_nkit_image(path) {
-        crate::cli::optical_hint::with_nkit_hint(base, path)
+    let hinted = if crate::model::optical_hint::is_nkit_image(path) {
+        crate::model::optical_hint::with_nkit_hint(base, path)
     } else {
-        crate::cli::optical_hint::with_optical_hint(base, path)
+        crate::model::optical_hint::with_optical_hint(base, path)
     };
     format!("{hinted:#}")
 }

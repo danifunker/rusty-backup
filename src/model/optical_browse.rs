@@ -63,7 +63,7 @@ pub fn open_source(src: &DiscSource) -> Result<DiscOpen, String> {
     };
     let fs = disc.filesystem().map_err(|e| {
         // An NKit image that reaches here could not be reconstructed: add the convert-it hint.
-        let msg = crate::cli::optical_hint::with_nkit_hint(
+        let msg = crate::model::optical_hint::with_nkit_hint(
             anyhow::anyhow!("Cannot open filesystem: {e}"),
             path,
         );
