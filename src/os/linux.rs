@@ -617,8 +617,8 @@ fn elevation_target_path() -> Result<PathBuf> {
 pub fn relaunch_with_elevation() -> Result<()> {
     super::ensure_physical_enabled()?;
     let target = elevation_target_path()?;
-    // `args()` panics on a non-UTF-8 argument, such as a Latin-1 file name (OSL-005).
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // `args()` panicked on a non-UTF-8 argument (OSL-005); pkexec starts in /root (OSL-006).
+    let args = super::args_for_relaunch();
 
     // Check if pkexec is available
     // Searched on PATH directly; minimal distros ship no `which` (OSL-011).

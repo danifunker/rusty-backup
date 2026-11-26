@@ -628,6 +628,14 @@ impl SectorAlignedWriter {
     }
 }
 
+/// A writer dropped unflushed used to lose up to its whole buffer (OSC-011); errors here have
+/// no one to go to, so callers that care still flush first.
+impl Drop for SectorAlignedWriter {
+    fn drop(&mut self) {
+        let _ = self.flush_padded();
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 impl Write for SectorAlignedWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
@@ -1024,6 +1032,22 @@ pub fn open_target_preserving(path: &Path) -> Result<DeviceWriteHandle> {
 pub fn is_device_path(path: &Path) -> bool {
     let s = path.to_string_lossy();
     s.starts_with("/dev/") || s.starts_with("\\\\.\\")
+}
+
+/// This process's arguments, with relative paths that exist made absolute: the elevated copy
+/// starts in System32 (runas) or /root (pkexec), so `disk.img` would name another file (OSW-006).
+pub fn args_for_relaunch() -> Vec<std::ffi::OsString> {
+    let cwd = std::env::current_dir().ok();
+    std::env::args_os()
+        .skip(1)
+        .map(|a| {
+            let p = Path::new(&a);
+            match &cwd {
+                Some(dir) if p.is_relative() && p.exists() => dir.join(p).into_os_string(),
+                _ => a,
+            }
+        })
+        .collect()
 }
 
 /// The one name a device goes by: symlinks resolved and Windows drive paths spelled

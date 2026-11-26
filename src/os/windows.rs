@@ -259,8 +259,8 @@ pub fn request_elevation() -> Result<()> {
     // A file-association launch carries the image path in argv (R14); the
     // elevated instance must see it or the double-clicked file is lost.
     let params = join_cmdline_args(
-        env::args_os()
-            .skip(1)
+        super::args_for_relaunch()
+            .into_iter()
             .map(|a| a.to_string_lossy().into_owned()),
     );
     let params_wide = params.as_deref().map(to_wide);

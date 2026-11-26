@@ -1325,13 +1325,8 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
 /// Never uses `O_EXLOCK`, which is unreliable on raw character devices and
 /// causes intermittent `EBUSY` errors even after a successful unmount.
 fn open_device(path: &str, flags: libc::c_int) -> Result<File> {
-    // Only escalate when escalation can actually work. Under `sudo` the old
-    // unconditional authopen-first forked a helper that waited on a dialog no
-    // terminal session can show, and the parent blocked in recvmsg behind it —
-    // the process just appeared to hang.
-    // Goes through the same descriptor cache as the read path, so a restore
-    // that follows an inspect (or any second operation on the device) reuses
-    // the first prompt's descriptor instead of raising another dialog.
+    // Escalate only where a dialog can show (under sudo it hung), through the read path's
+    // cache so a restore after an inspect reuses the first prompt's descriptor.
     match authopen_blocked_reason() {
         Some(reason) => log::info!("skipping authopen for {path}: {reason}"),
         None => match cached_authopen(path, flags).and_then(|d| Ok(d.dup_as_file()?)) {
@@ -1543,13 +1538,8 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
             } else if flags == libc::O_RDONLY {
                 log::info!("{raw_device} still has a volume mounted; escalating read-only");
             }
-            // `busy` is unknowable here: the probe loop breaks on EACCES before
-            // it can learn whether the device is also busy, so a read-write
-            // request can be refused *after* the user has already authenticated
-            // — authopen authorises, then its own open(2) returns EBUSY and it
-            // exits non-zero. Reading is what was asked for, so fall back to
-            // read-only rather than failing outright. A cancelled dialog is
-            // the user's answer, though: no second prompt for it (R11).
+            // A read-write grant can still fail on EBUSY inside authopen; reading is what was
+            // asked for, so retry read-only, unless the dialog was cancelled (R11).
             let shared = match cached_authopen(&raw_device, flags) {
                 Ok(s) => s,
                 Err(e) if flags != libc::O_RDONLY && !is_authorization_cancelled(&e) => {
