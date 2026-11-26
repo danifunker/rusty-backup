@@ -521,8 +521,8 @@ pub fn build_wrap_overlay(
     //    against a fixed-size window over the head. The fixed-size slice means
     //    a patcher that tried to write past the window (e.g. an NTFS end-of-
     //    volume backup) would error rather than silently grow the buffer; in
-    //    practice the FAT patcher patches NTFS's `hidden_sectors` first, so the
-    //    NTFS patcher then no-ops and never reaches for the volume tail.
+    //    practice the FAT patcher patches NTFS's `hidden_sectors`; the head-only
+    //    variant leaves the NTFS volume-tail backup to the overlay below.
     let head_len = ((WRAP_HEAD_PROBE as u64).min(source_size) as usize / 512 * 512)
         .max(512)
         .min(source_head.len());
@@ -530,8 +530,20 @@ pub fn build_wrap_overlay(
     {
         let mut log = |_: &str| {};
         let mut cur = Cursor::new(&mut head[..]);
-        patch_hidden_sectors_for(&mut cur, 0, first_lba, &mut log)
+        crate::fs::patch_hidden_sectors_head_only(&mut cur, 0, first_lba, &mut log)
             .context("patching wrapped VBR hidden_sectors for overlay")?;
+    }
+    // NTFS keeps a copy of its boot sector after TotalSectors; it takes the patch too (FSG-005).
+    if head.get(3..11) == Some(b"NTFS    ".as_slice()) {
+        let bps = u64::from(u16::from_le_bytes([head[11], head[12]]));
+        let total = u64::from_le_bytes(head[0x28..0x30].try_into().unwrap_or([0; 8]));
+        let fits = bps >= 512 && bps as usize <= head.len();
+        let at = total
+            .checked_mul(bps)
+            .filter(|&o| fits && o + bps <= source_size);
+        if let Some(at) = at {
+            fixed.push((first_byte + at, head[..bps as usize].to_vec()));
+        }
     }
     fixed.push((first_byte, head));
 
@@ -892,7 +904,8 @@ mod tests {
         // MBR + NTFS. total_sectors set so the backup boot sector overlay fires.
         {
             let fs_size = 4 * ONE_MIB;
-            let total = fs_size / 512;
+            // NTFS counts the partition minus the backup boot sector in its last sector.
+            let total = fs_size / 512 - 1;
             let mut vbr = ntfs_vbr_sector(0);
             vbr[0x28..0x30].copy_from_slice(&total.to_le_bytes());
             let src = make_source(vbr, fs_size);
@@ -935,7 +948,8 @@ mod tests {
         // GPT + NTFS: protective MBR + primary GPT at front, backup GPT at end.
         {
             let fs_size = 4 * ONE_MIB;
-            let total = fs_size / 512;
+            // NTFS counts the partition minus the backup boot sector in its last sector.
+            let total = fs_size / 512 - 1;
             let mut vbr = ntfs_vbr_sector(0);
             vbr[0x28..0x30].copy_from_slice(&total.to_le_bytes());
             let src = make_source(vbr, fs_size);

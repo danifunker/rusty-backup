@@ -640,6 +640,9 @@ fn crc32_of_file(path: &Path) -> Result<u32> {
 /// checksum is informational — restore doesn't re-verify it).
 fn fill_partition_checksums(staging: &Path) -> Result<()> {
     let meta_path = staging.join("metadata.json");
+    if std::fs::metadata(&meta_path).map_or(true, |m| m.len() > 16 << 20) {
+        return Ok(());
+    }
     let Ok(data) = std::fs::read_to_string(&meta_path) else {
         return Ok(());
     };
@@ -708,9 +711,15 @@ pub(crate) fn compare_to_prior_cbk(
         let Some(member) = members.iter().find(|m| m.name == member_name) else {
             continue; // prior backup had no manifest for this partition
         };
+        // A client sends these; one sized like a partition would fill the daemon's RAM (RMT-009).
+        const MANIFEST_MAX: u64 = 16 << 20;
+        if std::fs::metadata(path)?.len() > MANIFEST_MAX {
+            continue;
+        }
         let new_bytes = std::fs::read(path)?;
         let mut prior_bytes = Vec::new();
         crate::rbformats::cbk::cbk_member_content_reader(prior_cbk, member)?
+            .take(MANIFEST_MAX)
             .read_to_end(&mut prior_bytes)?;
 
         let (Ok(new_m), Ok(prior_m)) = (
@@ -1152,7 +1161,7 @@ fn handle_conn(
                 Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
             },
 
-            Request::WriteHostFile { path, force, .. } => {
+            Request::WriteHostFile { path, force, size } => {
                 // The body follows as a chunk stream and MUST be consumed on
                 // every path (read-only refusal, sandbox error, or success) or
                 // the framing desyncs. `host_write_target` resolves + opens the
@@ -1166,12 +1175,27 @@ fn handle_conn(
                     host_write_target(root, &path, force)
                 };
                 match target {
-                    Ok(mut f) => {
-                        read_chunks(&mut reader, &mut f)
-                            .map_err(|e| anyhow!("writing host file {path}: {e}"))?;
-                        f.flush()
-                            .map_err(|e| anyhow!("flushing host file {path}: {e}"))?;
-                        write_control(&mut writer, &Response::Ok)?;
+                    // Written beside the target and renamed over it only when whole: truncating
+                    // first lost the original to an aborted or short upload (RMT-010).
+                    Ok((mut f, part, full)) => {
+                        let got = read_chunks(&mut reader, &mut f).map_err(|e| {
+                            let _ = std::fs::remove_file(&part);
+                            anyhow!("writing host file {path}: {e}")
+                        })?;
+                        let done = f.flush().map_err(|e| anyhow!("{e}")).and_then(|_| {
+                            if got != size {
+                                bail!("{path}: {size} byte(s) announced, {got} arrived");
+                            }
+                            drop(f);
+                            std::fs::rename(&part, &full).context("moving the upload into place")
+                        });
+                        match done {
+                            Ok(()) => write_control(&mut writer, &Response::Ok)?,
+                            Err(e) => {
+                                let _ = std::fs::remove_file(&part);
+                                reply_err(&mut writer, format!("{e:#}"))?;
+                            }
+                        }
                     }
                     Err(e) => {
                         let _ = read_chunks(&mut reader, &mut std::io::sink());
@@ -1474,7 +1498,6 @@ fn handle_conn(
     }
 }
 
-/// Send an `Error` control frame.
 /// Run `f` as a job on this thread's behalf and wait for it (the engine wants a `JobCtx`).
 fn in_job<R: Send + 'static>(
     what: &str,
@@ -1560,6 +1583,7 @@ fn resize_image<W: std::io::Write>(
     Ok(())
 }
 
+/// Send an `Error` control frame.
 fn reply_err<W: std::io::Write>(writer: &mut W, message: String) -> Result<()> {
     write_control(writer, &Response::Error { message })?;
     Ok(())
@@ -2315,7 +2339,11 @@ fn mkdir_host(root: &Path, rel: &str) -> Result<()> {
 /// path escapes the sandbox, its parent is missing, it is an existing directory,
 /// or it already exists and `force` is false — the caller drains the body on
 /// that failure to keep the stream framed.
-fn host_write_target(root: &Path, rel: &str, force: bool) -> Result<std::fs::File> {
+fn host_write_target(
+    root: &Path,
+    rel: &str,
+    force: bool,
+) -> Result<(std::fs::File, PathBuf, PathBuf)> {
     let full = sandbox_join_create(root, rel)?;
     if full.is_dir() {
         bail!("{rel} is a directory");
@@ -2323,7 +2351,13 @@ fn host_write_target(root: &Path, rel: &str, force: bool) -> Result<std::fs::Fil
     if full.exists() && !force {
         bail!("{rel} already exists");
     }
-    std::fs::File::create(&full).with_context(|| format!("creating host file {rel}"))
+    let name = full
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let part = full.with_file_name(format!(".{name}.rb-part"));
+    let f = std::fs::File::create(&part).with_context(|| format!("creating host file {rel}"))?;
+    Ok((f, part, full))
 }
 
 /// Like `sandbox_join` but allows the root itself (empty `rel`) — for browsing

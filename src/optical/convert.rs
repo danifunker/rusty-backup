@@ -71,7 +71,20 @@ pub fn iso_to_bincue(
     let iso_file = File::open(iso_path)
         .with_context(|| format!("Failed to open ISO: {}", iso_path.display()))?;
     let iso_size = iso_file.metadata()?.len();
+    // A CD's MSF header counts to 99:59:74, and a partial last sector would be dropped (OPT-013).
+    if iso_size % 2048 != 0 {
+        bail!(
+            "{} is not a whole number of 2048-byte sectors",
+            iso_path.display()
+        );
+    }
     let sector_count = iso_size / 2048;
+    if sector_count + 150 > 100 * 60 * 75 {
+        bail!(
+            "{} is longer than a CD can address (99:59:74)",
+            iso_path.display()
+        );
+    }
 
     if let Ok(mut p) = progress.lock() {
         p.total_bytes = sector_count * 2352;

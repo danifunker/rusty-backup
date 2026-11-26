@@ -188,6 +188,11 @@ pub fn run_rip(config: RipConfig, progress: Arc<Mutex<RipProgress>>) -> Result<(
     };
 
     if let Err(ref e) = result {
+        // A cut-short rip left an image that opened as a good one (OPT-016).
+        let _ = std::fs::remove_file(&config.output_path);
+        if config.format == RipFormat::BinCue {
+            let _ = std::fs::remove_file(config.output_path.with_extension("bin"));
+        }
         if let Ok(mut p) = progress.lock() {
             p.error = Some(format!("{e:#}"));
             p.finished = true;
@@ -313,14 +318,22 @@ fn rip_iso(
     );
 
     // Find the first data track
-    let first_data = toc
+    let pos = toc
         .tracks
         .iter()
-        .find(|t| !t.is_audio)
+        .position(|t| !t.is_audio)
         .context("No data tracks found on disc")?;
+    let first_data = &toc.tracks[pos];
 
     let start_lba = first_data.start_lba;
-    let total_sectors = toc.leadout_lba - start_lba;
+    // The data track ends where the next begins, less the 2 s gap ahead of an audio track:
+    // reading to the lead-out hit a mixed-mode disc's audio as Mode 1 and failed (OPT-005).
+    let end_lba = match toc.tracks.get(pos + 1) {
+        Some(next) if next.is_audio => next.start_lba.saturating_sub(150).max(start_lba),
+        Some(next) => next.start_lba,
+        None => toc.leadout_lba,
+    };
+    let total_sectors = end_lba - start_lba;
     let sector_size = SectorReadFormat::Mode1Cooked.sector_size() as u64;
     let total_bytes = total_sectors as u64 * sector_size;
 
@@ -329,7 +342,7 @@ fn rip_iso(
         LogLevel::Info,
         format!(
             "Ripping data track: LBA {start_lba} - {}, {total_sectors} sectors ({:.1} MB)",
-            toc.leadout_lba,
+            end_lba,
             total_bytes as f64 / 1_048_576.0
         ),
     );
@@ -357,6 +370,13 @@ fn rip_iso(
         let data = source
             .read_data_sectors(lba, count, SectorReadFormat::Mode1Cooked)
             .with_context(|| format!("Read error at LBA {lba}"))?;
+        // A short reply (a remote daemon's word) would drop sectors and still count them (OPT-009).
+        if data.len() as u64 != count as u64 * sector_size {
+            bail!(
+                "read at LBA {lba} returned {} bytes for {count} sectors",
+                data.len()
+            );
+        }
 
         out.write_all(&data)
             .with_context(|| "Failed to write ISO data")?;
@@ -470,6 +490,12 @@ fn rip_bin_cue(
             let data = source
                 .read_data_sectors(lba, count, mode)
                 .with_context(|| format!("Read error at LBA {lba} (track {})", track.number))?;
+            if data.len() != count as usize * 2352 {
+                bail!(
+                    "read at LBA {lba} returned {} bytes for {count} sectors",
+                    data.len()
+                );
+            }
 
             bin_file
                 .write_all(&data)

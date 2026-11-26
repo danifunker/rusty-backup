@@ -117,8 +117,22 @@ pub fn patch_hidden_sectors_for(
     start_lba: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> anyhow::Result<()> {
-    fat::patch_bpb_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
+    // NTFS first: the FAT patcher also takes its BPB and left the backup boot sector stale (FSG-005).
     ntfs::patch_ntfs_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
+    exfat::patch_exfat_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
+    fat::patch_bpb_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
+    Ok(())
+}
+
+/// [`patch_hidden_sectors_for`] over a boot-sector window only: the FAT patcher covers NTFS's
+/// primary sector, and the caller lays the NTFS backup sector down itself.
+pub fn patch_hidden_sectors_head_only(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    start_lba: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    fat::patch_bpb_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
     exfat::patch_exfat_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
     Ok(())
 }
@@ -232,12 +246,15 @@ pub fn resize_filesystem_for(
     let new_sectors_u32 = u32::try_from(new_size_bytes / bps).unwrap_or(u32::MAX);
     let new_sectors_u64 = new_size_bytes / bps;
     let exfat_sectors = new_size_bytes / exfat_bps;
+    // Read before any resizer writes: HFS and ext check only a 2-byte magic at +1024, which a
+    // FAT's own table can hold, so they run only on the volume detection names (FSG-002).
+    let detected = detect_filesystem_type(file, partition_offset);
     // FAT says it declined only through its bool, so a shrink it refused is caught here.
     let fat_resized = fat::resize_fat_in_place(file, partition_offset, new_sectors_u32, log_cb)?;
     if fat_resized {
         recount_fat32_free(file, partition_offset, log_cb)?;
     }
-    if !fat_resized && detect_filesystem_type(file, partition_offset) == "fat" {
+    if !fat_resized && detected == "fat" {
         let declared = fat_declared_bytes(file, partition_offset)?;
         if declared > new_size_bytes {
             anyhow::bail!(
@@ -256,11 +273,14 @@ pub fn resize_filesystem_for(
     exfat::resize_exfat_in_place(file, partition_offset, exfat_sectors, log_cb)?;
     grow_exfat_past_its_fat(file, partition_offset, new_size_bytes, log_cb)?;
     // The classic resizer would rewrite a wrapper's MDB and leave the HFS+ inside untouched.
-    if !wrapped_hfsplus_guard(file, partition_offset, new_size_bytes, log_cb)? {
+    let mac = matches!(detected, "hfs" | "hfsplus");
+    if mac && !wrapped_hfsplus_guard(file, partition_offset, new_size_bytes, log_cb)? {
         hfs::resize_hfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
         hfsplus::resize_hfsplus_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     }
-    ext::resize_ext_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    if detected == "ext" {
+        ext::resize_ext_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    }
     btrfs::resize_btrfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     sfs::resize_sfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     pfs3::resize_pfs3_in_place(file, partition_offset, new_size_bytes, log_cb)?;
@@ -4066,10 +4086,11 @@ pub fn fit_apple_volume_to_partition(
     if partition_len < 2048 {
         return Ok(());
     }
+    // A whole sector: a 2-byte read at +1024 fails on a raw device (FSG-009).
     device.seek(SeekFrom::Start(partition_offset + 1024))?;
-    let mut sig = [0u8; 2];
-    device.read_exact(&mut sig)?;
-    match u16::from_be_bytes(sig) {
+    let mut sector = [0u8; 512];
+    device.read_exact(&mut sector)?;
+    match u16::from_be_bytes([sector[0], sector[1]]) {
         0x482B | 0x4858 => {
             hfsplus::mirror_alternate_volume_header(device, partition_offset, partition_len, log)?;
         }

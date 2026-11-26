@@ -66,8 +66,12 @@ impl RemoteConnection {
 
     /// A cheap round trip that proves the daemon still answers; a refusal counts as alive.
     pub fn heartbeat(&mut self) -> bool {
-        let _ = self.session.host_stat("/");
-        self.session.lost().is_none()
+        // A refusal is a reply; an I/O error (a write that hit a reset) is a dead daemon (RMT-014).
+        let io_failed = match self.session.host_stat("/") {
+            Ok(_) => false,
+            Err(e) => e.chain().any(|c| c.is::<std::io::Error>()),
+        };
+        !io_failed && self.session.lost().is_none()
     }
 
     /// The daemon offers Resize Image (it is writable and new enough).

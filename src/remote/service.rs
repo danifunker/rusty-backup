@@ -337,7 +337,11 @@ impl ServicePaths {
     /// then launch with the service arg, so a missing binary degrades to a
     /// no-op boot rather than an error.
     fn startup_cmd(&self) -> String {
-        let exe = self.exe.display();
+        // Quoted: a path with a space or shell metacharacter broke the boot script (RMT-020).
+        let exe = format!(
+            "'{}'",
+            self.exe.display().to_string().replace('\'', r"'\''")
+        );
         format!("[[ -e {exe} ]] && {exe} serve service start")
     }
 }
