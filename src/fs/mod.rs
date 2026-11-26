@@ -117,22 +117,8 @@ pub fn patch_hidden_sectors_for(
     start_lba: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> anyhow::Result<()> {
-    // NTFS first: the FAT patcher also takes its BPB and left the backup boot sector stale (FSG-005).
+    fat::patch_bpb_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
     ntfs::patch_ntfs_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
-    exfat::patch_exfat_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
-    fat::patch_bpb_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
-    Ok(())
-}
-
-/// [`patch_hidden_sectors_for`] over a boot-sector window only: the FAT patcher covers NTFS's
-/// primary sector, and the caller lays the NTFS backup sector down itself.
-pub fn patch_hidden_sectors_head_only(
-    file: &mut (impl Read + Write + Seek),
-    partition_offset: u64,
-    start_lba: u64,
-    log_cb: &mut impl FnMut(&str),
-) -> anyhow::Result<()> {
-    fat::patch_bpb_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
     exfat::patch_exfat_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
     Ok(())
 }

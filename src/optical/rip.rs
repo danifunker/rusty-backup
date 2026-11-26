@@ -182,16 +182,24 @@ pub fn run_rip(config: RipConfig, progress: Arc<Mutex<RipProgress>>) -> Result<(
         }
     };
 
+    let mut outputs = vec![config.output_path.clone()];
+    if config.format == RipFormat::BinCue {
+        outputs.push(config.output_path.with_extension("bin"));
+    }
+    let stamp = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let before: Vec<_> = outputs.iter().map(|p| stamp(p)).collect();
     let result = match config.format {
         RipFormat::Iso => rip_iso(&config, source.as_ref(), &progress),
         RipFormat::BinCue => rip_bin_cue(&config, source.as_ref(), &progress),
     };
 
     if let Err(ref e) = result {
-        // A cut-short rip left an image that opened as a good one (OPT-016).
-        let _ = std::fs::remove_file(&config.output_path);
-        if config.format == RipFormat::BinCue {
-            let _ = std::fs::remove_file(config.output_path.with_extension("bin"));
+        // A cut-short rip left an image that opened as a good one (OPT-016); one this rip
+        // never touched (a bad TOC, say) is a previous good rip and stays.
+        for (p, was) in outputs.iter().zip(&before) {
+            if stamp(p).is_some() && stamp(p) != *was {
+                let _ = std::fs::remove_file(p);
+            }
         }
         if let Ok(mut p) = progress.lock() {
             p.error = Some(format!("{e:#}"));

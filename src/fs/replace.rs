@@ -153,7 +153,32 @@ pub fn create_or_replace(
     preserved.apply_to_options(&mut opts);
 
     let taken: Vec<String> = siblings.iter().map(|e| e.name.clone()).collect();
-    let staged = staged_replace(efs, parent, name, &existing, data, data_len, &opts, &taken)?;
+    // Spooled so a fallback can read the contents again; step 1 already consumed `data`.
+    let mut spool = tempfile::spooled_tempfile(8 << 20);
+    std::io::copy(data, &mut spool).map_err(FilesystemError::Io)?;
+    let rewind = |s: &mut tempfile::SpooledTempFile| {
+        use std::io::Seek;
+        s.seek(std::io::SeekFrom::Start(0))
+            .map(|_| ())
+            .map_err(FilesystemError::Io)
+    };
+    rewind(&mut spool)?;
+    // Deleting first is safe only when the new copy fits where the old one was (FSX-001).
+    let fits_in_place = efs
+        .free_space()
+        .is_ok_and(|free| free.saturating_add(existing.size) >= data_len);
+    let staged = staged_replace(
+        efs,
+        parent,
+        name,
+        &existing,
+        &mut spool,
+        data_len,
+        &opts,
+        &taken,
+        fits_in_place,
+    )?;
+    rewind(&mut spool)?;
 
     // Whether the crash-safe path was available is known here and nowhere else:
     // `staged_replace` returns `None` precisely when it declined.
@@ -164,7 +189,7 @@ pub fn create_or_replace(
             // No usable rename: the original has to go first. This is the old
             // behaviour, and the window where a failure loses the file.
             efs.delete_entry(parent, &existing)?;
-            efs.create_file(parent, name, data, data_len, &opts)?
+            efs.create_file(parent, name, &mut spool, data_len, &opts)?
         }
     };
 
@@ -201,6 +226,7 @@ fn staged_replace(
     data_len: u64,
     opts: &CreateFileOptions,
     taken: &[String],
+    fits_in_place: bool,
 ) -> Result<Option<FileEntry>, FilesystemError> {
     let Some(tmp_new) = temp_name(taken, 0) else {
         return Ok(None);
@@ -209,13 +235,13 @@ fn staged_replace(
         return Ok(None);
     };
 
-    // 1. New contents under a temp name. A failure here (disk full, a bad read) already consumed
-    // the source, so the fallback would delete the original for nothing (FSX-001).
+    // 1. New contents under a temp name. Both copies may not fit (a full directory or disk):
+    // fall back to delete-then-create only when the new one fits in the old one's place (FSX-001).
     let staged = match efs.create_file(parent, &tmp_new, data, data_len, opts) {
         Ok(e) => e,
         Err(e) => {
             let _ = current_entry(efs, parent, &tmp_new).map(|t| efs.delete_entry(parent, &t));
-            return Err(e);
+            return if fits_in_place { Ok(None) } else { Err(e) };
         }
     };
 
@@ -323,6 +349,18 @@ mod tests {
             .find(|e| e.name.eq_ignore_ascii_case(name))
             .expect("entry present");
         fs.read_file(&entry, usize::MAX).expect("read")
+    }
+
+    /// Review of FSX-001: when both copies can't coexist but the new one fits the old one's
+    /// place, the replace still goes through, as delete-then-create did.
+    #[test]
+    fn a_replace_on_a_nearly_full_volume_still_works() {
+        let mut fs = blank();
+        let old = vec![1u8; 2600 * 1024];
+        put(&mut fs, "A.BIN", &old, OnConflict::Fail);
+        let new = vec![2u8; 2600 * 1024];
+        put(&mut fs, "A.BIN", &new, OnConflict::Replace);
+        assert_eq!(read_back(&mut fs, "A.BIN"), new);
     }
 
     /// FSX-001: a staged write that ran out of space fell back, deleting the original.

@@ -421,7 +421,6 @@ fn export_zip_file(
     Ok(summary)
 }
 
-/// One zip path component: a Mac name may hold a slash or backslash, which would nest or escape.
 /// `rel`'s folders under `dest`, each a legal host name: a folder called `..` or `C:` on the image
 /// would otherwise land outside the chosen folder (FSX-003).
 fn host_subdir(dest: &Path, rel: &str) -> std::path::PathBuf {
@@ -432,6 +431,7 @@ fn host_subdir(dest: &Path, rel: &str) -> std::path::PathBuf {
         })
 }
 
+/// One zip path component: a Mac name may hold a slash or backslash, which would nest or escape.
 fn zip_component(name: &str) -> String {
     let c: String = name
         .chars()

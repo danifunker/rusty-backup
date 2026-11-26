@@ -1187,6 +1187,10 @@ fn handle_conn(
                                 bail!("{path}: {size} byte(s) announced, {got} arrived");
                             }
                             drop(f);
+                            // A replaced file keeps its permissions (an executable stays one).
+                            if let Ok(meta) = std::fs::metadata(&full) {
+                                let _ = std::fs::set_permissions(&part, meta.permissions());
+                            }
                             std::fs::rename(&part, &full).context("moving the upload into place")
                         });
                         match done {
@@ -2356,6 +2360,9 @@ fn host_write_target(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let part = full.with_file_name(format!(".{name}.rb-part"));
+    if std::fs::symlink_metadata(&part).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!("{rel}: a symlink sits where the upload is staged");
+    }
     let f = std::fs::File::create(&part).with_context(|| format!("creating host file {rel}"))?;
     Ok((f, part, full))
 }
