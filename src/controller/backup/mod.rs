@@ -714,21 +714,20 @@ impl BackupController {
         if self.name.trim().is_empty() {
             return Err("Enter a backup name.".into());
         }
-        // The folder is created with `create_dir_all` and a whole-disk VHD truncated, so an
-        // earlier backup of the same name would be written over (CWR-010).
-        if let Some(dest) = self.destination.as_deref() {
-            // The name as the run uses it (`build_config`, `<name>.vhd`), untrimmed.
-            let name = self.name.as_str();
-            let folder = dest.join(name);
-            let used = std::fs::read_dir(&folder).is_ok_and(|mut d| d.next().is_some());
-            if used || dest.join(format!("{name}.vhd")).exists() {
-                return Err(format!("{name} already exists there; choose another name."));
-            }
-        }
         if self.has_partitions() && self.found.selected.is_empty() {
             return Err("Select at least one partition.".into());
         }
         Ok(())
+    }
+
+    /// Why Start would write over an earlier backup: the folder is created with `create_dir_all`
+    /// and a whole-disk VHD truncated (CWR-010). Checked at Start, not every frame.
+    pub(super) fn name_taken(&self) -> Option<String> {
+        let dest = self.destination.as_deref()?;
+        let name = self.name.as_str();
+        let used = std::fs::read_dir(dest.join(name)).is_ok_and(|mut d| d.next().is_some());
+        (used || dest.join(format!("{name}.vhd")).exists())
+            .then(|| format!("{name} already exists there; choose another name."))
     }
 
     // --- the VHD window -----------------------------------------------------------------

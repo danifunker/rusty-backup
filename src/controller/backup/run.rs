@@ -152,6 +152,14 @@ impl BackupController {
             self.run.last = Some(Err(e));
             return;
         }
+        if let Some(e) = self.name_taken() {
+            self.warn(e.as_str());
+            // A repeated Start after a backup that just finished leaves its "complete" shown.
+            if !matches!(self.run.last, Some(Ok(()))) {
+                self.run.last = Some(Err(e));
+            }
+            return;
+        }
         self.run.last = None;
         if !self.src.idle() {
             self.info("Waiting for the source to be read before starting...");
