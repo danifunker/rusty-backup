@@ -418,7 +418,7 @@ impl CommanderController {
             }
             M::OpenNested(path) => self.open_nested(&path),
             // A reopen during a mode job (a flatten, a compress) reopened what it just let go (CCM-013).
-            M::ShowDeleted(_) | M::CarveFullScan(_) | M::UpgradeSeekable(_) if self.mode_busy() => {
+            M::ShowDeleted(_) | M::CarveFullScan(_) if self.mode_busy() => {
                 self.modes.notice = Some("Wait for the running step to finish.".into());
                 Vec::new()
             }
@@ -975,10 +975,9 @@ impl CommanderController {
             return;
         }
         let session = self.modes.session.clone();
-        // It opens the image editable, so it holds the image like an apply does (CCM-016).
         let spawned = self.jobs.spawn(
             "Free space",
-            self.left.source_resources(),
+            Vec::new(),
             Arc::clone(&self.notify),
             move |_| {
                 let opened = session.open_editable().ok();

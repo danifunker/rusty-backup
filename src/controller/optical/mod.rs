@@ -630,7 +630,6 @@ impl OpticalController {
         }
     }
 
-    /// The source changed: close the browser, detect the new disc, reload the player.
     fn drop_chd_info(&mut self) {
         if let Some(job) = self.chd_info_job.take() {
             job.cancel();
@@ -638,6 +637,7 @@ impl OpticalController {
         self.chd_info = None;
     }
 
+    /// The source changed: close the browser, detect the new disc, reload the player.
     fn source_changed(&mut self) {
         // CHD Info for the previous image must not open over the new one (CIN-015).
         self.drop_chd_info();

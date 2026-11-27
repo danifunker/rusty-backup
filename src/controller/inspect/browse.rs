@@ -24,8 +24,6 @@ pub(super) struct BrowseState {
     build: Option<(usize, PathBuf, Job<()>)>,
     /// The partition last handed to the browse view, for its partition switcher.
     browsing: Option<usize>,
-    /// The partition a Browse is opening; it becomes `browsing` only once the view gets it (CIN-010).
-    opening: Option<usize>,
 }
 
 impl BrowseState {
@@ -79,13 +77,13 @@ impl InspectController {
 
     fn open_browse(
         &mut self,
+        index: usize,
         session: BrowseSession,
         edit: BrowseEdit,
         label_prefix: Option<String>,
     ) {
-        if let Some(index) = self.browse.opening.take() {
-            self.browse.browsing = Some(index);
-        }
+        // Set only as the view gets its session, for the partition it is (CIN-010).
+        self.browse.browsing = Some(index);
         let backup_folder = self.found.chd_backup.as_ref().map(|(f, _)| f.clone());
         self.requests
             .push(HostRequest::OpenBrowse(Box::new(BrowseOpen {
@@ -100,7 +98,6 @@ impl InspectController {
         let Some(part) = self.listed().find(|p| p.index == index).cloned() else {
             return;
         };
-        self.browse.opening = Some(index);
         let offset = part.byte_offset();
         let ptype = Self::effective_type(&part);
         let type_string = part.partition_type_string.clone();
@@ -120,7 +117,7 @@ impl InspectController {
                 ..Default::default()
             };
             // A remote image edits over a read-write block reader, like a local one.
-            self.open_browse(session, BrowseEdit::InPlace, prefix);
+            self.open_browse(index, session, BrowseEdit::InPlace, prefix);
             return;
         }
 
@@ -146,7 +143,7 @@ impl InspectController {
                 preopen_file: preopen,
                 ..Default::default()
             };
-            self.open_browse(session, BrowseEdit::InPlace, prefix);
+            self.open_browse(index, session, BrowseEdit::InPlace, prefix);
             return;
         }
 
@@ -204,7 +201,7 @@ impl InspectController {
                     index + 1,
                     meta.compression_type
                 ));
-                self.open_browse(session, edit, None);
+                self.open_browse(index, session, edit, None);
             }
             // These only fail on a real error (a missing or split data file).
             Err(e) => match meta.compression_type.as_str() {
@@ -245,6 +242,7 @@ impl InspectController {
                     index + 1
                 ));
                 self.open_browse(
+                    index,
                     BrowseSession::partclone(cache, ptype),
                     BrowseEdit::ReadOnly,
                     None,
@@ -298,7 +296,7 @@ impl InspectController {
                     partition_type_string: type_string,
                     ..Default::default()
                 };
-                self.open_browse(session, edit, None);
+                self.open_browse(index, session, edit, None);
                 return;
             }
             // Deleted or stale since: build it again.
@@ -312,7 +310,7 @@ impl InspectController {
             "Opening partition {index} via streaming reader (seekable cache building in background)...",
         ));
         match BrowseSession::streaming(data.as_path(), ptype, type_string) {
-            Ok(session) => self.open_browse(session, edit, None),
+            Ok(session) => self.open_browse(index, session, edit, None),
             Err(e) => {
                 self.requests.push(HostRequest::CloseBrowse);
                 self.error(e);
@@ -342,6 +340,7 @@ impl InspectController {
                     self.info(format!("Metadata scan complete for partition {index}."));
                     self.browse.caches.insert(index, Arc::clone(&cache));
                     self.open_browse(
+                        index,
                         BrowseSession::partclone(cache, ptype),
                         BrowseEdit::ReadOnly,
                         None,

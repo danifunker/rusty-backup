@@ -291,7 +291,7 @@ impl CommanderController {
         }
         if let Some(r) = pane.apply_report() {
             // In Edit Mode the left pane's retry goes through the mode apply, so its save follows (CCM-024).
-            let via_mode = side == Side::Left && self.modes_active();
+            let via_mode = side == Side::Left && self.edit_mode();
             out.push(report_window(side, r, pane.queue.len(), via_mode));
         }
         if pane.edits_shown() {
