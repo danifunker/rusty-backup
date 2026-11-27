@@ -155,6 +155,8 @@ pub(super) struct EditState {
     loss_accepted: bool,
     /// That question is on screen; a caller waiting on the apply keeps waiting.
     loss_asking: bool,
+    /// Edits a copy staged while the queue was locked, staged once the apply ends.
+    held: Vec<StagedEdit>,
 }
 
 impl EditState {
@@ -171,6 +173,7 @@ impl EditState {
             log: Vec::new(),
             loss_accepted: false,
             loss_asking: false,
+            held: Vec::new(),
         }
     }
 
@@ -352,10 +355,16 @@ impl BrowserPaneController {
     }
 
     /// True when a copy can land here (a host folder writes now, an image stages).
+    /// A check, write or review works from the queue now, so nothing may change it.
+    pub fn queue_locked(&self) -> bool {
+        self.checking().is_some() || self.applying().is_some() || self.apply_review().is_some()
+    }
+
     pub fn can_receive(&self) -> bool {
         !self.profile.read_only
             && self.listing.is_loaded()
             && !self.is_busy()
+            && !self.queue_locked()
             && !self.is_backup()
             && !self.is_archive()
     }
@@ -535,6 +544,21 @@ impl BrowserPaneController {
 
     /// Push a copy batch onto the queue, renaming names this volume cannot hold.
     pub fn stage_edits(&mut self, mut edits: Vec<StagedEdit>) -> StageOutcome {
+        // A copy landing mid-apply waits; staging it then shifted the write's indices (CBR-006).
+        if self.queue_locked() {
+            self.ed.log.push(format!(
+                "{} edit(s) held until the apply ends.",
+                edits.len()
+            ));
+            self.ed.held.append(&mut edits);
+            return StageOutcome {
+                staged: 0,
+                queue_start: self.queue.len(),
+                fs_type: self.volume().fs_type.clone(),
+                renamed: Vec::new(),
+                dropped: Vec::new(),
+            };
+        }
         let queue_start = self.queue.len();
         let target = self.target_folder();
         let target_path = target.map(|t| t.path).unwrap_or_default();
@@ -582,7 +606,7 @@ impl BrowserPaneController {
 
     /// Drop everything staged since `queue_start`; false while an apply holds the queue.
     pub fn unstage_since(&mut self, queue_start: usize) -> bool {
-        if self.is_busy() {
+        if self.is_busy() || self.queue_locked() {
             return false;
         }
         self.queue.truncate(queue_start);
@@ -668,7 +692,7 @@ impl BrowserPaneController {
             }
             A::Confirmed { purpose, yes } if purpose == purpose::DELETE_NOW => {
                 match self.ed.image_delete.take() {
-                    Some(pairs) if yes && !self.is_busy() => {
+                    Some(pairs) if yes && !self.is_busy() && !self.queue_locked() => {
                         self.toggle_delete(&pairs);
                         msg(format!("deleting {} item(s)...", pairs.len()))
                     }
@@ -677,7 +701,7 @@ impl BrowserPaneController {
             }
             A::Confirmed { purpose, yes } if purpose == purpose::DELETE_FOLDERS => {
                 match self.ed.image_delete.take() {
-                    Some(pairs) if yes && !self.is_busy() => {
+                    Some(pairs) if yes && !self.is_busy() && !self.queue_locked() => {
                         self.toggle_delete(&pairs);
                         msg(format!("toggled delete on {} item(s).", pairs.len()))
                     }
@@ -685,7 +709,7 @@ impl BrowserPaneController {
                 }
             }
             A::Confirmed { purpose, yes } if purpose == purpose::DISCARD_STAGED => {
-                if !yes || self.is_busy() {
+                if !yes || self.is_busy() || self.queue_locked() {
                     return Ok(Vec::new());
                 }
                 self.queue.clear();
@@ -1421,6 +1445,14 @@ impl BrowserPaneController {
     /// Installs finished edit jobs; called from `tick`.
     pub(super) fn poll_edits(&mut self) -> Vec<Effect> {
         let mut fx = self.poll_apply();
+        if !self.ed.held.is_empty() && !self.queue_locked() {
+            let held = std::mem::take(&mut self.ed.held);
+            let out = self.stage_edits(held);
+            fx.push(Effect::Message(format!(
+                "staged {} held edit(s).",
+                out.staged
+            )));
+        }
         fx.extend(self.poll_host());
         self.poll_wrapper();
         fx
@@ -1560,10 +1592,19 @@ mod tests {
         let review = vm.apply_review().expect("a review");
         assert_eq!(review.scan.conflicts.len(), 1);
         assert!(!vm.is_busy(), "a review waits on the user");
-        assert!(!vm.unstage_since(0) || vm.queue.is_empty());
+        // The queue is locked under the review: no unstaging, and a new copy is held back.
+        assert!(!vm.unstage_since(0));
+        let held = vm.stage_edits(commander_ops::stage_host_to_image(&root.entries, &cwd).edits);
+        assert_eq!(held.staged, 0);
         // Dismissing writes nothing; asking again and overwriting lands the copy.
-        vm.stage_edits(commander_ops::stage_host_to_image(&root.entries, &cwd).edits);
         vm.apply(A::DismissReview);
+        settle(&mut vm);
+        assert_eq!(
+            vm.queue.len(),
+            2,
+            "the held copy is staged once the review is gone"
+        );
+        vm.unstage_since(1);
         assert!(vm.apply_review().is_none());
         vm.apply(A::Apply);
         settle(&mut vm);

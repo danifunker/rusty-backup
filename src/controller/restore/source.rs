@@ -237,10 +237,8 @@ impl RestoreController {
         self.src.facts_probe = None;
         self.src.decode = None;
         if self.src.folder.as_deref() == Some(path.as_path())
-            && (self.src.loaded.is_some()
-                || self.src.load.is_some()
-                || self.src.load_error.is_some()
-                || self.src.load_deferred)
+            // A failed load is retried: the card may be mounted now (CWR-014).
+            && (self.src.loaded.is_some() || self.src.load.is_some() || self.src.load_deferred)
         {
             return;
         }
@@ -397,6 +395,11 @@ impl RestoreController {
     }
 
     pub(super) fn open_source_image(&mut self, path: PathBuf) {
+        // A running partition restore reads the decoded image; replacing it dropped it (CWR-009).
+        if self.is_running() {
+            self.warn("Wait for the restore to finish before changing the source.");
+            return;
+        }
         self.src.forget_backup();
         // A partition image is written as a flat sector stream, so wrapped images are decoded.
         if !crate::model::image_prep::needs_decoding(path.as_path(), true) {
@@ -465,6 +468,11 @@ impl RestoreController {
             self.mode = RestoreMode::FullDisk;
             self.open_backup(path);
         } else {
+            // Refused before the mode flips under a running restore (a folder waits instead).
+            if self.is_running() {
+                self.warn("Wait for the restore to finish before changing the source.");
+                return;
+            }
             self.mode = RestoreMode::SinglePartition;
             self.open_source_image(path);
         }

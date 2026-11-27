@@ -1240,7 +1240,9 @@ impl CommanderController {
 
     /// A copy needs a selection on the source, a ready destination and no copy in flight.
     pub fn can_copy(&self, from: Side) -> bool {
+        // Nor while a conflict question waits on the last copy (CCM-009).
         self.copy.is_none()
+            && self.conflict.is_none()
             && self.pane(from).has_selection()
             && self.pane(from.other()).can_receive()
     }

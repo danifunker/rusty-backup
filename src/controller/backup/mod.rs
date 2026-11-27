@@ -720,6 +720,16 @@ impl BackupController {
         Ok(())
     }
 
+    /// Why Start would write over an earlier backup: the folder is created with `create_dir_all`
+    /// and a whole-disk VHD truncated (CWR-010). Checked at Start, not every frame.
+    pub(super) fn name_taken(&self) -> Option<String> {
+        let dest = self.destination.as_deref()?;
+        let name = self.name.as_str();
+        let used = std::fs::read_dir(dest.join(name)).is_ok_and(|mut d| d.next().is_some());
+        (used || dest.join(format!("{name}.vhd")).exists())
+            .then(|| format!("{name} already exists there; choose another name."))
+    }
+
     // --- the VHD window -----------------------------------------------------------------
 
     pub fn vhd_open(&self) -> bool {
@@ -762,6 +772,17 @@ impl Controller for BackupController {
     type Action = BackupAction;
 
     fn apply(&mut self, action: BackupAction) -> Vec<Effect> {
+        // A running backup reads the decoded image; replacing the source dropped it (CWR-009).
+        let replaces = matches!(
+            action,
+            BackupAction::SelectDevice { .. }
+                | BackupAction::OpenImage { .. }
+                | BackupAction::CloseSource
+        ) || matches!(&action, BackupAction::Picked { purpose, .. } if *purpose == purpose::SOURCE_IMAGE);
+        if replaces && self.run.running() {
+            self.warn("Wait for the backup to finish before changing the source.");
+            return Vec::new();
+        }
         match action {
             BackupAction::SelectDevice { slot, device } => self.select_device(slot, device),
             BackupAction::OpenImage { path, rename } => self.open_image(path, rename),
