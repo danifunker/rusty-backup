@@ -60,6 +60,8 @@ pub(super) struct PendingExtract {
     from: Side,
     entry: FileEntry,
     options: ExtractOptions,
+    /// The pane's volume when asked; another one by pick time drops the extraction (CCM-018).
+    key: String,
 }
 
 impl CommanderController {
@@ -80,10 +82,12 @@ impl CommanderController {
             self.status = format!("Nothing to extract at '{path}'.");
             return Vec::new();
         };
+        let key = self.volume_key(from);
         self.extract = Some(PendingExtract {
             from,
             entry,
             options,
+            key,
         });
         if dest.is_some() {
             self.status = self.extract_picked(dest);
@@ -104,6 +108,7 @@ impl CommanderController {
             from,
             entry,
             options,
+            key,
         }) = self.extract.take()
         else {
             return String::new();
@@ -111,6 +116,12 @@ impl CommanderController {
         let Some(dest) = dest else {
             return "Extraction cancelled.".to_string();
         };
+        if self.volume_key(from) != key {
+            return format!(
+                "The {} pane changed while you chose; nothing was extracted.",
+                from.label()
+            );
+        }
         let pane = self.pane(from);
         let Some(source) = pane.base_stage_source() else {
             return "Source volume is not open.".to_string();

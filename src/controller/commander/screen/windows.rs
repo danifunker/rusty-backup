@@ -290,7 +290,9 @@ impl CommanderController {
             out.push(review_window(side, p));
         }
         if let Some(r) = pane.apply_report() {
-            out.push(report_window(side, r, pane.queue.len()));
+            // In Edit Mode the left pane's retry goes through the mode apply, so its save follows (CCM-024).
+            let via_mode = side == Side::Left && self.modes_active();
+            out.push(report_window(side, r, pane.queue.len(), via_mode));
         }
         if pane.edits_shown() {
             out.push(edits_window(side, &pane.edit_lines(), pane.is_busy()));
@@ -436,7 +438,8 @@ fn log_window(lines: &[String]) -> PaneWindow {
     let mut parts = vec![text(format!("{} operation(s) this session.", lines.len()))];
     parts.push(match lines.is_empty() {
         true => text(
-            "No operations yet. Applied edits, host copies / exports, and immediate host              deletes / renames / new folders are recorded here."
+            "No operations yet. Applied edits, host copies / exports, and immediate host \
+             deletes / renames / new folders are recorded here."
                 .into(),
         ),
         false => Part::Block(lines.join("\n")),
@@ -587,7 +590,7 @@ fn review_window(side: Side, p: &ApplyPreflight) -> PaneWindow {
     }
 }
 
-fn report_window(side: Side, r: &ApplyReport, still: usize) -> PaneWindow {
+fn report_window(side: Side, r: &ApplyReport, still: usize, via_mode: bool) -> PaneWindow {
     let mut parts = Vec::new();
     if let Some(fatal) = &r.fatal {
         parts.push(Part::Text(fatal.clone(), Tone::Error));
@@ -614,9 +617,13 @@ fn report_window(side: Side, r: &ApplyReport, still: usize) -> PaneWindow {
     let close = vec![pane(side, P::DismissReport)];
     let mut buttons = Vec::new();
     if still > 0 {
+        let apply = match via_mode {
+            true => A::Mode(ModeAction::Apply),
+            false => pane(side, P::Apply),
+        };
         buttons.push(WindowButton::send(
             "Retry",
-            vec![pane(side, P::DismissReport), pane(side, P::Apply)],
+            vec![pane(side, P::DismissReport), apply],
         ));
         buttons.push(WindowButton::send(
             "Discard remaining",

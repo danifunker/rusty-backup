@@ -221,10 +221,12 @@ impl CommanderController {
         let Some(notice) = self.rename_notice.take() else {
             return;
         };
-        let msg = if self
-            .pane_mut(notice.dest)
-            .unstage_since(notice.outcome.queue_start)
-        {
+        // Only while the queue still ends with exactly this copy: an apply or later edits moved it (CCM-017).
+        let end = notice.outcome.queue_start + notice.outcome.staged;
+        let pane = self.pane_mut(notice.dest);
+        let msg = if pane.queue.len() != end {
+            "The staged edits changed since; undo the copy from the edits list instead."
+        } else if pane.unstage_since(notice.outcome.queue_start) {
             "Copy removed from the staged edits."
         } else {
             "Can't undo the copy while an apply is running."
@@ -527,10 +529,12 @@ impl CommanderController {
                 file_name: String::new(),
             }
         };
+        let key = self.volume_key(from);
         self.export = Some(PendingExport {
             from,
             format,
             entries,
+            key,
         });
         if format.is_single_file() {
             vec![Effect::PickFile(spec)]
@@ -544,6 +548,7 @@ impl CommanderController {
             from,
             format,
             entries,
+            key,
         }) = self.export.take()
         else {
             return String::new();
@@ -551,6 +556,12 @@ impl CommanderController {
         let Some(dest) = path else {
             return "Export cancelled.".to_string();
         };
+        if self.volume_key(from) != key {
+            return format!(
+                "The {} pane changed while you chose; nothing was exported.",
+                from.label()
+            );
+        }
         let format = tar_format_for(format, &dest);
         let where_to = format!("export folder ({} pane)", from.label());
         if self.pane(from).is_host_pane() {

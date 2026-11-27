@@ -105,7 +105,7 @@ pub(super) fn finished<R>(job: &Job<R>) -> Option<Result<R, String>> {
 impl BackupController {
     pub(super) fn select_device(&mut self, slot: usize, device: DiskDevice) {
         self.drop_remote_source();
-        self.src.decode = None;
+        self.cancel_decode();
         let same = matches!(&self.source, Some(Source::Device { slot: s, device: d })
             if *s == slot && d.identity() == device.identity());
         self.source = Some(Source::Device { slot, device });
@@ -121,7 +121,7 @@ impl BackupController {
             .push(HostRequest::RememberRecent(path.clone()));
         // Backup needs a flat sector stream, so floppy containers are decoded too.
         if !crate::model::image_prep::needs_decoding(path.as_path(), true) {
-            self.src.decode = None;
+            self.cancel_decode();
             self.set_image(path, None, rename);
             return;
         }
@@ -139,6 +139,7 @@ impl BackupController {
                 &|| ctx.is_cancelled(),
             )?)
         });
+        self.cancel_decode();
         self.src.decode = Some(Decode {
             original: path,
             rename,
@@ -158,6 +159,13 @@ impl BackupController {
         }
         if changed {
             self.source_changed();
+        }
+    }
+
+    /// A superseded decode is cancelled, not just dropped: it kept decompressing (CWR-015).
+    fn cancel_decode(&mut self) {
+        if let Some(d) = self.src.decode.take() {
+            d.job.cancel();
         }
     }
 
@@ -353,7 +361,7 @@ impl BackupController {
     /// Close Drive: drop the handle so the OS releases the drive, and every derived state.
     pub(super) fn close_source(&mut self) {
         self.source = None;
-        self.src.decode = None;
+        self.cancel_decode();
         self.clear_found();
         if let Some(path) = self.escalated.take() {
             crate::os::release_elevated_devices(Some(&*path.to_string_lossy()));

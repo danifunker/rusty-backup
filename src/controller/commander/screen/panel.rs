@@ -423,7 +423,7 @@ impl CommanderController {
             true => pane.selected_entries().len(),
             false => 0,
         };
-        let format = self.export_format();
+        let format = self.export_format_for(side);
         MarkBar {
             count,
             label: format!("{count} selected"),

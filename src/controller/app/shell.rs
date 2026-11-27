@@ -223,7 +223,6 @@ pub fn elevation_button_hover() -> &'static str {
     }
 }
 
-/// The note beside a physical-device picker while unprivileged, naming the remedy.
 /// The Linux "restart as root?" question; answer with `AppAction::ConfirmElevation`.
 pub fn elevation_confirm() -> crate::controller::ConfirmSpec {
     crate::controller::ConfirmSpec {
@@ -238,6 +237,7 @@ pub fn elevation_confirm() -> crate::controller::ConfirmSpec {
     }
 }
 
+/// The note beside a physical-device picker while unprivileged, naming the remedy.
 pub fn unelevated_device_note() -> &'static str {
     if cfg!(windows) {
         "Note: physical devices need administrator privileges. Without it they may \
@@ -450,7 +450,6 @@ impl AppController {
     }
 }
 
-/// The one-line notice a tab shows while another tab's job locks its controls.
 /// What an About window says.
 pub mod about {
     pub const NAME: &str = "Rusty Backup";
@@ -465,6 +464,7 @@ pub fn app_version() -> &'static str {
     env!("APP_VERSION")
 }
 
+/// The one-line notice a tab shows while another tab's job locks its controls.
 pub fn busy_elsewhere_notice(tab: &str) -> String {
     format!("A disk job is running ({tab}); start controls unlock when it finishes.")
 }

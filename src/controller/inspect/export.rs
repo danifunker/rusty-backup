@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use super::{purpose, InspectController, LayoutSegment, LogSink, SegmentKind};
 use crate::controller::{Effect, PickSpec};
 use crate::model::export_runner::{self, ExportStatus, PartitionExportConfig, PerPartitionInputs};
-use crate::model::job::{Job, JobCtx, Status};
+use crate::model::job::{Job, JobCtx};
 use crate::rbformats::chd_options::ChdOptions;
 use crate::rbformats::export::ExportFormat;
 
@@ -321,14 +321,7 @@ impl ExportState {
 /// Starts an export runner on the job's thread.
 type ExportStart = Box<dyn FnOnce() -> anyhow::Result<Arc<Mutex<ExportStatus>>> + Send>;
 
-fn finished(job: &Job<()>) -> Option<Result<(), String>> {
-    match job.snapshot().status {
-        Status::Running => None,
-        Status::Done => Some(Ok(())),
-        Status::Failed(e) => Some(Err(e)),
-        Status::Cancelled => Some(Err("cancelled".to_string())),
-    }
-}
+use crate::controller::job_outcome as finished;
 
 impl InspectController {
     pub fn export_running(&self) -> bool {

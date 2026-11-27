@@ -8,7 +8,7 @@ use super::{push_log, InspectController, LogSink, Source};
 use crate::controller::log::LogLevel;
 use crate::model::backup_loader::{BackupLoadOutcome, ClonezillaLoadOutcome, LoadOutcome};
 use crate::model::inspect_runner::{inspect_source, InspectRequest, Inspected};
-use crate::model::job::{Job, JobCtx, Snapshot, Status};
+use crate::model::job::{Job, JobCtx, Snapshot};
 use crate::model::min_size_runner::{MinSizeRequest, MinSizeSource};
 use crate::model::volume_label_runner::{VolumeLabelRequest, VolumeLabelSource};
 use disk_core::display::format_size;
@@ -67,16 +67,7 @@ impl OpenState {
     }
 }
 
-/// A job's result, or the failure message once it ended without one.
-fn finished<R>(job: &Job<R>) -> Option<Result<R, String>> {
-    let snap = job.snapshot();
-    match snap.status {
-        Status::Running => None,
-        Status::Done => Some(job.take_result().ok_or_else(|| "no result".to_string())),
-        Status::Failed(e) => Some(Err(e)),
-        Status::Cancelled => Some(Err("cancelled".to_string())),
-    }
-}
+use crate::controller::job_outcome as finished;
 
 impl InspectController {
     /// Read the source again: a backup folder's metadata, or a disk's partition table.

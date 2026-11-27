@@ -13,7 +13,7 @@ use crate::fs::make_bootable::{
 };
 use crate::fs::{FsckResult, RepairReport};
 use crate::model::fsck_runner::{FsckRun, FsckSource, FsckTarget};
-use crate::model::job::{Job, JobCtx, Snapshot, Status};
+use crate::model::job::{Job, JobCtx, Snapshot};
 use crate::model::partition_editor::PartitionEditor;
 use crate::partition::{PartitionInfo, PartitionTable};
 use disk_core::display::format_size;
@@ -203,14 +203,7 @@ pub struct ResizePlan {
     pub path: PathBuf,
 }
 
-fn finished<R>(job: &Job<R>) -> Option<Result<R, String>> {
-    match job.snapshot().status {
-        Status::Running => None,
-        Status::Done => Some(job.take_result().ok_or_else(|| "no result".to_string())),
-        Status::Failed(e) => Some(Err(e)),
-        Status::Cancelled => Some(Err("cancelled".to_string())),
-    }
-}
+use crate::controller::job_outcome as finished;
 
 impl InspectController {
     // --- enablement ---------------------------------------------------------------------

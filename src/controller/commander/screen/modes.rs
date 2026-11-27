@@ -417,6 +417,11 @@ impl CommanderController {
                 Vec::new()
             }
             M::OpenNested(path) => self.open_nested(&path),
+            // A reopen during a mode job (a flatten, a compress) reopened what it just let go (CCM-013).
+            M::ShowDeleted(_) | M::CarveFullScan(_) | M::UpgradeSeekable(_) if self.mode_busy() => {
+                self.modes.notice = Some("Wait for the running step to finish.".into());
+                Vec::new()
+            }
             M::ShowDeleted(on) => {
                 self.modes.session.show_deleted = on;
                 self.reopen_modes()
@@ -583,8 +588,11 @@ impl CommanderController {
         if self.modes.chd.is_some() {
             self.leave_edit_state();
             self.start_chd_flatten();
-        } else if self.modes.archive.is_some() {
+        } else if self.modes.archive.is_some() && self.modes.copy_dirty {
             self.start_archive_compress();
+        } else if self.modes.archive.is_some() {
+            // Nothing written: drop the temp rather than rewrite the backup unchanged (CCM-020).
+            self.discard_archive_temp();
         } else {
             self.leave_edit_state();
         }
@@ -967,9 +975,10 @@ impl CommanderController {
             return;
         }
         let session = self.modes.session.clone();
+        // It opens the image editable, so it holds the image like an apply does (CCM-016).
         let spawned = self.jobs.spawn(
             "Free space",
-            Vec::new(),
+            self.left.source_resources(),
             Arc::clone(&self.notify),
             move |_| {
                 let opened = session.open_editable().ok();

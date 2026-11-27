@@ -1112,18 +1112,18 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | CCM-010 | S2 | fixed | [modes.rs:373](../../src/controller/commander/screen/modes.rs#L373) | Close during a Compress or Flatten mode job deletes the archive temp it is reading. | covered by the CCM-002 gate (mode jobs) |
 | CCM-011 | S3 | confirmed | [screen.rs:639](../../src/controller/commander/screen.rs#L639) | An implicit cursor selection survives a non-key action, so a later Delete acts on that stale row. | open |
 | CCM-012 | S3 | confirmed | [copy.rs:57](../../src/controller/commander/screen/copy.rs#L57) | Host->image copy walks and sniffs the whole host tree on the UI thread. | open |
-| CCM-013 | S3 | plausible | [modes.rs:419](../../src/controller/commander/screen/modes.rs#L419) | ShowDeleted / CarveFullScan / budget actions reopen the source during a mode job. | open |
+| CCM-013 | S3 | fixed | [modes.rs:419](../../src/controller/commander/screen/modes.rs#L419) | ShowDeleted / CarveFullScan / budget actions reopen the source during a mode job. | ShowDeleted / CarveFullScan / UpgradeSeekable wait while a mode job runs |
 | CCM-014 | S3 | confirmed | [modes.rs:906](../../src/controller/commander/screen/modes.rs#L906) | An uncompressed CHD written in place is marked dirty, offering a Discard that can't undo it. | kept: the CHD edit flow counts in-place writes as unsaved by design (test `a_chd_is_backed_up_edited...`); needs a product call |
 | CCM-015 | S3 | plausible | [screen.rs:1561](../../src/controller/commander/screen.rs#L1561) | Quit skips the modes' unsaved question, dropping an unsaved CHD diff or archive temp. | open |
-| CCM-016 | S3 | plausible | [modes.rs:968](../../src/controller/commander/screen/modes.rs#L968) | The free-space probe opens the image editable in a job that declares no resources. | open |
-| CCM-017 | S3 | plausible | [copy.rs:217](../../src/controller/commander/screen/copy.rs#L217) | Rename-notice Undo truncates the queue by position without checking its shape. | open |
-| CCM-018 | S3 | plausible | [copy.rs:539](../../src/controller/commander/screen/copy.rs#L539) | A pending export/extract takes its source at pick time, so a source change exports one volume's paths from another. | open |
+| CCM-016 | S3 | fixed | [modes.rs:968](../../src/controller/commander/screen/modes.rs#L968) | The free-space probe opens the image editable in a job that declares no resources. | the free-space probe holds the pane's source resources |
+| CCM-017 | S3 | fixed | [copy.rs:217](../../src/controller/commander/screen/copy.rs#L217) | Rename-notice Undo truncates the queue by position without checking its shape. | Undo only while the queue still ends with that copy |
+| CCM-018 | S3 | fixed | [copy.rs:539](../../src/controller/commander/screen/copy.rs#L539) | A pending export/extract takes its source at pick time, so a source change exports one volume's paths from another. | a pending export / extract is dropped if the pane's volume changed |
 | CCM-019 | S3 | fixed | [budget.rs:75](../../src/controller/commander/screen/budget.rs#L75) | Budget MiB fields multiply unchecked: a debug panic, or a wrapped tiny ceiling. | budget MiB values multiply saturating |
-| CCM-020 | S4 | confirmed | [modes.rs:585](../../src/controller/commander/screen/modes.rs#L585) | Leaving archive Edit Mode recompresses even when nothing was written. | open |
+| CCM-020 | S4 | fixed | [modes.rs:585](../../src/controller/commander/screen/modes.rs#L585) | Leaving archive Edit Mode recompresses even when nothing was written. | leaving Edit Mode with nothing written drops the temp instead of recompressing |
 | CCM-021 | S4 | confirmed | [screen.rs:1609](../../src/controller/commander/screen.rs#L1609) | A refused File Info job spawn is never retried. | open |
-| CCM-022 | S4 | confirmed | [panel.rs:426](../../src/controller/commander/screen/panel.rs#L426) | `mark_bar(side)` reports the active pane's export format. | open |
-| CCM-023 | S4 | confirmed | [windows.rs:439](../../src/controller/commander/screen/windows.rs#L439) | The empty-log text holds a run of spaces from a lost line continuation. | open |
-| CCM-024 | S4 | plausible | [windows.rs:619](../../src/controller/commander/screen/windows.rs#L619) | The Apply report's Retry bypasses the mode apply, so an archive retry is never recompressed. | open |
+| CCM-022 | S4 | fixed | [panel.rs:426](../../src/controller/commander/screen/panel.rs#L426) | `mark_bar(side)` reports the active pane's export format. | uses `export_format_for(side)` |
+| CCM-023 | S4 | fixed | [windows.rs:439](../../src/controller/commander/screen/windows.rs#L439) | The empty-log text holds a run of spaces from a lost line continuation. | line continuation restored |
+| CCM-024 | S4 | fixed | [windows.rs:619](../../src/controller/commander/screen/windows.rs#L619) | The Apply report's Retry bypasses the mode apply, so an archive retry is never recompressed. | Retry in Edit Mode goes through the mode apply |
 
 ## src/controller inspect, optical, archives (CIN)
 
@@ -1138,16 +1138,16 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | CIN-007 | S2 | fixed | [tools.rs:63](../../src/controller/inspect/tools.rs#L63) | A check still running at a source switch opens its window with the old source's verdict over the new one. | a source change cancels a plain check (a Repair keeps running) |
 | CIN-008 | S2 | fixed | [mod.rs:631](../../src/controller/inspect/mod.rs#L631) | Close/Open is refused only during export; during Repair or a table write on a device it releases the elevated descriptor and claim mid-write. | Open / Close / Load wait while a tool writes |
 | CIN-009 | S2 | fixed | [mod.rs:578](../../src/controller/optical/mod.rs#L578) | A drive scan requested while one runs is dropped, so a daemon connected mid-scan never shows its drives. | a scan asked for mid-scan runs when the current one lands |
-| CIN-010 | S3 | confirmed | [browse.rs:105](../../src/controller/inspect/browse.rs#L105) | `browsing` is set before failure paths, so the switcher names a partition that never opened. | open |
+| CIN-010 | S3 | fixed | [browse.rs:105](../../src/controller/inspect/browse.rs#L105) | `browsing` is set before failure paths, so the switcher names a partition that never opened. | `browsing` is set only when the view gets the session |
 | CIN-011 | S3 | fixed | [tools.rs:524](../../src/controller/inspect/tools.rs#L524) | A Make Bootable assess landing after a source switch opens its donor picker and writes to the previous image. | an assess for another image writes nothing |
 | CIN-012 | S3 | confirmed | [tools.rs:206](../../src/controller/inspect/tools.rs#L206) | In-place write tools run on a temp-backed Archives payload and report success though the result is thrown away. | open |
 | CIN-013 | S3 | fixed | [mod.rs:1230](../../src/controller/inspect/mod.rs#L1230) | Browse/Check/CalcMin are accepted during a repack; only shells enforce the lock. | Browse / Check / CalcMin are refused while a repack runs |
-| CIN-014 | S3 | confirmed | [mod.rs:922](../../src/controller/optical/mod.rs#L922) | OpenImage and CloseDisc are accepted while a rip runs, changing the form under it. | open |
-| CIN-015 | S3 | confirmed | [mod.rs:741](../../src/controller/optical/mod.rs#L741) | A CHD Info job for the previous image opens over a newly opened one. | open |
+| CIN-014 | S3 | fixed | [mod.rs:922](../../src/controller/optical/mod.rs#L922) | OpenImage and CloseDisc are accepted while a rip runs, changing the form under it. | OpenImage / CloseDisc wait while a rip runs |
+| CIN-015 | S3 | fixed | [mod.rs:741](../../src/controller/optical/mod.rs#L741) | A CHD Info job for the previous image opens over a newly opened one. | a source change or close drops the CHD Info job |
 | CIN-016 | S3 | plausible | [mod.rs:600](../../src/controller/optical/mod.rs#L600) | Drive selection survives a refresh by label only, so two identical drives can swap. | open |
 | CIN-017 | S3 | confirmed | [archives.rs:406](../../src/controller/archives.rs#L406) | Mounting an archive's disk-image payload writes it to a temp dir on the UI thread. | open |
 | CIN-018 | S3 | plausible | [mod.rs:912](../../src/controller/inspect/mod.rs#L912) | The first frame after a reinspect opens a ChdReader on the UI thread for the disk size. | open |
-| CIN-019 | S4 | confirmed | [tools.rs:184](../../src/controller/inspect/tools.rs#L184) | Four copies of a `finished(job)` helper beside `controller::job_outcome`. | open |
+| CIN-019 | S4 | fixed | [tools.rs:184](../../src/controller/inspect/tools.rs#L184) | Four copies of a `finished(job)` helper beside `controller::job_outcome`. | the four copies are imports of `controller::job_outcome` |
 
 ## src/controller write tasks (CWR)
 
@@ -1164,10 +1164,10 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | CWR-009 | S2 | fixed | [mod.rs:764](../../src/controller/backup/mod.rs#L764) | Source changes during a running backup/restore drop the decoded image's TempDir under the job. | source changes are refused while a backup or partition restore runs |
 | CWR-010 | S2 | fixed | [mod.rs:702](../../src/controller/backup/mod.rs#L702) | Backup never refuses an existing `<dest>/<name>` folder or .vhd, overwriting an earlier backup. | Start refuses a used `<dest>/<name>` folder or an existing `<name>.vhd` (checked at Start, so a finished run's own folder doesn't fail validation) |
 | CWR-011 | S3 | fixed | [run.rs:116](../../src/controller/restore/run.rs#L116) | The single-partition confirm names "Partition {index}" from 0 where every other screen counts from 1. | the confirm and log count partitions from 1 |
-| CWR-012 | S3 | confirmed | [run.rs:134](../../src/controller/restore/run.rs#L134) | No restore confirm names the source, so a source swap passes the staleness check. | open |
+| CWR-012 | S3 | fixed | [run.rs:134](../../src/controller/restore/run.rs#L134) | No restore confirm names the source, so a source swap passes the staleness check. | every restore question starts with the source |
 | CWR-013 | S3 | confirmed | [mod.rs:505](../../src/controller/backup/mod.rs#L505) | Backup's device list follows the row, not the disk, after a refresh. | open |
 | CWR-014 | S3 | fixed | [source.rs:237](../../src/controller/restore/source.rs#L237) | Reopening a backup that failed to load is a no-op instead of a retry. | reopening a backup whose load failed retries it |
-| CWR-015 | S4 | confirmed | [source.rs:236](../../src/controller/restore/source.rs#L236) | Superseded decode jobs are dropped without cancel and keep decompressing. | open |
+| CWR-015 | S4 | fixed | [source.rs:236](../../src/controller/restore/source.rs#L236) | Superseded decode jobs are dropped without cancel and keep decompressing. | superseded decode jobs are cancelled |
 
 ## src/controller other tasks (CTK)
 
@@ -1186,6 +1186,6 @@ fs glue, optical, remote. Four read-only reviewers: `src/fs/mod.rs` (FSG), the r
 | CTK-011 | S3 | confirmed | [keys.rs:543](../../src/controller/keys.rs#L543) | Rebinding to a chord another command uses does nothing and reports nothing; `[section]` headers are ignored. | open |
 | CTK-012 | S3 | confirmed | [resize_image.rs:793](../../src/controller/resize_image.rs#L793) | Opening the wizard reads the disk size (a daemon round trip or a CHD open) on the UI thread. | open |
 | CTK-013 | S3 | plausible | [expand_hfs.rs:250](../../src/controller/expand_hfs.rs#L250) | When used space exceeds the block size's ceiling, Expand stays enabled and fails after building the target. | open |
-| CTK-014 | S3 | plausible | [settings.rs:152](../../src/controller/settings.rs#L152) | File-association (un)registration errors are dropped and the settings report success. | open |
+| CTK-014 | S3 | fixed | [settings.rs:152](../../src/controller/settings.rs#L152) | File-association (un)registration errors are dropped and the settings report success. | a failed (un)registration leaves the setting and says so |
 | CTK-015 | S4 | fixed | [resize.rs:197](../../src/controller/resize.rs#L197) | Resize Partitions names partitions from 0 where the layout bar and Inspect count from 1. | Resize Partitions' confirm and errors count from 1 |
-| CTK-016 | S4 | confirmed | [shell.rs:226](../../src/controller/app/shell.rs#L226) | Two doc comments sit on the wrong items. | open |
+| CTK-016 | S4 | fixed | [shell.rs:226](../../src/controller/app/shell.rs#L226) | Two doc comments sit on the wrong items. | both doc comments are back on their items |

@@ -631,7 +631,16 @@ impl OpticalController {
     }
 
     /// The source changed: close the browser, detect the new disc, reload the player.
+    fn drop_chd_info(&mut self) {
+        if let Some(job) = self.chd_info_job.take() {
+            job.cancel();
+        }
+        self.chd_info = None;
+    }
+
     fn source_changed(&mut self) {
+        // CHD Info for the previous image must not open over the new one (CIN-015).
+        self.drop_chd_info();
         let was_browsing = self.browsing;
         self.close_browser();
         self.detect(was_browsing);
@@ -679,6 +688,7 @@ impl OpticalController {
     }
 
     fn close_disc(&mut self) {
+        self.drop_chd_info();
         self.close_browser();
         self.disc = None;
         self.disc_error = None;
@@ -929,6 +939,10 @@ impl Controller for OpticalController {
             }
             OpticalAction::Eject if !running => self.eject(),
             OpticalAction::PickImage if !running => return self.pick_image(),
+            // A hand-off or drop during a rip waits: it changed the form under the rip (CIN-014).
+            OpticalAction::OpenImage(_) | OpticalAction::CloseDisc if running => {
+                self.info("Wait for the rip to finish before changing the source.");
+            }
             OpticalAction::OpenImage(path) => self.open_image(path),
             OpticalAction::OpenAddRemote => {
                 #[cfg(feature = "remote")]

@@ -144,23 +144,37 @@ impl SettingsController {
         let mut config = self.config.load();
         config.update_check.enabled = self.update_check;
         config.update_check.repository_url = self.repo_url.trim().to_string();
+        // A failed (un)registration leaves the association setting as it was, and says so (CTK-014).
+        #[allow(unused_mut)]
+        let mut assoc_error: Option<String> = None;
         #[cfg(windows)]
         {
             let was_enabled = config.file_associations_enabled;
-            config.file_associations_enabled = self.file_associations;
-            if self.file_associations {
-                let _ = crate::os::file_assoc::register_file_associations();
-                config.assoc_registered_version = Some(env!("APP_VERSION").to_string());
-            } else if was_enabled {
-                let _ = crate::os::file_assoc::unregister_file_associations();
-                config.assoc_registered_version = None;
+            let done = match (self.file_associations, was_enabled) {
+                (true, _) => crate::os::file_assoc::register_file_associations().map(|()| true),
+                (false, true) => {
+                    crate::os::file_assoc::unregister_file_associations().map(|()| true)
+                }
+                (false, false) => Ok(false),
+            };
+            match done {
+                Ok(changed) => {
+                    config.file_associations_enabled = self.file_associations;
+                    if changed {
+                        config.assoc_registered_version = self
+                            .file_associations
+                            .then(|| env!("APP_VERSION").to_string());
+                    }
+                }
+                Err(e) => assoc_error = Some(format!("File associations were not changed: {e}")),
             }
         }
-        self.status = Some(match self.config.try_save(&config) {
-            Ok(()) => {
+        self.status = Some(match (self.config.try_save(&config), assoc_error) {
+            (Err(e), _) => format!("Error saving settings: {e}"),
+            (Ok(()), Some(why)) => format!("Settings saved, but: {why}"),
+            (Ok(()), None) => {
                 "Settings saved successfully! Restart to apply update check changes.".to_string()
             }
-            Err(e) => format!("Error saving settings: {e}"),
         });
     }
 }

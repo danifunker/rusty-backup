@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use super::{BrowseEdit, BrowseOpen, HostRequest, InspectController};
 use crate::model::browse_session::BrowseSession;
 use crate::model::commander_source::{self, BackupEdit, ClonezillaOpen, PartcloneLookup};
-use crate::model::job::{Job, JobCtx, Progress, Snapshot, Status, Unit};
+use crate::model::job::{Job, JobCtx, Progress, Snapshot, Unit};
 use dsk_clonezilla::block_cache::PartcloneBlockCache;
 
 type Cache = Arc<Mutex<PartcloneBlockCache>>;
@@ -24,6 +24,8 @@ pub(super) struct BrowseState {
     build: Option<(usize, PathBuf, Job<()>)>,
     /// The partition last handed to the browse view, for its partition switcher.
     browsing: Option<usize>,
+    /// The partition a Browse is opening; it becomes `browsing` only once the view gets it (CIN-010).
+    opening: Option<usize>,
 }
 
 impl BrowseState {
@@ -38,14 +40,7 @@ impl BrowseState {
     }
 }
 
-fn finished(job: &Job<()>) -> Option<Result<(), String>> {
-    match job.snapshot().status {
-        Status::Running => None,
-        Status::Done => Some(Ok(())),
-        Status::Failed(e) => Some(Err(e)),
-        Status::Cancelled => Some(Err("cancelled".to_string())),
-    }
-}
+use crate::controller::job_outcome as finished;
 
 impl InspectController {
     /// The partitions the browse view's switcher offers: (index, label), in table order.
@@ -88,6 +83,9 @@ impl InspectController {
         edit: BrowseEdit,
         label_prefix: Option<String>,
     ) {
+        if let Some(index) = self.browse.opening.take() {
+            self.browse.browsing = Some(index);
+        }
         let backup_folder = self.found.chd_backup.as_ref().map(|(f, _)| f.clone());
         self.requests
             .push(HostRequest::OpenBrowse(Box::new(BrowseOpen {
@@ -102,7 +100,7 @@ impl InspectController {
         let Some(part) = self.listed().find(|p| p.index == index).cloned() else {
             return;
         };
-        self.browse.browsing = Some(index);
+        self.browse.opening = Some(index);
         let offset = part.byte_offset();
         let ptype = Self::effective_type(&part);
         let type_string = part.partition_type_string.clone();

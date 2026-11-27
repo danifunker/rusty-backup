@@ -583,6 +583,8 @@ struct PendingExport {
     from: Side,
     format: ExportFormat,
     entries: Vec<FileEntry>,
+    /// The pane's volume when asked; another one by pick time drops the export (CCM-018).
+    key: String,
 }
 
 /// Both panes and the operations between them; see the module docs.
