@@ -1608,8 +1608,12 @@ impl CommanderController {
     fn open_detail(&mut self, side: Side, name: String) -> Vec<Effect> {
         let pane = self.pane_mut(side);
         // Host folders, read-only sources and a wrapper's contents show metadata without editors.
-        // `is_read_only` also covers a read-only profile and a disc (CCM-006).
-        let editable = !pane.is_host_pane() && !pane.is_read_only() && !pane.tree_active();
+        // What the entry allows; the pane's read-only state is applied live where editors show (CCM-006).
+        let editable = !pane.is_host_pane()
+            && !pane.is_backup()
+            && !pane.is_archive()
+            && !pane.is_optical()
+            && !pane.tree_active();
         let fs_type = pane.detail_fs_type();
         let Some(entry) = pane.detail_entry(&name) else {
             self.status = format!("[{}] could not open File Info for '{name}'.", side.label());

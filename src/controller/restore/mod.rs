@@ -559,7 +559,9 @@ impl RestoreController {
         }
         // A whole-disk restore onto the running OS's disk is refused, as Build Disk and the CLI
         // refuse it; a single partition there keeps its warning (CWR-007).
+        // A remote full-disk target is checked by the daemon, not the local slot left behind.
         let whole_slot = match self.mode {
+            RestoreMode::FullDisk if self.remote_active() => None,
             RestoreMode::FullDisk => Some(TargetSlot::FullDisk),
             RestoreMode::NewDisk => Some(TargetSlot::NewDisk),
             _ => None,

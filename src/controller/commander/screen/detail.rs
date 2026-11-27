@@ -192,6 +192,9 @@ impl CommanderController {
         let Some(d) = self.detail.as_ref().filter(|d| d.editable) else {
             return Vec::new();
         };
+        if self.pane(d.side).is_read_only() {
+            return Vec::new();
+        }
         DetailField::ALL
             .into_iter()
             .filter(|f| f.applies(&d.entry))

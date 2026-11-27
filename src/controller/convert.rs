@@ -831,7 +831,7 @@ impl ConvertController {
         ));
     }
 
-    /// The question Start asks when outputs exist; the shell shows it from [`Self::tick`].
+    /// The question Start (or a re-ask) returns when outputs exist.
     fn conflict_question(&self) -> Effect {
         let n = self.conflicts.len();
         Effect::Choose(ChoiceSpec {
@@ -1154,6 +1154,10 @@ impl Controller for ConvertController {
             ConvertAction::Chose { purpose, index } => {
                 if purpose == purpose::CONFLICTS {
                     self.resolve(index);
+                    // A changed list is asked about again, here, where the shell hears it.
+                    if !self.conflicts.is_empty() {
+                        return vec![self.conflict_question()];
+                    }
                 }
             }
             ConvertAction::Cancel => {

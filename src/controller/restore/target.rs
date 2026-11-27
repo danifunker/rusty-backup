@@ -197,6 +197,14 @@ impl RestoreController {
         Ok(())
     }
 
+    /// The full-disk target is a drive: the remote pick when Remote is on, else the local slot.
+    pub(super) fn full_target_is_device(&self) -> bool {
+        match self.remote_active() {
+            true => self.remote_device_size().is_some(),
+            false => self.targets.full.is_device,
+        }
+    }
+
     /// The full-disk target's size: the device, or the source plus the trailing free space.
     pub fn target_size(&self) -> u64 {
         if let Some(size) = self.remote_device_size() {
@@ -240,7 +248,7 @@ impl RestoreController {
         if target == 0 {
             return None;
         }
-        let is_device = self.targets.full.is_device;
+        let is_device = self.full_target_is_device();
         Some(crate::model::restore_plan::layout_fit(
             meta,
             &self.resolved_alignment(),
@@ -351,7 +359,7 @@ impl RestoreController {
         use crate::model::restore_plan::{plan_caveats, volume_caveats};
         match self.mode {
             RestoreMode::FullDisk => self.loaded().map_or_else(Vec::new, |loaded| {
-                let is_device = self.targets.full.is_device;
+                let is_device = self.full_target_is_device();
                 plan_caveats(
                     loaded,
                     &self.resolved_alignment(),

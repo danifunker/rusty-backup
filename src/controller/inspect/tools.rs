@@ -65,6 +65,13 @@ pub(super) struct ToolState {
 impl ToolState {
     /// The source changed: results and questions about the old one go; running writes finish.
     pub fn reset(&mut self) {
+        // A plain check of the old source is dropped (a remote or backup has no path to tell them
+        // apart by); a Repair keeps running, as it owns its write (CIN-007).
+        if !self.repairing {
+            if let Some(job) = self.fsck.take() {
+                job.cancel();
+            }
+        }
         self.fsck_result = None;
         self.repair_report = None;
         self.fsck_open = false;

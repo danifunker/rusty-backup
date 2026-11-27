@@ -126,7 +126,14 @@ pub fn restore_to_remote(
 
     // --- 3. Push the staging image to the remote target. ---
     set_operation(&progress, "Pushing image to remote target...");
-    let push_result = push_image(&staging_path, &conn, handle, push_len, &progress);
+    // A drive restore is laid out to the drive's size; only the partitions and the table tail are
+    // sent, not the unallocated zeros between (a 4 GB backup onto a 256 GB card sent 256 GB).
+    let skip = if is_device {
+        unallocated_gap(&staging_path, push_len)
+    } else {
+        None
+    };
+    let push_result = push_image(&staging_path, &conn, handle, push_len, skip, &progress);
 
     // --- 4. Flush + close the remote handle regardless of outcome. ---
     if push_result.is_ok() {
@@ -150,8 +157,10 @@ fn push_image(
     conn: &Arc<Mutex<RemoteConnection>>,
     handle: u64,
     total: u64,
+    skip: Option<(u64, u64)>,
     progress: &Arc<Mutex<RestoreProgress>>,
 ) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
     let mut f = File::open(path).with_context(|| format!("opening staging image {path:?}"))?;
     set_progress_bytes(progress, 0, total);
     let mut buf = vec![0u8; PUSH_CHUNK];
@@ -160,7 +169,17 @@ fn push_image(
         if is_cancelled(progress) {
             bail!("restore cancelled");
         }
-        let want = PUSH_CHUNK.min((total - offset) as usize);
+        if let Some((_, to)) = skip.filter(|&(from, to)| offset >= from && offset < to) {
+            offset = to;
+            f.seek(SeekFrom::Start(offset))?;
+            set_progress_bytes(progress, offset, total);
+            continue;
+        }
+        let end = match skip {
+            Some((from, _)) if offset < from => from.min(total),
+            _ => total,
+        };
+        let want = PUSH_CHUNK.min((end - offset) as usize);
         f.read_exact(&mut buf[..want])
             .with_context(|| format!("reading staging image at offset {offset}"))?;
         {
@@ -172,6 +191,22 @@ fn push_image(
         set_progress_bytes(progress, offset, total);
     }
     Ok(())
+}
+
+/// The unallocated stretch of a staged drive image, from the last partition's end to the final
+/// MiB (where a GPT keeps its backup header), MiB-aligned; `None` when there is none worth skipping.
+fn unallocated_gap(path: &Path, total: u64) -> Option<(u64, u64)> {
+    const MIB: u64 = 1 << 20;
+    let mut f = File::open(path).ok()?;
+    let table = crate::partition::PartitionTable::detect(&mut f).ok()?;
+    let end = table
+        .partitions()
+        .iter()
+        .map(|p| p.byte_offset().saturating_add(p.size_bytes))
+        .max()?;
+    let from = end.div_ceil(MIB) * MIB;
+    let to = total.saturating_sub(MIB) / MIB * MIB;
+    (to > from + MIB).then_some((from, to))
 }
 
 fn lock(
@@ -209,4 +244,22 @@ fn set_progress_bytes(progress: &Arc<Mutex<RestoreProgress>>, current: u64, tota
 
 fn is_cancelled(progress: &Arc<Mutex<RestoreProgress>>) -> bool {
     progress.lock().map(|p| p.cancel_requested).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 64 MiB drive image holding one 8 MiB partition: only the gap after it is skipped.
+    #[test]
+    fn the_unallocated_tail_is_skipped_but_not_the_last_mib() {
+        let mbr = part_tables::mbr::build_minimal_mbr(1, &[(0x0b, 2048, 16384, false)], 255, 63);
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), &mbr[..]).unwrap();
+        let total = 64u64 << 20;
+        f.as_file().set_len(total).unwrap();
+        let (from, to) = unallocated_gap(f.path(), total).expect("a gap");
+        assert_eq!(from, 9 << 20, "the partition ends at 9 MiB");
+        assert_eq!(to, total - (1 << 20), "the last MiB is always sent");
+    }
 }

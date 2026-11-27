@@ -76,7 +76,6 @@ impl RestoreController {
         self.remote.active = on;
     }
 
-    /// The full-disk target is on a daemon.
     /// The remote drive a full-disk restore writes, by its size; `None` for an image or no pick.
     pub fn remote_device_size(&self) -> Option<u64> {
         #[cfg(feature = "remote")]
@@ -86,6 +85,7 @@ impl RestoreController {
         None
     }
 
+    /// The full-disk target is on a daemon.
     pub fn remote_active(&self) -> bool {
         cfg!(feature = "remote") && self.remote.active
     }
