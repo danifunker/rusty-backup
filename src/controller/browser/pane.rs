@@ -296,6 +296,8 @@ pub struct BrowserPaneController {
     vol: volume::VolumeState,
     /// The archive viewer, save dialog and archive imports.
     arc: archives::ArchiveState,
+    /// A no-staging pane's edit waiting for another job to free the volume.
+    auto_waiting: bool,
 }
 
 impl Default for BrowserPaneController {
@@ -432,6 +434,9 @@ impl Controller for BrowserPaneController {
         fx.extend(self.poll_volume());
         fx.extend(self.poll_archives());
         self.poll_folders();
+        if self.auto_waiting && !self.is_busy() {
+            self.auto_apply();
+        }
         self.sync_tree();
         self.rebuild_rows();
         self.pump_folders();
@@ -479,6 +484,7 @@ impl BrowserPaneController {
             dirs: expand::Folders::default(),
             vol: volume::VolumeState::default(),
             arc: archives::ArchiveState::default(),
+            auto_waiting: false,
         }
     }
 
@@ -490,6 +496,33 @@ impl BrowserPaneController {
     fn refused(&self, action: &BrowserPaneAction) -> Option<String> {
         use BrowserPaneAction as A;
         let p = &self.profile;
+        // The queue is what a check or write is working from, and what the review shows: changing
+        // it then shifted the landed edits or wrote unchecked ones (CBR-006, CBR-011).
+        let queue_busy =
+            self.checking().is_some() || self.applying().is_some() || self.apply_review().is_some();
+        let changes_queue = matches!(
+            action,
+            A::Delete
+                | A::CancelRename(_)
+                | A::RequestRename(_)
+                | A::RenameAtCursor
+                | A::RequestNewFolder
+                | A::Answered { .. }
+                | A::Discard
+                | A::Unstage(_)
+                | A::SetProdosLock(_)
+                | A::Bless
+                | A::BootBlocks
+                | A::SaveText { .. }
+                | A::Import
+                | A::AddHostPaths { .. }
+                | A::AddPicked(_)
+                | A::ChooseImport(_)
+                | A::SubmitMetadata(_)
+        );
+        if queue_busy && changes_queue {
+            return Some("wait for the apply to finish (or dismiss its review) first.".into());
+        }
         let (allowed, what) = match action {
             A::OpenImage(_) | A::PickImage | A::OpenDisc(_) => {
                 (p.sources.image, "opening an image")
@@ -524,6 +557,8 @@ impl BrowserPaneController {
             A::EditMetadata | A::SubmitMetadata(_) => {
                 (p.tools.metadata && !p.read_only, "editing metadata")
             }
+            // Read-only stays read-only even with edits staged before it was set (CBR-012).
+            A::Apply | A::ApplyReviewed(_) => (!p.read_only, "applying edits"),
             _ => (true, ""),
         };
         (!allowed).then(|| p.refusal(what))
@@ -543,10 +578,17 @@ impl BrowserPaneController {
 
     /// Without staging, what was just staged applies at once (through the same preflight and review).
     fn auto_apply(&mut self) {
-        if !self.profile.staging {
-            let fx = self.start_check();
-            self.out.extend(fx);
+        if self.profile.staging {
+            return;
         }
+        // Another job holds the volume: the edit waits and writes once it is free (CBR-009).
+        if self.is_busy() && !self.queue.is_empty() {
+            self.auto_waiting = true;
+            return;
+        }
+        self.auto_waiting = false;
+        let fx = self.start_check();
+        self.out.extend(fx);
     }
 
     /// The rows to draw, rebuilding [`Self::tree_index`].

@@ -200,10 +200,15 @@ impl MetadataFields {
         if (ty.is_some() || cr.is_some())
             && (entry.type_code.is_some() || entry.creator_code.is_some())
         {
+            // An untouched code keeps its bytes: its text shows unprintables as `?` (CBR-008).
+            let code = |typed: Option<String>, raw: Option<[u8; 4]>| match typed {
+                Some(t) => parse_code(&t),
+                None => Ok(raw.unwrap_or(*b"    ")),
+            };
             out.push(MetadataEdit::TypeCreator {
                 entry: entry.clone(),
-                type_code: parse_code(&ty.unwrap_or_else(|| self.type_code.clone()))?,
-                creator_code: parse_code(&cr.unwrap_or_else(|| self.creator.clone()))?,
+                type_code: code(ty, entry.type_code)?,
+                creator_code: code(cr, entry.creator_code)?,
             });
         }
         let modified = changed(&self.modified, &initial.modified);
@@ -963,6 +968,8 @@ impl BrowserPaneController {
         };
         match self.cursor_entry() {
             Some(e) if editable(&e) => {
+                // Staged values first, so submitting never reverts the field left alone (CBR-010).
+                let e = self.with_staged_metadata(e);
                 self.tl.form = Some(MetadataForm {
                     initial: MetadataFields::of(&e),
                     entry: e,
@@ -972,6 +979,28 @@ impl BrowserPaneController {
             }
             _ => msg("metadata editing needs an HFS/HFS+ file or POSIX metadata."),
         }
+    }
+
+    /// `e` as the queue will leave it: staged type/creator, dates, mode and owner applied.
+    fn with_staged_metadata(&self, mut e: FileEntry) -> FileEntry {
+        use crate::controller::browser::metadata as md;
+        if e.type_code.is_some() || e.creator_code.is_some() {
+            let tc = md::hfs_type_creator(&self.queue, &e);
+            e.type_code = Some(tc.type_code);
+            e.creator_code = Some(tc.creator_code);
+        }
+        if e.mac_dates.is_some() {
+            e.mac_dates = Some(md::hfs_dates(&self.queue, &e));
+        }
+        if e.mode.is_some() {
+            e.mode = Some(md::permissions(&self.queue, &e));
+        }
+        if e.uid.is_some() && e.gid.is_some() {
+            let (u, g) = md::owner(&self.queue, &e);
+            e.uid = Some(u);
+            e.gid = Some(g);
+        }
+        e
     }
 
     fn submit_form(&mut self, fields: &MetadataFields) -> Vec<Effect> {
@@ -1002,6 +1031,10 @@ impl BrowserPaneController {
 
     /// Stage a File Info metadata edit; a pane without staging writes it at once.
     pub fn stage_metadata(&mut self, edit: MetadataEdit) -> String {
+        // It replaces queue entries, which a running check or write indexes into (CBR-006).
+        if self.checking().is_some() || self.applying().is_some() || self.apply_review().is_some() {
+            return "Wait for the apply to finish first.".to_string();
+        }
         let said = self.queue.stage_metadata(edit);
         self.auto_apply();
         said

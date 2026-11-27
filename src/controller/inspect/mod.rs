@@ -1235,9 +1235,16 @@ impl Controller for InspectController {
                 self.select_partition(index);
                 Vec::new()
             }
+            InspectAction::CalcMin(_) if self.rows_locked() => Vec::new(),
             InspectAction::CalcMin(index) => {
                 self.calc_min(index);
                 Vec::new()
+            }
+            // Row actions read a volume a repack is rewriting (CIN-013).
+            InspectAction::Browse(_) | InspectAction::Check(_) if self.rows_locked() => Vec::new(),
+            // Another partition's browse would replace this one's staged edits unasked (CIN-006).
+            InspectAction::Browse(index) if self.browsing().is_some_and(|b| b != index) => {
+                self.gate(UnsavedGate::Browse(index), None)
             }
             InspectAction::Browse(index) => {
                 self.browse_partition(index);

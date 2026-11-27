@@ -28,7 +28,7 @@ const ENTRY_FAILED_BUTTONS: [(&str, char); 3] = [
 impl CommanderController {
     /// Copy the `from` pane's selection into the other pane's folder; returns the status line.
     pub(super) fn copy(&mut self, from: Side) -> String {
-        if self.copy.is_some() {
+        if self.copy.is_some() || self.conflict.is_some() {
             return "A copy is already in progress; wait for it to finish.".to_string();
         }
         let to = from.other();
@@ -54,7 +54,9 @@ impl CommanderController {
         match (src_host, dest.is_host_pane()) {
             // host -> image: stage the host paths themselves, nothing to extract.
             (true, false) => {
-                let staged = commander_ops::stage_host_to_image(&entries, &dest_parent);
+                // The destination's fs decides forks and ProDOS suffixes, as drop and pick do (CCM-007).
+                let fs_type = self.pane(to).volume().fs_type.clone();
+                let staged = commander_ops::stage_host_for(&entries, &dest_parent, &fs_type);
                 let out = self.pane_mut(to).stage_edits(staged.edits);
                 let said = self.note_staged(to, out);
                 match staged.unreadable.as_slice() {
@@ -266,6 +268,10 @@ impl CommanderController {
         resources: Vec<Resource>,
         where_to: String,
     ) -> Result<(), String> {
+        // One copy at a time: a second replaced the running one, orphaning it (CCM-009).
+        if self.copy.is_some() {
+            return Err("A copy is already running; wait for it to finish.".to_string());
+        }
         let spawned = self
             .jobs
             .spawn("Copying", resources, Arc::clone(&self.notify), move |ctx| {

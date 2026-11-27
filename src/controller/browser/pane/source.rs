@@ -680,6 +680,8 @@ impl BrowserPaneController {
                 if let Some(o) = &self.src.opening {
                     o.job.cancel();
                 }
+                // An open waiting for the abandoned one to let go is cancelled too (CBR-013).
+                self.src.deferred = None;
                 Vec::new()
             }
             A::SubmitPassword(secret) => self.submit_password(secret),

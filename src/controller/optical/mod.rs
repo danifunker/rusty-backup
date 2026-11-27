@@ -215,6 +215,8 @@ pub struct OpticalController {
     mode: SourceMode,
     drives: Vec<RipDevice>,
     drives_job: Option<(Job<Vec<RipDevice>>, DriveScan)>,
+    /// A scan asked for while one ran (its daemon list was taken at spawn); it runs next (CIN-009).
+    rescan: Option<DriveScan>,
     drive: Option<usize>,
     image: Option<PathBuf>,
     disc: Option<DiscImageInfo>,
@@ -244,6 +246,7 @@ impl OpticalController {
             mode: SourceMode::ImageFile,
             drives: Vec::new(),
             drives_job: None,
+            rescan: None,
             drive: None,
             image: None,
             disc: None,
@@ -577,6 +580,10 @@ impl OpticalController {
 
     fn scan_drives(&mut self, why: DriveScan) {
         if self.drives_job.is_some() {
+            // A Refresh the user asked for outranks a quiet one already queued.
+            if self.rescan != Some(DriveScan::Refresh) {
+                self.rescan = Some(why);
+            }
             return;
         }
         #[cfg(feature = "remote")]
@@ -810,6 +817,9 @@ impl OpticalController {
                     }
                     _ => {}
                 }
+            }
+            if let Some(next) = self.rescan.take() {
+                self.scan_drives(next);
             }
         }
         if let Some(done) = self.detecting.as_ref().and_then(|(j, _)| job_outcome(j)) {

@@ -571,6 +571,10 @@ impl InspectController {
                 self.error(format!("Make Bootable failed: {e}"))
             }
             Ok(BootStep::Assessed(_, Err(e))) => self.error(format!("Make Bootable: {e}")),
+            // An assess of the previous image must not open a picker or write it (CIN-011).
+            Ok(BootStep::Assessed(path, Ok(_))) if self.image_path() != Some(path.as_path()) => {
+                self.info("Make Bootable: the image changed; nothing was written.")
+            }
             Ok(BootStep::Assessed(path, Ok(a))) => {
                 let kind = match a.kind {
                     BootDiskKind::FlatHfs => "flat HFS image (kept flat)",

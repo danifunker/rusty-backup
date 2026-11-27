@@ -714,6 +714,16 @@ impl BackupController {
         if self.name.trim().is_empty() {
             return Err("Enter a backup name.".into());
         }
+        // The folder is created with `create_dir_all` and a whole-disk VHD truncated, so an
+        // earlier backup of the same name would be written over (CWR-010).
+        if let Some(dest) = self.destination.as_deref() {
+            let name = self.name.trim();
+            let folder = dest.join(name);
+            let used = std::fs::read_dir(&folder).is_ok_and(|mut d| d.next().is_some());
+            if used || dest.join(format!("{name}.vhd")).exists() {
+                return Err(format!("{name} already exists there; choose another name."));
+            }
+        }
         if self.has_partitions() && self.found.selected.is_empty() {
             return Err("Select at least one partition.".into());
         }
@@ -762,6 +772,17 @@ impl Controller for BackupController {
     type Action = BackupAction;
 
     fn apply(&mut self, action: BackupAction) -> Vec<Effect> {
+        // A running backup reads the decoded image; replacing the source dropped it (CWR-009).
+        let replaces = matches!(
+            action,
+            BackupAction::SelectDevice { .. }
+                | BackupAction::OpenImage { .. }
+                | BackupAction::CloseSource
+        ) || matches!(&action, BackupAction::Picked { purpose, .. } if *purpose == purpose::SOURCE_IMAGE);
+        if replaces && self.run.running() {
+            self.warn("Wait for the backup to finish before changing the source.");
+            return Vec::new();
+        }
         match action {
             BackupAction::SelectDevice { slot, device } => self.select_device(slot, device),
             BackupAction::OpenImage { path, rename } => self.open_image(path, rename),
