@@ -72,8 +72,9 @@ impl BudgetForm {
     pub fn selected(&self) -> SizeBudget {
         match self.mode {
             BudgetMode::Fit => SizeBudget::Fit,
-            BudgetMode::Absolute => SizeBudget::Limit(self.absolute_mib * MIB),
-            BudgetMode::Headroom => SizeBudget::Grow(self.headroom_mib * MIB),
+            // Typed values: a huge one must not wrap to a tiny ceiling (CCM-019).
+            BudgetMode::Absolute => SizeBudget::Limit(self.absolute_mib.saturating_mul(MIB)),
+            BudgetMode::Headroom => SizeBudget::Grow(self.headroom_mib.saturating_mul(MIB)),
         }
     }
 

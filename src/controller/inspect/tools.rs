@@ -38,6 +38,8 @@ pub(super) struct ToolState {
     show_debug: bool,
     /// What a Repair rewrites: the checked partition's (offset, type byte, type string).
     repair_target: Option<(u64, u8, Option<String>)>,
+    /// The fsck job is a Repair (a write), not a check.
+    repairing: bool,
     bootable: Option<Job<BootStep>>,
     /// The assessed image waiting for a boot-block donor.
     boot_pending: Option<PathBuf>,
@@ -72,6 +74,17 @@ impl ToolState {
 
     pub fn repacking(&self) -> bool {
         self.repack.is_some()
+    }
+
+    /// A tool is writing the disk: each write refused only a second run of its own kind (CIN-002).
+    pub fn writing(&self) -> bool {
+        self.repairing
+            || self.bootable.is_some()
+            || self.boot_pending.is_some()
+            || self.table_apply.is_some()
+            || self.expand.is_some()
+            || self.repack.is_some()
+            || self.swab.is_some()
     }
 
     pub fn running(&self) -> Option<&'static str> {
@@ -384,7 +397,9 @@ impl InspectController {
         if self.tools.fsck.is_some() {
             return;
         }
+        // The shown result and the Repair target always describe one partition (CIN-001).
         self.tools.repair_target = Some(target.clone());
+        self.tools.fsck_result = None;
         self.tools.repair_report = None;
         let Some(source) = self.fsck_source() else {
             self.error("No source available for filesystem check");
@@ -405,6 +420,23 @@ impl InspectController {
                     .map_err(|e| format!("{e:#}")),
             })
         }));
+    }
+
+    /// Before an in-place write: no other tool writing, and the browse view closed so its cached
+    /// metadata can't write stale edits after; staged edits there must go first (CIN-002/004/005).
+    fn ready_to_write(&mut self) -> bool {
+        if self.tools.writing() {
+            self.error("Another tool is writing to this disk; wait for it to finish.");
+            return false;
+        }
+        if self.browse_dirty {
+            self.error("Apply or discard the staged edits in the browse view first.");
+            return false;
+        }
+        if self.browsing().is_some() {
+            self.requests.push(HostRequest::CloseBrowse);
+        }
+        true
     }
 
     pub(super) fn ask_repair(&mut self) -> Vec<Effect> {
@@ -450,6 +482,10 @@ impl InspectController {
             ptype,
             type_string,
         };
+        if !self.ready_to_write() {
+            return;
+        }
+        self.tools.repairing = true;
         self.tools.fsck = Some(self.spawn("Repairing the filesystem...", move |job| {
             job.set_can_cancel(false);
             crate::model::fsck_runner::repair_and_recheck(&target)
@@ -502,6 +538,9 @@ impl InspectController {
             return;
         };
         if self.tools.bootable.is_some() {
+            return;
+        }
+        if !self.ready_to_write() {
             return;
         }
         self.tools.bootable = Some(self.spawn(
@@ -592,6 +631,10 @@ impl InspectController {
     }
 
     fn write_bootable(&mut self, path: PathBuf, donor: Option<PathBuf>) {
+        // The write itself is gated too: the assess may have waited on a donor meanwhile.
+        if !self.ready_to_write() {
+            return;
+        }
         let opts = MakeBootableOptions {
             donor,
             driver: DriverSource::Builtin,
@@ -735,6 +778,9 @@ impl InspectController {
             edits.len(),
             path.display()
         ));
+        if !self.ready_to_write() {
+            return;
+        }
         self.tools.table_apply = Some(self.spawn("Writing the partition table...", move |job| {
             job.set_can_cancel(false);
             Ok(crate::model::partition_editor::apply_to_source(
@@ -946,6 +992,9 @@ impl InspectController {
         ));
         let sink = Arc::clone(&self.log);
         self.tools.expand_chd = is_chd;
+        if !self.ready_to_write() {
+            return;
+        }
         self.tools.expand = Some(self.spawn("Expanding the image...", move |job| {
             job.set_can_cancel(false);
             if is_chd {
@@ -1011,7 +1060,9 @@ impl InspectController {
             return;
         };
         // The browse view's handles go first so the repack can rewrite the file.
-        self.requests.push(HostRequest::CloseBrowse);
+        if !self.ready_to_write() {
+            return;
+        }
         self.info("Starting Human68k defragment (repack)...");
         let sink = Arc::clone(&self.log);
         self.tools.repack = Some(self.spawn("Defragmenting...", move |job| {
@@ -1069,6 +1120,11 @@ impl InspectController {
             return;
         }
         let sink = Arc::clone(&self.log);
+        // A separate output: only another write is in the way, not an open browse.
+        if self.tools.writing() {
+            self.error("Another tool is writing to this disk; wait for it to finish.");
+            return;
+        }
         self.tools.swab = Some(self.spawn("Swapping word order...", move |job| {
             job.set_can_cancel(false);
             let status = crate::model::swab_runner::spawn(path, Some(dest));
@@ -1130,6 +1186,7 @@ impl InspectController {
         let mut fx = Vec::new();
         if let Some(done) = self.tools.fsck.as_ref().and_then(finished) {
             self.tools.fsck = None;
+            self.tools.repairing = false;
             self.fsck_done(done);
         }
         if let Some(done) = self.tools.bootable.as_ref().and_then(finished) {

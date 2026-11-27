@@ -195,7 +195,12 @@ impl ResizeController {
         for r in preview.iter().filter(|r| r.action != "No change") {
             msg.push_str(&format!(
                 "\n  Partition {}: {} at {} -> {} at {} ({})",
-                r.index, r.old_size, r.old_start, r.new_size, r.new_start, r.action
+                r.index + 1,
+                r.old_size,
+                r.old_start,
+                r.new_size,
+                r.new_start,
+                r.action
             ));
         }
         msg.push_str("\n\nThe partitions are rewritten in place. Back up the disk first.");
@@ -384,14 +389,15 @@ impl ResizeController {
             let Some(new_bytes) = parsed_new_size(row.text.as_str(), row.original_size) else {
                 self.plan_error = Some(format!(
                     "Invalid size for partition {}: '{}'",
-                    row.index, row.text
+                    row.index + 1,
+                    row.text
                 ));
                 return;
             };
             if row.minimum_size > 0 && new_bytes < row.minimum_size {
                 self.plan_error = Some(format!(
                     "Partition {} new size ({}) is below minimum ({})",
-                    row.index,
+                    row.index + 1,
                     disk_core::display::format_size(new_bytes),
                     disk_core::display::format_size(row.minimum_size),
                 ));
@@ -486,7 +492,8 @@ impl ResizeController {
             let Some(new_bytes) = parsed_new_size(row.text.as_str(), row.original_size) else {
                 let msg = format!(
                     "Invalid size for partition {}: '{}' - nothing was written.",
-                    row.index, row.text
+                    row.index + 1,
+                    row.text
                 );
                 self.error(msg);
                 return;

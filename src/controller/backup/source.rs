@@ -203,7 +203,8 @@ impl BackupController {
     /// The source changed: forget what was found, and preview an image (devices wait for a scan).
     pub(super) fn source_changed(&mut self) {
         // A Start waiting on the old source's minimum sizes must not fire on the new one.
-        self.run.pending_start = false;
+        // The pending Start itself, or it fired for the next source (CWR-001).
+        self.run.clear_pending();
         self.clear_found();
         let Some(path) = self.image_path().map(|p| p.to_path_buf()) else {
             return;
@@ -222,6 +223,8 @@ impl BackupController {
     pub(super) fn clear_found(&mut self) {
         self.src.stop_reading();
         self.found = super::Found::default();
+        // The VHD window's overrides describe the old disk (CWR-006).
+        self.run.vhd = None;
     }
 
     /// "Load partition info": read the table off the UI thread (a device may prompt for credentials).
@@ -354,7 +357,8 @@ impl BackupController {
         if let Some(path) = self.escalated.take() {
             crate::os::release_elevated_devices(Some(&*path.to_string_lossy()));
         }
-        self.run.pending_start = false;
+        // The pending Start itself, or it fired for the next source (CWR-001).
+        self.run.clear_pending();
     }
 
     // --- Calc min -----------------------------------------------------------------------

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use super::source::purpose;
 use super::volume::{ArchiveRead, ArchiveUse, MacArchiveKind};
 use super::BrowserPaneController;
-use crate::controller::{Effect, PickSpec};
+use crate::controller::{ConfirmSpec, Effect, PickSpec};
 use crate::model::archive_import::{self, ArchiveRow, HostPick, TarPreview, TarStep};
 use crate::model::job::{Job, Resource, Snapshot, Status};
 use arc_mac::stuffit::StuffItArchive;
@@ -172,6 +172,8 @@ pub(super) struct ArchiveState {
     /// A picked tar and the folder it goes to, waiting for `ChooseTar`.
     tar: Option<(PathBuf, String)>,
     tar_preview: Option<(TarPreview, String)>,
+    /// A tar import held for the re-encode warning's answer: (archive, folder, preflight).
+    tar_lossy: Option<(PathBuf, Option<String>, bool)>,
     job: Option<ArchiveJob>,
     viewer: Option<ArchiveViewer>,
     save: Option<ArchiveSave>,
@@ -181,6 +183,25 @@ pub(super) struct ArchiveState {
     temp: Option<tempfile::TempDir>,
     imported: usize,
     notice: Option<String>,
+}
+
+impl ArchiveState {
+    /// Forget pending imports, prompts and the viewer of the old source (CBR-005). A host write
+    /// or a tar import already writing keeps running and reports.
+    pub(super) fn forget_source(&mut self) {
+        match self.job.take() {
+            Some(keep @ (ArchiveJob::Host(_) | ArchiveJob::Tar(..))) => self.job = Some(keep),
+            Some(ArchiveJob::Classify { job, .. }) => job.cancel(),
+            Some(ArchiveJob::Import { job, .. }) => job.cancel(),
+            None => {}
+        }
+        self.imports.clear();
+        self.tar = None;
+        self.tar_preview = None;
+        self.tar_lossy = None;
+        self.viewer = None;
+        self.save = None;
+    }
 }
 
 fn is_mac_fs(fs_type: &str) -> bool {
@@ -260,6 +281,15 @@ impl BrowserPaneController {
                 Some(p) => self.start_tar(p, None, true),
                 None => Vec::new(),
             },
+            A::Confirmed { purpose, yes } if purpose == purpose::LOSSY_TAR => {
+                match self.arc.tar_lossy.take() {
+                    Some((archive, folder, check)) if yes => {
+                        self.accept_loss();
+                        self.start_tar(archive, folder, check)
+                    }
+                    _ => Vec::new(),
+                }
+            }
             A::ConfirmTarImport(yes) => match self.arc.tar_preview.take() {
                 Some((pf, folder)) if yes => self.start_tar(pf.archive, Some(folder), false),
                 Some(_) => {
@@ -484,6 +514,17 @@ impl BrowserPaneController {
     fn start_tar(&mut self, archive: PathBuf, folder: Option<String>, check: bool) -> Vec<Effect> {
         if let Err(fx) = self.writable_volume().and_then(|_| self.job_free()) {
             return fx;
+        }
+        // The import writes the image at once, so it hears the re-encode warning first (CBR-004).
+        if let Some(note) = self.unaccepted_loss() {
+            self.arc.tar_lossy = Some((archive, folder, check));
+            return vec![Effect::Confirm(ConfirmSpec {
+                purpose: purpose::LOSSY_TAR,
+                title: "Import into this image?".into(),
+                message: note.to_string(),
+                confirm_label: "Import Anyway".into(),
+                destructive: true,
+            })];
         }
         let dest = match &folder {
             Some(path) => self.entry_at(path).filter(|e| e.is_directory()),

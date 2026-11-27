@@ -536,6 +536,26 @@ impl CommanderController {
             };
             return self.start_host_copy(job, None, conflicts, resources, where_to);
         }
+        // The folder exports overwrite what is there; refuse rather than replace unasked (CCM-001).
+        let folder_format = matches!(
+            format,
+            ExportFormat::LooseFiles
+                | ExportFormat::GzipPerFile
+                | ExportFormat::ZstdPerFile
+                | ExportFormat::BinHex
+        );
+        let taken = match folder_format {
+            true => folder_collisions(&entries, &dest),
+            false => Vec::new(),
+        };
+        if !taken.is_empty() {
+            return format!(
+                "Export refused: {} item(s) already exist in {} (first: {}); pick an empty folder.",
+                taken.len(),
+                dest.display(),
+                taken[0]
+            );
+        }
         let Some(source) = self.pane(from).copy_stage_source() else {
             return "Source volume is not open.".to_string();
         };
@@ -684,6 +704,34 @@ fn without_nested(entries: Vec<FileEntry>) -> Vec<FileEntry> {
 }
 
 /// A tar export takes its compression from the name picked (`.tar`, `.tar.gz` / `.tgz`, `.tar.zst`).
+/// Items a folder export would write over in `dest`: a name (as is or sanitized) taken alone or with
+/// an added extension; an existing folder counts, as the export writes inside it.
+fn folder_collisions(entries: &[FileEntry], dest: &std::path::Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(dest) else {
+        return Vec::new();
+    };
+    let existing: Vec<String> = rd
+        .flatten()
+        .map(|d| d.file_name().to_string_lossy().to_lowercase())
+        .collect();
+    let hits = |stem: &str| {
+        existing.iter().any(|n| {
+            n == stem
+                || n.strip_prefix(stem)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
+    };
+    entries
+        .iter()
+        .filter(|e| {
+            let plain = e.name.to_lowercase();
+            let safe = crate::model::host_component(&e.name, "_").to_lowercase();
+            hits(&plain) || hits(&safe)
+        })
+        .map(|e| e.name.clone())
+        .collect()
+}
+
 fn tar_format_for(format: ExportFormat, dest: &std::path::Path) -> ExportFormat {
     let tar = [
         ExportFormat::Tar,
