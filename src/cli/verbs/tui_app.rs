@@ -5265,6 +5265,22 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let img = crate::controller::test_fixtures::sgi_efs_disk(dir.path());
         let mut app = inspect_on(&img);
+        // A shrink needs the measured minimum, so Calc Min runs on the EFS partition first.
+        let efs_part = app
+            .inspect
+            .as_ref()
+            .unwrap()
+            .ctl
+            .partitions()
+            .iter()
+            .find(|p| p.type_name.contains("EFS"))
+            .map(|p| p.index)
+            .expect("an EFS partition");
+        crate::controller::Controller::apply(
+            &mut app.inspect.as_mut().unwrap().ctl,
+            crate::controller::inspect::InspectAction::CalcMin(efs_part),
+        );
+        inspect_settle(&mut app);
         ikey(&mut app, KeyCode::Char('s'));
         assert_eq!(app.key_context().0, "Inspect - resize");
         let s = app.inspect.as_ref().unwrap();

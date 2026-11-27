@@ -27,9 +27,12 @@ OUT="$HERE/watt32"
 mkdir -p "$DL" "$OUT"
 ZIP="$DL/$(basename "$WATT32_URL")"
 
+# delorie.com has failed to resolve on CI runners; the UK mirror carries the same tree.
+WATT32_MIRROR="${WATT32_MIRROR:-https://www.mirrorservice.org/sites/ftp.delorie.com/pub/djgpp/current/v2tk/$(basename "$WATT32_URL")}"
 if [ ! -f "$ZIP" ]; then
     echo "Fetching WATT-32 (DJGPP binary package): $WATT32_URL"
-    curl -fsSL -o "$ZIP" "$WATT32_URL"
+    curl -fsSL --retry 3 --retry-all-errors -o "$ZIP" "$WATT32_URL" \
+        || curl -fsSL --retry 3 --retry-all-errors -o "$ZIP" "$WATT32_MIRROR"
 fi
 
 # The package lays the library out under net/watt/{inc,lib}; lift those two

@@ -1,0 +1,20 @@
+# Resize Partitions refuses a shrink until the partition's minimum is measured (Calc Min); keeping
+# the size is still allowed. CTK-008, the owner's decision.
+name = "Resize: a shrink needs the measured minimum"
+vm = "resize"
+
+[[step]]
+action = "Open"
+arg = "$sgi-unmeasured"
+expect = { open = true, can_apply = false }
+
+[[step]]
+action = "Custom"
+
+[[step]]
+action = "SetSize"
+arg = "32"
+
+[[step]]
+action = "Preview"
+expect = { plan_error = "~minimum size is not known", can_apply = false }

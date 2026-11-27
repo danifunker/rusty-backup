@@ -313,14 +313,32 @@ fn the_resize_controller_writes_the_same_bytes_as_the_engine() {
         std::thread::sleep(std::time::Duration::from_millis(5));
         inspect.tick();
     }
-    let plan = inspect.resize_plan().expect("a table to resize");
-    let align = plan.alignment_sectors;
-    let efs = plan
+    let efs = inspect
+        .resize_plan()
+        .expect("a table to resize")
         .partitions
         .iter()
         .find(|p| p.partition_type_byte == 0xA1)
         .map(|p| p.index)
         .unwrap();
+    // A shrink needs the measured minimum first.
+    inspect.apply(InspectAction::CalcMin(efs));
+    for _ in 0..6000 {
+        inspect.tick();
+        if inspect
+            .resize_plan()
+            .is_some_and(|p| p.min_sizes.contains_key(&efs))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let plan = inspect.resize_plan().expect("a table to resize");
+    assert!(
+        plan.min_sizes.contains_key(&efs),
+        "Calc Min measured the EFS partition"
+    );
+    let align = plan.alignment_sectors;
 
     let mut ctl = ResizeController::new(Arc::new(NoNotify));
     ctl.apply(ResizeAction::Open(Box::new(plan)));

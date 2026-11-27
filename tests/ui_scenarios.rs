@@ -2245,7 +2245,11 @@ impl ResizeTarget {
             .extend(self.ctl.take_log().into_iter().map(|(_, m)| m));
     }
 
-    fn open_sgi(&mut self) -> Result<rusty_backup::controller::resize::ResizePlan, String> {
+    /// The IRIX disk's resize plan; `measure` runs Calc Min on its EFS partition first.
+    fn open_sgi(
+        &mut self,
+        measure: bool,
+    ) -> Result<rusty_backup::controller::resize::ResizePlan, String> {
         use rusty_backup::controller::inspect::{
             InspectAction, InspectController, InspectServices, InspectSource, JobRegistry, NoNotify,
         };
@@ -2273,7 +2277,23 @@ impl ResizeTarget {
             .find(|p| p.partition_type_byte == 0xA1)
             .map(|p| p.index)
             .ok_or("no EFS partition")?;
-        Ok(plan)
+        if !measure {
+            return Ok(plan);
+        }
+        inspect.apply(InspectAction::CalcMin(self.efs));
+        for _ in 0..6000 {
+            inspect.tick();
+            if inspect
+                .resize_plan()
+                .is_some_and(|p| p.min_sizes.contains_key(&self.efs))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        inspect
+            .resize_plan()
+            .ok_or_else(|| "no table to resize".into())
     }
 }
 
@@ -2283,10 +2303,12 @@ impl Target for ResizeTarget {
         let index = self.efs;
         let a = match action {
             "Open" => {
-                if arg_str(arg)? != "$sgi" {
-                    return Err("Open takes $sgi".into());
-                }
-                ResizeAction::Open(Box::new(self.open_sgi()?))
+                let measure = match arg_str(arg)? {
+                    "$sgi" => true,
+                    "$sgi-unmeasured" => false,
+                    _ => return Err("Open takes $sgi or $sgi-unmeasured".into()),
+                };
+                ResizeAction::Open(Box::new(self.open_sgi(measure)?))
             }
             "Custom" => ResizeAction::SetMode {
                 index,

@@ -47,8 +47,11 @@ cp "$FDBASE" "$DIST/cbdos-freedos.img"
 DL="$HERE/dl"
 CSDPMI_URL="${CSDPMI_URL:-http://www.delorie.com/pub/djgpp/current/v2misc/csdpmi7b.zip}"
 mkdir -p "$DL"
+# delorie.com has failed to resolve on CI runners; the UK mirror carries the same tree.
+CSDPMI_MIRROR="${CSDPMI_MIRROR:-https://www.mirrorservice.org/sites/ftp.delorie.com/pub/djgpp/current/v2misc/csdpmi7b.zip}"
 if [ ! -f "$DL/CWSDPMI.EXE" ]; then
-    curl -fsSL -o "$DL/csdpmi7b.zip" "$CSDPMI_URL"
+    curl -fsSL --retry 3 --retry-all-errors -o "$DL/csdpmi7b.zip" "$CSDPMI_URL" \
+        || curl -fsSL --retry 3 --retry-all-errors -o "$DL/csdpmi7b.zip" "$CSDPMI_MIRROR"
     ( cd "$DL" && unzip -o -j -q csdpmi7b.zip bin/CWSDPMI.EXE )
 fi
 

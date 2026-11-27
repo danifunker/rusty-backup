@@ -912,7 +912,10 @@ impl CommanderController {
         self.modes.generation += 1;
         self.modes.free = None;
         self.modes.free_job = None;
-        if self.modes.chd.is_some() || (self.modes.edit_mode && self.modes.archive_temp.is_some()) {
+        // An uncompressed CHD is written in place, so Apply is its save, as for any image; only a
+        // diff waits for a flatten (CCM-014).
+        let diffed = self.modes.chd.as_ref().is_some_and(|c| c.diff.is_some());
+        if diffed || (self.modes.edit_mode && self.modes.archive_temp.is_some()) {
             self.modes.copy_dirty = true;
         }
     }
