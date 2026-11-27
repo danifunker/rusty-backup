@@ -177,7 +177,8 @@ pub(super) struct Modes {
     pending_close: bool,
     close: bool,
     /// The Apply in flight: what follows it, the queue size, and whether it wrote.
-    follow: Option<(FollowUp, usize, bool)>,
+    /// (what follows, edits asked about, a write seen, the pane's write count at the start).
+    follow: Option<(FollowUp, usize, bool, u64)>,
     /// The pane's write count last seen.
     writes: u64,
     /// Bumped whenever the volume is reopened or written, so a view drops what it showed.
@@ -627,7 +628,7 @@ impl CommanderController {
             return Vec::new();
         }
         let total = self.left.queue.len();
-        self.modes.follow = Some((follow, total, false));
+        self.modes.follow = Some((follow, total, false, self.left.write_count()));
         self.forward(Side::Left, BrowserPaneAction::Apply)
     }
 
@@ -909,13 +910,14 @@ impl CommanderController {
     }
 
     fn poll_apply_follow(&mut self) {
-        let Some((follow, total, wrote)) = self.modes.follow else {
+        let Some((follow, total, wrote, start)) = self.modes.follow else {
             return;
         };
-        let wrote = wrote || self.left.applying().is_some();
+        // The write count, not a sampled "applying": a write can start and end between ticks (CCM-005).
+        let wrote = wrote || self.left.applying().is_some() || self.left.write_count() != start;
         let waiting = self.left.awaiting_save_answer();
         if self.left.is_busy() || self.left.apply_review().is_some() || waiting {
-            self.modes.follow = Some((follow, total, wrote));
+            self.modes.follow = Some((follow, total, wrote, start));
             return;
         }
         self.modes.follow = None;
@@ -989,6 +991,11 @@ impl CommanderController {
         let Some(temp) = self.modes.nested.take() else {
             return;
         };
+        // A failed or cancelled extraction leaves a partial file; it is not opened.
+        if !std::mem::take(&mut self.last_copy_whole) {
+            self.modes.notice = Some(format!("Open as disk image: {}", self.status));
+            return;
+        }
         let first = std::fs::read_dir(temp.path())
             .ok()
             .and_then(|mut d| d.find_map(|e| e.ok()))

@@ -557,6 +557,30 @@ impl RestoreController {
                 return Err("This mode starts from its own window.".into());
             }
         }
+        // A whole-disk restore onto the running OS's disk is refused, as Build Disk and the CLI
+        // refuse it; a single partition there keeps its warning (CWR-007).
+        let whole_slot = match self.mode {
+            RestoreMode::FullDisk => Some(TargetSlot::FullDisk),
+            RestoreMode::NewDisk => Some(TargetSlot::NewDisk),
+            _ => None,
+        };
+        let on_system =
+            |slot| self.target_is_device(slot) && self.device(slot).is_some_and(|d| d.is_system);
+        if whole_slot.is_some_and(on_system) {
+            return Err("That is the system disk; choose another target.".into());
+        }
+        // Writing the image being read destroys it before it is copied (CWR-008).
+        let src_image = self.src.image_path();
+        let into_source = whole_slot
+            .and_then(|slot| {
+                self.target_image(slot)
+                    .filter(|_| !self.target_is_device(slot))
+            })
+            .zip(src_image)
+            .is_some_and(|(dst, src)| crate::model::same_file(dst, src));
+        if into_source {
+            return Err("The target image is the source image; choose another file.".into());
+        }
         if let Some(c) = self
             .size_caveats()
             .into_iter()

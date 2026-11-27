@@ -167,6 +167,10 @@ impl DiskWriteController {
 
     /// "Source is X but the partition holds Y" for the chosen partition.
     pub fn partition_warning(&self) -> Option<String> {
+        // Why Write stays disabled on the running OS's disk, shown where every shell already looks.
+        if self.target_device().is_some_and(|d| d.is_system) {
+            return Some("That is the system disk; choose another device.".into());
+        }
         let src = self.source.as_ref()?;
         let part = self.chosen_partition()?;
         crate::model::disk_write_plan::partition_fit_warning(src.size_bytes, part)

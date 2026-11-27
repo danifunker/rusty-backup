@@ -271,8 +271,9 @@ impl RestoreController {
         };
         let base = self.source_size().unwrap_or(0);
         // An image honours the trailing free space; the daemon checks the image fits a device.
+        // A drive is filled to its own size, as a local one is (CWR-004).
         let target_size = if is_device {
-            base
+            self.remote_device_size().unwrap_or(base)
         } else {
             base.saturating_add(self.targets.expand.free_bytes(false))
         };

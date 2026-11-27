@@ -98,6 +98,8 @@ impl SourceState {
         self.load_deferred = false;
         self.guard = None;
         self.source_partition = None;
+        // A drop-swap landing later reloaded the old backup over the new one (CWR-003).
+        self.drop_swap = None;
     }
 }
 
@@ -353,10 +355,16 @@ impl RestoreController {
     }
 
     pub(super) fn drop_swap(&mut self) {
+        if self.is_running() || self.src.drop_swap.is_some() {
+            return;
+        }
         let Some(folder) = self.src.loaded.as_ref().map(|l| l.folder.clone()) else {
             return;
         };
+        // The unpacked .cbk folder lives while the job reads it.
+        let guard = self.src.guard.clone();
         self.src.drop_swap = Some(self.spawn("Dropping swap files", move |ctx| {
+            let _guard = guard;
             ctx.set_can_cancel(false);
             ctx.set_phase("Dropping swap files...");
             let mut log = |m: String| ctx.set_phase(m);
@@ -423,14 +431,14 @@ impl RestoreController {
         let Some((original, _)) = self.src.decode.take() else {
             return;
         };
-        // A failed decode falls back to the file as picked.
-        self.src.image = Some(match done {
-            Ok(prepared) => prepared,
+        // A failed decode sets no source: the container's raw bytes are not a partition (CWR-002).
+        self.src.image = match done {
+            Ok(prepared) => Some(prepared),
             Err(e) => {
                 self.error(format!("Failed to decompress {}: {e}", original.display()));
-                (original, None)
+                None
             }
-        });
+        };
         if let Some(path) = self.src.image_path().map(Path::to_path_buf) {
             self.probe_image_facts(path);
         }

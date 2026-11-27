@@ -1340,6 +1340,10 @@ impl BuildDiskController {
         if self.job.is_some() {
             return Some("A build is running.".to_string());
         }
+        // A late probe or donor result changes the layout; building first left its content out (CWR-005).
+        if self.probing() || self.donor_reading() {
+            return Some("Wait for the sources to be read.".to_string());
+        }
         for step in self.steps() {
             if matches!(step, Step::Review | Step::Build) {
                 break;

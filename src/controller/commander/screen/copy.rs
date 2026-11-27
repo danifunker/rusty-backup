@@ -88,7 +88,12 @@ impl CommanderController {
                 );
                 match spawned {
                     Ok(job) => {
-                        self.copy = Some(CopyRun::Stage { job, dest: to });
+                        let dest_key = self.volume_key(to);
+                        self.copy = Some(CopyRun::Stage {
+                            job,
+                            dest: to,
+                            dest_key,
+                        });
                         format!("Copying to the {other} pane...")
                     }
                     Err(busy) => format!("Copy refused: {busy}"),
@@ -350,7 +355,14 @@ impl CommanderController {
                     self.reload(side);
                 }
                 let asked = self.asked.take().is_some();
-                let msg = match (job.snapshot().status, job.take_result()) {
+                let status = job.snapshot().status;
+                let result = job.take_result();
+                // Whether every file landed whole, for an "Open as Disk Image" waiting on it (CCM-008).
+                self.last_copy_whole = matches!(
+                    (&status, &result),
+                    (Status::Done, Some(d)) if d.skipped.is_empty() && d.stopped.is_none()
+                );
+                let msg = match (status, result) {
                     (Status::Done, Some(done)) if done.stopped.is_some() || asked => {
                         self.end_asked_run(done, &where_to);
                         return;
@@ -376,8 +388,17 @@ impl CommanderController {
                 };
                 self.report(msg);
             }
-            Some(CopyRun::Stage { job, dest }) => {
+            Some(CopyRun::Stage {
+                job,
+                dest,
+                dest_key,
+            }) => {
+                let moved = self.volume_key(dest) != dest_key;
                 let msg = match (job.snapshot().status, job.take_result()) {
+                    (Status::Done, Some(_)) if moved => format!(
+                        "The {} pane now shows another volume; the copy was not staged.",
+                        dest.label()
+                    ),
                     (Status::Done, Some(edits)) => {
                         let out = self.pane_mut(dest).stage_edits(edits);
                         self.note_staged(dest, out)

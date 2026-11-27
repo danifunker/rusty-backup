@@ -33,6 +33,9 @@ pub(super) struct RemoteState {
     /// The chosen target: its daemon-side path, the `rb://` label, and whether it is a device.
     #[cfg(feature = "remote")]
     selected: Option<(String, String, bool)>,
+    /// The picked remote drive's size, which a full-disk restore fills (CWR-004).
+    #[cfg(feature = "remote")]
+    device_size: Option<u64>,
     #[cfg(feature = "remote")]
     job: Option<Job<(Conn, Vec<WireDevice>)>>,
 }
@@ -74,6 +77,15 @@ impl RestoreController {
     }
 
     /// The full-disk target is on a daemon.
+    /// The remote drive a full-disk restore writes, by its size; `None` for an image or no pick.
+    pub fn remote_device_size(&self) -> Option<u64> {
+        #[cfg(feature = "remote")]
+        if self.remote_active() && self.remote.selected.as_ref().is_some_and(|s| s.2) {
+            return self.remote.device_size;
+        }
+        None
+    }
+
     pub fn remote_active(&self) -> bool {
         cfg!(feature = "remote") && self.remote.active
     }
@@ -181,6 +193,7 @@ impl RestoreController {
             format!("{a}:7341")
         };
         self.remote.selected = None;
+        self.remote.device_size = None;
         self.remote.devices.clear();
         self.remote.conn = None;
         self.remote.error = None;
@@ -201,6 +214,7 @@ impl RestoreController {
             disk_core::display::format_size(size)
         );
         self.remote.selected = Some((path, display, true));
+        self.remote.device_size = Some(size);
     }
 
     #[cfg(not(feature = "remote"))]

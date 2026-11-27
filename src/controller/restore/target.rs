@@ -199,6 +199,9 @@ impl RestoreController {
 
     /// The full-disk target's size: the device, or the source plus the trailing free space.
     pub fn target_size(&self) -> u64 {
+        if let Some(size) = self.remote_device_size() {
+            return size;
+        }
         let t = &self.targets.full;
         if t.is_device {
             t.device.as_ref().map(|p| p.device.size_bytes).unwrap_or(0)

@@ -629,7 +629,11 @@ impl InspectController {
 
     /// Close applies: a local source, not loading and not exporting (a remote one closes apart).
     pub fn can_close(&self) -> bool {
-        self.has_local_source() && self.loading().is_none() && !self.export_running()
+        // Nor while a tool writes: closing releases the device's claim mid-write (CIN-008).
+        self.has_local_source()
+            && self.loading().is_none()
+            && !self.export_running()
+            && !self.tools.writing()
     }
 
     /// Expand Image's sizes for `add_mib` more MiB: (current, after); the step is capped at 4 TiB.
@@ -1198,6 +1202,14 @@ impl Controller for InspectController {
     type Action = InspectAction;
 
     fn apply(&mut self, action: InspectAction) -> Vec<Effect> {
+        let replaces = matches!(
+            action,
+            InspectAction::Open(_) | InspectAction::Close | InspectAction::Load(_)
+        );
+        if replaces && self.tools.writing() {
+            self.error("A tool is writing to this disk; wait for it to finish.");
+            return Vec::new();
+        }
         match action {
             InspectAction::Open(source) => self.gate(UnsavedGate::Open, Some(source)),
             InspectAction::ChooseImage => vec![Effect::PickFile(Self::image_picker())],
