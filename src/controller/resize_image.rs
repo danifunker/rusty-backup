@@ -262,6 +262,8 @@ pub struct ResizeImageController {
     outcome: Option<Result<(), String>>,
     open_request: Option<PathBuf>,
     disk_changed: bool,
+    /// The check job is a Repair, which writes the image.
+    repairing: bool,
 }
 
 impl ResizeImageController {
@@ -291,6 +293,7 @@ impl ResizeImageController {
             outcome: None,
             open_request: None,
             disk_changed: false,
+            repairing: false,
         }
     }
 
@@ -894,6 +897,7 @@ impl ResizeImageController {
             .filter_map(|r| r.verdict.clone().map(|v| (r.index, v)))
             .collect::<Vec<_>>();
         let backend = self.backend();
+        self.repairing = true;
         self.check_job = Some(Job::spawn(
             "Repairing the volume",
             Arc::clone(&self.notify),
@@ -1127,6 +1131,10 @@ impl ResizeImageController {
         }
         if let Some(done) = self.check_job.as_ref().and_then(job_outcome) {
             self.check_job = None;
+            // A Repair changed the image, so Inspect reads it again (CTK-006).
+            if std::mem::take(&mut self.repairing) {
+                self.disk_changed = true;
+            }
             match done {
                 Ok(results) => {
                     for (i, v) in results {
@@ -1197,13 +1205,15 @@ impl Controller for ResizeImageController {
             action,
             A::Open(_) | A::Close | A::Cancel | A::Confirmed { .. } | A::OpenResult
         );
-        if edits && self.work.is_some() {
+        // Not while the plan is checked either: the old plan then reached Review (CTK-004).
+        if edits && (self.work.is_some() || self.plan_job.is_some()) {
             return Vec::new();
         }
         match action {
             A::Open(source) => self.open(*source),
+            // Not while a Repair still writes the image either (CTK-007).
             A::Close => {
-                if self.work.is_none() {
+                if self.work.is_none() && !self.repairing {
                     self.source = None;
                 }
             }
@@ -1242,7 +1252,9 @@ impl Controller for ResizeImageController {
                     return Vec::new();
                 }
                 match purpose {
-                    purpose::IN_PLACE => self.start(),
+                    // The answer counts only for the reviewed plan still on screen (CTK-005).
+                    purpose::IN_PLACE if self.can_start() => self.start(),
+                    purpose::IN_PLACE => {}
                     purpose::REPAIR => {
                         if let Some(i) = self.pending_repair.take() {
                             self.repair(i);

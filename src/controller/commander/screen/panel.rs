@@ -253,7 +253,7 @@ impl CommanderController {
             qnx: applies.rs_to_lf,
             text,
             edit_mode: self.edit_mode(),
-            metadata: extras && d.editable,
+            metadata: extras && d.editable && !self.pane(d.side).is_read_only(),
         })
     }
 }

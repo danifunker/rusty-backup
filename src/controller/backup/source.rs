@@ -168,6 +168,7 @@ impl BackupController {
         let Some(decode) = self.src.decode.take() else {
             return;
         };
+        // A failed decode sets no source: backing up the container's bytes is not a backup (CWR-002).
         let (path, temp) = match done {
             Ok(prepared) => prepared,
             Err(e) => {
@@ -175,7 +176,7 @@ impl BackupController {
                     "Failed to decompress {}: {e}",
                     decode.original.display()
                 ));
-                (decode.original, None)
+                return;
             }
         };
         self.set_image(path, temp, decode.rename);

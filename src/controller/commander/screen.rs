@@ -564,6 +564,8 @@ enum CopyRun {
     Stage {
         job: Job<Vec<StagedEdit>>,
         dest: Side,
+        /// The destination's volume when the copy began; another one there drops it (CCM-003).
+        dest_key: String,
     },
 }
 
@@ -600,6 +602,8 @@ pub struct CommanderController {
     /// Each pane's explicit export format pick and the volume it was made on.
     export_pick: [Option<(ExportFormat, String)>; 2],
     copy: Option<CopyRun>,
+    /// The last host copy finished with every file whole.
+    last_copy_whole: bool,
     conflict: Option<PendingConflict>,
     rename_notice: Option<RenameNotice>,
     /// The running copy's question put to the shell (its id), so it is asked once.
@@ -929,6 +933,7 @@ impl CommanderController {
             export_fork_mode: ResourceForkMode::MacBinary,
             export_pick: [None, None],
             copy: None,
+            last_copy_whole: false,
             conflict: None,
             rename_notice: None,
             asked: None,
@@ -1113,7 +1118,7 @@ impl CommanderController {
     }
 
     /// What a pick is remembered against: a refresh keeps it, another volume does not.
-    fn volume_key(&self, side: Side) -> String {
+    pub(super) fn volume_key(&self, side: Side) -> String {
         let p = self.pane(side);
         format!(
             "{:?}|{:?}|{}",
@@ -1603,8 +1608,12 @@ impl CommanderController {
     fn open_detail(&mut self, side: Side, name: String) -> Vec<Effect> {
         let pane = self.pane_mut(side);
         // Host folders, read-only sources and a wrapper's contents show metadata without editors.
-        let editable =
-            !pane.is_host_pane() && !pane.is_backup() && !pane.is_archive() && !pane.tree_active();
+        // What the entry allows; the pane's read-only state is applied live where editors show (CCM-006).
+        let editable = !pane.is_host_pane()
+            && !pane.is_backup()
+            && !pane.is_archive()
+            && !pane.is_optical()
+            && !pane.tree_active();
         let fs_type = pane.detail_fs_type();
         let Some(entry) = pane.detail_entry(&name) else {
             self.status = format!("[{}] could not open File Info for '{name}'.", side.label());
@@ -1681,7 +1690,7 @@ impl CommanderController {
             return;
         };
         let pane = self.pane_mut(side);
-        let result = if !editable {
+        let result = if !editable || pane.is_read_only() {
             "This entry is read-only here.".to_string()
         } else if pane.is_busy() {
             "Wait for the running apply to finish.".to_string()

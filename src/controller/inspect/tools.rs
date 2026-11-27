@@ -40,6 +40,8 @@ pub(super) struct ToolState {
     repair_target: Option<(u64, u8, Option<String>)>,
     /// The fsck job is a Repair (a write), not a check.
     repairing: bool,
+    /// The source the fsck job reads, so a result for an earlier one is not shown (CIN-007).
+    fsck_for: Option<PathBuf>,
     bootable: Option<Job<BootStep>>,
     /// The assessed image waiting for a boot-block donor.
     boot_pending: Option<PathBuf>,
@@ -63,6 +65,13 @@ pub(super) struct ToolState {
 impl ToolState {
     /// The source changed: results and questions about the old one go; running writes finish.
     pub fn reset(&mut self) {
+        // A plain check of the old source is dropped (a remote or backup has no path to tell them
+        // apart by); a Repair keeps running, as it owns its write (CIN-007).
+        if !self.repairing {
+            if let Some(job) = self.fsck.take() {
+                job.cancel();
+            }
+        }
         self.fsck_result = None;
         self.repair_report = None;
         self.fsck_open = false;
@@ -412,6 +421,7 @@ impl InspectController {
             ptype,
             type_string,
         };
+        self.tools.fsck_for = self.disk_path();
         self.tools.fsck = Some(self.spawn("Checking the filesystem...", move |job| {
             job.set_can_cancel(false);
             Ok(FsckRun {
@@ -486,6 +496,7 @@ impl InspectController {
             return;
         }
         self.tools.repairing = true;
+        self.tools.fsck_for = self.disk_path();
         self.tools.fsck = Some(self.spawn("Repairing the filesystem...", move |job| {
             job.set_can_cancel(false);
             crate::model::fsck_runner::repair_and_recheck(&target)
@@ -1187,7 +1198,12 @@ impl InspectController {
         if let Some(done) = self.tools.fsck.as_ref().and_then(finished) {
             self.tools.fsck = None;
             self.tools.repairing = false;
-            self.fsck_done(done);
+            match self.tools.fsck_for.take() == self.disk_path() {
+                true => self.fsck_done(done),
+                false => {
+                    self.info("A check of the previous source finished; its result is not shown.")
+                }
+            }
         }
         if let Some(done) = self.tools.bootable.as_ref().and_then(finished) {
             self.tools.bootable = None;

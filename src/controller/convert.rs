@@ -269,6 +269,8 @@ pub struct ConvertController {
     scan_error: Option<String>,
     /// The items Start would write over, while the question is up.
     conflicts: Vec<usize>,
+    /// What the conflict question was asked about; an answer for another list is not acted on.
+    asked_ready: Vec<(usize, PathBuf)>,
     pending_chd: ChdChoices,
     run: Option<Job<RunResult>>,
     place: Arc<Mutex<Option<Progress>>>,
@@ -293,6 +295,7 @@ impl ConvertController {
             scan: None,
             scan_error: None,
             conflicts: Vec::new(),
+            asked_ready: Vec::new(),
             pending_chd: ChdChoices::default(),
             run: None,
             place: Arc::new(Mutex::new(None)),
@@ -820,6 +823,7 @@ impl ConvertController {
         }
         let count = conflicts.len();
         self.conflicts = conflicts;
+        self.asked_ready = self.ready();
         self.pending_chd = chd;
         self.log.push((
             LogLevel::Info,
@@ -827,7 +831,7 @@ impl ConvertController {
         ));
     }
 
-    /// The question Start asks when outputs exist; the shell shows it from [`Self::tick`].
+    /// The question Start (or a re-ask) returns when outputs exist.
     fn conflict_question(&self) -> Effect {
         let n = self.conflicts.len();
         Effect::Choose(ChoiceSpec {
@@ -857,9 +861,20 @@ impl ConvertController {
     }
 
     fn resolve(&mut self, index: usize) {
+        // Only an answer to the question on screen, with nothing running (CTK-009).
+        if self.conflicts.is_empty() || self.run.is_some() {
+            return;
+        }
         let conflicts = std::mem::take(&mut self.conflicts);
         let chd = std::mem::take(&mut self.pending_chd);
         let ready = self.ready();
+        if ready != std::mem::take(&mut self.asked_ready) {
+            // The list changed while the question was up: ask again about the new one.
+            if index != 2 {
+                self.start(chd);
+            }
+            return;
+        }
         match index {
             0 => {
                 let keep: Vec<(usize, PathBuf)> = ready
@@ -1139,6 +1154,10 @@ impl Controller for ConvertController {
             ConvertAction::Chose { purpose, index } => {
                 if purpose == purpose::CONFLICTS {
                     self.resolve(index);
+                    // A changed list is asked about again, here, where the shell hears it.
+                    if !self.conflicts.is_empty() {
+                        return vec![self.conflict_question()];
+                    }
                 }
             }
             ConvertAction::Cancel => {

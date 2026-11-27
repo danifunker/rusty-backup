@@ -68,7 +68,10 @@ impl DiskWriteController {
 
     /// Write is enabled: a source, a target, nothing being read or written.
     pub fn can_write(&self) -> bool {
+        // Never the running OS's disk (CWR-007).
+        let system = self.target_device().is_some_and(|d| d.is_system);
         self.source.is_some()
+            && !system
             && (self.target_device().is_some() || self.target_image().is_some())
             && !self.target.scanning()
             && !self.run.running()
