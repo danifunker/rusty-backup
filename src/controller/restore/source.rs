@@ -468,6 +468,11 @@ impl RestoreController {
             self.mode = RestoreMode::FullDisk;
             self.open_backup(path);
         } else {
+            // Refused before the mode flips under a running restore (a folder waits instead).
+            if self.is_running() {
+                self.warn("Wait for the restore to finish before changing the source.");
+                return;
+            }
             self.mode = RestoreMode::SinglePartition;
             self.open_source_image(path);
         }

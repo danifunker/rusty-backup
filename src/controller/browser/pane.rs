@@ -498,8 +498,7 @@ impl BrowserPaneController {
         let p = &self.profile;
         // The queue is what a check or write is working from, and what the review shows: changing
         // it then shifted the landed edits or wrote unchecked ones (CBR-006, CBR-011).
-        let queue_busy =
-            self.checking().is_some() || self.applying().is_some() || self.apply_review().is_some();
+        let queue_busy = self.queue_locked();
         let changes_queue = matches!(
             action,
             A::Delete

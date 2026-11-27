@@ -1032,7 +1032,7 @@ impl BrowserPaneController {
     /// Stage a File Info metadata edit; a pane without staging writes it at once.
     pub fn stage_metadata(&mut self, edit: MetadataEdit) -> String {
         // It replaces queue entries, which a running check or write indexes into (CBR-006).
-        if self.checking().is_some() || self.applying().is_some() || self.apply_review().is_some() {
+        if self.queue_locked() {
             return "Wait for the apply to finish first.".to_string();
         }
         let said = self.queue.stage_metadata(edit);

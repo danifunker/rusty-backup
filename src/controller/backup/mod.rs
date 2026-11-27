@@ -717,7 +717,8 @@ impl BackupController {
         // The folder is created with `create_dir_all` and a whole-disk VHD truncated, so an
         // earlier backup of the same name would be written over (CWR-010).
         if let Some(dest) = self.destination.as_deref() {
-            let name = self.name.trim();
+            // The name as the run uses it (`build_config`, `<name>.vhd`), untrimmed.
+            let name = self.name.as_str();
             let folder = dest.join(name);
             let used = std::fs::read_dir(&folder).is_ok_and(|mut d| d.next().is_some());
             if used || dest.join(format!("{name}.vhd")).exists() {
