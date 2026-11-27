@@ -235,7 +235,7 @@ impl RestoreController {
         self.src.image = None;
         self.src.image_facts = None;
         self.src.facts_probe = None;
-        self.src.decode = None;
+        self.cancel_decode();
         if self.src.folder.as_deref() == Some(path.as_path())
             // A failed load is retried: the card may be mounted now (CWR-014).
             && (self.src.loaded.is_some() || self.src.load.is_some() || self.src.load_deferred)
@@ -403,7 +403,7 @@ impl RestoreController {
         self.src.forget_backup();
         // A partition image is written as a flat sector stream, so wrapped images are decoded.
         if !crate::model::image_prep::needs_decoding(path.as_path(), true) {
-            self.src.decode = None;
+            self.cancel_decode();
             self.probe_image_facts(path.clone());
             self.src.image = Some((path, None));
             return;
@@ -424,7 +424,15 @@ impl RestoreController {
                 &|| ctx.is_cancelled(),
             )?)
         });
+        self.cancel_decode();
         self.src.decode = Some((path, job));
+    }
+
+    /// A superseded decode is cancelled, not just dropped: it kept decompressing (CWR-015).
+    fn cancel_decode(&mut self) {
+        if let Some((_, job)) = self.src.decode.take() {
+            job.cancel();
+        }
     }
 
     pub(super) fn poll_decode(&mut self) {

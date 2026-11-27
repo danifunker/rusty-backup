@@ -74,11 +74,29 @@ impl RestoreController {
 
     /// What the Restore button would ask now; Write Image File has its own window.
     fn question(&self) -> Option<String> {
-        match self.mode {
-            RestoreMode::FullDisk => Some(self.full_disk_question()),
-            RestoreMode::SinglePartition => Some(self.single_question()),
-            RestoreMode::NewDisk => Some(self.new_disk_question()),
-            RestoreMode::WriteImage => None,
+        let body = match self.mode {
+            RestoreMode::FullDisk => self.full_disk_question(),
+            RestoreMode::SinglePartition => self.single_question(),
+            RestoreMode::NewDisk => self.new_disk_question(),
+            RestoreMode::WriteImage => return None,
+        };
+        // Naming the source makes a source swap a different question, so a stale yes can't pass (CWR-012).
+        Some(format!("From: {}\n\n{body}", self.source_label()))
+    }
+
+    fn source_label(&self) -> String {
+        if let Some(image) = self.src.image_path() {
+            return image.display().to_string();
+        }
+        match (
+            self.loaded().map(|l| l.folder.display().to_string()),
+            self.src.source_partition,
+        ) {
+            (Some(folder), Some(p)) if self.mode != RestoreMode::FullDisk => {
+                format!("{folder}, partition {}", p + 1)
+            }
+            (Some(folder), _) => folder,
+            (None, _) => "Unknown".into(),
         }
     }
 
