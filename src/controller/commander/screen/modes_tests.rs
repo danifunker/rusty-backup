@@ -134,7 +134,7 @@ fn chd_of(img: &Path, dir: &Path) -> PathBuf {
 
 #[cfg(feature = "chd")]
 #[test]
-fn a_chd_is_backed_up_edited_and_its_writes_count_as_unsaved_until_edit_mode_ends() {
+fn an_uncompressed_chd_is_backed_up_edited_and_saved_by_apply() {
     let dir = tempfile::tempdir().unwrap();
     let chd = chd_of(&fat_volume(dir.path()), dir.path());
     let mut ctl = inspect(session(&chd));
@@ -152,15 +152,12 @@ fn a_chd_is_backed_up_edited_and_its_writes_count_as_unsaved_until_edit_mode_end
     ctl.apply(CommanderAction::Mode(ModeAction::Apply));
     settle(&mut ctl);
     assert!(ctl.pane(Side::Left).queue.is_empty());
-    assert!(
-        ctl.has_unsaved_edits(),
-        "a written diff waits for the flatten"
-    );
-    mode(&mut ctl, ModeAction::ToggleEditMode);
-    assert!(ctl.unsaved_shown());
-    mode(&mut ctl, ModeAction::Unsaved(UnsavedChoice::Apply));
-    assert!(!ctl.edit_mode() && !ctl.has_unsaved_edits());
+    // Written in place: Apply was the save, so nothing is left unsaved and no question follows.
+    assert!(!ctl.has_unsaved_edits());
     assert!(root_names(&chd).contains(&"NEWDIR".to_string()));
+    mode(&mut ctl, ModeAction::ToggleEditMode);
+    assert!(!ctl.unsaved_shown());
+    assert!(!ctl.edit_mode() && !ctl.has_unsaved_edits());
 }
 
 #[test]

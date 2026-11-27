@@ -75,6 +75,8 @@ pub struct ResizeRow {
     pub type_name: String,
     pub original_size: u64,
     pub minimum_size: u64,
+    /// The minimum was measured (Calc Min); without it the row can't shrink (CTK-008).
+    pub minimum_known: bool,
     /// An extended container: shown, not editable.
     pub extended: bool,
     pub mode: SizeMode,
@@ -311,12 +313,18 @@ impl ResizeController {
             .iter()
             .filter(|p| !p.is_logical)
             .map(|p| {
-                let min = plan.min_sizes.get(&p.index).copied().unwrap_or(0).max(512);
+                // Not measured: no shrink at all until Calc Min runs, rather than down to 512 bytes (CTK-008).
+                let min = plan
+                    .min_sizes
+                    .get(&p.index)
+                    .copied()
+                    .map_or(p.size_bytes, |m| m.max(512));
                 ResizeRow {
                     index: p.index,
                     type_name: p.type_name.clone(),
                     original_size: p.size_bytes,
                     minimum_size: min,
+                    minimum_known: plan.min_sizes.contains_key(&p.index),
                     extended: p.is_extended_container,
                     mode: SizeMode::Original,
                     text: stamp_mib(p.size_bytes),
@@ -394,6 +402,14 @@ impl ResizeController {
                 ));
                 return;
             };
+            if new_bytes < row.original_size && !row.minimum_known {
+                self.plan_error = Some(format!(
+                    "Partition {}'s minimum size is not known; calculate it (Calc Min) before \
+                     shrinking.",
+                    row.index + 1
+                ));
+                return;
+            }
             if row.minimum_size > 0 && new_bytes < row.minimum_size {
                 self.plan_error = Some(format!(
                     "Partition {} new size ({}) is below minimum ({})",
@@ -774,6 +790,7 @@ mod tests {
             type_name: "FAT16".into(),
             original_size: 8 << 20,
             minimum_size: 512,
+            minimum_known: true,
             extended: false,
             mode: SizeMode::Original,
             text: stamp_mib(8 << 20),
