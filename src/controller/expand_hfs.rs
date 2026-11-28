@@ -244,7 +244,32 @@ impl ExpandHfsController {
     }
 
     pub fn can_start(&self) -> bool {
-        self.editable() && self.output.is_some() && self.source.is_some()
+        self.editable()
+            && self.output.is_some()
+            && self.source.is_some()
+            && self.blocker().is_none()
+    }
+
+    /// Why no target size can work: the used space is past this block size's (or the HFV's) ceiling.
+    pub fn blocker(&self) -> Option<String> {
+        self.source.as_ref()?;
+        let (min, max) = self.size_bounds();
+        (min > max).then(|| {
+            let fix = if self.flat_hfv && max == HFV_MAX_MIB {
+                "a flat HFV cannot hold it; write an APM disk instead"
+            } else {
+                "pick a larger block size"
+            };
+            format!(
+                "The volume uses {min} MiB, more than {max} MiB fits at this block size: {fix}."
+            )
+        })
+    }
+
+    fn warn_if_blocked(&mut self) {
+        if let Some(why) = self.blocker() {
+            self.log.push((LogLevel::Warning, why));
+        }
     }
 
     fn clamp_size(&mut self) {
@@ -271,6 +296,7 @@ impl ExpandHfsController {
         fresh.source = Some(source);
         fresh.clamp_size();
         *self = fresh;
+        self.warn_if_blocked();
     }
 
     fn pick_output(&self) -> Vec<Effect> {
@@ -401,11 +427,13 @@ impl Controller for ExpandHfsController {
             ExpandHfsAction::SetFlatHfv(on) => {
                 self.flat_hfv = on;
                 self.clamp_size();
+                self.warn_if_blocked();
             }
             ExpandHfsAction::SetBlockSize(bs) => {
                 if BLOCK_SIZE_CHOICES.contains(&bs) {
                     self.block_size = bs;
                     self.clamp_size();
+                    self.warn_if_blocked();
                 }
             }
             ExpandHfsAction::SetSizeMib(n) => {
@@ -530,5 +558,28 @@ mod tests {
         assert_eq!(bar[0].kind, SegmentKind::Partition { color_index: 1 });
         assert_eq!(bar[0].size_bytes + bar[1].size_bytes, 4 * MIB);
         assert_eq!(bar[0].size_bytes, source.used_bytes);
+    }
+
+    #[test]
+    fn a_block_size_too_small_for_the_used_space_blocks_expand() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = hfs_image(dir.path(), 4);
+        let mut source =
+            crate::model::hfs_expand_runner::summarize_source(&src, 0, 4 * MIB).unwrap();
+        source.used_bytes = 300 * MIB;
+        source.partition_offset = 512;
+        let mut ctl = ExpandHfsController::new(Arc::new(NoNotify));
+        ctl.apply(ExpandHfsAction::Open(source));
+        ctl.apply(ExpandHfsAction::Picked {
+            purpose: purpose::OUTPUT,
+            path: Some(dir.path().join("out.hda")),
+        });
+        ctl.apply(ExpandHfsAction::SetBlockSize(BLOCK_SIZE_CHOICES[0]));
+        assert!(ctl.blocker().is_some() && !ctl.can_start());
+        assert!(ctl.take_log().iter().any(|(l, _)| *l == LogLevel::Warning));
+        let big = *BLOCK_SIZE_CHOICES.last().unwrap();
+        ctl.apply(ExpandHfsAction::SetBlockSize(big));
+        assert_eq!(ctl.blocker(), None);
+        assert!(ctl.can_start());
     }
 }

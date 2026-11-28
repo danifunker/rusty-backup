@@ -213,7 +213,8 @@ impl InspectController {
         matches!(
             self.source,
             Some(Source::Device { .. }) | Some(Source::Image { .. })
-        ) && self.found.clonezilla.is_none()
+        ) && !self.temp_backed()
+            && self.found.clonezilla.is_none()
             && !matches!(self.found.table, None | Some(PartitionTable::None { .. }))
             && !self.export_running()
     }
@@ -227,7 +228,7 @@ impl InspectController {
     pub fn can_resize_image(&self) -> bool {
         let local = self.can_expand_image()
             && (self.found.chd_path.is_none() || cfg!(feature = "chd"))
-            && !matches!(&self.source, Some(Source::Image { _temp: Some(_), .. }));
+            && !self.temp_backed();
         let remote = self.remote_resizable() && !self.export_running();
         (local || remote) && self.found.table.is_some()
     }
@@ -428,6 +429,10 @@ impl InspectController {
     /// Before an in-place write: no other tool writing, and the browse view closed so its cached
     /// metadata can't write stale edits after; staged edits there must go first (CIN-002/004/005).
     fn ready_to_write(&mut self) -> bool {
+        if self.temp_backed() {
+            self.error("This image is a temporary copy unpacked from an archive, so a change to it would be lost. Extract it to a file and open that.");
+            return false;
+        }
         if self.tools.writing() {
             self.error("Another tool is writing to this disk; wait for it to finish.");
             return false;
@@ -929,17 +934,17 @@ impl InspectController {
         if let Some(Source::Remote { conn }) = &self.source {
             return self.remote_resize_source(conn.clone());
         }
+        if self.temp_backed() {
+            return Err(
+                "This image is unpacked from a container; convert it to a raw image first."
+                    .to_string(),
+            );
+        }
         if !self.is_image_file() {
             return Err("Resize Image works on a disk image file.".to_string());
         }
         if self.found.chd_path.is_some() && !cfg!(feature = "chd") {
             return Err("This build has no CHD support.".to_string());
-        }
-        if matches!(&self.source, Some(Source::Image { _temp: Some(_), .. })) {
-            return Err(
-                "This image is unpacked from a container; convert it to a raw image first."
-                    .to_string(),
-            );
         }
         let plan = self
             .resize_plan()
@@ -1020,6 +1025,7 @@ impl InspectController {
 
     fn expanded(&mut self, out: Result<u64, String>) {
         let chd = self.tools.expand_chd;
+        let grown = out.as_ref().ok().copied().filter(|&n| n > 0);
         match out {
             Ok(_) if chd => self.info("CHD expansion complete. Click Re-inspect to refresh."),
             Ok(total) => self.info(format!(
@@ -1029,7 +1035,7 @@ impl InspectController {
             Err(e) if chd => self.error(format!("Expand Image (CHD) failed: {e}")),
             Err(e) => self.error(format!("Expand Image failed: {e}")),
         }
-        self.found.disk_size = None;
+        self.found.disk_size = grown.map(Some);
     }
 
     // --- Defragment (Human68k) ----------------------------------------------------------
@@ -1314,7 +1320,7 @@ fn expand_chd_in_job(
     sink: &LogSink,
     job: &JobCtx,
 ) -> anyhow::Result<u64> {
-    let status = crate::model::chd_expand_runner::spawn(path, add_bytes);
+    let status = crate::model::chd_expand_runner::spawn(path.clone(), add_bytes);
     let mut err = None;
     crate::model::worker::wait_spawned(job, &status, |s, ctx| {
         drain(sink, &mut s.log_messages);
@@ -1329,7 +1335,11 @@ fn expand_chd_in_job(
     });
     match err {
         Some(e) => Err(anyhow::anyhow!(e)),
-        None => Ok(0),
+        // The new logical size, read here so the view never opens the CHD for it (CIN-018).
+        None => {
+            Ok(crate::rbformats::chd::ChdReader::open(path.as_path())
+                .map_or(0, |r| r.logical_size()))
+        }
     }
 }
 

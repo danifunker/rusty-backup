@@ -510,21 +510,22 @@ impl BackupController {
             return;
         };
         let slot = *slot;
-        let now = devices.get(slot);
-        if now.map(DiskDevice::identity) == Some(device.identity()) {
+        if devices.get(slot).map(DiskDevice::identity) == Some(device.identity()) {
             return;
         }
-        match now {
+        // The disk is followed, never whatever now sits in its row (CWR-013), as the other tabs do.
+        let identity = device.identity();
+        match devices.iter().position(|d| d.identity() == identity) {
+            Some(moved) => {
+                // The same disk at another row: only the row changes, the scan stays valid.
+                self.source = Some(Source::Device {
+                    slot: moved,
+                    device: devices[moved].clone(),
+                });
+            }
             None => {
                 self.warn("The selected source device is no longer listed; clearing it.");
                 self.source = None;
-                self.source_changed();
-            }
-            Some(dev) => {
-                self.source = Some(Source::Device {
-                    slot,
-                    device: dev.clone(),
-                });
                 self.source_changed();
             }
         }

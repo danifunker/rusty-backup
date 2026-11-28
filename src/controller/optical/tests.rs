@@ -548,3 +548,20 @@ fn the_output_name_follows_the_format_unless_the_user_named_it_otherwise() {
     ctl.apply(OpticalAction::SetOutputFormat(OutputFormat::BinCue));
     assert_eq!(ctl.output(), Some(own.as_path()));
 }
+
+#[test]
+fn a_rescan_keeps_the_picked_drive_among_identical_ones() {
+    let mut ctl = controller();
+    ctl.land_drives(vec![local_drive("Drive", ""), local_drive("Drive", "")]);
+    ctl.drive = Some(1);
+    ctl.land_drives(vec![
+        local_drive("Drive", ""),
+        local_drive("Drive", "/dev/disk5"),
+    ]);
+    assert_eq!(ctl.drive, Some(1), "the slot survives a disc arriving");
+    ctl.land_drives(vec![
+        local_drive("Drive", "/dev/disk5"),
+        local_drive("Drive", ""),
+    ]);
+    assert_eq!(ctl.drive, Some(0), "a unique path follows the drive");
+}

@@ -24,9 +24,6 @@ use crate::model::text_edit::{decode_for_edit, encode_after_edit, TextEditError,
 /// Largest file the text editor opens: it holds the whole file as lines.
 pub const MAX_TEXT_EDIT: usize = 1024 * 1024;
 
-/// Seconds between the Mac (1904) and Unix (1970) epochs.
-const MAC_EPOCH_OFFSET: i64 = 2_082_844_800;
-
 /// A check or repair result, as lines for a scrolling window and as data for a richer one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolReport {
@@ -99,6 +96,8 @@ pub(super) struct ToolState {
     temp: Option<tempfile::TempDir>,
     /// Host items an `AddHostPaths` could not stage: (path, why).
     staging_errors: Vec<(String, String)>,
+    /// The running Repair belongs to a source the pane has since left (CBR-016).
+    repair_left_behind: bool,
 }
 
 fn msg(text: impl Into<String>) -> Vec<Effect> {
@@ -110,7 +109,10 @@ impl ToolState {
     /// acted on the new volume (CBR-005, CBR-016). A running Repair is kept; it owns its write.
     pub(super) fn forget_source(&mut self) {
         match self.job.take() {
-            Some(keep @ ToolJob::Repair { .. }) => self.job = Some(keep),
+            Some(keep @ ToolJob::Repair { .. }) => {
+                self.job = Some(keep);
+                self.repair_left_behind = true;
+            }
             Some(ToolJob::Volume { job, .. }) => job.cancel(),
             Some(ToolJob::Read(job)) => job.cancel(),
             None => {}
@@ -122,19 +124,14 @@ impl ToolState {
     }
 }
 
-/// A Mac-epoch timestamp as `YYYY-MM-DD HH:MM:SS` (UTC).
+/// A Mac-epoch timestamp as `YYYY-MM-DD HH:MM:SS` (UTC); blank for zero, as the date editor shows it.
 pub fn format_mac_date(mac: u32) -> String {
-    let unix = mac as i64 - MAC_EPOCH_OFFSET;
-    chrono::DateTime::from_timestamp(unix, 0)
-        .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_default()
+    fs_mac::hfs_common::format_mac_date(mac).unwrap_or_default()
 }
 
-/// `YYYY-MM-DD HH:MM:SS` back to a Mac-epoch timestamp.
+/// `YYYY-MM-DD HH:MM:SS` back to a Mac-epoch timestamp, by the date editor's rules.
 pub fn parse_mac_date(s: &str) -> Option<u32> {
-    let ndt = chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S").ok()?;
-    let mac = ndt.and_utc().timestamp() + MAC_EPOCH_OFFSET;
-    (0..=u32::MAX as i64).contains(&mac).then_some(mac as u32)
+    fs_mac::hfs_common::parse_mac_date(s)
 }
 
 /// A 4-byte Mac OSType as editable text (non-printable bytes become `?`).
@@ -660,6 +657,7 @@ impl BrowserPaneController {
         match spawned {
             Ok(job) => {
                 self.tl.job = Some(ToolJob::Repair { title, job });
+                self.tl.repair_left_behind = false;
                 msg("repairing the filesystem...")
             }
             Err(busy) => msg(format!("cannot repair: {busy}")),
@@ -1093,6 +1091,9 @@ impl BrowserPaneController {
                     },
                 };
                 self.ed_log(format!("{title}: {}", done.lines[0]));
+                if std::mem::take(&mut self.tl.repair_left_behind) {
+                    return msg(format!("{title} (no longer open): {}", done.lines[0]));
+                }
                 self.tl.report = Some(ToolReport {
                     title,
                     lines: done.lines,

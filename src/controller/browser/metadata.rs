@@ -68,12 +68,7 @@ pub fn resolved_prodos_type(queue: &EditQueue, entry: &FileEntry) -> (u8, u16) {
             ..
         } = edit
         {
-            let path = if parent.path == "/" {
-                format!("/{name}")
-            } else {
-                format!("{}/{name}", parent.path)
-            };
-            if path != entry.path {
+            if EditQueue::pending_path(&parent.path, name) != entry.path {
                 continue;
             }
             return (prodos_type.unwrap_or(0), prodos_aux.unwrap_or(0));

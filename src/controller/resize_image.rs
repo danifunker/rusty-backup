@@ -237,6 +237,9 @@ pub enum ResizeImageAction {
 
 type Checks = Vec<(usize, Verdict)>;
 
+/// The disk's size and each partition's probe (or why probing failed).
+type Probed = (u64, Result<Vec<PartProbe>, String>);
+
 pub struct ResizeImageController {
     notify: Arc<dyn Notify>,
     log: Vec<(LogLevel, String)>,
@@ -248,7 +251,8 @@ pub struct ResizeImageController {
     checks: Vec<CheckRow>,
     continue_anyway: bool,
     check_job: Option<Job<Checks>>,
-    probe_job: Option<Job<Vec<PartProbe>>>,
+    /// The disk's size and each partition's probe, read off the UI thread (CTK-012).
+    probe_job: Option<Job<Probed>>,
     rows: Vec<PartRow>,
     plan_job: Option<Job<Result<Layout, String>>>,
     plan_error: Option<String>,
@@ -459,7 +463,7 @@ impl ResizeImageController {
             return false;
         }
         match self.page {
-            Page::Size => self.disk_size().is_ok(),
+            Page::Size => !self.probing() && self.disk_size().is_ok(),
             Page::Check => {
                 !self.check
                     || (self.checks.iter().all(|r| r.verdict.is_some())
@@ -793,18 +797,8 @@ impl ResizeImageController {
         }
         let path = source.plan.path.clone();
         let backend = source.backend.clone();
-        let (old, _) = match backend.disk_size(path.as_path()) {
-            Ok(s) => s,
-            Err(e) => {
-                self.log
-                    .push((LogLevel::Error, format!("Resize Image: {e:#}")));
-                return;
-            }
-        };
         let mut fresh = ResizeImageController::new(Arc::clone(&self.notify));
         fresh.log = std::mem::take(&mut self.log);
-        fresh.old_disk = old;
-        fresh.disk_text = stamp_size(old);
         fresh.output = Some(default_copy(path.as_path()));
         // A copy would be a path on the daemon: a remote image is resized where it is.
         fresh.in_place = backend.is_remote();
@@ -841,7 +835,12 @@ impl ResizeImageController {
         fresh.probe_job = Some(Job::spawn(
             "Reading the partitions",
             Arc::clone(&fresh.notify),
-            move |ctx| backend.probe(path.as_path(), all.as_slice(), ctx),
+            move |ctx| {
+                ctx.set_phase("Reading the disk size");
+                let (old, _) = backend.disk_size(path.as_path())?;
+                let probes = backend.probe(path.as_path(), all.as_slice(), ctx);
+                Ok((old, probes.map_err(|e| format!("{e:#}"))))
+            },
         ));
         *self = fresh;
     }
@@ -1115,8 +1114,16 @@ impl ResizeImageController {
         if let Some(done) = self.probe_job.as_ref().and_then(job_outcome) {
             self.probe_job = None;
             match done {
-                Ok(probes) => {
-                    for p in probes {
+                Ok((old, probes)) => {
+                    self.old_disk = old;
+                    if self.disk_text.trim().is_empty() {
+                        self.disk_text = stamp_size(old);
+                    }
+                    if let Err(e) = &probes {
+                        self.log
+                            .push((LogLevel::Warning, format!("Resize Image: {e}")));
+                    }
+                    for p in probes.unwrap_or_default() {
                         if let Some(r) = self.rows.iter_mut().find(|r| r.index == p.index) {
                             r.fixed = p.fixed;
                             r.minimum = p.minimum.or(r.minimum);
@@ -1124,9 +1131,11 @@ impl ResizeImageController {
                         }
                     }
                 }
-                Err(e) => self
-                    .log
-                    .push((LogLevel::Warning, format!("Resize Image: {e}"))),
+                Err(e) => {
+                    self.log
+                        .push((LogLevel::Error, format!("Resize Image: {e}")));
+                    self.source = None;
+                }
             }
         }
         if let Some(done) = self.check_job.as_ref().and_then(job_outcome) {

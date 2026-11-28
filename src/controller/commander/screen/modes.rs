@@ -160,6 +160,8 @@ pub(super) struct Modes {
     chd: Option<ChdEdit>,
     /// Writes into a CHD diff or an archive's temp copy that no flatten or recompress saved yet.
     copy_dirty: bool,
+    /// A flatten failed: Edit Mode reopens the diff, whose edits are still unsaved (CCM-004).
+    rejoin_dirty: bool,
     /// The close question's Apply saves the copy first; the close follows a save that succeeded.
     close_after_save: bool,
     /// The single-file-chd backup whose metadata a flatten refreshes.
@@ -813,9 +815,13 @@ impl CommanderController {
                         self.modes.session.chd_edit_session = Some(session);
                         self.modes.chd = Some(ChdEdit { parent, diff });
                         self.enter_edit_state();
+                        self.modes.copy_dirty |= std::mem::take(&mut self.modes.rejoin_dirty);
                         self.reopen_modes();
                     }
-                    Some((_, Err(message))) => self.modes.notice = Some(message),
+                    Some((_, Err(message))) => {
+                        self.modes.rejoin_dirty = false;
+                        self.modes.notice = Some(message)
+                    }
                     None => {
                         self.modes.notice = Some(format!("Error opening CHD: {}", failed(snap)))
                     }
@@ -826,11 +832,23 @@ impl CommanderController {
                 let out = job.take_result();
                 let ok = matches!(out, Some(Ok(_)));
                 self.modes.notice = Some(match out {
-                    Some(Ok(said)) | Some(Err(said)) => said,
-                    None => format!("Error flattening CHD: {}", failed(snap)),
+                    Some(Ok(said)) => said,
+                    // The diff still holds the edits: Edit Mode comes back on them (CCM-004).
+                    Some(Err(said)) => {
+                        format!("{said} Your edits are kept; Edit Mode is back on to try again.")
+                    }
+                    None => format!(
+                        "Error flattening CHD: {}. Your edits are kept; Edit Mode is back on.",
+                        failed(snap)
+                    ),
                 });
-                self.reopen_modes();
                 self.saved_for_close(ok);
+                if ok {
+                    self.reopen_modes();
+                } else {
+                    self.modes.rejoin_dirty = true;
+                    self.start_chd_open();
+                }
             }
             Some(ModeJob::Extract(job)) => {
                 let snap = job.snapshot();
@@ -982,9 +1000,10 @@ impl CommanderController {
             "Free space",
             Vec::new(),
             Arc::clone(&self.notify),
+            // Read-only, as the apply preflight reads it: an editable open raced a write (CCM-016).
             move |_| {
-                let opened = session.open_editable().ok();
-                Ok(opened.and_then(|(mut efs, _commit)| efs.free_space().ok()))
+                let fs = session.open().ok();
+                Ok(fs.map(|fs| fs.total_size().saturating_sub(fs.used_size())))
             },
         );
         self.modes.free_job = spawned.ok();

@@ -890,6 +890,10 @@ impl BrowserPaneController {
             let Some(kind) = classify_entry(&row.entry) else {
                 return;
             };
+            // Mounting can take seconds, so a parent that reopens off-thread does it in a job (CBR-014).
+            if !self.wrapper_tree.is_mounted(node_id) && self.open_nested_wrapper(&row, kind) {
+                return;
+            }
             let opened = self
                 .wrapper_tree
                 .read_wrapper_source(&row)

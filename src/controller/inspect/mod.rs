@@ -662,7 +662,14 @@ impl InspectController {
 
     /// The image is a plain file (not a device, backup or remote image) a tool may rewrite.
     pub fn is_image_file(&self) -> bool {
-        matches!(self.source, Some(Source::Image { .. })) && self.found.clonezilla.is_none()
+        matches!(self.source, Some(Source::Image { .. }))
+            && self.found.clonezilla.is_none()
+            && !self.temp_backed()
+    }
+
+    /// The image is a temporary copy unpacked from an archive: a write would be thrown away (CIN-012).
+    pub(super) fn temp_backed(&self) -> bool {
+        matches!(&self.source, Some(Source::Image { _temp: Some(_), .. }))
     }
 
     // --- what was found -----------------------------------------------------------------

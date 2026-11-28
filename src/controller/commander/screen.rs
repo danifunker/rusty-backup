@@ -553,6 +553,9 @@ impl Checksums {
     }
 }
 
+/// A staging job's edits, with the host items it could not read: (path, why).
+type Staged = (Vec<StagedEdit>, Vec<(String, String)>);
+
 enum CopyRun {
     /// An immediate write; `dest` is the pane to re-list, `None` for an export.
     Host {
@@ -560,9 +563,10 @@ enum CopyRun {
         dest: Option<Side>,
         where_to: String,
     },
-    /// An image -> image extraction whose edits stage onto `dest`.
+    /// An image -> image extraction (or a host walk, CCM-012) whose edits stage onto `dest`,
+    /// with the host items it could not read.
     Stage {
-        job: Job<Vec<StagedEdit>>,
+        job: Job<Staged>,
         dest: Side,
         /// The destination's volume when the copy began; another one there drops it (CCM-003).
         dest_key: String,
@@ -619,6 +623,8 @@ pub struct CommanderController {
     detail_serial: u64,
     /// Reads the open File Info's extras.
     detail_job: Option<Job<DetailExtras>>,
+    /// File Info's read was refused (an apply held the source): retried from `tick` (CCM-021).
+    detail_retry: Option<(Side, FileEntry, bool)>,
     log: Vec<String>,
     show_log: bool,
     show_help: bool,
@@ -642,13 +648,21 @@ impl Controller for CommanderController {
     type Action = CommanderAction;
 
     fn apply(&mut self, action: CommanderAction) -> Vec<Effect> {
-        if !matches!(
-            action,
-            CommanderAction::Key(..) | CommanderAction::SetPageRows(..)
-        ) {
-            self.implicit = None;
-        }
+        // A non-key action ends the cursor's stand-in selection, after it ran (a pick or a confirm
+        // still needs it); leaving it selected let a later Delete hit that stale row (CCM-011).
+        let ended = match action {
+            CommanderAction::Key(..) | CommanderAction::SetPageRows(..) => None,
+            _ => self.implicit.take(),
+        };
+        let before = ended.map(|was| self.pane(was).listing.selection().to_vec());
         let fx = self.apply_action(action);
+        if let (Some(was), Some(before)) = (ended, before) {
+            // Only the stand-in itself: a click that picked another row keeps its choice.
+            let after = self.pane(was).listing.selection();
+            if after.len() == 1 && after == before.as_slice() {
+                self.forward(was, BrowserPaneAction::ClearSelection);
+            }
+        }
         // A copy stages onto the other pane, so both panes' rows can change.
         self.left.rebuild_rows();
         self.right.rebuild_rows();
@@ -946,6 +960,7 @@ impl CommanderController {
             detail: None,
             detail_serial: 0,
             detail_job: None,
+            detail_retry: None,
             log: Vec::new(),
             show_log: false,
             show_help: false,
@@ -1577,6 +1592,19 @@ impl CommanderController {
         if self.modes_active() && !quit && self.has_unsaved_edits() {
             return self.apply_mode(ModeAction::RequestClose);
         }
+        // Quitting skipped the modes' question, so an unsaved CHD diff or archive copy went
+        // without a word (CCM-015); it is named before the quit.
+        if quit && self.modes_active() && self.has_unsaved_edits() {
+            return vec![Effect::Confirm(ConfirmSpec {
+                purpose: purpose::QUIT_UNSAVED,
+                title: "Unsaved changes".into(),
+                message: "Edit Mode has changes that are not saved into the image yet. \
+                          Quitting now discards them; leave Edit Mode first to save."
+                    .into(),
+                confirm_label: "Discard & Quit".into(),
+                destructive: true,
+            })];
+        }
         let n = self.left.queue.len() + self.right.queue.len();
         if n == 0 && self.single && !quit {
             return vec![Effect::Confirm(ConfirmSpec {
@@ -1623,20 +1651,12 @@ impl CommanderController {
             self.status = format!("[{}] could not open File Info for '{name}'.", side.label());
             return Vec::new();
         };
-        let source = pane.detail_source();
         let at_root = !pane.tree_active() && !entry.path.trim_start_matches('/').contains('/');
         self.close_detail();
-        let job = source.and_then(|source| {
-            let entry = entry.clone();
-            let body = move |_: &JobCtx| {
-                entry_detail::read_detail(source, &entry, MAX_PREVIEW_SIZE, at_root)
-            };
-            let reads = self.reads(side);
-            let notify = Arc::clone(&self.notify);
-            self.jobs
-                .spawn("Reading File Info", reads, notify, body)
-                .ok()
-        });
+        let job = self.spawn_detail_read(side, &entry, at_root);
+        if job.is_none() && self.pane(side).detail_source().is_some() {
+            self.detail_retry = Some((side, entry.clone(), at_root));
+        }
         self.status = format!("File Info: {}", entry.name);
         self.detail_serial += 1;
         self.detail = Some(FileDetail {
@@ -1644,7 +1664,7 @@ impl CommanderController {
             entry,
             editable,
             fs_type,
-            loading: job.is_some(),
+            loading: job.is_some() || self.detail_retry.is_some(),
             preview: None,
             rsrc_preview: None,
             xattrs: Vec::new(),
@@ -1661,10 +1681,42 @@ impl CommanderController {
         if let Some(job) = self.detail_job.take() {
             job.cancel();
         }
+        self.detail_retry = None;
         self.detail = None;
     }
 
+    /// File Info's preview / xattr read as a job, or `None` when the source is busy.
+    fn spawn_detail_read(
+        &mut self,
+        side: Side,
+        entry: &FileEntry,
+        at_root: bool,
+    ) -> Option<Job<DetailExtras>> {
+        let source = self.pane(side).detail_source()?;
+        let entry = entry.clone();
+        let body =
+            move |_: &JobCtx| entry_detail::read_detail(source, &entry, MAX_PREVIEW_SIZE, at_root);
+        let reads = self.reads(side);
+        let notify = Arc::clone(&self.notify);
+        self.jobs
+            .spawn("Reading File Info", reads, notify, body)
+            .ok()
+    }
+
     fn poll_detail(&mut self) {
+        if self.detail_job.is_none() {
+            if let Some((side, entry, at_root)) = self.detail_retry.take() {
+                match self.spawn_detail_read(side, &entry, at_root) {
+                    Some(job) => {
+                        if let Some(d) = self.detail.as_mut() {
+                            d.loading = true;
+                        }
+                        self.detail_job = Some(job);
+                    }
+                    None => self.detail_retry = Some((side, entry, at_root)),
+                }
+            }
+        }
         let Some(job) = self.detail_job.as_ref().filter(|j| !j.is_running()) else {
             return;
         };

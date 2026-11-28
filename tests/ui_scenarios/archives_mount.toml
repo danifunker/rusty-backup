@@ -16,9 +16,10 @@ expect = { loaded = true, files = 1, mountable = "raw HFS" }
 
 [[step]]
 action = "Mount"
-expect = { mounted = "~Disk", log = "" }
+settle = true
+expect = { mounted = "~Disk", log = "~Routing raw HFS payload to Inspect tab" }
 
 [[step]]
 action = "Close"
 settle = true
-expect = { loaded = false, log = "~Routing raw HFS payload to Inspect tab" }
+expect = { loaded = false }

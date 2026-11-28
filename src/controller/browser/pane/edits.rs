@@ -21,7 +21,7 @@ use crate::controller::browser::pane::purpose;
 use crate::controller::{ConfirmSpec, Effect, TextSpec};
 use crate::fs::replace::OnConflict;
 use crate::model::browse_session::BrowseSession;
-use crate::model::commander_descend::classify_entry;
+use crate::model::commander_descend::{classify_entry, DescendKind};
 use crate::model::commander_ops::{
     self, ApplyOutcome, ApplyPreflight, FailedEdit, StageSource, WrapperExtract, WrapperOpenPlan,
 };
@@ -31,6 +31,7 @@ use crate::model::host_ops::{self, DeleteOutcome};
 use crate::model::job::{Job, JobCtx, Resource, Snapshot, Status};
 use crate::model::stage_names::{legalize_staged_names, LegalizeReport, NameChange};
 use crate::model::wrapper_tree::PreparedMount;
+use crate::model::wrapper_tree::TreeRow;
 
 /// A finished apply that did not land everything; the rest stays staged.
 #[derive(Debug, Clone)]
@@ -1390,6 +1391,34 @@ impl BrowserPaneController {
             }
             (WrapperOpenPlan::Bytes(buf), Vec::new())
         };
+        self.spawn_wrapper_open(node_id, name, kind, plan, resources);
+    }
+
+    /// Open a nested wrapper in a job from its parent mount's recipe; false when it has none.
+    pub(super) fn open_nested_wrapper(&mut self, row: &TreeRow, kind: DescendKind) -> bool {
+        let Some(recipe) = self.wrapper_tree.mount_reopen(&row.mount) else {
+            return false;
+        };
+        if self.ed.wrapper.is_some() {
+            self.out.push(Effect::Message(
+                "a wrapper is already opening; wait for it.".into(),
+            ));
+            return true;
+        }
+        let plan = WrapperOpenPlan::Nested(Box::new((recipe, row.entry.clone())));
+        let name = row.entry.name.clone();
+        self.spawn_wrapper_open(&row.node_id, name, kind, plan, Vec::new());
+        true
+    }
+
+    fn spawn_wrapper_open(
+        &mut self,
+        node_id: &str,
+        name: String,
+        kind: DescendKind,
+        plan: WrapperOpenPlan,
+        resources: Vec<Resource>,
+    ) {
         let (jobs, notify) = self.job_services();
         let file_name = name.clone();
         let spawned = jobs.spawn(format!("Opening {name}"), resources, notify, move |ctx| {

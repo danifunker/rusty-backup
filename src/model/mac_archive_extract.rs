@@ -31,7 +31,8 @@ pub struct ArchiveEntryRow {
 /// A single-entry archive's decoded data fork that is itself a disk image.
 pub struct MountablePayload {
     pub kind: MountableImageKind,
-    pub decoded: Vec<u8>,
+    /// Shared, so writing it to a temporary file can run in a job.
+    pub decoded: Arc<Vec<u8>>,
     /// The entry's name, for the temporary file.
     pub name: String,
 }
@@ -99,7 +100,7 @@ fn sniff_mountable_payload(bytes: &[u8], archive: &StuffItArchive) -> Option<Mou
     let kind = detect_mountable_image(decoded.as_slice())?;
     Some(MountablePayload {
         kind,
-        decoded,
+        decoded: Arc::new(decoded),
         name: entry.name.clone(),
     })
 }

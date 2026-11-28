@@ -205,7 +205,7 @@ impl InspectController {
         self.found.volume_labels = out.volume_labels;
         self.found.deferred = out.deferred_min_sizes;
         self.found.format_label = out.format_label;
-        self.found.disk_size = None;
+        self.found.disk_size = out.chd_logical_size.map(Some);
         // Browse and Calc min share one handle, so a device is not opened (or prompted for) twice.
         if let Some(f) = out.device_file {
             match f.into_file() {

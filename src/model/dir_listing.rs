@@ -298,6 +298,14 @@ impl DirListing {
         self.list_children(dir)
     }
 
+    /// `dir`'s children when the navigation stack already holds them (the cwd and its ancestors).
+    pub fn cached_children(&self, dir: &FileEntry) -> Option<Vec<FileEntry>> {
+        self.stack
+            .iter()
+            .find(|f| f.dir.path == dir.path)
+            .map(|f| f.entries.clone())
+    }
+
     /// Jump the current directory to `path` (used by the tree view, which can
     /// select any descendant of the root). Rebuilds the navigation stack from
     /// the root down so `up()` still works afterwards. `path` must be the root

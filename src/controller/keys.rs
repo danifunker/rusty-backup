@@ -20,6 +20,9 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+/// The one section `keybindings.toml` has; entries before any header belong to it too.
+const KEYS_SECTION: &str = "file-manager";
+
 /// A key, independent of any toolkit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
@@ -513,9 +516,24 @@ impl KeyMap {
     /// Applies a `keybindings.toml` text; returns one message per line it could not use.
     pub fn apply_overrides(&mut self, text: &str) -> Vec<String> {
         let mut problems = Vec::new();
+        let mut skipping = false;
         for (n, raw) in text.lines().enumerate() {
             let line = strip_comment(raw).trim();
-            if line.is_empty() || line.starts_with('[') {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(section) = line.strip_prefix('[') {
+                let section = section.trim_end_matches(']').trim().trim_matches('"');
+                skipping = section != KEYS_SECTION;
+                if skipping {
+                    problems.push(format!(
+                        "line {}: unknown section `[{section}]`; its lines are skipped",
+                        n + 1
+                    ));
+                }
+                continue;
+            }
+            if skipping {
                 continue;
             }
             let Some((name, value)) = line.split_once('=') else {
@@ -540,6 +558,24 @@ impl KeyMap {
             }
             if ok {
                 self.bindings.retain(|(_, c)| *c != cmd);
+                for chord in &chords {
+                    let mac = self.mac;
+                    let taken: Vec<Command> = self
+                        .bindings
+                        .iter()
+                        .filter(|(c, _)| c.collides(chord))
+                        .map(|(_, other)| *other)
+                        .collect();
+                    for other in taken {
+                        problems.push(format!(
+                            "line {}: {} was bound to `{}`; it now means `{name}`",
+                            n + 1,
+                            chord.display(mac),
+                            other.name()
+                        ));
+                    }
+                    self.bindings.retain(|(c, _)| !c.collides(chord));
+                }
                 self.bindings.extend(chords.into_iter().map(|c| (c, cmd)));
             }
         }
@@ -591,6 +627,23 @@ impl KeyMap {
 }
 
 impl Chord {
+    /// True when one key press on some platform could mean both chords.
+    fn collides(&self, other: &Chord) -> bool {
+        let same_key = match (self.key, other.key) {
+            (Key::Char(a), Key::Char(b)) => a.eq_ignore_ascii_case(&b),
+            (a, b) => a == b,
+        };
+        let platforms = !matches!(
+            (self.on, other.on),
+            (OnPlatform::MacOnly, OnPlatform::PcOnly) | (OnPlatform::PcOnly, OnPlatform::MacOnly)
+        );
+        same_key
+            && platforms
+            && self.primary == other.primary
+            && self.alt == other.alt
+            && self.shift == other.shift
+    }
+
     fn applies(&self, mac: bool) -> bool {
         match self.on {
             OnPlatform::All => true,
@@ -1001,5 +1054,16 @@ mod tests {
             Some(Command::Help),
             "a bad line keeps the default"
         );
+    }
+
+    #[test]
+    fn a_taken_chord_moves_and_says_so_and_other_sections_are_skipped() {
+        let mut map = KeyMap::defaults(false);
+        let problems = map.apply_overrides("apply = \"F2\"\n[viewer]\nrename = \"F12\"\n");
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("rename"), "{problems:?}");
+        assert!(problems[1].contains("[viewer]"), "{problems:?}");
+        assert_eq!(map.lookup(Key::F(2), Mods::default()), Some(Command::Apply));
+        assert_eq!(map.lookup(Key::F(12), Mods::default()), None);
     }
 }
