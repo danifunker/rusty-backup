@@ -160,6 +160,8 @@ pub(super) struct Modes {
     chd: Option<ChdEdit>,
     /// Writes into a CHD diff or an archive's temp copy that no flatten or recompress saved yet.
     copy_dirty: bool,
+    /// A flatten failed: Edit Mode reopens the diff, whose edits are still unsaved (CCM-004).
+    rejoin_dirty: bool,
     /// The close question's Apply saves the copy first; the close follows a save that succeeded.
     close_after_save: bool,
     /// The single-file-chd backup whose metadata a flatten refreshes.
@@ -513,6 +515,18 @@ impl CommanderController {
         self.modes.job = job.map(ModeJob::ChdOpen);
     }
 
+    /// A CHD open failed; after a failed flatten the pane was released, so the plain parent comes back.
+    fn chd_open_failed(&mut self, why: String) {
+        if !std::mem::take(&mut self.modes.rejoin_dirty) {
+            self.modes.notice = Some(why);
+            return;
+        }
+        self.modes.notice = Some(format!(
+            "The save failed and Edit Mode could not reopen ({why}). The edits stay in the CHD's diff file; turn Edit Mode on to try again."
+        ));
+        self.reopen_modes();
+    }
+
     fn start_archive_extract(&mut self) {
         let Some(ctx) = self.modes.archive.clone() else {
             return;
@@ -813,12 +827,11 @@ impl CommanderController {
                         self.modes.session.chd_edit_session = Some(session);
                         self.modes.chd = Some(ChdEdit { parent, diff });
                         self.enter_edit_state();
+                        self.modes.copy_dirty |= std::mem::take(&mut self.modes.rejoin_dirty);
                         self.reopen_modes();
                     }
-                    Some((_, Err(message))) => self.modes.notice = Some(message),
-                    None => {
-                        self.modes.notice = Some(format!("Error opening CHD: {}", failed(snap)))
-                    }
+                    Some((_, Err(message))) => self.chd_open_failed(message),
+                    None => self.chd_open_failed(format!("Error opening CHD: {}", failed(snap))),
                 }
             }
             Some(ModeJob::Flatten(job)) => {
@@ -826,11 +839,27 @@ impl CommanderController {
                 let out = job.take_result();
                 let ok = matches!(out, Some(Ok(_)));
                 self.modes.notice = Some(match out {
-                    Some(Ok(said)) | Some(Err(said)) => said,
-                    None => format!("Error flattening CHD: {}", failed(snap)),
+                    Some(Ok(said)) => said,
+                    // The diff still holds the edits: Edit Mode comes back on them (CCM-004).
+                    Some(Err(said)) => {
+                        format!("{said} Your edits are kept; Edit Mode is back on to try again.")
+                    }
+                    None => format!(
+                        "Error flattening CHD: {}. Your edits are kept; Edit Mode is back on.",
+                        failed(snap)
+                    ),
                 });
-                self.reopen_modes();
                 self.saved_for_close(ok);
+                if ok {
+                    self.reopen_modes();
+                } else {
+                    self.modes.rejoin_dirty = true;
+                    self.start_chd_open();
+                    if self.modes.job.is_none() {
+                        let why = self.modes.notice.take().unwrap_or_default();
+                        self.chd_open_failed(why);
+                    }
+                }
             }
             Some(ModeJob::Extract(job)) => {
                 let snap = job.snapshot();
@@ -978,13 +1007,20 @@ impl CommanderController {
             return;
         }
         let session = self.modes.session.clone();
+        // SquashFS only knows its room as a rebuild estimate; its editor writes nothing until sync.
+        let squash = self.left.volume().fs_type == "SquashFS";
         let spawned = self.jobs.spawn(
             "Free space",
             Vec::new(),
             Arc::clone(&self.notify),
+            // Read-only, as the apply preflight reads it: an editable open raced a write (CCM-016).
             move |_| {
-                let opened = session.open_editable().ok();
-                Ok(opened.and_then(|(mut efs, _commit)| efs.free_space().ok()))
+                if squash {
+                    let opened = session.open_editable().ok();
+                    return Ok(opened.and_then(|(mut efs, _commit)| efs.free_space().ok()));
+                }
+                let fs = session.open().ok();
+                Ok(fs.map(|fs| fs.total_size().saturating_sub(fs.used_size())))
             },
         );
         self.modes.free_job = spawned.ok();

@@ -1893,6 +1893,7 @@ mod tests {
         for name in names {
             cursor_to(app, name);
             app.on_key(key(KeyCode::F(6)));
+            settle(app);
         }
         assert_eq!(staged(app, Side::Right), names.len(), "{}", status(app));
         app.on_key(key(KeyCode::Tab));
@@ -1947,6 +1948,7 @@ mod tests {
         let (_h, _i, mut app) = host_and_image(&["NEW.TXT"]);
         cursor_to(&mut app, "NEW.TXT");
         app.on_key(key(KeyCode::F(6)));
+        settle(&mut app);
         assert_eq!(staged(&app, Side::Right), 1, "{}", status(&app));
         let r = row(&app, Side::Right, "NEW.TXT").expect("the staged add is listed");
         assert_eq!(r.kind, RowKind::PendingAdd);
@@ -2070,6 +2072,7 @@ mod tests {
         let (_h, _i, mut app) = host_and_image(&["KEEP.TXT"]);
         cursor_to(&mut app, "KEEP.TXT");
         app.on_key(key(KeyCode::F(6)));
+        settle(&mut app);
         app.on_key(key(KeyCode::Esc));
         assert!(matches!(view(&app).modal, Some(Modal::Confirm(_))));
         app.on_key(key(KeyCode::Char('n')));
@@ -2088,6 +2091,7 @@ mod tests {
         let (_h, _i, mut app) = host_and_image(&["KEEP.TXT"]);
         cursor_to(&mut app, "KEEP.TXT");
         app.on_key(key(KeyCode::F(6)));
+        settle(&mut app);
         // From another tab too: the quit comes back to Commander to ask.
         app.on_key(key(KeyCode::Char('1')));
         assert!(app.current() != TabId::Commander);
@@ -2148,6 +2152,7 @@ mod tests {
         let (_h, _i, mut app) = host_and_image(&["SHOWN.TXT"]);
         cursor_to(&mut app, "SHOWN.TXT");
         app.on_key(key(KeyCode::F(6)));
+        settle(&mut app);
         let text = screen(&app);
         assert!(text.contains("[1 staged]"), "{text}");
         assert!(text.contains("+SHOWN.TXT"), "{text}");

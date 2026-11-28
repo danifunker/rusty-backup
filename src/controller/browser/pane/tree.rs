@@ -61,13 +61,18 @@ impl BrowserPaneController {
         self.has_folder_tree() && self.folders.focused
     }
 
-    /// Expand `i`'s child folders under it, listing them now (quick once the volume is open).
+    /// Expand `i`'s child folders under it; the cwd and its ancestors come from the listing's stack,
+    /// so a rebuild after a reload reads nothing again (CBR-015). Another folder lists on demand.
     fn tree_expand(&mut self, i: usize) {
         let Some(node) = self.folders.nodes.get(i).filter(|n| !n.expanded) else {
             return;
         };
         let (dir, depth) = (node.entry.clone(), node.depth);
-        let kids = folders_first(self.listing.list_dir(&dir).unwrap_or_default());
+        let listed = match self.listing.cached_children(&dir) {
+            Some(kids) => kids,
+            None => self.listing.list_dir(&dir).unwrap_or_default(),
+        };
+        let kids = folders_first(listed);
         self.folders.nodes[i].expanded = true;
         let nodes = kids.into_iter().map(|entry| TreeNode {
             entry,

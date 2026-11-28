@@ -92,6 +92,7 @@ fn a_host_to_image_copy_stages_adds_on_the_image_pane() {
     select(&mut ctl, Side::Left, "NEW.TXT");
     assert!(ctl.can_copy(Side::Left));
     ctl.apply(A::Copy(Side::Left));
+    settle(&mut ctl);
     assert!(
         ctl.status()
             .starts_with("Staged copy of 1 item(s) into the R pane"),
@@ -342,6 +343,7 @@ fn keys_copy_switch_panes_and_delete_on_the_active_pane() {
     assert!(ctl.binds(Key::F(6), Mods::default()));
     select(&mut ctl, Side::Left, "KEY.TXT");
     ctl.apply(key(Key::F(6)));
+    settle(&mut ctl);
     assert_eq!(ctl.pane(Side::Right).queue.len(), 1, "{}", ctl.status());
 
     ctl.apply(key(Key::Tab));
@@ -440,6 +442,7 @@ fn keyboard_copy_and_delete_act_on_the_cursor_row_when_nothing_is_marked() {
     assert!(ctl.pane(Side::Right).queue.is_empty());
     ctl.apply(key(Key::Down));
     ctl.apply(key(Key::F(6)));
+    settle(&mut ctl);
     assert_eq!(ctl.pane(Side::Right).queue.len(), 1, "{}", ctl.status());
     ctl.apply(key(Key::Tab));
     ctl.apply(key(Key::End));

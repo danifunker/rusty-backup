@@ -180,6 +180,11 @@ impl WrapperTree {
         prepared.note
     }
 
+    /// The node already has its mount, so expanding it again needs no open.
+    pub fn is_mounted(&self, node_id: &str) -> bool {
+        self.mounts.contains_key(node_id)
+    }
+
     /// Expand a folder node (its enclosing wrapper is already mounted).
     pub fn expand_folder(&mut self, node_id: &str) {
         self.expanded.insert(node_id.to_string());
@@ -209,28 +214,7 @@ impl WrapperTree {
         let fs = self
             .mount_fs(&row.mount)
             .ok_or_else(|| anyhow::anyhow!("wrapper mount not open"))?;
-        let mut rsrc = Vec::new();
-        let _ = fs.write_resource_fork_to(&row.entry, &mut rsrc);
-        let bcem = dsk_dmg::ndif::extract_bcem(&rsrc);
-        // A large nested wrapper goes to a temp file so it is never held in memory whole.
-        if bcem.is_none() && row.entry.size > fs_tar::mem_archive::INLINE_MAX {
-            let (dir, path) = commander_descend::materialize_streamed(&row.entry.name, |f| {
-                let mut w = std::io::BufWriter::new(f);
-                fs.write_file_to(&row.entry, &mut w)?;
-                std::io::Write::flush(&mut w)?;
-                Ok(())
-            })
-            .map_err(|e| anyhow::anyhow!("read '{}': {e:#}", row.entry.name))?;
-            return Ok(WrapperSource::TempFile(dir, path));
-        }
-        if let Some(bcem) = bcem {
-            return ndif_to_temp(fs, row, &bcem)
-                .map_err(|e| anyhow::anyhow!("NDIF '{}': {e:#}", row.entry.name));
-        }
-        let mut data = Vec::new();
-        fs.write_file_to(&row.entry, &mut data)
-            .map_err(|e| anyhow::anyhow!("read '{}': {e}", row.entry.name))?;
-        Ok(WrapperSource::Bytes(data))
+        wrapper_source_from(fs, &row.entry)
     }
 
     /// Walk the expanded subtree rooted at base wrapper `wrapper_id` (already
@@ -416,23 +400,50 @@ pub fn tree_range(rows: &[TreeRow], anchor: &str, clicked: &str) -> Vec<String> 
         .collect()
 }
 
+/// A nested wrapper's openable content read from the filesystem holding it; an NDIF image is
+/// rebuilt from both forks so it opens like any flat disk. Runs in a job when the parent reopens.
+pub fn wrapper_source_from(fs: &mut dyn Filesystem, entry: &FileEntry) -> Result<WrapperSource> {
+    let mut rsrc = Vec::new();
+    let _ = fs.write_resource_fork_to(entry, &mut rsrc);
+    let bcem = dsk_dmg::ndif::extract_bcem(&rsrc);
+    // A large nested wrapper goes to a temp file so it is never held in memory whole.
+    if bcem.is_none() && entry.size > fs_tar::mem_archive::INLINE_MAX {
+        let (dir, path) = commander_descend::materialize_streamed(&entry.name, |f| {
+            let mut w = std::io::BufWriter::new(f);
+            fs.write_file_to(entry, &mut w)?;
+            std::io::Write::flush(&mut w)?;
+            Ok(())
+        })
+        .map_err(|e| anyhow::anyhow!("read '{}': {e:#}", entry.name))?;
+        return Ok(WrapperSource::TempFile(dir, path));
+    }
+    if let Some(bcem) = bcem {
+        return ndif_to_temp(fs, entry, &bcem)
+            .map_err(|e| anyhow::anyhow!("NDIF '{}': {e:#}", entry.name));
+    }
+    let mut data = Vec::new();
+    fs.write_file_to(entry, &mut data)
+        .map_err(|e| anyhow::anyhow!("read '{}': {e}", entry.name))?;
+    Ok(WrapperSource::Bytes(data))
+}
+
 /// A nested NDIF rebuilt through temp files, chunk by chunk: its data fork and the disk it
 /// holds can each be hundreds of MB, so neither is read into memory (MCM-024).
 fn ndif_to_temp(
     fs: &mut dyn disk_core::filesystem::Filesystem,
-    row: &TreeRow,
+    entry: &FileEntry,
     bcem: &[u8],
 ) -> anyhow::Result<WrapperSource> {
     use std::io::{Read, Seek, SeekFrom};
     let (dir, data_path) = commander_descend::materialize_streamed("ndif-data-fork", |f| {
         let mut w = std::io::BufWriter::new(f);
-        fs.write_file_to(&row.entry, &mut w)?;
+        fs.write_file_to(entry, &mut w)?;
         std::io::Write::flush(&mut w)?;
         Ok(())
     })?;
     let image_path = dir
         .path()
-        .join(crate::model::host_component(&row.entry.name, "ndif.img"));
+        .join(crate::model::host_component(&entry.name, "ndif.img"));
     let mut data = std::fs::File::open(&data_path)?;
     let mut out = std::fs::File::create(&image_path)?;
     let len = dsk_dmg::ndif::reconstruct_to(

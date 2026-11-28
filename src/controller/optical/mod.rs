@@ -16,6 +16,7 @@ mod run;
 
 #[cfg(all(test, feature = "native-zstd"))]
 mod identity_tests;
+
 #[cfg(test)]
 mod tests;
 
@@ -27,7 +28,7 @@ use opticaldiscs::detect::DiscImageInfo;
 use crate::controller::log::LogLevel;
 use crate::controller::{job_outcome, Controller, Effect, PickSpec};
 use crate::model::job::{Job, Notify, Snapshot};
-use crate::model::optical_devices::RipDevice;
+use crate::model::optical_devices::{DeviceLocation, RipDevice};
 use crate::model::optical_ops;
 
 pub use crate::controller::backup::ChdChoice;
@@ -605,21 +606,17 @@ impl OpticalController {
 
     /// A scan's drives: the selection stays on its own drive, and never takes the one now in its row.
     fn land_drives(&mut self, devices: Vec<RipDevice>) {
-        let picked = self.selected_device().map(RipDevice::picker_label);
+        let picked = self.selected_device().map(|d| {
+            let key = (d.display_name.clone(), location_key(d));
+            (d.picker_label(), key, d.device_path.is_empty())
+        });
+        let old = self.drive;
         self.drives = devices;
-        let Some(label) = picked else {
+        let Some(was) = picked else {
             return;
         };
-        let at = |i: usize, d: &[RipDevice]| d.get(i).map(RipDevice::picker_label);
-        if self
-            .drive
-            .and_then(|i| at(i, self.drives.as_slice()))
-            .as_ref()
-            == Some(&label)
-        {
-            return;
-        }
-        self.drive = self.drives.iter().position(|d| d.picker_label() == label);
+        let (label, key, no_disc) = was;
+        self.drive = reselect_drive(&label, &key, no_disc, old, &self.drives);
         if self.drive.is_none() {
             self.warn(format!(
                 "{label} is no longer listed, so it is no longer the source."
@@ -1012,5 +1009,38 @@ impl Controller for OpticalController {
     fn tick(&mut self) -> Vec<Effect> {
         self.poll();
         Vec::new()
+    }
+}
+
+/// Where the drive picked before a rescan sits now: a unique path match, else the old slot when it
+/// still holds the same drive (identical drives share a label; an empty tray gains a path).
+fn reselect_drive(
+    label: &str,
+    key: &(String, String),
+    no_disc: bool,
+    old: Option<usize>,
+    drives: &[RipDevice],
+) -> Option<usize> {
+    let same_drive = |d: &RipDevice| d.display_name == key.0 && location_key(d) == key.1;
+    let hits: Vec<usize> = (0..drives.len())
+        .filter(|&i| drives[i].picker_label() == label)
+        .collect();
+    if hits.len() == 1 && !no_disc {
+        return hits.first().copied();
+    }
+    if let Some(i) = old.filter(|&i| drives.get(i).is_some_and(same_drive)) {
+        return Some(i);
+    }
+    match hits.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
+}
+
+fn location_key(d: &RipDevice) -> String {
+    match &d.location {
+        DeviceLocation::Local => String::new(),
+        #[cfg(feature = "remote")]
+        DeviceLocation::Remote { label, .. } => label.clone(),
     }
 }

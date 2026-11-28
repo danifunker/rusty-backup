@@ -137,6 +137,9 @@ pub type ExtractOutcome = Result<(ExtractStats, PathBuf), Failure>;
 /// An extraction's result and the lines it logged along the way.
 type Extracted = (Result<ExtractStats, Failure>, Vec<String>);
 
+/// A payload written out for Inspect: its file, the folder keeping it, and its kind's label.
+type Mounted = (PathBuf, tempfile::TempDir, &'static str);
+
 pub struct ArchivesController {
     notify: Arc<dyn Notify>,
     path: Option<PathBuf>,
@@ -146,6 +149,8 @@ pub struct ArchivesController {
     load_error: Option<Failure>,
     format: ForkFormat,
     extract: Option<(PathBuf, Job<Extracted>)>,
+    /// The payload being written to a temporary file for Inspect (CIN-017).
+    mounting: Option<Job<Mounted>>,
     last_extract: Option<ExtractOutcome>,
     log: Vec<(LogLevel, String)>,
     requests: Vec<HostRequest>,
@@ -162,6 +167,7 @@ impl ArchivesController {
             load_error: None,
             format: ForkFormat::BinHex,
             extract: None,
+            mounting: None,
             last_extract: None,
             log: Vec::new(),
             requests: Vec::new(),
@@ -238,6 +244,11 @@ impl ArchivesController {
         self.loaded.as_ref()?.mountable.as_ref().map(|m| m.kind)
     }
 
+    /// Mount is writing the payload out for Inspect.
+    pub fn is_mounting(&self) -> bool {
+        self.mounting.is_some()
+    }
+
     pub fn is_extracting(&self) -> bool {
         self.extract.is_some()
     }
@@ -265,6 +276,10 @@ impl ArchivesController {
     }
 
     fn open(&mut self, path: PathBuf) {
+        // A mount still writing belongs to the archive being replaced.
+        if let Some(job) = self.mounting.take() {
+            job.cancel();
+        }
         self.requests
             .push(HostRequest::RememberRecent(path.clone()));
         self.path = Some(path.clone());
@@ -351,6 +366,7 @@ impl ArchivesController {
     }
 
     fn poll(&mut self) {
+        self.poll_mount();
         if let Some(done) = self.load.as_ref().and_then(job_outcome) {
             self.load = None;
             match done.unwrap_or_else(|e| {
@@ -404,18 +420,35 @@ impl ArchivesController {
     }
 
     fn mount(&mut self) {
+        if self.mounting.is_some() {
+            return;
+        }
         let Some(payload) = self.loaded.as_ref().and_then(|l| l.mountable.as_ref()) else {
             return;
         };
-        match write_payload_to_tempdir(payload.name.as_str(), payload.decoded.as_slice()) {
-            Ok((path, guard)) => {
+        let name = payload.name.clone();
+        let bytes = Arc::clone(&payload.decoded);
+        let label = payload.kind.label();
+        self.mounting = Some(Job::spawn(
+            "Writing the disk image out",
+            Arc::clone(&self.notify),
+            move |_| {
+                let (path, guard) = write_payload_to_tempdir(name.as_str(), bytes.as_slice())?;
+                Ok((path, guard, label))
+            },
+        ));
+    }
+
+    fn poll_mount(&mut self) {
+        let Some(done) = self.mounting.as_ref().and_then(job_outcome) else {
+            return;
+        };
+        self.mounting = None;
+        match done {
+            Ok((path, guard, label)) => {
                 self.log.push((
                     LogLevel::Info,
-                    format!(
-                        "Routing {} payload to Inspect tab: {}",
-                        payload.kind.label(),
-                        path.display()
-                    ),
+                    format!("Routing {label} payload to Inspect tab: {}", path.display()),
                 ));
                 self.requests
                     .push(HostRequest::OpenInInspect { path, guard });
@@ -429,7 +462,7 @@ impl ArchivesController {
 
     /// Block until the open and any extraction end; for a headless shell or a test.
     pub fn wait_idle(&mut self) {
-        while self.load.is_some() || self.extract.is_some() {
+        while self.load.is_some() || self.extract.is_some() || self.mounting.is_some() {
             self.poll();
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -458,7 +491,7 @@ impl Controller for ArchivesController {
     type Action = ArchivesAction;
 
     fn apply(&mut self, action: ArchivesAction) -> Vec<Effect> {
-        let busy = self.extract.is_some();
+        let busy = self.extract.is_some() || self.mounting.is_some();
         match action {
             ArchivesAction::Pick if !busy => {
                 let exts = crate::model::file_types::archives_picker_exts()

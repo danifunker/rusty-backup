@@ -8,7 +8,7 @@ use disk_core::entry::FileEntry;
 
 use super::{
     purpose, ChecksumRow, Checksums, CommanderController, CopyRun, ExportFormat, PendingConflict,
-    PendingExport, RenameNotice, Side, SkippedReport,
+    PendingExport, RenameNotice, Side, SkippedReport, Staged,
 };
 use crate::controller::browser::pane::StageOutcome;
 use crate::controller::commander::OnConflict;
@@ -16,7 +16,7 @@ use crate::controller::{Choice, ChoiceSpec, Effect, PickSpec};
 use crate::model::checksum::{self, ChecksumJob, FileChecksum};
 use crate::model::commander_ops::{self, ExportJob, HostCopyJob};
 use crate::model::extract::{ASK_ENTRY_FAILED, ENTRY_FAILED_CHOICES};
-use crate::model::job::{Resource, Status};
+use crate::model::job::{Busy, Job, Resource, Status};
 
 /// A failed entry's buttons, in `ENTRY_FAILED_CHOICES` order, with the terminal keys.
 const ENTRY_FAILED_BUTTONS: [(&str, char); 3] = [
@@ -56,14 +56,17 @@ impl CommanderController {
             (true, false) => {
                 // The destination's fs decides forks and ProDOS suffixes, as drop and pick do (CCM-007).
                 let fs_type = self.pane(to).volume().fs_type.clone();
-                let staged = commander_ops::stage_host_for(&entries, &dest_parent, &fs_type);
-                let out = self.pane_mut(to).stage_edits(staged.edits);
-                let said = self.note_staged(to, out);
-                match staged.unreadable.as_slice() {
-                    [] => said,
-                    [(path, e)] => format!("{said} Left out {path}: {e}"),
-                    many => format!("{said} Left out {} unreadable folders.", many.len()),
-                }
+                let spawned = self.jobs.spawn(
+                    "Reading the host files",
+                    Vec::new(),
+                    Arc::clone(&self.notify),
+                    move |_| {
+                        let staged =
+                            commander_ops::stage_host_for(&entries, &dest_parent, &fs_type);
+                        Ok((staged.edits, staged.unreadable))
+                    },
+                );
+                self.begin_stage(spawned, to)
             }
             (false, false) => {
                 let Some(source) = self.pane(from).copy_stage_source() else {
@@ -78,28 +81,18 @@ impl CommanderController {
                     reads,
                     Arc::clone(&self.notify),
                     move |ctx| {
-                        commander_ops::stage_copy_in_job(
+                        let edits = commander_ops::stage_copy_in_job(
                             source,
                             entries,
                             dest_parent,
                             temp_dir,
                             keep_dates,
                             ctx,
-                        )
+                        )?;
+                        Ok((edits, Vec::new()))
                     },
                 );
-                match spawned {
-                    Ok(job) => {
-                        let dest_key = self.volume_key(to);
-                        self.copy = Some(CopyRun::Stage {
-                            job,
-                            dest: to,
-                            dest_key,
-                        });
-                        format!("Copying to the {other} pane...")
-                    }
-                    Err(busy) => format!("Copy refused: {busy}"),
-                }
+                self.begin_stage(spawned, to)
             }
             (false, true) => {
                 let Some(source) = self.pane(from).copy_stage_source() else {
@@ -344,6 +337,22 @@ impl CommanderController {
         }
     }
 
+    /// Track a staging job that lands on `to`, or say why it could not start.
+    fn begin_stage(&mut self, spawned: Result<Job<Staged>, Busy>, to: Side) -> String {
+        match spawned {
+            Ok(job) => {
+                let dest_key = self.volume_key(to);
+                self.copy = Some(CopyRun::Stage {
+                    job,
+                    dest: to,
+                    dest_key,
+                });
+                format!("Copying to the {} pane...", to.label())
+            }
+            Err(busy) => format!("Copy refused: {busy}"),
+        }
+    }
+
     pub(super) fn poll_copy(&mut self) {
         let finished = match &self.copy {
             Some(CopyRun::Host { job, .. }) => !job.is_running(),
@@ -407,9 +416,14 @@ impl CommanderController {
                         "The {} pane now shows another volume; the copy was not staged.",
                         dest.label()
                     ),
-                    (Status::Done, Some(edits)) => {
+                    (Status::Done, Some((edits, unreadable))) => {
                         let out = self.pane_mut(dest).stage_edits(edits);
-                        self.note_staged(dest, out)
+                        let said = self.note_staged(dest, out);
+                        match unreadable.as_slice() {
+                            [] => said,
+                            [(path, e)] => format!("{said} Left out {path}: {e}"),
+                            many => format!("{said} Left out {} unreadable folders.", many.len()),
+                        }
                     }
                     (Status::Failed(e), _) => {
                         format!("Copy to the {} pane failed: {e}", dest.label())

@@ -85,6 +85,8 @@ pub struct InspectOutcome {
     pub deferred_min_sizes: HashMap<usize, &'static str>,
     /// The detected image format ("Fixed VHD", "Norton Ghost (GHO)", ...).
     pub format_label: Option<String>,
+    /// A local CHD's logical size, read here so the view never opens the CHD for it (CIN-018).
+    pub chd_logical_size: Option<u64>,
     /// macOS only: the elevated device handle and its claim, kept so a browse never re-prompts.
     pub device_file: Option<crate::os::SourceHandle>,
     pub device_guard: Option<crate::os::TempFileGuard>,
@@ -403,6 +405,11 @@ pub fn inspect_source(
         drop((device_file, guard));
         (None, None)
     };
+    let chd_logical_size = (!remote && crate::model::source_reader::is_chd_path(path))
+        .then(|| crate::rbformats::chd::ChdReader::open(path).ok())
+        .flatten()
+        .map(|r| r.logical_size())
+        .filter(|&n| n > 0);
     Ok(Inspected::Disk(Box::new(InspectOutcome {
         table,
         alignment,
@@ -413,6 +420,7 @@ pub fn inspect_source(
         volume_labels,
         deferred_min_sizes,
         format_label,
+        chd_logical_size,
         device_file,
         device_guard,
     })))

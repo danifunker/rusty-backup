@@ -496,6 +496,8 @@ pub enum WrapperOpenPlan {
     /// The wrapper bytes, already pulled off a non-reopenable enclosing layer on
     /// the UI thread; the worker still owns the materialize + probe + open.
     Bytes(Vec<u8>),
+    /// A wrapper inside an expanded one: reopen the parent from its recipe and read it there (CBR-014).
+    Nested(Box<(crate::model::commander_descend::ReopenRecipe, FileEntry)>),
 }
 
 /// The reopenable source + wrapper entry for a [`WrapperOpenPlan::Extract`].
@@ -515,6 +517,11 @@ pub fn prepare_wrapper(
     let source = match plan {
         WrapperOpenPlan::HostPath(path) => WrapperSource::Path(path),
         WrapperOpenPlan::Bytes(bytes) => WrapperSource::Bytes(bytes),
+        WrapperOpenPlan::Nested(nested) => {
+            let (recipe, entry) = *nested;
+            let mut fs = recipe.open()?;
+            crate::model::wrapper_tree::wrapper_source_from(fs.as_mut(), &entry)?
+        }
         WrapperOpenPlan::Extract(ex) => {
             let WrapperExtract { base, entry } = *ex;
             let mut fs = base.open()?;

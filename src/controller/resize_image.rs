@@ -249,6 +249,8 @@ pub struct ResizeImageController {
     continue_anyway: bool,
     check_job: Option<Job<Checks>>,
     probe_job: Option<Job<Vec<PartProbe>>>,
+    /// The disk's size, read off the UI thread (a daemon round trip or a CHD open, CTK-012).
+    size_job: Option<Job<u64>>,
     rows: Vec<PartRow>,
     plan_job: Option<Job<Result<Layout, String>>>,
     plan_error: Option<String>,
@@ -280,6 +282,7 @@ impl ResizeImageController {
             continue_anyway: false,
             check_job: None,
             probe_job: None,
+            size_job: None,
             rows: Vec::new(),
             plan_job: None,
             plan_error: None,
@@ -459,7 +462,7 @@ impl ResizeImageController {
             return false;
         }
         match self.page {
-            Page::Size => self.disk_size().is_ok(),
+            Page::Size => self.size_job.is_none() && self.disk_size().is_ok(),
             Page::Check => {
                 !self.check
                     || (self.checks.iter().all(|r| r.verdict.is_some())
@@ -793,18 +796,9 @@ impl ResizeImageController {
         }
         let path = source.plan.path.clone();
         let backend = source.backend.clone();
-        let (old, _) = match backend.disk_size(path.as_path()) {
-            Ok(s) => s,
-            Err(e) => {
-                self.log
-                    .push((LogLevel::Error, format!("Resize Image: {e:#}")));
-                return;
-            }
-        };
+        let (size_backend, size_path) = (backend.clone(), path.clone());
         let mut fresh = ResizeImageController::new(Arc::clone(&self.notify));
         fresh.log = std::mem::take(&mut self.log);
-        fresh.old_disk = old;
-        fresh.disk_text = stamp_size(old);
         fresh.output = Some(default_copy(path.as_path()));
         // A copy would be a path on the daemon: a remote image is resized where it is.
         fresh.in_place = backend.is_remote();
@@ -842,6 +836,11 @@ impl ResizeImageController {
             "Reading the partitions",
             Arc::clone(&fresh.notify),
             move |ctx| backend.probe(path.as_path(), all.as_slice(), ctx),
+        ));
+        fresh.size_job = Some(Job::spawn(
+            "Reading the disk size",
+            Arc::clone(&fresh.notify),
+            move |_| Ok(size_backend.disk_size(size_path.as_path())?.0),
         ));
         *self = fresh;
     }
@@ -1129,6 +1128,22 @@ impl ResizeImageController {
                     .push((LogLevel::Warning, format!("Resize Image: {e}"))),
             }
         }
+        if let Some(done) = self.size_job.as_ref().and_then(job_outcome) {
+            self.size_job = None;
+            match done {
+                Ok(old) => {
+                    self.old_disk = old;
+                    if self.disk_text.trim().is_empty() {
+                        self.disk_text = stamp_size(old);
+                    }
+                }
+                Err(e) => {
+                    self.log
+                        .push((LogLevel::Error, format!("Resize Image: {e}")));
+                    self.source = None;
+                }
+            }
+        }
         if let Some(done) = self.check_job.as_ref().and_then(job_outcome) {
             self.check_job = None;
             // A Repair changed the image, so Inspect reads it again (CTK-006).
@@ -1188,7 +1203,7 @@ impl ResizeImageController {
 
     /// Block until every job ends; for a headless shell or a test.
     pub fn wait_idle(&mut self) {
-        while self.busy() || self.probe_job.is_some() {
+        while self.busy() || self.probe_job.is_some() || self.size_job.is_some() {
             self.poll();
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

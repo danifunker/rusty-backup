@@ -890,13 +890,20 @@ impl BrowserPaneController {
             let Some(kind) = classify_entry(&row.entry) else {
                 return;
             };
-            let opened = self
-                .wrapper_tree
-                .read_wrapper_source(&row)
-                .and_then(|src| self.wrapper_tree.expand_wrapper(node_id, &name, kind, src));
-            if let Err(e) = opened {
-                self.wrapper_failed(&name, format!("{e:#}"));
+            // Mounting can take seconds, so a parent that reopens off-thread does it in a job (CBR-014).
+            if self.wrapper_tree.is_mounted(node_id) {
+                self.wrapper_tree.expand_folder(node_id);
+            } else if self.open_nested_wrapper(&row, kind) {
                 return;
+            } else {
+                let opened = self
+                    .wrapper_tree
+                    .read_wrapper_source(&row)
+                    .and_then(|src| self.wrapper_tree.expand_wrapper(node_id, &name, kind, src));
+                if let Err(e) = opened {
+                    self.wrapper_failed(&name, format!("{e:#}"));
+                    return;
+                }
             }
         } else {
             self.wrapper_tree.expand_folder(node_id);
@@ -920,6 +927,14 @@ impl BrowserPaneController {
             self.context_select(&row.name);
         }
         true
+    }
+
+    /// Every selected row, listing, wrapper tree and combined tree, to tell whether a step changed it.
+    pub(in crate::controller) fn selection_snapshot(&self) -> Vec<String> {
+        let mut all = self.listing.selection().to_vec();
+        all.extend(self.tree_selected.iter().cloned());
+        all.extend(self.dirs.selected.iter().cloned());
+        all
     }
 
     /// The number of selected rows, listing, wrapper tree or combined tree.

@@ -574,7 +574,12 @@ mod tests {
         let status = app.archive.as_ref().unwrap().status.clone().unwrap();
         assert!(status.contains("raw HFS"), "{status}");
         assert!(app.handle_archive_key(KeyCode::Char('m')));
-        assert!(app.current() == TabId::Inspect);
+        let start = std::time::Instant::now();
+        while app.current() != TabId::Inspect {
+            assert!(start.elapsed().as_secs() < 60, "the mount never landed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.archive_tick();
+        }
         let start = std::time::Instant::now();
         while app.inspect.as_ref().unwrap().busy() {
             assert!(start.elapsed().as_secs() < 60, "the open never ended");
