@@ -400,8 +400,6 @@ pub fn tree_range(rows: &[TreeRow], anchor: &str, clicked: &str) -> Vec<String> 
         .collect()
 }
 
-/// A nested NDIF rebuilt through temp files, chunk by chunk: its data fork and the disk it
-/// holds can each be hundreds of MB, so neither is read into memory (MCM-024).
 /// A nested wrapper's openable content read from the filesystem holding it; an NDIF image is
 /// rebuilt from both forks so it opens like any flat disk. Runs in a job when the parent reopens.
 pub fn wrapper_source_from(fs: &mut dyn Filesystem, entry: &FileEntry) -> Result<WrapperSource> {
@@ -429,6 +427,8 @@ pub fn wrapper_source_from(fs: &mut dyn Filesystem, entry: &FileEntry) -> Result
     Ok(WrapperSource::Bytes(data))
 }
 
+/// A nested NDIF rebuilt through temp files, chunk by chunk: its data fork and the disk it
+/// holds can each be hundreds of MB, so neither is read into memory (MCM-024).
 fn ndif_to_temp(
     fs: &mut dyn disk_core::filesystem::Filesystem,
     entry: &FileEntry,

@@ -68,6 +68,8 @@ pub enum SortColumn {
 struct Frame {
     dir: FileEntry,
     entries: Vec<FileEntry>,
+    /// Listed since the last reload; a reload refreshes only the current folder.
+    fresh: bool,
 }
 
 /// A single rendered row. `Parent` is the synthetic `..` row; `Entry` borrows
@@ -277,8 +279,12 @@ impl DirListing {
             return Ok(());
         };
         let entries = self.list_children(&dir)?;
+        for frame in self.stack.iter_mut() {
+            frame.fresh = false;
+        }
         if let Some(frame) = self.stack.last_mut() {
             frame.entries = entries;
+            frame.fresh = true;
         }
         self.sort_current();
         self.clear_selection();
@@ -302,7 +308,7 @@ impl DirListing {
     pub fn cached_children(&self, dir: &FileEntry) -> Option<Vec<FileEntry>> {
         self.stack
             .iter()
-            .find(|f| f.dir.path == dir.path)
+            .find(|f| f.fresh && f.dir.path == dir.path)
             .map(|f| f.entries.clone())
     }
 
@@ -404,7 +410,11 @@ impl DirListing {
 
     /// Push a new directory frame, sorting its children by the active sort.
     fn push_dir(&mut self, dir: FileEntry, entries: Vec<FileEntry>) {
-        self.stack.push(Frame { dir, entries });
+        self.stack.push(Frame {
+            dir,
+            entries,
+            fresh: true,
+        });
         self.sort_current();
     }
 

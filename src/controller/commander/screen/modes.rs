@@ -515,6 +515,18 @@ impl CommanderController {
         self.modes.job = job.map(ModeJob::ChdOpen);
     }
 
+    /// A CHD open failed; after a failed flatten the pane was released, so the plain parent comes back.
+    fn chd_open_failed(&mut self, why: String) {
+        if !std::mem::take(&mut self.modes.rejoin_dirty) {
+            self.modes.notice = Some(why);
+            return;
+        }
+        self.modes.notice = Some(format!(
+            "The save failed and Edit Mode could not reopen ({why}). The edits stay in the CHD's diff file; turn Edit Mode on to try again."
+        ));
+        self.reopen_modes();
+    }
+
     fn start_archive_extract(&mut self) {
         let Some(ctx) = self.modes.archive.clone() else {
             return;
@@ -818,13 +830,8 @@ impl CommanderController {
                         self.modes.copy_dirty |= std::mem::take(&mut self.modes.rejoin_dirty);
                         self.reopen_modes();
                     }
-                    Some((_, Err(message))) => {
-                        self.modes.rejoin_dirty = false;
-                        self.modes.notice = Some(message)
-                    }
-                    None => {
-                        self.modes.notice = Some(format!("Error opening CHD: {}", failed(snap)))
-                    }
+                    Some((_, Err(message))) => self.chd_open_failed(message),
+                    None => self.chd_open_failed(format!("Error opening CHD: {}", failed(snap))),
                 }
             }
             Some(ModeJob::Flatten(job)) => {
@@ -848,6 +855,10 @@ impl CommanderController {
                 } else {
                     self.modes.rejoin_dirty = true;
                     self.start_chd_open();
+                    if self.modes.job.is_none() {
+                        let why = self.modes.notice.take().unwrap_or_default();
+                        self.chd_open_failed(why);
+                    }
                 }
             }
             Some(ModeJob::Extract(job)) => {
@@ -996,12 +1007,18 @@ impl CommanderController {
             return;
         }
         let session = self.modes.session.clone();
+        // SquashFS only knows its room as a rebuild estimate; its editor writes nothing until sync.
+        let squash = self.left.volume().fs_type == "SquashFS";
         let spawned = self.jobs.spawn(
             "Free space",
             Vec::new(),
             Arc::clone(&self.notify),
             // Read-only, as the apply preflight reads it: an editable open raced a write (CCM-016).
             move |_| {
+                if squash {
+                    let opened = session.open_editable().ok();
+                    return Ok(opened.and_then(|(mut efs, _commit)| efs.free_space().ok()));
+                }
                 let fs = session.open().ok();
                 Ok(fs.map(|fs| fs.total_size().saturating_sub(fs.used_size())))
             },

@@ -39,14 +39,15 @@ pub fn hfs_now() -> u32 {
 
 /// Format an HFS/HFS+ Mac-epoch timestamp (seconds since 1904-01-01 UTC) as a
 /// human-readable `YYYY-MM-DD HH:MM:SS` string. Returns `None` for a zero
-/// timestamp ("no date set" on disk). Dates before the Unix epoch clamp to
-/// 1970-01-01 — vintage Mac files are 1984+, so this is harmless in practice.
+/// timestamp ("no date set" on disk). Dates from 1904 to 1969 (a dead PRAM
+/// battery) show as themselves, not clamped to 1970.
 pub fn format_mac_date(mac_secs: u32) -> Option<String> {
     if mac_secs == 0 {
         return None;
     }
     let unix = mac_secs as i64 - MAC_EPOCH_DELTA as i64;
-    Some(disk_core::unix_common::inode::format_unix_timestamp(unix))
+    let dt = chrono::DateTime::from_timestamp(unix, 0)?;
+    Some(dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
 /// Convert an HFS/HFS+ Mac-epoch timestamp to seconds since the Unix epoch,
@@ -2648,6 +2649,8 @@ mod tests {
             format_mac_date(MAC_EPOCH_DELTA as u32).as_deref(),
             Some("1970-01-01 00:00:00")
         );
+        // Before 1970 (a dead PRAM battery) is shown as it is.
+        assert_eq!(format_mac_date(1).as_deref(), Some("1904-01-01 00:00:01"));
         // A real vintage Mac timestamp: 2000-01-01 00:00:00 UTC.
         assert_eq!(
             format_mac_date((MAC_EPOCH_DELTA + 946_684_800) as u32).as_deref(),

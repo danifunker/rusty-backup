@@ -558,12 +558,14 @@ impl KeyMap {
             }
             if ok {
                 self.bindings.retain(|(_, c)| *c != cmd);
-                for chord in &chords {
-                    let mac = self.mac;
+                let mac = self.mac;
+                // Only chords this platform uses can take one over; a `mac:` line leaves PC keys alone.
+                for chord in chords.iter().filter(|c| c.applies(mac)) {
+                    let clash = |c: &Chord| c.applies(mac) && c.collides(chord);
                     let taken: Vec<Command> = self
                         .bindings
                         .iter()
-                        .filter(|(c, _)| c.collides(chord))
+                        .filter(|(c, _)| clash(c))
                         .map(|(_, other)| *other)
                         .collect();
                     for other in taken {
@@ -574,7 +576,7 @@ impl KeyMap {
                             other.name()
                         ));
                     }
-                    self.bindings.retain(|(c, _)| !c.collides(chord));
+                    self.bindings.retain(|(c, _)| !clash(c));
                 }
                 self.bindings.extend(chords.into_iter().map(|c| (c, cmd)));
             }
@@ -627,18 +629,13 @@ impl KeyMap {
 }
 
 impl Chord {
-    /// True when one key press on some platform could mean both chords.
+    /// True when the same key press means both chords (the caller checks they apply here).
     fn collides(&self, other: &Chord) -> bool {
         let same_key = match (self.key, other.key) {
             (Key::Char(a), Key::Char(b)) => a.eq_ignore_ascii_case(&b),
             (a, b) => a == b,
         };
-        let platforms = !matches!(
-            (self.on, other.on),
-            (OnPlatform::MacOnly, OnPlatform::PcOnly) | (OnPlatform::PcOnly, OnPlatform::MacOnly)
-        );
         same_key
-            && platforms
             && self.primary == other.primary
             && self.alt == other.alt
             && self.shift == other.shift
@@ -1065,5 +1062,12 @@ mod tests {
         assert!(problems[1].contains("[viewer]"), "{problems:?}");
         assert_eq!(map.lookup(Key::F(2), Mods::default()), Some(Command::Apply));
         assert_eq!(map.lookup(Key::F(12), Mods::default()), None);
+    }
+
+    #[test]
+    fn a_mac_only_rebind_leaves_the_pc_binding_alone() {
+        let mut pc = KeyMap::defaults(false);
+        assert!(pc.apply_overrides("apply = \"mac:F2\"\n").is_empty());
+        assert_eq!(pc.lookup(Key::F(2), Mods::default()), Some(Command::Rename));
     }
 }

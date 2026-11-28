@@ -650,16 +650,18 @@ impl Controller for CommanderController {
     fn apply(&mut self, action: CommanderAction) -> Vec<Effect> {
         // A non-key action ends the cursor's stand-in selection, after it ran (a pick or a confirm
         // still needs it); leaving it selected let a later Delete hit that stale row (CCM-011).
-        let ended = match action {
+        let ended = match &action {
             CommanderAction::Key(..) | CommanderAction::SetPageRows(..) => None,
+            // A click or mark makes the selection the user's own.
+            CommanderAction::Pane(_, a) if selects(a) => self.implicit.take().and(None),
             _ => self.implicit.take(),
         };
-        let before = ended.map(|was| self.pane(was).listing.selection().to_vec());
+        let before = ended.map(|was| self.pane(was).selection_snapshot());
         let fx = self.apply_action(action);
         if let (Some(was), Some(before)) = (ended, before) {
-            // Only the stand-in itself: a click that picked another row keeps its choice.
-            let after = self.pane(was).listing.selection();
-            if after.len() == 1 && after == before.as_slice() {
+            // Only the stand-in itself: whatever changed the selection keeps its choice.
+            let after = self.pane(was).selection_snapshot();
+            if after.len() == 1 && after == before {
                 self.forward(was, BrowserPaneAction::ClearSelection);
             }
         }
@@ -1599,7 +1601,7 @@ impl CommanderController {
                 purpose: purpose::QUIT_UNSAVED,
                 title: "Unsaved changes".into(),
                 message: "Edit Mode has changes that are not saved into the image yet. \
-                          Quitting now discards them; leave Edit Mode first to save."
+                          Quitting now leaves them unsaved; leave Edit Mode first to save them."
                     .into(),
                 confirm_label: "Discard & Quit".into(),
                 destructive: true,
@@ -1713,7 +1715,15 @@ impl CommanderController {
                         }
                         self.detail_job = Some(job);
                     }
-                    None => self.detail_retry = Some((side, entry, at_root)),
+                    // Only a busy refusal waits; a pane with nothing to read from stops loading.
+                    None if self.pane(side).detail_source().is_some() => {
+                        self.detail_retry = Some((side, entry, at_root))
+                    }
+                    None => {
+                        if let Some(d) = self.detail.as_mut() {
+                            d.loading = false;
+                        }
+                    }
                 }
             }
         }
@@ -1755,4 +1765,18 @@ impl CommanderController {
         };
         self.set_metadata_result(result);
     }
+}
+
+/// A pane action that sets the selection itself.
+fn selects(a: &BrowserPaneAction) -> bool {
+    matches!(
+        a,
+        BrowserPaneAction::Click { .. }
+            | BrowserPaneAction::TreeClick { .. }
+            | BrowserPaneAction::ContextSelect(_)
+            | BrowserPaneAction::TreeContextSelect(_)
+            | BrowserPaneAction::ToggleMark
+            | BrowserPaneAction::Mark(_)
+            | BrowserPaneAction::ClearSelection
+    )
 }

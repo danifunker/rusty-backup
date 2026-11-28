@@ -255,8 +255,11 @@ impl ExpandHfsController {
         self.source.as_ref()?;
         let (min, max) = self.size_bounds();
         (min > max).then(|| {
+            let largest = BLOCK_SIZE_CHOICES.last() == Some(&self.block_size);
             let fix = if self.flat_hfv && max == HFV_MAX_MIB {
                 "a flat HFV cannot hold it; write an APM disk instead"
+            } else if largest {
+                "classic HFS cannot hold this much"
             } else {
                 "pick a larger block size"
             };

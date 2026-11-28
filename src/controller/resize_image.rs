@@ -237,9 +237,6 @@ pub enum ResizeImageAction {
 
 type Checks = Vec<(usize, Verdict)>;
 
-/// The disk's size and each partition's probe (or why probing failed).
-type Probed = (u64, Result<Vec<PartProbe>, String>);
-
 pub struct ResizeImageController {
     notify: Arc<dyn Notify>,
     log: Vec<(LogLevel, String)>,
@@ -251,8 +248,9 @@ pub struct ResizeImageController {
     checks: Vec<CheckRow>,
     continue_anyway: bool,
     check_job: Option<Job<Checks>>,
-    /// The disk's size and each partition's probe, read off the UI thread (CTK-012).
-    probe_job: Option<Job<Probed>>,
+    probe_job: Option<Job<Vec<PartProbe>>>,
+    /// The disk's size, read off the UI thread (a daemon round trip or a CHD open, CTK-012).
+    size_job: Option<Job<u64>>,
     rows: Vec<PartRow>,
     plan_job: Option<Job<Result<Layout, String>>>,
     plan_error: Option<String>,
@@ -284,6 +282,7 @@ impl ResizeImageController {
             continue_anyway: false,
             check_job: None,
             probe_job: None,
+            size_job: None,
             rows: Vec::new(),
             plan_job: None,
             plan_error: None,
@@ -463,7 +462,7 @@ impl ResizeImageController {
             return false;
         }
         match self.page {
-            Page::Size => !self.probing() && self.disk_size().is_ok(),
+            Page::Size => self.size_job.is_none() && self.disk_size().is_ok(),
             Page::Check => {
                 !self.check
                     || (self.checks.iter().all(|r| r.verdict.is_some())
@@ -797,6 +796,7 @@ impl ResizeImageController {
         }
         let path = source.plan.path.clone();
         let backend = source.backend.clone();
+        let (size_backend, size_path) = (backend.clone(), path.clone());
         let mut fresh = ResizeImageController::new(Arc::clone(&self.notify));
         fresh.log = std::mem::take(&mut self.log);
         fresh.output = Some(default_copy(path.as_path()));
@@ -835,12 +835,12 @@ impl ResizeImageController {
         fresh.probe_job = Some(Job::spawn(
             "Reading the partitions",
             Arc::clone(&fresh.notify),
-            move |ctx| {
-                ctx.set_phase("Reading the disk size");
-                let (old, _) = backend.disk_size(path.as_path())?;
-                let probes = backend.probe(path.as_path(), all.as_slice(), ctx);
-                Ok((old, probes.map_err(|e| format!("{e:#}"))))
-            },
+            move |ctx| backend.probe(path.as_path(), all.as_slice(), ctx),
+        ));
+        fresh.size_job = Some(Job::spawn(
+            "Reading the disk size",
+            Arc::clone(&fresh.notify),
+            move |_| Ok(size_backend.disk_size(size_path.as_path())?.0),
         ));
         *self = fresh;
     }
@@ -1114,21 +1114,27 @@ impl ResizeImageController {
         if let Some(done) = self.probe_job.as_ref().and_then(job_outcome) {
             self.probe_job = None;
             match done {
-                Ok((old, probes)) => {
-                    self.old_disk = old;
-                    if self.disk_text.trim().is_empty() {
-                        self.disk_text = stamp_size(old);
-                    }
-                    if let Err(e) = &probes {
-                        self.log
-                            .push((LogLevel::Warning, format!("Resize Image: {e}")));
-                    }
-                    for p in probes.unwrap_or_default() {
+                Ok(probes) => {
+                    for p in probes {
                         if let Some(r) = self.rows.iter_mut().find(|r| r.index == p.index) {
                             r.fixed = p.fixed;
                             r.minimum = p.minimum.or(r.minimum);
                             r.hfs_block = p.hfs_block;
                         }
+                    }
+                }
+                Err(e) => self
+                    .log
+                    .push((LogLevel::Warning, format!("Resize Image: {e}"))),
+            }
+        }
+        if let Some(done) = self.size_job.as_ref().and_then(job_outcome) {
+            self.size_job = None;
+            match done {
+                Ok(old) => {
+                    self.old_disk = old;
+                    if self.disk_text.trim().is_empty() {
+                        self.disk_text = stamp_size(old);
                     }
                 }
                 Err(e) => {
@@ -1197,7 +1203,7 @@ impl ResizeImageController {
 
     /// Block until every job ends; for a headless shell or a test.
     pub fn wait_idle(&mut self) {
-        while self.busy() || self.probe_job.is_some() {
+        while self.busy() || self.probe_job.is_some() || self.size_job.is_some() {
             self.poll();
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

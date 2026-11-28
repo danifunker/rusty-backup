@@ -96,8 +96,8 @@ pub(super) struct ToolState {
     temp: Option<tempfile::TempDir>,
     /// Host items an `AddHostPaths` could not stage: (path, why).
     staging_errors: Vec<(String, String)>,
-    /// The running Repair belongs to a source the pane has since left (CBR-016).
-    repair_left_behind: bool,
+    /// The source and partition the running Repair writes, to tell whether the pane left it (CBR-016).
+    repair_for: Option<String>,
 }
 
 fn msg(text: impl Into<String>) -> Vec<Effect> {
@@ -109,10 +109,7 @@ impl ToolState {
     /// acted on the new volume (CBR-005, CBR-016). A running Repair is kept; it owns its write.
     pub(super) fn forget_source(&mut self) {
         match self.job.take() {
-            Some(keep @ ToolJob::Repair { .. }) => {
-                self.job = Some(keep);
-                self.repair_left_behind = true;
-            }
+            Some(keep @ ToolJob::Repair { .. }) => self.job = Some(keep),
             Some(ToolJob::Volume { job, .. }) => job.cancel(),
             Some(ToolJob::Read(job)) => job.cancel(),
             None => {}
@@ -657,7 +654,7 @@ impl BrowserPaneController {
         match spawned {
             Ok(job) => {
                 self.tl.job = Some(ToolJob::Repair { title, job });
-                self.tl.repair_left_behind = false;
+                self.tl.repair_for = Some(self.repair_key());
                 msg("repairing the filesystem...")
             }
             Err(busy) => msg(format!("cannot repair: {busy}")),
@@ -1038,6 +1035,10 @@ impl BrowserPaneController {
         said
     }
 
+    fn repair_key(&self) -> String {
+        format!("{:?}|{:?}", self.source_path(), self.selected_partition())
+    }
+
     /// Installs a finished tool job; called from `tick`.
     pub(super) fn poll_tools(&mut self) -> Vec<Effect> {
         let done = match &self.tl.job {
@@ -1091,7 +1092,7 @@ impl BrowserPaneController {
                     },
                 };
                 self.ed_log(format!("{title}: {}", done.lines[0]));
-                if std::mem::take(&mut self.tl.repair_left_behind) {
+                if self.tl.repair_for.take() != Some(self.repair_key()) {
                     return msg(format!("{title} (no longer open): {}", done.lines[0]));
                 }
                 self.tl.report = Some(ToolReport {

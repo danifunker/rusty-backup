@@ -1407,7 +1407,12 @@ impl BrowserPaneController {
         }
         let plan = WrapperOpenPlan::Nested(Box::new((recipe, row.entry.clone())));
         let name = row.entry.name.clone();
-        self.spawn_wrapper_open(&row.node_id, name, kind, plan, Vec::new());
+        // The recipe may re-read this pane's image, so the open waits out an apply's write.
+        let resources = match self.listing.is_host() {
+            true => Vec::new(),
+            false => self.apply_resources(),
+        };
+        self.spawn_wrapper_open(&row.node_id, name, kind, plan, resources);
         true
     }
 
